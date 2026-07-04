@@ -54,6 +54,7 @@ import {
 import { getProfile, createMissingProfile, getTenantProfiles } from "./src/lib/profileService.js";
 import { sendInviteEmail } from "./src/lib/emailService.js";
 import { provisionTenant, buildInviteUrl, normalizeProvisionedOrg, createMemberInvite } from "./src/lib/provisioningService.js";
+import { awardLessonPoints, awardCoursePoints, awardQuizPoints, awardGamePointsForSession } from "./src/lib/scoringService.js";
 
 // ── MOBILE HOOK ────────────────────────────────────────────
 function useMobile() {
@@ -5456,8 +5457,45 @@ function LearnScreen({ role, user, orgUsers = [], orgs = [], onNav, onAwardXp, p
     if (lessonXp) onAwardXp?.(lessonXp);
     // Persist to Supabase for real users (fire-and-forget)
     if (isReal && user?.id) {
-      markLessonComplete(user.id, id, tenantId ?? null)
+      const uid = user.id;
+      const tid = tenantId ?? null;
+      markLessonComplete(uid, id, tid)
         .then(({ error }) => { if (error) console.error("[ralli] markLessonComplete failed:", error); });
+
+      // Award lesson XP — find any assignment for this lesson to check dueAt
+      const userTeamId = orgUsers.find(u => u.id === uid)?.teamId ?? null;
+      const lessonAssignment = assignments.find(a =>
+        a.contentType === "lesson" && a.contentId === id && (
+          (a.assignedTo.type === "group"      && a.assignedTo.orgId === user?.orgId) ||
+          (a.assignedTo.type === "individual" && a.assignedTo.userId === uid)        ||
+          (a.assignedTo.type === "team"       && userTeamId && a.assignedTo.teamId === userTeamId)
+        )
+      );
+      if (tid) {
+        awardLessonPoints(tid, uid, id, { dueAt: lessonAssignment?.dueAt })
+          .catch(e => console.error("[ralli] awardLessonPoints failed:", e));
+      }
+
+      // Detect course completion — check if any course containing this lesson is now fully done
+      if (tid) {
+        const updatedCompleted = new Set([...completedLessons, id]);
+        courses.forEach(course => {
+          if (!course.lessonIds?.includes(id)) return;
+          const wasComplete = course.lessonIds.every(lid => completedLessons.has(lid));
+          if (wasComplete) return; // already completed before this lesson
+          const nowComplete = course.lessonIds.every(lid => updatedCompleted.has(lid));
+          if (!nowComplete) return;
+          const courseAssignment = assignments.find(a =>
+            a.contentType === "course" && a.contentId === course.id && (
+              (a.assignedTo.type === "group"      && a.assignedTo.orgId === user?.orgId) ||
+              (a.assignedTo.type === "individual" && a.assignedTo.userId === uid)        ||
+              (a.assignedTo.type === "team"       && userTeamId && a.assignedTo.teamId === userTeamId)
+            )
+          );
+          awardCoursePoints(tid, uid, course.id, { dueAt: courseAssignment?.dueAt })
+            .catch(e => console.error("[ralli] awardCoursePoints failed:", e));
+        });
+      }
     }
   };
 
@@ -7786,6 +7824,13 @@ function QuizzesScreen({ role, onNav, quizzes, onEditQuiz, onDeleteQuiz, onToggl
       ));
       setActiveAttempt(attempt);
       setView("results");
+      // Award quiz XP for real users
+      if (isReal && currentUser?.id && tenantId) {
+        const previousAttempts = assignments.find(q => q.id === activeId)?.attempts ?? [];
+        const isRetake = previousAttempts.length > 0;
+        awardQuizPoints(tenantId, currentUser.id, activeId, attempt, { isRetake })
+          .catch(e => console.error("[ralli] awardQuizPoints failed:", e));
+      }
     };
 
     // ── Quiz taking ──
@@ -9727,109 +9772,152 @@ const fullLeaderboard = [
   { rank: 8, initials: "CR", name: "Carlos Reyes", title: "SDR", score: 74, weeklyXp: 610, streak: 2, color: "#14B8A6" },
 ];
 
-function LeaderboardScreen({ currentUser, isReal = false }) {
-  const [period, setPeriod] = useState("week");
-  const leaderboard = fullLeaderboard.map(p => ({ ...p, isMe: p.name === currentUser?.name }));
+function LeaderboardScreen({ currentUser, isReal = false, tenantId = null }) {
+  const [rows,    setRows]    = useState([]);
+  const [loading, setLoading] = useState(isReal);
 
-  // Real tenants start with no activity — show empty state until data exists
-  if (isReal) {
+  useEffect(() => {
+    if (!isReal || !tenantId) { setLoading(false); return; }
+    // Inline import to avoid circular dep — scoringService is not imported at the module level for this component
+    import("./src/lib/scoringService.js").then(({ getLeaderboard }) => {
+      getLeaderboard(tenantId, currentUser?.id).then(({ data }) => {
+        setRows(data ?? []);
+        setLoading(false);
+      });
+    });
+  }, [tenantId, isReal, currentUser?.id]); // eslint-disable-line react-hooks/exhaustive-deps
+
+  const leaderboard = isReal ? rows : fullLeaderboard.map(p => ({ ...p, isMe: p.name === currentUser?.name }));
+
+  const colGrid = "48px 1fr 90px 80px 80px 72px 72px 72px";
+  const colHeader = ["#", "MEMBER", "TOTAL", "QUIZ PTS", "GAME PTS", "LEARN XP", "GAMES", "QUIZZES"];
+
+  if (loading) {
     return (
       <div style={{ display: "flex", flexDirection: "column", gap: 20 }}>
         <div>
           <h2 style={{ margin: 0, fontSize: 22, fontWeight: 800, color: C.text }}>Leaderboard</h2>
-          <p style={{ margin: "4px 0 0", fontSize: 13, color: C.textSub }}>Team rankings based on knowledge score</p>
+          <p style={{ margin: "4px 0 0", fontSize: 13, color: C.textSub }}>Team rankings based on total points earned</p>
+        </div>
+        <div style={{ padding: 60, textAlign: "center", color: C.textMuted, fontSize: 14 }}>Loading rankings…</div>
+      </div>
+    );
+  }
+
+  if (isReal && leaderboard.length === 0) {
+    return (
+      <div style={{ display: "flex", flexDirection: "column", gap: 20 }}>
+        <div>
+          <h2 style={{ margin: 0, fontSize: 22, fontWeight: 800, color: C.text }}>Leaderboard</h2>
+          <p style={{ margin: "4px 0 0", fontSize: 13, color: C.textSub }}>Team rankings based on total points earned</p>
         </div>
         <div style={{ background: C.white, borderRadius: 12, border: `1px solid ${C.border}`, display: "flex", flexDirection: "column", alignItems: "center", justifyContent: "center", padding: "60px 40px", textAlign: "center", gap: 12 }}>
           <div style={{ width: 56, height: 56, borderRadius: 14, background: C.orangeLight, display: "flex", alignItems: "center", justifyContent: "center", fontSize: 24 }}>🏆</div>
           <div style={{ fontSize: 16, fontWeight: 800, color: C.text }}>No rankings yet</div>
           <p style={{ margin: 0, fontSize: 13, color: C.textSub, maxWidth: 300, lineHeight: 1.6 }}>
-            Rankings appear once your team members start completing lessons and quizzes. Invite your first reps to get started.
+            Rankings appear once your team starts completing lessons, quizzes, and live games.
           </p>
         </div>
       </div>
     );
   }
 
+  const podium = leaderboard.slice(0, 3);
+  const podiumOrder = podium.length >= 3 ? [podium[1], podium[0], podium[2]] : podium;
+  const podiumMedals = ["2nd", "1st", "3rd"];
+  const podiumColors = [C.orange, "#F5A623", "#CD7F32"];
+
   return (
     <div style={{ display: "flex", flexDirection: "column", gap: 20 }}>
-      <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center" }}>
-        <div>
-          <h2 style={{ margin: 0, fontSize: 22, fontWeight: 800, color: C.text }}>Leaderboard</h2>
-          <p style={{ margin: "4px 0 0", fontSize: 13, color: C.textSub }}>Team rankings based on knowledge score</p>
-        </div>
-        <div style={{ display: "flex", gap: 6 }}>
-          {["week", "month", "all"].map(p => (
-            <button key={p} onClick={() => setPeriod(p)} style={{
-              padding: "7px 14px", borderRadius: 8, border: `1px solid ${period === p ? C.orange : C.border}`,
-              background: period === p ? C.orangeLight : C.white,
-              color: period === p ? C.orange : C.textSub,
-              fontSize: 13, fontWeight: 600, cursor: "pointer",
-            }}>
-              {p === "week" ? "This Week" : p === "month" ? "This Month" : "All Time"}
-            </button>
-          ))}
-        </div>
+      <div>
+        <h2 style={{ margin: 0, fontSize: 22, fontWeight: 800, color: C.text }}>Leaderboard</h2>
+        <p style={{ margin: "4px 0 0", fontSize: 13, color: C.textSub }}>Team rankings based on total points earned</p>
       </div>
 
       {/* Top 3 podium */}
-      <Card style={{ background: `linear-gradient(135deg, ${C.dark}, #1F2937)`, border: "none" }}>
-        <div style={{ display: "flex", alignItems: "flex-end", justifyContent: "center", gap: 20, padding: "20px 0 8px" }}>
-          {[leaderboard[1], leaderboard[0], leaderboard[2]].map((p, i) => {
-            const isFirst = i === 1;
-            return (
-              <div key={p.rank} style={{ textAlign: "center", flex: 1 }}>
-                <div style={{ fontSize: isFirst ? 32 : 24, marginBottom: 8 }}>
-                  {p.rank === 1 ? "1st" : p.rank === 2 ? "2nd" : "3rd"}
+      {podiumOrder.length >= 2 && (
+        <Card style={{ background: `linear-gradient(135deg, ${C.dark}, #1F2937)`, border: "none" }}>
+          <div style={{ display: "flex", alignItems: "flex-end", justifyContent: "center", gap: 20, padding: "20px 0 8px" }}>
+            {podiumOrder.map((p, i) => {
+              if (!p) return null;
+              const isFirst = i === 1;
+              const scoreColor = podiumColors[i] ?? "#A8B2C0";
+              return (
+                <div key={p.userId ?? p.rank} style={{ textAlign: "center", flex: 1 }}>
+                  <div style={{ fontSize: isFirst ? 28 : 20, marginBottom: 8 }}>{podiumMedals[i]}</div>
+                  <Avatar initials={p.initials} size={isFirst ? 60 : 48} color={scoreColor} bg={scoreColor + "33"} />
+                  <div style={{ fontSize: isFirst ? 14 : 12, fontWeight: 700, color: "#fff", marginTop: 8 }}>
+                    {(p.name ?? "").split(" ")[0]}{p.isMe ? " (you)" : ""}
+                  </div>
+                  <div style={{ fontSize: isFirst ? 22 : 18, fontWeight: 800, color: scoreColor, marginTop: 4 }}>
+                    {(isReal ? p.total : p.score ?? p.total ?? 0).toLocaleString()}
+                  </div>
+                  <div style={{ height: isFirst ? 80 : i === 0 ? 60 : 50, background: "rgba(255,255,255,0.06)", borderRadius: "6px 6px 0 0", marginTop: 10, border: "1px solid rgba(255,255,255,0.1)" }} />
                 </div>
-                <Avatar initials={p.initials} size={isFirst ? 60 : 48} color={p.color} bg={p.color + "33"} />
-                <div style={{ fontSize: isFirst ? 14 : 12, fontWeight: 700, color: "#fff", marginTop: 8 }}>{p.name.split(" ")[0]}</div>
-                <div style={{ fontSize: 11, color: C.textMuted, marginBottom: 6 }}>{p.title}</div>
-                <div style={{ fontSize: isFirst ? 22 : 18, fontWeight: 800, color: p.rank === 1 ? "#F5A623" : p.rank === 2 ? "#A8B2C0" : "#CD7F32" }}>
-                  {p.score}
-                </div>
-                <div style={{
-                  height: isFirst ? 80 : i === 0 ? 60 : 50,
-                  background: "rgba(255,255,255,0.06)",
-                  borderRadius: "6px 6px 0 0", marginTop: 10,
-                  border: "1px solid rgba(255,255,255,0.1)",
-                }} />
-              </div>
-            );
-          })}
-        </div>
-      </Card>
-
-      {/* Full list */}
-      <Card style={{ padding: 0, overflow: "hidden" }}>
-        <div style={{ padding: "12px 20px", borderBottom: `1px solid ${C.border}`, display: "grid", gridTemplateColumns: "48px 1fr 80px 80px 80px", gap: 8, fontSize: 11, fontWeight: 600, color: C.textMuted, letterSpacing: "0.06em" }}>
-          <div>#</div><div>MEMBER</div><div style={{ textAlign: "right" }}>SCORE</div><div style={{ textAlign: "right" }}>WEEKLY XP</div><div style={{ textAlign: "right" }}>STREAK</div>
-        </div>
-        {leaderboard.map((p, i) => (
-          <div key={p.rank} style={{
-            padding: "12px 20px", display: "grid",
-            gridTemplateColumns: "48px 1fr 80px 80px 80px",
-            gap: 8, alignItems: "center",
-            background: p.isMe ? C.orangeLight : "transparent",
-            borderBottom: i < leaderboard.length - 1 ? `1px solid ${C.border}` : "none",
-            borderLeft: `3px solid ${p.isMe ? C.orange : "transparent"}`,
-          }}>
-            <div style={{ fontSize: 14, fontWeight: 700, color: p.rank <= 3 ? C.orange : C.textSub }}>#{p.rank}</div>
-            <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
-              <Avatar initials={p.initials} size={34} color={p.color} />
-              <div>
-                <div style={{ fontSize: 14, fontWeight: p.isMe ? 700 : 500, color: p.isMe ? C.orange : C.text }}>
-                  {p.name} {p.isMe && <span style={{ fontSize: 11, opacity: 0.7 }}>(you)</span>}
-                </div>
-                <div style={{ fontSize: 12, color: C.textSub }}>{p.title}</div>
-              </div>
-            </div>
-            <div style={{ textAlign: "right", fontSize: 15, fontWeight: 700, color: C.text }}>{p.score}</div>
-            <div style={{ textAlign: "right", fontSize: 13, fontWeight: 600, color: C.orange }}>{p.weeklyXp.toLocaleString()}</div>
-            <div style={{ textAlign: "right", fontSize: 13, color: p.streak >= 7 ? C.red : C.textSub }}>
-              {p.streak}d
-            </div>
+              );
+            })}
           </div>
-        ))}
+        </Card>
+      )}
+
+      {/* Full table */}
+      <Card style={{ padding: 0, overflow: "hidden" }}>
+        {/* Header */}
+        <div style={{
+          padding: "10px 20px",
+          borderBottom: `1px solid ${C.border}`,
+          display: "grid",
+          gridTemplateColumns: colGrid,
+          gap: 6,
+          fontSize: 10,
+          fontWeight: 700,
+          color: C.textMuted,
+          letterSpacing: "0.08em",
+          textTransform: "uppercase",
+        }}>
+          {colHeader.map((h, i) => (
+            <div key={h} style={{ textAlign: i >= 2 ? "right" : "left" }}>{h}</div>
+          ))}
+        </div>
+
+        {/* Rows */}
+        {leaderboard.map((p, i) => {
+          const total        = isReal ? p.total        : (p.score ?? 0);
+          const quizPoints   = isReal ? p.quizPoints   : 0;
+          const gamePoints   = isReal ? p.gamePoints   : 0;
+          const learningXp   = isReal ? p.learningXp   : (p.weeklyXp ?? 0);
+          const gamesPlayed  = isReal ? p.gamesPlayed  : 0;
+          const quizzesDone  = isReal ? p.quizzesCompleted : 0;
+          return (
+            <div key={p.userId ?? p.rank} style={{
+              padding: "12px 20px",
+              display: "grid",
+              gridTemplateColumns: colGrid,
+              gap: 6,
+              alignItems: "center",
+              background: p.isMe ? C.orangeLight : "transparent",
+              borderBottom: i < leaderboard.length - 1 ? `1px solid ${C.border}` : "none",
+              borderLeft: `3px solid ${p.isMe ? C.orange : "transparent"}`,
+            }}>
+              <div style={{ fontSize: 14, fontWeight: 700, color: p.rank <= 3 ? C.orange : C.textSub }}>#{p.rank}</div>
+              <div style={{ display: "flex", alignItems: "center", gap: 10, minWidth: 0 }}>
+                <Avatar initials={p.initials} size={34} color={p.color ?? C.orange} />
+                <div style={{ minWidth: 0 }}>
+                  <div style={{ fontSize: 14, fontWeight: p.isMe ? 700 : 500, color: p.isMe ? C.orange : C.text, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
+                    {p.name}{p.isMe ? " (you)" : ""}
+                  </div>
+                  {p.title && <div style={{ fontSize: 12, color: C.textSub }}>{p.title}</div>}
+                </div>
+              </div>
+              <div style={{ textAlign: "right", fontSize: 15, fontWeight: 800, color: C.text }}>{total.toLocaleString()}</div>
+              <div style={{ textAlign: "right", fontSize: 13, fontWeight: 600, color: C.purple ?? "#8B5CF6" }}>{quizPoints.toLocaleString()}</div>
+              <div style={{ textAlign: "right", fontSize: 13, fontWeight: 600, color: C.orange }}>{gamePoints.toLocaleString()}</div>
+              <div style={{ textAlign: "right", fontSize: 13, fontWeight: 600, color: C.green ?? "#22C55E" }}>{learningXp.toLocaleString()}</div>
+              <div style={{ textAlign: "right", fontSize: 13, color: C.textSub }}>{gamesPlayed}</div>
+              <div style={{ textAlign: "right", fontSize: 13, color: C.textSub }}>{quizzesDone}</div>
+            </div>
+          );
+        })}
       </Card>
     </div>
   );
@@ -13719,11 +13807,17 @@ export default function App() {
     setGameResultsData(data);
     setViewResultsCode(lobbyPin);
     navigate("rankd-results");
+    const gameTenantId = currentOrg?.id ?? user?.orgId ?? null;
     // Persist results to Supabase (fire-and-forget — UI has already navigated)
     endGameSession(lobbyPin, {
       scores:   data?.scores ?? [],
-      tenantId: currentOrg?.id ?? user?.orgId ?? null,
+      tenantId: gameTenantId,
     }).catch(e => console.error("[ralli] endGameSession failed:", e));
+    // Award game points for all real participants
+    if (user?._isReal && gameTenantId && lobbyPin) {
+      awardGamePointsForSession(gameTenantId, lobbyPin, data?.scores ?? [])
+        .catch(e => console.error("[ralli] awardGamePointsForSession failed:", e));
+    }
   };
 
   const handleViewResults = (code) => {
@@ -13781,7 +13875,7 @@ export default function App() {
       case "progress":          return isAdminType
         ? <LeadershipDashboardScreen currentOrg={currentOrg} orgUsers={orgUsers} isReal={!!user?._isReal} />
         : <ProgressScreen />;
-      case "leaderboard":       return <LeaderboardScreen currentUser={user} isReal={!!user?._isReal} />;
+      case "leaderboard":       return <LeaderboardScreen currentUser={user} isReal={!!user?._isReal} tenantId={currentOrg?.id ?? null} />;
       case "organizations":     return selectedOrg
         ? <OrgDetailScreen org={selectedOrg} orgUsers={orgUsers} onBack={() => setSelectedOrg(null)} onAddUser={handleAddUser} onDeactivateOrg={handleDeactivateOrg} onReactivateOrg={handleReactivateOrg} onDeleteOrg={handleDeleteOrg} onCancelOrg={handleCancelOrg} onUpdateOrg={handleUpdateOrg} onUpdateMember={handleUpdateMember} onRemoveMember={handleRemoveMember} onCancelInvite={handleCancelInvite} onResendMemberInvite={handleResendMemberInvite} />
         : <OrganizationsScreen orgs={orgs} onInviteOrg={handleInviteOrg} onSelectOrg={(org) => setSelectedOrg(org)} onRefresh={handleRefreshOrgs} onDeactivateOrg={handleDeactivateOrg} onReactivateOrg={handleReactivateOrg} onDeleteOrg={handleDeleteOrg} onCancelOrg={handleCancelOrg} />;
