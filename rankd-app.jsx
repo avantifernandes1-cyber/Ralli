@@ -5385,7 +5385,7 @@ const INITIAL_ASSIGNMENTS = [
 const LESSON_TYPE_ICONS  = { video:"", text:"", image:"", flipcard:"", quiz:"", recording:"", interactive:"" };
 const LESSON_TYPE_COLORS = { video:C.blue, text:C.green, image:C.blue, flipcard:C.purple, quiz:C.purple, recording:C.red, interactive:C.orange };
 
-function LearnScreen({ role, user, orgUsers = [], orgs = [], onNav, onAwardXp, pendingLessonId, onClearPendingLesson, canCreate = true, canEdit = true, canDelete = true, canAssign = true, tenantId = null, isReal = false }) {
+function LearnScreen({ role, user, orgUsers = [], orgs = [], onNav, onAwardXp, pendingLessonId, onClearPendingLesson, canCreate = true, canEdit = true, canDelete = true, canAssign = true, tenantId = null, isReal = false, quizzes = [] }) {
   const isAdmin = role === "admin";
   const [tab, setTab]           = useState(isAdmin ? "courses" : "assigned");
   const [courses, setCourses]   = useState(INITIAL_LEARN_COURSES);
@@ -5410,6 +5410,7 @@ function LearnScreen({ role, user, orgUsers = [], orgs = [], onNav, onAwardXp, p
   const [archivedCourses,   setArchivedCourses]   = useState([]);
   const [archivedLessons,   setArchivedLessons]   = useState([]);
   const [tenantCompletions, setTenantCompletions] = useState([]); // manager/admin only
+  const [selectedAssignmentId, setSelectedAssignmentId] = useState(null); // manager click-through
 
   // ── Load content from Supabase for real users ────────────────────────────
   useEffect(() => {
@@ -5536,9 +5537,11 @@ function LearnScreen({ role, user, orgUsers = [], orgs = [], onNav, onAwardXp, p
 
   // ── USER VIEW ─────────────────────────────────────────────
   if (!isAdmin) {
+    const userTeamId = orgUsers.find(u => u.id === user?.id)?.teamId ?? null;
     const myAssignments = assignments.filter(a =>
-      (a.assignedTo.type === "group"      && a.assignedTo.orgId === user?.orgId) ||
-      (a.assignedTo.type === "individual" && a.assignedTo.userId === user?.id)
+      (a.assignedTo.type === "group"      && a.assignedTo.orgId === user?.orgId)  ||
+      (a.assignedTo.type === "individual" && a.assignedTo.userId === user?.id)    ||
+      (a.assignedTo.type === "team"       && userTeamId && userTeamId === a.assignedTo.teamId)
     );
     const xpEarned = [...completedLessons].reduce((s, id) => s + (lessons.find(x => x.id === id)?.xp ?? 0), 0);
 
@@ -6017,7 +6020,12 @@ function LearnScreen({ role, user, orgUsers = [], orgs = [], onNav, onAwardXp, p
         // Expand assignments into per-rep rows
         const allRows = assignments.flatMap(a => {
           const isCourse = a.contentType === "course";
-          const content  = isCourse ? courses.find(c => c.id === a.contentId) : lessons.find(l => l.id === a.contentId);
+          const isQuiz   = a.contentType === "quiz";
+          const content  = isCourse
+            ? courses.find(c => c.id === a.contentId)
+            : isQuiz
+              ? quizzes.find(q => q.id === a.contentId)
+              : lessons.find(l => l.id === a.contentId);
           if (!content) return [];
 
           let users = [];
@@ -6047,25 +6055,23 @@ function LearnScreen({ role, user, orgUsers = [], orgs = [], onNav, onAwardXp, p
                   const dates = done.map(l => userComps.find(c => c.lessonId === l.id)?.completedAt).filter(Boolean).sort();
                   completedAt = dates[dates.length - 1] ?? null;
                 } else if (progress > 0) { status = "in_progress"; }
-              } else {
+              } else if (!isQuiz) {
+                // Lesson
                 const comp = userComps.find(c => c.lessonId === a.contentId);
                 if (comp) { progress = 100; status = "completed"; completedAt = comp.completedAt; }
               }
+              // Quiz: no completion table yet — shows as not_started (overdue check still applies)
               if (status !== "completed" && a.dueAt && a.dueAt !== "Open") {
                 const d = new Date(a.dueAt);
                 if (!isNaN(d) && d < new Date()) status = "overdue";
               }
             }
 
-            return { a, content, isCourse, u, progress, status, completedAt };
+            return { a, content, isCourse, isQuiz, u, progress, status, completedAt };
           });
         });
 
-        const searchedRows = sq
-          ? allRows.filter(r => r.content?.title.toLowerCase().includes(sq) || r.u?.name?.toLowerCase().includes(sq))
-          : allRows;
-
-        if (searchedRows.length === 0) {
+        if (allRows.length === 0 && !sq) {
           return (
             <div style={{ padding: 60, textAlign: "center", background: C.white, borderRadius: 12, border: `1px solid ${C.border}` }}>
               <div style={{ fontSize: 32, marginBottom: 12 }}>📋</div>
@@ -6075,58 +6081,130 @@ function LearnScreen({ role, user, orgUsers = [], orgs = [], onNav, onAwardXp, p
           );
         }
 
+        // Summary stats (always over all rows, not search-filtered)
+        const statCounts = {
+          total:       assignments.length,
+          not_started: allRows.filter(r => r.status === "not_started").length,
+          in_progress: allRows.filter(r => r.status === "in_progress").length,
+          completed:   allRows.filter(r => r.status === "completed").length,
+          overdue:     allRows.filter(r => r.status === "overdue").length,
+        };
+
+        // Detail view when an assignment is selected
+        const detailAssignment = selectedAssignmentId ? assignments.find(a => a.id === selectedAssignmentId) : null;
+        const detailContent = detailAssignment
+          ? (detailAssignment.contentType === "course" ? courses.find(c => c.id === detailAssignment.contentId) : lessons.find(l => l.id === detailAssignment.contentId))
+          : null;
+
+        // Rows to show: detail-filtered or search-filtered
+        const searchedRows = sq
+          ? allRows.filter(r => r.content?.title.toLowerCase().includes(sq) || r.u?.name?.toLowerCase().includes(sq))
+          : allRows;
+        const visibleRows = selectedAssignmentId
+          ? allRows.filter(r => r.a.id === selectedAssignmentId)
+          : searchedRows;
+
+        const renderTable = (rows) => (
+          <div style={{ borderRadius: 12, overflow: "hidden", border: `1px solid ${C.border}` }}>
+            <div style={{ display: "grid", gridTemplateColumns: "2fr 1.2fr 0.8fr 1fr 0.8fr 80px", gap: 10, padding: "10px 16px", background: C.pageBg, fontSize: 11, fontWeight: 700, color: C.textMuted, letterSpacing: "0.05em" }}>
+              <span>CONTENT</span><span>REP</span><span>DUE DATE</span><span>STATUS</span><span>PROGRESS</span><span>DONE</span>
+            </div>
+            {rows.map(({ a, content, isCourse, isQuiz, u, progress, status, completedAt }, i) => {
+              const sc     = STATUS_CONFIG[status] ?? STATUS_CONFIG.not_started;
+              const tColor = isCourse ? (content.color ?? C.orange) : isQuiz ? C.purple : (LESSON_TYPE_COLORS[content.type] ?? C.orange);
+              const contentLabel = isCourse ? "Course" : isQuiz ? "Quiz" : "Lesson";
+              const contentIcon  = isCourse ? content.emoji : isQuiz ? "📋" : LESSON_TYPE_ICONS[content.type];
+              const contentTitle = content.title ?? content.name ?? "Untitled";
+              const dueLabel = a.dueAt && a.dueAt !== "Open"
+                ? (() => { try { return new Date(a.dueAt).toLocaleDateString("en-US", { month: "short", day: "numeric" }); } catch { return a.dueAt; } })()
+                : "Open";
+              return (
+                <div key={`${a.id}-${u.id}-${i}`} style={{ display: "grid", gridTemplateColumns: "2fr 1.2fr 0.8fr 1fr 0.8fr 80px", gap: 10, padding: "13px 16px", background: C.white, borderTop: `1px solid ${C.border}`, alignItems: "center" }}>
+                  {/* Content — clickable to drill into this assignment */}
+                  <div style={{ display: "flex", alignItems: "center", gap: 10, minWidth: 0 }}>
+                    <div style={{ width: 30, height: 30, borderRadius: 7, background: tColor + "20", flexShrink: 0, display: "flex", alignItems: "center", justifyContent: "center", fontSize: 13 }}>
+                      {contentIcon}
+                    </div>
+                    <div style={{ minWidth: 0 }}>
+                      <button
+                        onClick={() => setSelectedAssignmentId(selectedAssignmentId === a.id ? null : a.id)}
+                        style={{ background: "none", border: "none", padding: 0, cursor: "pointer", textAlign: "left" }}
+                      >
+                        <div style={{ fontSize: 13, fontWeight: 700, color: C.text, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap", textDecoration: "underline", textDecorationColor: C.border }}>{contentTitle}</div>
+                      </button>
+                      <div style={{ fontSize: 11, color: C.textSub }}>{contentLabel}{a.required ? " · Required" : ""}</div>
+                    </div>
+                  </div>
+                  {/* Rep */}
+                  <div style={{ display: "flex", alignItems: "center", gap: 7, minWidth: 0 }}>
+                    <div style={{ width: 24, height: 24, borderRadius: "50%", background: u.color ?? C.orange, display: "flex", alignItems: "center", justifyContent: "center", fontSize: 10, fontWeight: 700, color: "#fff", flexShrink: 0 }}>
+                      {(u.initials ?? u.name?.[0] ?? "?").toUpperCase()}
+                    </div>
+                    <span style={{ fontSize: 13, fontWeight: 600, color: C.text, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{u.name}</span>
+                  </div>
+                  {/* Due */}
+                  <span style={{ fontSize: 13, color: status === "overdue" ? C.red : C.textSub, fontWeight: status === "overdue" ? 700 : 400 }}>{dueLabel}</span>
+                  {/* Status badge */}
+                  <div><span style={{ fontSize: 11, fontWeight: 700, padding: "3px 8px", borderRadius: 6, background: sc.bg, color: sc.text }}>{sc.label}</span></div>
+                  {/* Progress bar */}
+                  <div style={{ display: "flex", alignItems: "center", gap: 5 }}>
+                    <div style={{ flex: 1, height: 5, background: C.muted, borderRadius: 3, overflow: "hidden" }}>
+                      <div style={{ height: "100%", width: `${progress}%`, background: status === "completed" ? C.green : status === "overdue" ? C.red : C.orange, borderRadius: 3 }} />
+                    </div>
+                    <span style={{ fontSize: 11, fontWeight: 700, color: C.textSub, flexShrink: 0 }}>{progress}%</span>
+                  </div>
+                  {/* Completed at */}
+                  <span style={{ fontSize: 12, color: C.textSub }}>
+                    {completedAt ? (() => { try { return new Date(completedAt).toLocaleDateString("en-US", { month: "short", day: "numeric" }); } catch { return "—"; } })() : "—"}
+                  </span>
+                </div>
+              );
+            })}
+          </div>
+        );
+
         return (
           <div>
-            <p style={{ margin: "0 0 14px", fontSize: 13, color: C.textSub }}>{searchedRows.length} rep assignment{searchedRows.length !== 1 ? "s" : ""}</p>
-            <div style={{ borderRadius: 12, overflow: "hidden", border: `1px solid ${C.border}` }}>
-              {/* Header */}
-              <div style={{ display: "grid", gridTemplateColumns: "2fr 1.2fr 0.8fr 1fr 0.8fr 80px", gap: 10, padding: "10px 16px", background: C.pageBg, fontSize: 11, fontWeight: 700, color: C.textMuted, letterSpacing: "0.05em" }}>
-                <span>CONTENT</span><span>REP</span><span>DUE DATE</span><span>STATUS</span><span>PROGRESS</span><span>DONE</span>
-              </div>
-              {searchedRows.map(({ a, content, isCourse, u, progress, status, completedAt }, i) => {
-                const sc  = STATUS_CONFIG[status] ?? STATUS_CONFIG.not_started;
-                const tColor = isCourse ? (content.color ?? C.orange) : (LESSON_TYPE_COLORS[content.type] ?? C.orange);
-                const dueLabel = a.dueAt && a.dueAt !== "Open"
-                  ? (() => { try { return new Date(a.dueAt).toLocaleDateString("en-US", { month: "short", day: "numeric" }); } catch { return a.dueAt; } })()
-                  : "Open";
-                return (
-                  <div key={`${a.id}-${u.id}-${i}`} style={{ display: "grid", gridTemplateColumns: "2fr 1.2fr 0.8fr 1fr 0.8fr 80px", gap: 10, padding: "13px 16px", background: C.white, borderTop: `1px solid ${C.border}`, alignItems: "center" }}>
-                    {/* Content */}
-                    <div style={{ display: "flex", alignItems: "center", gap: 10, minWidth: 0 }}>
-                      <div style={{ width: 30, height: 30, borderRadius: 7, background: tColor + "20", flexShrink: 0, display: "flex", alignItems: "center", justifyContent: "center", fontSize: 13 }}>
-                        {isCourse ? content.emoji : LESSON_TYPE_ICONS[content.type]}
-                      </div>
-                      <div style={{ minWidth: 0 }}>
-                        <div style={{ fontSize: 13, fontWeight: 700, color: C.text, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{content.title}</div>
-                        <div style={{ fontSize: 11, color: C.textSub }}>{isCourse ? "Course" : "Lesson"}{a.required ? " · Required" : ""}</div>
-                      </div>
-                    </div>
-                    {/* Rep */}
-                    <div style={{ display: "flex", alignItems: "center", gap: 7, minWidth: 0 }}>
-                      <div style={{ width: 24, height: 24, borderRadius: "50%", background: u.color ?? C.orange, display: "flex", alignItems: "center", justifyContent: "center", fontSize: 10, fontWeight: 700, color: "#fff", flexShrink: 0 }}>
-                        {(u.initials ?? u.name?.[0] ?? "?").toUpperCase()}
-                      </div>
-                      <span style={{ fontSize: 13, fontWeight: 600, color: C.text, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{u.name}</span>
-                    </div>
-                    {/* Due */}
-                    <span style={{ fontSize: 13, color: status === "overdue" ? C.red : C.textSub, fontWeight: status === "overdue" ? 700 : 400 }}>{dueLabel}</span>
-                    {/* Status badge */}
-                    <div><span style={{ fontSize: 11, fontWeight: 700, padding: "3px 8px", borderRadius: 6, background: sc.bg, color: sc.text }}>{sc.label}</span></div>
-                    {/* Progress bar */}
-                    <div style={{ display: "flex", alignItems: "center", gap: 5 }}>
-                      <div style={{ flex: 1, height: 5, background: C.muted, borderRadius: 3, overflow: "hidden" }}>
-                        <div style={{ height: "100%", width: `${progress}%`, background: status === "completed" ? C.green : status === "overdue" ? C.red : C.orange, borderRadius: 3 }} />
-                      </div>
-                      <span style={{ fontSize: 11, fontWeight: 700, color: C.textSub, flexShrink: 0 }}>{progress}%</span>
-                    </div>
-                    {/* Completed at */}
-                    <span style={{ fontSize: 12, color: C.textSub }}>
-                      {completedAt ? (() => { try { return new Date(completedAt).toLocaleDateString("en-US", { month: "short", day: "numeric" }); } catch { return "—"; } })() : "—"}
-                    </span>
+            {/* Summary stats — only show in list view, not detail view */}
+            {!selectedAssignmentId && (
+              <div style={{ display: "grid", gridTemplateColumns: "repeat(5, 1fr)", gap: 10, marginBottom: 20 }}>
+                {[
+                  { label: "Total Assigned", count: statCounts.total,       color: C.text    },
+                  { label: "Not Started",    count: statCounts.not_started,  color: C.textSub },
+                  { label: "In Progress",    count: statCounts.in_progress,  color: C.blue    },
+                  { label: "Completed",      count: statCounts.completed,    color: C.green   },
+                  { label: "Overdue",        count: statCounts.overdue,      color: C.red     },
+                ].map(({ label, count, color }) => (
+                  <div key={label} style={{ background: C.white, borderRadius: 10, padding: "14px 16px", border: `1px solid ${C.border}` }}>
+                    <div style={{ fontSize: 22, fontWeight: 800, color, marginBottom: 3 }}>{count}</div>
+                    <div style={{ fontSize: 11, fontWeight: 600, color: C.textSub, lineHeight: 1.3 }}>{label}</div>
                   </div>
-                );
-              })}
-            </div>
+                ))}
+              </div>
+            )}
+
+            {/* Detail view header */}
+            {selectedAssignmentId && detailContent && (
+              <div style={{ display: "flex", alignItems: "center", gap: 12, marginBottom: 16, padding: "12px 16px", background: C.white, borderRadius: 10, border: `1px solid ${C.border}` }}>
+                <button onClick={() => setSelectedAssignmentId(null)} style={{ background: "none", border: "none", cursor: "pointer", color: C.textSub, fontSize: 13, fontWeight: 700, display: "flex", alignItems: "center", gap: 6, padding: 0, flexShrink: 0 }}>← All Assignments</button>
+                <span style={{ color: C.border, fontSize: 18 }}>|</span>
+                <span style={{ fontSize: 15 }}>{detailAssignment?.contentType === "course" ? detailContent.emoji : detailAssignment?.contentType === "quiz" ? "📋" : LESSON_TYPE_ICONS[detailContent.type]}</span>
+                <div style={{ flex: 1, minWidth: 0 }}>
+                  <div style={{ fontSize: 14, fontWeight: 700, color: C.text }}>{detailContent.title ?? detailContent.name}</div>
+                  <div style={{ fontSize: 11, color: C.textSub }}>{detailAssignment?.contentType === "course" ? "Course" : detailAssignment?.contentType === "quiz" ? "Quiz" : "Lesson"}{detailAssignment?.required ? " · Required" : ""} · {visibleRows.length} rep{visibleRows.length !== 1 ? "s" : ""}</div>
+                </div>
+              </div>
+            )}
+
+            {/* Row count label */}
+            {!selectedAssignmentId && (
+              <p style={{ margin: "0 0 14px", fontSize: 13, color: C.textSub }}>{visibleRows.length} rep assignment{visibleRows.length !== 1 ? "s" : ""}</p>
+            )}
+
+            {visibleRows.length === 0
+              ? <div style={{ padding: 40, textAlign: "center", color: C.textMuted, fontSize: 14 }}>No matching assignments</div>
+              : renderTable(visibleRows)
+            }
           </div>
         );
       })()}
@@ -6952,16 +7030,16 @@ function AssignContentModal({ contentType, contentId, content, orgUsers, orgs, c
       onClick={e => { if (e.target === e.currentTarget) onClose(); }}>
       <div style={{ background: C.white, borderRadius: 16, padding: 28, width: "100%", maxWidth: 480, boxShadow: "0 24px 60px rgba(0,0,0,0.2)" }}>
         <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", marginBottom: 6 }}>
-          <h3 style={{ margin: 0, fontSize: 18, fontWeight: 800, color: C.text }}>Assign {contentType === "course" ? "Course" : "Lesson"}</h3>
+          <h3 style={{ margin: 0, fontSize: 18, fontWeight: 800, color: C.text }}>Assign {contentType === "course" ? "Course" : contentType === "quiz" ? "Quiz" : "Lesson"}</h3>
           <button onClick={onClose} style={{ background: "none", border: "none", fontSize: 20, cursor: "pointer", color: C.textMuted }}>×</button>
         </div>
 
         {content && (
           <div style={{ display: "flex", alignItems: "center", gap: 10, padding: "10px 14px", background: C.pageBg, borderRadius: 10, marginBottom: 24 }}>
-            <span style={{ fontSize: 20 }}>{contentType === "course" ? content.emoji : LESSON_TYPE_ICONS[content.type]}</span>
+            <span style={{ fontSize: 20 }}>{contentType === "course" ? content.emoji : contentType === "quiz" ? "📋" : LESSON_TYPE_ICONS[content.type]}</span>
             <div>
-              <div style={{ fontSize: 13, fontWeight: 700, color: C.text }}>{content.title}</div>
-              <div style={{ fontSize: 11, color: C.textSub }}>{contentType === "course" ? `${content.lessonIds?.length ?? 0} lessons` : `${content.duration} · ${content.type}`}</div>
+              <div style={{ fontSize: 13, fontWeight: 700, color: C.text }}>{content.title ?? content.name}</div>
+              <div style={{ fontSize: 11, color: C.textSub }}>{contentType === "course" ? `${content.lessonIds?.length ?? 0} lessons` : contentType === "quiz" ? `${content.questions?.length ?? 0} questions` : `${content.duration} · ${content.type}`}</div>
             </div>
           </div>
         )}
@@ -7061,7 +7139,7 @@ function AssignContentModal({ contentType, contentId, content, orgUsers, orgs, c
             background: canSubmit ? C.orange : C.muted, color: canSubmit ? "#fff" : C.textMuted,
             fontSize: 13, fontWeight: 700, cursor: canSubmit ? "pointer" : "default",
           }}>
-            Assign {contentType === "course" ? "Course" : "Lesson"} →
+            Assign {contentType === "course" ? "Course" : contentType === "quiz" ? "Quiz" : "Lesson"} →
           </button>
         </div>
       </div>
@@ -7551,7 +7629,7 @@ function QuizResultsView({ quiz, attempt, onRetake, onBack }) {
 // ── QuizLibraryGrid ──────────────────────────────────────────────────────────
 // Admin/Manager quiz list. Displays each quiz with edit, delete, favorite, and
 // active-toggle actions. Production hook: replace callbacks with API mutations.
-function QuizLibraryGrid({ quizzes, onEditQuiz, onNav, onDeleteQuiz, onToggleFavorite, onToggleActive, canEdit = true, canDelete = true }) {
+function QuizLibraryGrid({ quizzes, onEditQuiz, onNav, onDeleteQuiz, onToggleFavorite, onToggleActive, onAssign, canEdit = true, canDelete = true, canAssign = true }) {
   const [confirmDelete, setConfirmDelete] = useState(null); // quiz id pending delete confirm
 
   return (
@@ -7597,6 +7675,14 @@ function QuizLibraryGrid({ quizzes, onEditQuiz, onNav, onDeleteQuiz, onToggleFav
                 style={{ fontSize: 11, fontWeight: 700, padding: "4px 10px", borderRadius: 6, border: `1px solid ${C.border}`, background: inactive ? C.muted : C.greenBg, color: inactive ? C.textMuted : C.trueGreen, cursor: "pointer" }}
               >{inactive ? "Inactive" : "Active"}</button>
 
+              {/* Assign */}
+              {canAssign && onAssign && (
+                <button
+                  onClick={() => onAssign(quiz)}
+                  style={{ fontSize: 12, fontWeight: 700, padding: "6px 14px", borderRadius: 8, border: `1px solid ${C.orange}`, background: C.orangeLight, color: C.orange, cursor: "pointer" }}
+                >Assign</button>
+              )}
+
               {/* Edit */}
               {canEdit && (
                 <button
@@ -7632,13 +7718,45 @@ function QuizLibraryGrid({ quizzes, onEditQuiz, onNav, onDeleteQuiz, onToggleFav
 }
 
 // ── QuizzesScreen (user branch rewritten, admin branch preserved) ─────────────
-function QuizzesScreen({ role, onNav, quizzes, onEditQuiz, onDeleteQuiz, onToggleFavorite, onToggleActive, pendingQuizId, onClearPendingQuiz, canCreate = true, canEdit = true, canDelete = true, canLaunch = true }) {
+function QuizzesScreen({ role, onNav, quizzes, onEditQuiz, onDeleteQuiz, onToggleFavorite, onToggleActive, pendingQuizId, onClearPendingQuiz, canCreate = true, canEdit = true, canDelete = true, canLaunch = true, canAssign = true, onAssignQuiz, orgUsers = [], orgs = [], currentUser = null, tenantId = null, isReal = false }) {
 
   // ── USER VIEW ─────────────────────────────────────────────────────────────
   if (role === "user") {
-    // Assignment state — starts from seed, attempts appended locally.
-    // Production hook: replace useState init with API fetch.
-    const [assignments, setAssignments] = useState(USER_QUIZ_ASSIGNMENTS_SEED);
+    // Assignment state — seed for demo; replaced with real data when isReal
+    const [assignments, setAssignments] = useState(isReal ? [] : USER_QUIZ_ASSIGNMENTS_SEED);
+    const [assignmentsLoaded, setAssignmentsLoaded] = useState(!isReal);
+
+    // Load quiz assignments from Supabase for real users
+    useEffect(() => {
+      if (!isReal || !tenantId || !currentUser) return;
+      getTenantAssignments(tenantId).then(({ data }) => {
+        if (!data) { setAssignmentsLoaded(true); return; }
+        const userTeamId = currentUser.teamId ?? null;
+        const myQuizAssignments = data.filter(a =>
+          a.contentType === "quiz" && (
+            (a.assignedTo.type === "group"      && a.assignedTo.orgId === currentUser.orgId)  ||
+            (a.assignedTo.type === "individual" && a.assignedTo.userId === currentUser.id)    ||
+            (a.assignedTo.type === "team"       && userTeamId && userTeamId === a.assignedTo.teamId)
+          )
+        );
+        // Merge with quiz data from the quizzes prop (which has questions)
+        const merged = myQuizAssignments.map(a => {
+          const quiz = quizzes.find(q => q.id === a.contentId);
+          if (!quiz) return null;
+          return {
+            ...quiz,
+            id:         quiz.id,
+            title:      quiz.name,
+            dueAt:      a.dueAt === "Open" ? null : a.dueAt,
+            assignedAt: a.assignedAt,
+            required:   a.required,
+            attempts:   [],
+          };
+        }).filter(Boolean);
+        setAssignments(merged);
+        setAssignmentsLoaded(true);
+      });
+    }, [tenantId, isReal, currentUser?.id]); // eslint-disable-line react-hooks/exhaustive-deps
     // view: "list" | "taking" | "results"
     const [view,         setView]         = useState("list");
     const [activeId,     setActiveId]     = useState(null);
@@ -7680,15 +7798,38 @@ function QuizzesScreen({ role, onNav, quizzes, onEditQuiz, onDeleteQuiz, onToggl
       return <QuizResultsView quiz={activeQuiz} attempt={activeAttempt} onRetake={() => retakeQuiz(activeId)} onBack={() => setView("list")} />;
     }
 
+    // ── Loading state for real users ──
+    if (!assignmentsLoaded) {
+      return (
+        <div style={{ padding: 60, textAlign: "center", color: C.textMuted, fontSize: 14 }}>Loading quizzes…</div>
+      );
+    }
+
+    // ── Empty state for real users with no assignments ──
+    if (isReal && assignments.length === 0) {
+      return (
+        <div style={{ display: "flex", flexDirection: "column", gap: 20 }}>
+          <div>
+            <h2 style={{ margin: 0, fontSize: 22, fontWeight: 800, color: C.text }}>Quizzes</h2>
+            <p style={{ margin: "4px 0 0", fontSize: 13, color: C.textSub }}>Test your knowledge and earn XP</p>
+          </div>
+          <div style={{ padding: 48, textAlign: "center", background: C.white, borderRadius: 16, border: `1px solid ${C.border}` }}>
+            <p style={{ fontSize: 15, fontWeight: 700, color: C.text, margin: "0 0 4px" }}>No quizzes assigned yet</p>
+            <p style={{ fontSize: 13, color: C.textSub, margin: 0 }}>Your manager will assign quizzes here when they're ready.</p>
+          </div>
+        </div>
+      );
+    }
+
     // ── Search filter ──
     const q = search.trim().toLowerCase();
     const searchFiltered = q
       ? assignments.filter(quiz =>
-          quiz.title.toLowerCase().includes(q)       ||
+          (quiz.title ?? quiz.name ?? "").toLowerCase().includes(q) ||
           (quiz.description ?? "").toLowerCase().includes(q) ||
           (quiz.track ?? "").toLowerCase().includes(q) ||
           quiz.tags?.some(t => t.includes(q))        ||
-          quiz.questions?.some(qs => qs.text.toLowerCase().includes(q))
+          quiz.questions?.some(qs => qs.text?.toLowerCase().includes(q))
         )
       : assignments;
 
@@ -7826,7 +7967,9 @@ function QuizzesScreen({ role, onNav, quizzes, onEditQuiz, onDeleteQuiz, onToggl
     );
   }
 
-  // ── ADMIN VIEW (untouched) ────────────────────────────────────────────────
+  // ── ADMIN VIEW ────────────────────────────────────────────────────────────
+  const [assignModal, setAssignModal] = useState(null); // null | quiz object
+
   return (
     <div style={{ display: "flex", flexDirection: "column", gap: 20 }}>
       <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center" }}>
@@ -7857,7 +8000,39 @@ function QuizzesScreen({ role, onNav, quizzes, onEditQuiz, onDeleteQuiz, onToggl
           )}
         </div>
       ) : (
-        <QuizLibraryGrid quizzes={quizzes} onEditQuiz={onEditQuiz} onNav={onNav} onDeleteQuiz={onDeleteQuiz} onToggleFavorite={onToggleFavorite} onToggleActive={onToggleActive} canEdit={canEdit} canDelete={canDelete} />
+        <QuizLibraryGrid
+          quizzes={quizzes}
+          onEditQuiz={onEditQuiz}
+          onNav={onNav}
+          onDeleteQuiz={onDeleteQuiz}
+          onToggleFavorite={onToggleFavorite}
+          onToggleActive={onToggleActive}
+          onAssign={canAssign ? (quiz) => setAssignModal(quiz) : null}
+          canEdit={canEdit}
+          canDelete={canDelete}
+          canAssign={canAssign}
+        />
+      )}
+
+      {/* Assign modal */}
+      {assignModal && (
+        <AssignContentModal
+          contentType="quiz"
+          contentId={assignModal.id}
+          content={assignModal}
+          orgUsers={orgUsers}
+          orgs={orgs}
+          currentUser={currentUser}
+          tenantId={tenantId}
+          isReal={isReal}
+          onAssign={async (assignment) => {
+            if (onAssignQuiz) {
+              await onAssignQuiz(assignment);
+            }
+            setAssignModal(null);
+          }}
+          onClose={() => setAssignModal(null)}
+        />
       )}
     </div>
   );
@@ -8071,15 +8246,36 @@ const INITIAL_BATTLE_CARDS = [
 // ─────────────────────────────────────────────────────────────────────────────
 
 function BattleCardsAdminScreen({ categories, cards, onSaveCategory, onDeleteCategory, onSaveCard, onDeleteCard }) {
-  // view: "list" | "editCard" | "editCategory"
-  const [view,         setView]         = useState("list");
-  const [activeCatId,  setActiveCatId]  = useState(categories[0]?.id ?? null);
-  const [editingCard,  setEditingCard]  = useState(null);  // null = new card
-  const [editingCat,   setEditingCat]   = useState(null);  // null = new cat
+  // view: "home" | "category" | "detail" | "editCard"
+  const [view,         setView]         = useState("home");
+  const [activeCatId,  setActiveCatId]  = useState(null);
+  const [activeCardId, setActiveCardId] = useState(null);
+  const [search,       setSearch]       = useState("");
+  const [editingCard,  setEditingCard]  = useState(null);
+  const [editingCat,   setEditingCat]   = useState(null);
   const [showCatForm,  setShowCatForm]  = useState(false);
-  const [confirmDel,   setConfirmDel]   = useState(null);  // { type, id }
+  const [confirmDel,   setConfirmDel]   = useState(null); // { type, id }
 
-  // ── Card editor state ────────────────────────────────────────────────
+  // ── Navigation ──────────────────────────────────────────────────────────────
+  const openCategory = (catId) => { setActiveCatId(catId); setView("category"); };
+  const openCard     = (cardId) => { setActiveCardId(cardId); setView("detail"); };
+  const goHome       = () => { setView("home"); setActiveCatId(null); setActiveCardId(null); setSearch(""); };
+  const goCategory   = () => { setView("category"); setActiveCardId(null); };
+
+  const selectedCard   = cards.find(c => c.id === activeCardId);
+  const selectedCat    = categories.find(c => c.id === activeCatId);
+  const cardsInCat     = cards.filter(c => c.categoryId === activeCatId).sort((a, b) => a.title.localeCompare(b.title));
+  const allCardsSorted = [...cards].sort((a, b) => a.title.localeCompare(b.title));
+  const filtered = search.trim()
+    ? allCardsSorted.filter(c =>
+        c.title.toLowerCase().includes(search.toLowerCase()) ||
+        c.subtitle.toLowerCase().includes(search.toLowerCase()) ||
+        c.summary.toLowerCase().includes(search.toLowerCase()) ||
+        c.tags?.some(t => t.includes(search.toLowerCase()))
+      )
+    : allCardsSorted;
+
+  // ── Card editor state ───────────────────────────────────────────────────────
   const blankCard = () => ({
     id: `card-${Date.now()}`,
     categoryId: activeCatId ?? categories[0]?.id ?? "",
@@ -8087,18 +8283,17 @@ function BattleCardsAdminScreen({ categories, cards, onSaveCategory, onDeleteCat
     strength: "", weakness: "", ourWin: "", talkTrack: "",
     tags: [], updatedAt: new Date().toISOString().slice(0,10), content: [],
   });
-
   const [draft, setDraft] = useState(blankCard);
   const setF = (field) => (e) => setDraft(d => ({ ...d, [field]: e.target.value }));
 
   const openNewCard  = () => { setDraft(blankCard()); setEditingCard("new"); setView("editCard"); };
   const openEditCard = (card) => { setDraft({ ...card }); setEditingCard(card.id); setView("editCard"); };
-
   const saveCard = () => {
     if (!draft.title.trim()) return;
     onSaveCard({ ...draft, title: draft.title.trim(), updatedAt: new Date().toISOString().slice(0,10) });
-    setView("list");
+    setView(activeCatId ? "category" : "home");
   };
+  const cancelEditCard = () => setView(activeCardId ? "detail" : activeCatId ? "category" : "home");
 
   // content sections
   const addSection    = () => setDraft(d => ({ ...d, content: [...d.content, { heading: "", body: "" }] }));
@@ -8114,10 +8309,9 @@ function BattleCardsAdminScreen({ categories, cards, onSaveCategory, onDeleteCat
     return { ...d, content: c };
   });
 
-  // ── Category editor state ────────────────────────────────────────────
+  // ── Category editor state ───────────────────────────────────────────────────
   const blankCat = () => ({ id: `cat-${Date.now()}`, label: "", description: "" });
   const [catDraft, setCatDraft] = useState(blankCat);
-
   const openNewCat  = () => { setCatDraft(blankCat()); setEditingCat("new"); setShowCatForm(true); };
   const openEditCat = (cat) => { setCatDraft({ ...cat }); setEditingCat(cat.id); setShowCatForm(true); };
   const saveCat     = () => {
@@ -8127,35 +8321,87 @@ function BattleCardsAdminScreen({ categories, cards, onSaveCategory, onDeleteCat
     if (editingCat === "new") setActiveCatId(catDraft.id);
   };
 
-  // ── Confirm delete ───────────────────────────────────────────────────
+  // ── Confirm delete ──────────────────────────────────────────────────────────
   const doDelete = () => {
     if (!confirmDel) return;
-    if (confirmDel.type === "card")     onDeleteCard(confirmDel.id);
-    if (confirmDel.type === "category") { onDeleteCategory(confirmDel.id); if (activeCatId === confirmDel.id) setActiveCatId(categories.filter(c=>c.id!==confirmDel.id)[0]?.id ?? null); }
+    if (confirmDel.type === "card") {
+      onDeleteCard(confirmDel.id);
+      if (activeCardId === confirmDel.id) goCategory();
+    }
+    if (confirmDel.type === "category") {
+      onDeleteCategory(confirmDel.id);
+      if (activeCatId === confirmDel.id) goHome();
+    }
     setConfirmDel(null);
   };
 
   const inputStyle = { width:"100%", boxSizing:"border-box", padding:"10px 14px", borderRadius:10, border:`1.5px solid ${C.border}`, background:C.cardBg, fontSize:14, color:C.text, outline:"none", fontFamily:"inherit" };
   const taStyle    = { ...inputStyle, resize:"vertical", minHeight:90, lineHeight:1.6 };
-  const label      = (txt, req) => (
+  const lbl        = (txt, req) => (
     <label style={{ display:"block", fontSize:11, fontWeight:700, color:C.textMuted, letterSpacing:"0.08em", textTransform:"uppercase", marginBottom:8 }}>
       {txt}{req && <span style={{ color:C.red }}> *</span>}
     </label>
   );
 
-  // ── CARD EDITOR VIEW ─────────────────────────────────────────────────
+  // Shared modals (appended to every view)
+  const modals = (
+    <>
+      {showCatForm && (
+        <div style={{ position:"fixed", inset:0, background:"rgba(0,0,0,0.45)", display:"flex", alignItems:"center", justifyContent:"center", zIndex:9999 }}
+          onClick={e => { if (e.target === e.currentTarget) setShowCatForm(false); }}>
+          <div style={{ background:C.cardBg, borderRadius:20, padding:"32px 36px", width:420, maxWidth:"90vw", border:`1px solid ${C.creamBorder}` }}>
+            <h3 style={{ margin:"0 0 20px", fontSize:18, fontWeight:900, color:C.text }}>{editingCat === "new" ? "New Category" : "Edit Category"}</h3>
+            <div style={{ marginBottom:14 }}>
+              <label style={{ display:"block", fontSize:11, fontWeight:700, color:C.textMuted, letterSpacing:"0.08em", textTransform:"uppercase", marginBottom:8 }}>Name <span style={{ color:C.red }}>*</span></label>
+              <input style={{ width:"100%", boxSizing:"border-box", padding:"10px 14px", borderRadius:10, border:`1.5px solid ${C.border}`, background:C.white, fontSize:14, color:C.text, outline:"none", fontFamily:"inherit" }}
+                value={catDraft.label} onChange={e => setCatDraft(d => ({ ...d, label: e.target.value }))} placeholder="e.g. Competitor Knowledge"
+                autoFocus />
+            </div>
+            <div style={{ marginBottom:24 }}>
+              <label style={{ display:"block", fontSize:11, fontWeight:700, color:C.textMuted, letterSpacing:"0.08em", textTransform:"uppercase", marginBottom:8 }}>Description</label>
+              <textarea style={{ width:"100%", boxSizing:"border-box", padding:"10px 14px", borderRadius:10, border:`1.5px solid ${C.border}`, background:C.white, fontSize:13, color:C.text, outline:"none", fontFamily:"inherit", resize:"vertical", minHeight:72, lineHeight:1.6 }}
+                value={catDraft.description} onChange={e => setCatDraft(d => ({ ...d, description: e.target.value }))} placeholder="Short description shown to reps" />
+            </div>
+            <div style={{ display:"flex", gap:10 }}>
+              <button onClick={() => setShowCatForm(false)} style={{ flex:1, padding:"11px 0", borderRadius:10, border:`1px solid ${C.border}`, background:C.cardBg, fontSize:13, fontWeight:700, cursor:"pointer", color:C.text }}>Cancel</button>
+              <button onClick={saveCat} disabled={!catDraft.label.trim()} style={{ flex:2, padding:"11px 0", borderRadius:10, border:"none", background:catDraft.label.trim()?C.orange:C.muted, color:catDraft.label.trim()?"#fff":C.textMuted, fontSize:13, fontWeight:700, cursor:catDraft.label.trim()?"pointer":"not-allowed" }}>
+                {editingCat === "new" ? "Create Category" : "Save Changes"}
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+      {confirmDel && (
+        <div style={{ position:"fixed", inset:0, background:"rgba(0,0,0,0.45)", display:"flex", alignItems:"center", justifyContent:"center", zIndex:9999 }}>
+          <div style={{ background:C.cardBg, borderRadius:20, padding:"32px 36px", width:360, maxWidth:"90vw", textAlign:"center", border:`1px solid ${C.creamBorder}` }}>
+            <h3 style={{ margin:"0 0 8px", fontSize:18, fontWeight:900, color:C.text }}>Delete {confirmDel.type === "card" ? "card" : "category"}?</h3>
+            <p style={{ margin:"0 0 24px", fontSize:13, color:C.textSub }}>
+              {confirmDel.type === "category"
+                ? "This will delete the category. Cards inside it will lose their category assignment."
+                : "This card will be permanently removed."}
+            </p>
+            <div style={{ display:"flex", gap:10 }}>
+              <button onClick={() => setConfirmDel(null)} style={{ flex:1, padding:"11px 0", borderRadius:10, border:`1px solid ${C.border}`, background:C.cardBg, fontSize:13, fontWeight:700, cursor:"pointer", color:C.text }}>Cancel</button>
+              <button onClick={doDelete} style={{ flex:1, padding:"11px 0", borderRadius:10, border:"none", background:"#ef4444", color:"#fff", fontSize:13, fontWeight:700, cursor:"pointer" }}>Delete</button>
+            </div>
+          </div>
+        </div>
+      )}
+    </>
+  );
+
+  // ── CARD EDITOR VIEW ────────────────────────────────────────────────────────
   if (view === "editCard") {
     const isNew = editingCard === "new";
     return (
       <div style={{ maxWidth: 740, display:"flex", flexDirection:"column", gap:0 }}>
-        {/* Header */}
         <div style={{ display:"flex", alignItems:"center", justifyContent:"space-between", marginBottom:24 }}>
           <div>
-            <button onClick={() => setView("list")} style={{ background:"none", border:"none", cursor:"pointer", fontSize:13, fontWeight:600, color:C.textSub, padding:0, display:"flex", alignItems:"center", gap:6, marginBottom:8 }}>← Battle Cards</button>
-            <h2 style={{ margin:0, fontSize:20, fontWeight:900, color:C.text }}>{isNew ? "New Battle Card" : `Edit: ${editingCard === "new" ? "" : cards.find(c=>c.id===editingCard)?.title ?? ""}`}</h2>
+            <button onClick={cancelEditCard} style={{ background:"none", border:"none", cursor:"pointer", fontSize:13, fontWeight:600, color:C.textSub, padding:0, display:"flex", alignItems:"center", gap:6, marginBottom:8 }}>← Battle Cards</button>
+            <h2 style={{ margin:0, fontSize:20, fontWeight:900, color:C.text }}>{isNew ? "New Battle Card" : `Edit: ${cards.find(c => c.id === editingCard)?.title ?? ""}`}</h2>
           </div>
           <div style={{ display:"flex", gap:10 }}>
-            <button onClick={() => setView("list")} style={{ padding:"10px 18px", borderRadius:10, border:`1px solid ${C.border}`, background:C.cardBg, fontSize:13, fontWeight:700, cursor:"pointer", color:C.text }}>Cancel</button>
+            <button onClick={cancelEditCard} style={{ padding:"10px 18px", borderRadius:10, border:`1px solid ${C.border}`, background:C.cardBg, fontSize:13, fontWeight:700, cursor:"pointer", color:C.text }}>Cancel</button>
             <button onClick={saveCard} disabled={!draft.title.trim()} style={{ padding:"10px 20px", borderRadius:10, border:"none", background:draft.title.trim()?C.orange:C.muted, color:draft.title.trim()?"#fff":C.textMuted, fontSize:13, fontWeight:700, cursor:draft.title.trim()?"pointer":"not-allowed" }}>
               {isNew ? "Create Card" : "Save Changes"}
             </button>
@@ -8163,55 +8409,31 @@ function BattleCardsAdminScreen({ categories, cards, onSaveCategory, onDeleteCat
         </div>
 
         <div style={{ display:"flex", flexDirection:"column", gap:16 }}>
-          {/* Core fields */}
           <Card>
             <div style={{ fontSize:13, fontWeight:800, color:C.text, marginBottom:16 }}>Basic Info</div>
             <div style={{ display:"grid", gridTemplateColumns:"1fr 1fr", gap:14, marginBottom:14 }}>
-              <div>
-                {label("Title", true)}
-                <input style={inputStyle} value={draft.title} onChange={setF("title")} placeholder="e.g. Salesforce" />
-              </div>
-              <div>
-                {label("Subtitle / Type")}
-                <input style={inputStyle} value={draft.subtitle} onChange={setF("subtitle")} placeholder="e.g. CRM" />
-              </div>
+              <div>{lbl("Title", true)}<input style={inputStyle} value={draft.title} onChange={setF("title")} placeholder="e.g. Salesforce" /></div>
+              <div>{lbl("Subtitle / Type")}<input style={inputStyle} value={draft.subtitle} onChange={setF("subtitle")} placeholder="e.g. CRM" /></div>
             </div>
             <div style={{ marginBottom:14 }}>
-              {label("Category", true)}
+              {lbl("Category", true)}
               <select value={draft.categoryId} onChange={setF("categoryId")} style={{ ...inputStyle }}>
                 {categories.map(c => <option key={c.id} value={c.id}>{c.label}</option>)}
               </select>
             </div>
-            <div>
-              {label("Summary")}
-              <input style={inputStyle} value={draft.summary} onChange={setF("summary")} placeholder="One-line description shown in lists" />
-            </div>
+            <div>{lbl("Summary")}<input style={inputStyle} value={draft.summary} onChange={setF("summary")} placeholder="One-line description shown in lists" /></div>
           </Card>
 
-          {/* Competitive fields */}
           <Card>
             <div style={{ fontSize:13, fontWeight:800, color:C.text, marginBottom:16 }}>Competitive Detail</div>
             <div style={{ display:"flex", flexDirection:"column", gap:14 }}>
-              <div>
-                {label("Their Strengths", true)}
-                <textarea style={taStyle} value={draft.strength} onChange={setF("strength")} placeholder="What they do well..." />
-              </div>
-              <div>
-                {label("Their Weaknesses", true)}
-                <textarea style={taStyle} value={draft.weakness} onChange={setF("weakness")} placeholder="Where they fall short..." />
-              </div>
-              <div>
-                {label("Why We Win", true)}
-                <textarea style={taStyle} value={draft.ourWin} onChange={setF("ourWin")} placeholder="Our differentiated value..." />
-              </div>
-              <div>
-                {label("Talk Track")}
-                <textarea style={{ ...taStyle, minHeight:110 }} value={draft.talkTrack} onChange={setF("talkTrack")} placeholder="The rep's suggested script for this objection/competitor..." />
-              </div>
+              <div>{lbl("Their Strengths", true)}<textarea style={taStyle} value={draft.strength} onChange={setF("strength")} placeholder="What they do well..." /></div>
+              <div>{lbl("Their Weaknesses", true)}<textarea style={taStyle} value={draft.weakness} onChange={setF("weakness")} placeholder="Where they fall short..." /></div>
+              <div>{lbl("Why We Win", true)}<textarea style={taStyle} value={draft.ourWin} onChange={setF("ourWin")} placeholder="Our differentiated value..." /></div>
+              <div>{lbl("Talk Track")}<textarea style={{ ...taStyle, minHeight:110 }} value={draft.talkTrack} onChange={setF("talkTrack")} placeholder="The rep's suggested script..." /></div>
             </div>
           </Card>
 
-          {/* In-depth content sections */}
           <Card>
             <div style={{ display:"flex", alignItems:"center", justifyContent:"space-between", marginBottom:16 }}>
               <div style={{ fontSize:13, fontWeight:800, color:C.text }}>In-Depth Content</div>
@@ -8241,150 +8463,221 @@ function BattleCardsAdminScreen({ categories, cards, onSaveCategory, onDeleteCat
             )}
           </Card>
         </div>
+        {modals}
       </div>
     );
   }
 
-  // ── LIST VIEW ────────────────────────────────────────────────────────
-  const activeCat   = categories.find(c => c.id === activeCatId);
-  const cardsInCat  = cards.filter(c => c.categoryId === activeCatId).sort((a,b) => a.title.localeCompare(b.title));
+  // ── DETAIL VIEW ─────────────────────────────────────────────────────────────
+  if (view === "detail" && selectedCard) {
+    return (
+      <>
+        <BattleCardDetail
+          card={selectedCard}
+          onBack={activeCatId ? goCategory : goHome}
+          actions={
+            <>
+              <button onClick={() => openEditCard(selectedCard)} style={{ padding:"7px 16px", borderRadius:8, border:`1px solid ${C.border}`, background:C.white, fontSize:12, fontWeight:700, cursor:"pointer", color:C.text }}>Edit</button>
+              <button onClick={() => setConfirmDel({ type:"card", id:selectedCard.id })} style={{ padding:"7px 16px", borderRadius:8, border:"1px solid rgba(239,68,68,0.3)", background:"rgba(239,68,68,0.05)", fontSize:12, fontWeight:700, cursor:"pointer", color:"#ef4444" }}>Delete</button>
+            </>
+          }
+        />
+        {modals}
+      </>
+    );
+  }
 
-  return (
-    <div style={{ display:"flex", flexDirection:"column", gap:20 }}>
-      {/* Header */}
-      <div style={{ display:"flex", alignItems:"flex-start", justifyContent:"space-between" }}>
+  // ── CATEGORY VIEW ───────────────────────────────────────────────────────────
+  if (view === "category" && selectedCat) {
+    return (
+      <div style={{ display:"flex", flexDirection:"column", gap:20 }}>
         <div>
-          <h2 style={{ margin:0, fontSize:22, fontWeight:900, color:C.text }}>Battle Cards</h2>
-          <p style={{ margin:"4px 0 0", fontSize:13, color:C.textSub }}>Manage categories and cards for your team</p>
+          <button onClick={goHome} style={{ background:"none", border:"none", cursor:"pointer", padding:0, fontSize:13, fontWeight:600, color:C.textSub, display:"flex", alignItems:"center", gap:6, marginBottom:16 }}>← Battle Cards</button>
+          <div style={{ display:"flex", alignItems:"flex-start", justifyContent:"space-between", flexWrap:"wrap", gap:12 }}>
+            <div>
+              <h2 style={{ margin:0, fontSize:22, fontWeight:900, color:C.text }}>{selectedCat.label}</h2>
+              <p style={{ margin:"4px 0 0", fontSize:13, color:C.textSub }}>{selectedCat.description}</p>
+            </div>
+            <div style={{ display:"flex", gap:8, flexShrink:0 }}>
+              <button onClick={() => openEditCat(selectedCat)} style={{ padding:"9px 16px", borderRadius:10, border:`1px solid ${C.border}`, background:C.white, fontSize:12, fontWeight:700, cursor:"pointer", color:C.text }}>Edit Category</button>
+              <button onClick={openNewCard} style={{ padding:"9px 16px", borderRadius:10, border:"none", background:C.orange, color:"#fff", fontSize:12, fontWeight:700, cursor:"pointer" }}>+ New Card</button>
+            </div>
+          </div>
         </div>
-        <button onClick={openNewCard} style={{ padding:"10px 20px", borderRadius:12, border:"none", background:C.orange, color:"#fff", fontSize:13, fontWeight:700, cursor:"pointer", flexShrink:0 }}>
-          + New Card
-        </button>
+
+        {cardsInCat.length === 0 ? (
+          <div style={{ padding:"48px 32px", textAlign:"center", borderRadius:16, border:`2px dashed ${C.creamBorder}`, background:C.cardBg }}>
+            <p style={{ margin:"0 0 6px", fontSize:14, fontWeight:700, color:C.text }}>No cards in this category yet</p>
+            <p style={{ margin:"0 0 20px", fontSize:13, color:C.textSub }}>Create the first card for {selectedCat.label}.</p>
+            <button onClick={openNewCard} style={{ padding:"10px 22px", borderRadius:10, border:"none", background:C.orange, color:"#fff", fontSize:13, fontWeight:700, cursor:"pointer" }}>+ New Card</button>
+          </div>
+        ) : (
+          <div style={{ display:"flex", flexDirection:"column", gap:8 }}>
+            {cardsInCat.map(card => (
+              <div key={card.id} style={{ display:"flex", alignItems:"center", gap:8 }}>
+                <button onClick={() => openCard(card.id)} style={{
+                  flex:1, display:"flex", alignItems:"center", justifyContent:"space-between",
+                  padding:"16px 20px", borderRadius:14,
+                  border:`1px solid ${C.creamBorder}`, background:C.cardBg,
+                  cursor:"pointer", textAlign:"left",
+                  transition:"border-color 0.12s, background 0.12s",
+                }}
+                onMouseEnter={e => { e.currentTarget.style.borderColor = C.orange; e.currentTarget.style.background = C.orangeLight; }}
+                onMouseLeave={e => { e.currentTarget.style.borderColor = C.creamBorder; e.currentTarget.style.background = C.cardBg; }}
+                >
+                  <div>
+                    <div style={{ fontSize:14, fontWeight:700, color:C.text }}>{card.title}</div>
+                    <div style={{ fontSize:12, color:C.textSub, marginTop:2 }}>{card.subtitle}</div>
+                    {card.summary && <div style={{ fontSize:12, color:C.textMuted, marginTop:4, maxWidth:520 }}>{card.summary}</div>}
+                  </div>
+                  <span style={{ fontSize:16, color:C.textMuted, flexShrink:0, marginLeft:16 }}>→</span>
+                </button>
+                <button onClick={() => openEditCard(card)} title="Edit" style={{ width:34, height:34, borderRadius:8, border:`1px solid ${C.border}`, background:C.white, fontSize:12, cursor:"pointer", color:C.textSub, flexShrink:0 }}>✎</button>
+                <button onClick={() => setConfirmDel({ type:"card", id:card.id })} title="Delete" style={{ width:34, height:34, borderRadius:8, border:"1px solid rgba(239,68,68,0.3)", background:"rgba(239,68,68,0.05)", fontSize:12, cursor:"pointer", color:"#ef4444", flexShrink:0 }}>✕</button>
+              </div>
+            ))}
+          </div>
+        )}
+        {modals}
+      </div>
+    );
+  }
+
+  // ── HOME VIEW ───────────────────────────────────────────────────────────────
+  return (
+    <div style={{ display:"flex", flexDirection:"column", gap:24 }}>
+      {/* Header */}
+      <div style={{ display:"flex", alignItems:"flex-start", justifyContent:"space-between", gap:12 }}>
+        <div>
+          <h2 style={{ margin:0, fontSize:22, fontWeight:800, color:C.text }}>Battle Cards</h2>
+          <p style={{ margin:"4px 0 0", fontSize:13, color:C.textSub }}>Manage competitive intelligence for your team</p>
+        </div>
+        <div style={{ display:"flex", gap:8, flexShrink:0 }}>
+          <button onClick={openNewCat} style={{ padding:"10px 18px", borderRadius:12, border:`1px solid ${C.border}`, background:C.white, color:C.text, fontSize:13, fontWeight:700, cursor:"pointer" }}>+ New Category</button>
+          <button onClick={openNewCard} style={{ padding:"10px 20px", borderRadius:12, border:"none", background:C.orange, color:"#fff", fontSize:13, fontWeight:700, cursor:"pointer" }}>+ New Card</button>
+        </div>
       </div>
 
-      <div style={{ display:"grid", gridTemplateColumns:"220px 1fr", gap:16, alignItems:"start" }}>
-        {/* Category sidebar */}
-        <div style={{ display:"flex", flexDirection:"column", gap:8 }}>
-          <div style={{ display:"flex", alignItems:"center", justifyContent:"space-between", marginBottom:4 }}>
-            <span style={{ fontSize:11, fontWeight:700, color:C.textMuted, letterSpacing:"0.08em", textTransform:"uppercase" }}>Categories</span>
-            <button onClick={openNewCat} style={{ fontSize:11, fontWeight:700, color:C.orange, background:"none", border:"none", cursor:"pointer", padding:0 }}>+ Add</button>
-          </div>
-          {categories.map(cat => {
-            const count = cards.filter(c => c.categoryId === cat.id).length;
-            const isActive = cat.id === activeCatId;
-            return (
-              <div key={cat.id} style={{ display:"flex", alignItems:"center", gap:4 }}>
-                <button onClick={() => setActiveCatId(cat.id)} style={{
-                  flex:1, display:"flex", alignItems:"center", justifyContent:"space-between",
-                  padding:"9px 12px", borderRadius:9, border:`1px solid ${isActive ? C.orange : C.creamBorder}`,
-                  background: isActive ? C.orangeLight : C.cardBg,
-                  cursor:"pointer", textAlign:"left", minWidth:0,
-                }}>
-                  <span style={{ fontSize:13, fontWeight:700, color: isActive ? C.orange : C.text, overflow:"hidden", textOverflow:"ellipsis", whiteSpace:"nowrap" }}>{cat.label}</span>
-                  <span style={{ fontSize:11, fontWeight:600, color: isActive ? C.orange : C.textMuted, flexShrink:0, marginLeft:6 }}>{count}</span>
-                </button>
-                <button onClick={() => openEditCat(cat)} title="Edit" style={{ width:28, height:28, borderRadius:7, border:`1px solid ${C.border}`, background:C.cardBg, fontSize:11, cursor:"pointer", color:C.textSub, flexShrink:0 }}>✎</button>
-                <button onClick={() => setConfirmDel({ type:"category", id:cat.id })} title="Delete" style={{ width:28, height:28, borderRadius:7, border:"1px solid rgba(239,68,68,0.3)", background:"rgba(239,68,68,0.05)", fontSize:11, cursor:"pointer", color:"#ef4444", flexShrink:0 }}>✕</button>
-              </div>
-            );
-          })}
-          {categories.length === 0 && (
-            <p style={{ fontSize:12, color:C.textMuted, margin:0 }}>No categories yet.</p>
+      {/* Search */}
+      <div style={{ display:"flex", alignItems:"center", gap:10, padding:"10px 14px", borderRadius:10, background:C.cardBg, border:`1px solid ${C.creamBorder}`, maxWidth:420 }}>
+        <span style={{ fontSize:13, color:C.textMuted }}>Search</span>
+        <input
+          type="text" value={search} placeholder="Cards, topics, competitors…"
+          onChange={e => setSearch(e.target.value)}
+          style={{ flex:1, border:"none", background:"transparent", fontSize:13, color:C.text, outline:"none", fontFamily:"inherit" }}
+        />
+        {search && <button onClick={() => setSearch("")} style={{ background:"none", border:"none", cursor:"pointer", fontSize:13, color:C.textMuted, padding:0, lineHeight:1 }}>✕</button>}
+      </div>
+
+      {/* Search results */}
+      {search.trim() ? (
+        <div>
+          <p style={{ margin:"0 0 12px", fontSize:12, fontWeight:700, color:C.textMuted, letterSpacing:"0.06em", textTransform:"uppercase" }}>
+            {filtered.length} result{filtered.length !== 1 ? "s" : ""}
+          </p>
+          {filtered.length === 0 ? (
+            <div style={{ padding:"40px 32px", textAlign:"center", borderRadius:16, border:`2px dashed ${C.creamBorder}`, background:C.cardBg }}>
+              <p style={{ margin:0, fontSize:14, fontWeight:700, color:C.text }}>No results for "{search}"</p>
+            </div>
+          ) : (
+            <div style={{ display:"flex", flexDirection:"column", gap:8 }}>
+              {filtered.map(card => (
+                <div key={card.id} style={{ display:"flex", alignItems:"center", gap:8 }}>
+                  <button onClick={() => { setActiveCatId(card.categoryId); openCard(card.id); }} style={{
+                    flex:1, display:"flex", alignItems:"center", justifyContent:"space-between",
+                    padding:"14px 18px", borderRadius:12, border:`1px solid ${C.creamBorder}`,
+                    background:C.cardBg, cursor:"pointer", textAlign:"left",
+                    transition:"border-color 0.12s",
+                  }}
+                  onMouseEnter={e => { e.currentTarget.style.borderColor = C.orange; e.currentTarget.style.background = C.orangeLight; }}
+                  onMouseLeave={e => { e.currentTarget.style.borderColor = C.creamBorder; e.currentTarget.style.background = C.cardBg; }}
+                  >
+                    <div>
+                      <div style={{ fontSize:14, fontWeight:700, color:C.text }}>{card.title}</div>
+                      <div style={{ fontSize:12, color:C.textSub, marginTop:2 }}>{card.subtitle} · {categories.find(c => c.id === card.categoryId)?.label}</div>
+                    </div>
+                    <span style={{ fontSize:16, color:C.textMuted, flexShrink:0, marginLeft:16 }}>→</span>
+                  </button>
+                  <button onClick={() => { setActiveCatId(card.categoryId); openEditCard(card); }} title="Edit" style={{ width:34, height:34, borderRadius:8, border:`1px solid ${C.border}`, background:C.white, fontSize:12, cursor:"pointer", color:C.textSub, flexShrink:0 }}>✎</button>
+                  <button onClick={() => setConfirmDel({ type:"card", id:card.id })} title="Delete" style={{ width:34, height:34, borderRadius:8, border:"1px solid rgba(239,68,68,0.3)", background:"rgba(239,68,68,0.05)", fontSize:12, cursor:"pointer", color:"#ef4444", flexShrink:0 }}>✕</button>
+                </div>
+              ))}
+            </div>
           )}
         </div>
-
-        {/* Cards panel */}
-        <div>
-          {activeCat ? (
-            <>
-              <div style={{ display:"flex", alignItems:"center", justifyContent:"space-between", marginBottom:14 }}>
-                <div>
-                  <div style={{ fontSize:15, fontWeight:800, color:C.text }}>{activeCat.label}</div>
-                  {activeCat.description && <div style={{ fontSize:12, color:C.textSub, marginTop:2 }}>{activeCat.description}</div>}
-                </div>
-                <button onClick={openNewCard} style={{ padding:"8px 16px", borderRadius:9, border:`1px solid ${C.orange}`, background:C.orangeLight, color:C.orange, fontSize:12, fontWeight:700, cursor:"pointer" }}>
-                  + New Card
-                </button>
+      ) : (
+        <>
+          {/* Category grid */}
+          <div>
+            <p style={{ margin:"0 0 12px", fontSize:12, fontWeight:700, color:C.textMuted, letterSpacing:"0.06em", textTransform:"uppercase" }}>Categories</p>
+            {categories.length === 0 ? (
+              <div style={{ padding:"48px 32px", textAlign:"center", borderRadius:16, border:`2px dashed ${C.creamBorder}`, background:C.cardBg }}>
+                <p style={{ margin:"0 0 6px", fontSize:14, fontWeight:700, color:C.text }}>No categories yet</p>
+                <p style={{ margin:"0 0 20px", fontSize:13, color:C.textSub }}>Create a category to organize your battle cards.</p>
+                <button onClick={openNewCat} style={{ padding:"10px 22px", borderRadius:10, border:"none", background:C.orange, color:"#fff", fontSize:13, fontWeight:700, cursor:"pointer" }}>+ New Category</button>
               </div>
-              {cardsInCat.length === 0 ? (
-                <div style={{ padding:"48px 32px", textAlign:"center", borderRadius:14, border:`2px dashed ${C.creamBorder}`, background:C.cardBg }}>
-                  <p style={{ margin:"0 0 6px", fontSize:14, fontWeight:700, color:C.text }}>No cards in this category</p>
-                  <p style={{ margin:"0 0 20px", fontSize:13, color:C.textSub }}>Create the first card for {activeCat.label}.</p>
-                  <button onClick={openNewCard} style={{ padding:"10px 22px", borderRadius:10, border:"none", background:C.orange, color:"#fff", fontSize:13, fontWeight:700, cursor:"pointer" }}>+ New Card</button>
-                </div>
-              ) : (
-                <div style={{ display:"flex", flexDirection:"column", gap:8 }}>
-                  {cardsInCat.map(card => (
-                    <div key={card.id} style={{ display:"flex", alignItems:"center", justifyContent:"space-between", padding:"14px 18px", borderRadius:12, border:`1px solid ${C.creamBorder}`, background:C.cardBg }}>
-                      <div style={{ minWidth:0, flex:1 }}>
-                        <div style={{ fontSize:14, fontWeight:700, color:C.text }}>{card.title}</div>
-                        {card.subtitle && <div style={{ fontSize:12, color:C.textSub, marginTop:2 }}>{card.subtitle}</div>}
-                        {card.summary  && <div style={{ fontSize:12, color:C.textMuted, marginTop:2, overflow:"hidden", textOverflow:"ellipsis", whiteSpace:"nowrap", maxWidth:420 }}>{card.summary}</div>}
-                      </div>
-                      <div style={{ display:"flex", gap:8, flexShrink:0, marginLeft:16 }}>
-                        {card.content?.length > 0 && (
-                          <span style={{ fontSize:11, fontWeight:600, color:C.textMuted, padding:"3px 8px", borderRadius:99, background:C.pageBg, border:`1px solid ${C.creamBorder}`, alignSelf:"center" }}>
-                            {card.content.length} section{card.content.length !== 1 ? "s" : ""}
-                          </span>
-                        )}
-                        <button onClick={() => openEditCard(card)} style={{ padding:"7px 14px", borderRadius:8, border:`1px solid ${C.border}`, background:C.white, fontSize:12, fontWeight:700, cursor:"pointer", color:C.text }}>Edit</button>
-                        <button onClick={() => setConfirmDel({ type:"card", id:card.id })} style={{ padding:"7px 14px", borderRadius:8, border:"1px solid rgba(239,68,68,0.3)", background:"rgba(239,68,68,0.05)", fontSize:12, fontWeight:700, cursor:"pointer", color:"#ef4444" }}>Delete</button>
+            ) : (
+              <div style={{ display:"grid", gridTemplateColumns:"repeat(2, 1fr)", gap:12 }}>
+                {categories.map(cat => {
+                  const count = cards.filter(c => c.categoryId === cat.id).length;
+                  return (
+                    <div key={cat.id} style={{ position:"relative" }}>
+                      <button onClick={() => openCategory(cat.id)} style={{
+                        display:"block", width:"100%", padding:"18px 20px", borderRadius:14, textAlign:"left", cursor:"pointer",
+                        border:`1.5px solid ${C.creamBorder}`, background:C.cardBg,
+                        transition:"border-color 0.12s, background 0.12s",
+                      }}
+                      onMouseEnter={e => { e.currentTarget.style.borderColor = C.orange; e.currentTarget.style.background = C.orangeLight; }}
+                      onMouseLeave={e => { e.currentTarget.style.borderColor = C.creamBorder; e.currentTarget.style.background = C.cardBg; }}
+                      >
+                        <div style={{ fontSize:14, fontWeight:800, color:C.text, marginBottom:4, paddingRight:56 }}>{cat.label}</div>
+                        <div style={{ fontSize:12, color:C.textSub, lineHeight:1.4, marginBottom:10 }}>{cat.description}</div>
+                        <div style={{ fontSize:11, fontWeight:700, color:C.orange }}>{count} card{count !== 1 ? "s" : ""} →</div>
+                      </button>
+                      {/* Manager edit/delete overlay */}
+                      <div style={{ position:"absolute", top:10, right:10, display:"flex", gap:4, zIndex:1 }}>
+                        <button onClick={e => { e.stopPropagation(); openEditCat(cat); }} title="Edit category" style={{ width:26, height:26, borderRadius:6, border:`1px solid ${C.border}`, background:"rgba(255,255,255,0.92)", fontSize:11, cursor:"pointer", color:C.textSub }}>✎</button>
+                        <button onClick={e => { e.stopPropagation(); setConfirmDel({ type:"category", id:cat.id }); }} title="Delete category" style={{ width:26, height:26, borderRadius:6, border:"1px solid rgba(239,68,68,0.3)", background:"rgba(255,255,255,0.92)", fontSize:11, cursor:"pointer", color:"#ef4444" }}>✕</button>
                       </div>
                     </div>
-                  ))}
-                </div>
-              )}
-            </>
-          ) : (
-            <div style={{ padding:"60px 32px", textAlign:"center", borderRadius:14, border:`2px dashed ${C.creamBorder}`, background:C.cardBg }}>
-              <p style={{ margin:0, fontSize:14, color:C.textSub }}>Select a category to manage its cards.</p>
+                  );
+                })}
+              </div>
+            )}
+          </div>
+
+          {/* All cards A–Z */}
+          {allCardsSorted.length > 0 && (
+            <div>
+              <p style={{ margin:"0 0 12px", fontSize:12, fontWeight:700, color:C.textMuted, letterSpacing:"0.06em", textTransform:"uppercase" }}>All Cards — A to Z</p>
+              <div style={{ display:"flex", flexDirection:"column", gap:6 }}>
+                {allCardsSorted.map(card => (
+                  <div key={card.id} style={{ display:"flex", alignItems:"center", gap:8 }}>
+                    <button onClick={() => { setActiveCatId(card.categoryId); openCard(card.id); }} style={{
+                      flex:1, display:"flex", alignItems:"center", justifyContent:"space-between",
+                      padding:"14px 18px", borderRadius:12, border:`1px solid ${C.creamBorder}`,
+                      background:C.cardBg, cursor:"pointer", textAlign:"left",
+                      transition:"border-color 0.12s, background 0.12s",
+                    }}
+                    onMouseEnter={e => { e.currentTarget.style.borderColor = C.orange; e.currentTarget.style.background = C.orangeLight; }}
+                    onMouseLeave={e => { e.currentTarget.style.borderColor = C.creamBorder; e.currentTarget.style.background = C.cardBg; }}
+                    >
+                      <div>
+                        <div style={{ fontSize:14, fontWeight:700, color:C.text }}>{card.title}</div>
+                        <div style={{ fontSize:12, color:C.textSub, marginTop:2 }}>{card.subtitle} · {categories.find(c => c.id === card.categoryId)?.label}</div>
+                      </div>
+                      <span style={{ fontSize:16, color:C.textMuted, flexShrink:0, marginLeft:16 }}>→</span>
+                    </button>
+                    <button onClick={() => { setActiveCatId(card.categoryId); openEditCard(card); }} title="Edit" style={{ width:34, height:34, borderRadius:8, border:`1px solid ${C.border}`, background:C.white, fontSize:12, cursor:"pointer", color:C.textSub, flexShrink:0 }}>✎</button>
+                    <button onClick={() => setConfirmDel({ type:"card", id:card.id })} title="Delete" style={{ width:34, height:34, borderRadius:8, border:"1px solid rgba(239,68,68,0.3)", background:"rgba(239,68,68,0.05)", fontSize:12, cursor:"pointer", color:"#ef4444", flexShrink:0 }}>✕</button>
+                  </div>
+                ))}
+              </div>
             </div>
           )}
-        </div>
-      </div>
-
-      {/* Category form modal */}
-      {showCatForm && (
-        <div style={{ position:"fixed", inset:0, background:"rgba(0,0,0,0.45)", display:"flex", alignItems:"center", justifyContent:"center", zIndex:9999 }}>
-          <div style={{ background:C.cardBg, borderRadius:20, padding:"32px 36px", width:420, maxWidth:"90vw", border:`1px solid ${C.creamBorder}` }}>
-            <h3 style={{ margin:"0 0 20px", fontSize:18, fontWeight:900, color:C.text }}>{editingCat === "new" ? "New Category" : "Edit Category"}</h3>
-            <div style={{ marginBottom:14 }}>
-              <label style={{ display:"block", fontSize:11, fontWeight:700, color:C.textMuted, letterSpacing:"0.08em", textTransform:"uppercase", marginBottom:8 }}>Name <span style={{ color:C.red }}>*</span></label>
-              <input style={{ width:"100%", boxSizing:"border-box", padding:"10px 14px", borderRadius:10, border:`1.5px solid ${C.border}`, background:C.white, fontSize:14, color:C.text, outline:"none", fontFamily:"inherit" }}
-                value={catDraft.label} onChange={e => setCatDraft(d => ({ ...d, label: e.target.value }))} placeholder="e.g. Competitor Knowledge" />
-            </div>
-            <div style={{ marginBottom:24 }}>
-              <label style={{ display:"block", fontSize:11, fontWeight:700, color:C.textMuted, letterSpacing:"0.08em", textTransform:"uppercase", marginBottom:8 }}>Description</label>
-              <textarea style={{ width:"100%", boxSizing:"border-box", padding:"10px 14px", borderRadius:10, border:`1.5px solid ${C.border}`, background:C.white, fontSize:13, color:C.text, outline:"none", fontFamily:"inherit", resize:"vertical", minHeight:72, lineHeight:1.6 }}
-                value={catDraft.description} onChange={e => setCatDraft(d => ({ ...d, description: e.target.value }))} placeholder="Short description shown to reps" />
-            </div>
-            <div style={{ display:"flex", gap:10 }}>
-              <button onClick={() => setShowCatForm(false)} style={{ flex:1, padding:"11px 0", borderRadius:10, border:`1px solid ${C.border}`, background:C.cardBg, fontSize:13, fontWeight:700, cursor:"pointer", color:C.text }}>Cancel</button>
-              <button onClick={saveCat} disabled={!catDraft.label.trim()} style={{ flex:2, padding:"11px 0", borderRadius:10, border:"none", background:catDraft.label.trim()?C.orange:C.muted, color:catDraft.label.trim()?"#fff":C.textMuted, fontSize:13, fontWeight:700, cursor:catDraft.label.trim()?"pointer":"not-allowed" }}>
-                {editingCat === "new" ? "Create Category" : "Save Changes"}
-              </button>
-            </div>
-          </div>
-        </div>
+        </>
       )}
-
-      {/* Delete confirm modal */}
-      {confirmDel && (
-        <div style={{ position:"fixed", inset:0, background:"rgba(0,0,0,0.45)", display:"flex", alignItems:"center", justifyContent:"center", zIndex:9999 }}>
-          <div style={{ background:C.cardBg, borderRadius:20, padding:"32px 36px", width:360, maxWidth:"90vw", textAlign:"center", border:`1px solid ${C.creamBorder}` }}>
-            <h3 style={{ margin:"0 0 8px", fontSize:18, fontWeight:900, color:C.text }}>Delete {confirmDel.type === "card" ? "card" : "category"}?</h3>
-            <p style={{ margin:"0 0 24px", fontSize:13, color:C.textSub }}>
-              {confirmDel.type === "category"
-                ? "This will delete the category. Cards inside it won't be deleted but will lose their category."
-                : "This card will be permanently removed."}
-            </p>
-            <div style={{ display:"flex", gap:10 }}>
-              <button onClick={() => setConfirmDel(null)} style={{ flex:1, padding:"11px 0", borderRadius:10, border:`1px solid ${C.border}`, background:C.cardBg, fontSize:13, fontWeight:700, cursor:"pointer", color:C.text }}>Cancel</button>
-              <button onClick={doDelete} style={{ flex:1, padding:"11px 0", borderRadius:10, border:"none", background:"#ef4444", color:"#fff", fontSize:13, fontWeight:700, cursor:"pointer" }}>Delete</button>
-            </div>
-          </div>
-        </div>
-      )}
+      {modals}
     </div>
   );
 }
@@ -8393,15 +8686,18 @@ function BattleCardsAdminScreen({ categories, cards, onSaveCategory, onDeleteCat
 // Navigation: home → category view → card detail
 // All navigation is internal state (no router needed for this screen)
 
-function BattleCardDetail({ card, onBack }) {
+function BattleCardDetail({ card, onBack, actions }) {
   return (
     <div style={{ display: "flex", flexDirection: "column", gap: 20 }}>
       {/* Back + header */}
       <div>
-        <button onClick={onBack} style={{
-          background: "none", border: "none", cursor: "pointer", padding: 0,
-          fontSize: 13, fontWeight: 600, color: C.textSub, display: "flex", alignItems: "center", gap: 6, marginBottom: 16,
-        }}>← Back</button>
+        <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", marginBottom: 16 }}>
+          <button onClick={onBack} style={{
+            background: "none", border: "none", cursor: "pointer", padding: 0,
+            fontSize: 13, fontWeight: 600, color: C.textSub, display: "flex", alignItems: "center", gap: 6,
+          }}>← Back</button>
+          {actions && <div style={{ display: "flex", gap: 8 }}>{actions}</div>}
+        </div>
         <div style={{ display: "flex", alignItems: "flex-start", justifyContent: "space-between", flexWrap: "wrap", gap: 10 }}>
           <div>
             <h2 style={{ margin: 0, fontSize: 22, fontWeight: 900, color: C.text }}>{card.title}</h2>
@@ -11045,7 +11341,30 @@ function OrgDetailScreen({ org, orgUsers, onBack, onAddUser, onDeactivateOrg, on
 
 // ── TEAM SCREEN (org admin manages their users) ────────────
 function TeamScreen({ orgId, orgName, orgUsers, onAddUser, onMemberInvited }) {
-  const members = orgUsers.filter(u => u.orgId === orgId);
+  const [localMembers, setLocalMembers] = useState(null); // null = loading
+
+  useEffect(() => {
+    if (!orgId) return;
+    supabase
+      .from("profiles")
+      .select("id, name, email, role, color, status, team_id")
+      .eq("tenant_id", orgId)
+      .then(({ data }) => {
+        if (!data) { setLocalMembers([]); return; }
+        setLocalMembers(data.map(m => ({
+          id: m.id,
+          email: m.email,
+          name: m.name ?? m.email?.split("@")[0] ?? "User",
+          initials: (m.name ?? m.email ?? "U").split(" ").map(p => p[0] ?? "").join("").toUpperCase().slice(0, 2) || "U",
+          role: m.role ?? "user",
+          color: m.color ?? "#F97316",
+          status: m.status ?? "active",
+          _isReal: true,
+        })));
+      });
+  }, [orgId]); // eslint-disable-line
+
+  const members = localMembers !== null ? localMembers : orgUsers.filter(u => u.orgId === orgId);
 
   // ── Invite modal state ─────────────────────────────────────────────────────
   const [showAdd, setShowAdd]     = useState(false);
@@ -11242,6 +11561,8 @@ function TeamScreen({ orgId, orgName, orgUsers, onAddUser, onMemberInvited }) {
 
   const ROLE_COLORS = { user: C.orange, orgAdmin: C.green, superadmin: C.purple };
   const ROLE_LABELS = { user: "Rep", orgAdmin: "Manager", superadmin: "Super Admin" };
+  const STATUS_COLORS = { active: "#22c55e", inactive: C.textMuted, invited: C.orange };
+  const STATUS_LABELS = { active: "Active", inactive: "Inactive", invited: "Invited" };
 
   // ── Team detail view ────────────────────────────────────────────────────────
   if (selectedTeam) {
@@ -11324,7 +11645,9 @@ function TeamScreen({ orgId, orgName, orgUsers, onAddUser, onMemberInvited }) {
       <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between" }}>
         <div>
           <h2 style={{ margin: 0, fontSize: 20, fontWeight: 800, color: C.text }}>Team · {orgName}</h2>
-          <p style={{ margin: "4px 0 0", fontSize: 13, color: C.textSub }}>{members.length} member{members.length !== 1 ? "s" : ""}</p>
+          <p style={{ margin: "4px 0 0", fontSize: 13, color: C.textSub }}>
+            {localMembers === null ? "Loading…" : `${members.length} member${members.length !== 1 ? "s" : ""}`}
+          </p>
         </div>
         <button
           onClick={() => setShowAdd(true)}
@@ -11415,7 +11738,10 @@ function TeamScreen({ orgId, orgName, orgUsers, onAddUser, onMemberInvited }) {
         <div style={{ padding: "14px 20px", borderBottom: members.length ? `1px solid ${C.border}` : "none" }}>
           <div style={{ fontSize: 14, fontWeight: 700, color: C.text }}>Members</div>
         </div>
-        {members.length === 0 && (
+        {localMembers === null && (
+          <div style={{ padding: 24, textAlign: "center", color: C.textMuted, fontSize: 13 }}>Loading…</div>
+        )}
+        {localMembers !== null && members.length === 0 && (
           <div style={{ padding: 40, textAlign: "center", color: C.textMuted, fontSize: 14 }}>No members yet. Invite your first rep.</div>
         )}
         {members.map((u, i) => (
@@ -11423,10 +11749,13 @@ function TeamScreen({ orgId, orgName, orgUsers, onAddUser, onMemberInvited }) {
             <div style={{ width: 38, height: 38, borderRadius: "50%", background: u.color, display: "flex", alignItems: "center", justifyContent: "center", fontSize: 13, fontWeight: 800, color: "#fff", flexShrink: 0 }}>{u.initials}</div>
             <div style={{ flex: 1, minWidth: 0 }}>
               <div style={{ fontSize: 14, fontWeight: 700, color: C.text }}>{u.name}</div>
-              <div style={{ fontSize: 12, color: C.textSub, marginTop: 1 }}>{u.email}{u.title ? ` · ${u.title}` : ""}</div>
+              <div style={{ fontSize: 12, color: C.textSub, marginTop: 1 }}>{u.email}</div>
             </div>
             <span style={{ fontSize: 11, fontWeight: 700, padding: "3px 8px", borderRadius: 6, background: (ROLE_COLORS[u.role] ?? C.textMuted) + "18", color: ROLE_COLORS[u.role] ?? C.textMuted }}>
               {ROLE_LABELS[u.role] ?? u.role}
+            </span>
+            <span style={{ fontSize: 11, fontWeight: 700, padding: "3px 8px", borderRadius: 6, background: (STATUS_COLORS[u.status] ?? C.textMuted) + "18", color: STATUS_COLORS[u.status] ?? C.textMuted }}>
+              {STATUS_LABELS[u.status] ?? u.status}
             </span>
           </div>
         ))}
@@ -12886,12 +13215,12 @@ export default function App() {
           // Real org admin from Supabase — check tenant status
           supabase.from("tenants").select("status").eq("id", u.orgId).single()
             .then(({ data: tenant }) => {
-              setScreen(tenant?.status === "onboarding" ? "org-setup" : "team");
+              setScreen(tenant?.status === "onboarding" ? "org-setup" : "home");
             })
-            .catch(() => setScreen("team"));
+            .catch(() => setScreen("home"));
         } else {
-          // Demo seed org admin — go straight to team
-          setScreen("team");
+          // Demo seed org admin — go straight to home
+          setScreen("home");
         }
       } else {
         setScreen("home");
@@ -13216,6 +13545,14 @@ export default function App() {
     });
   };
 
+  const handleAssignQuiz = async (assignment) => {
+    const tenantId = currentOrg?.id ?? null;
+    if (user?._isReal && tenantId) {
+      const { error } = await dbCreateAssignment(tenantId, assignment, user?.id);
+      if (error) console.error("[ralli] quiz createAssignment failed:", error);
+    }
+  };
+
   const handleCreateSession = async (session) => {
     // Persist to Supabase first — enables cross-device joins by PIN
     const tenantId = currentOrg?.id ?? user?.orgId ?? null;
@@ -13394,10 +13731,20 @@ export default function App() {
     setScreen("rankd-results");
   };
 
-  // Admin: re-launch ended session
+  // Admin: re-launch ended session — create a brand-new session with fresh PIN + empty lobby.
+  // The old session stays in sessions[] as "ended" so it stays visible in Past Sessions.
   const handleRelaunch = (session) => {
-    setSessions(prev => prev.map(s => s.code === session.code ? { ...s, status: "waiting", playerCount: 0 } : s));
-    handleLaunch(session);
+    const newPin = String(Math.floor(100000 + Math.random() * 900000));
+    handleCreateSession({
+      code: newPin,
+      name: session.name,
+      quizId: session.quizId,
+      questionCount: session.questionCount,
+      status: "waiting",
+      playerCount: 0,
+      demoMode: session.demoMode ?? false,
+      players: [],
+    });
   };
 
   const fullScreen = FULL_SCREEN_ROUTES.has(screen);
@@ -13426,8 +13773,8 @@ export default function App() {
       case "rankd-lobby":       return <RankdLobbyScreen onNav={navigate} pin={lobbyPin} playerName={lobbyPlayerName} playerEmoji={lobbyPlayerEmoji} sessionName={lobbySessionName} role={gameRole} sessions={sessions} currentUser={currentUser} onGameStart={handleGameStart} chPlayers={chPlayers} broadcast={broadcast} playerId={playerId} chMsg={chMsg} />;
       case "rankd-game":        return <RankdGameScreen onNav={navigate} sessionName={lobbySessionName} role={gameRole} playerName={lobbyPlayerName ?? user.name} questions={gameQuestions ?? GAME_QUESTIONS} demoMode={gameRole === "admin" && sessions.find(s => s.code === lobbyPin)?.demoMode !== false} pin={lobbyPin} sessionDbId={sessions.find(s => s.code === lobbyPin)?.dbId ?? null} tenantId={currentOrg?.id ?? user?.orgId ?? null} broadcast={broadcast} chMsg={chMsg} chAnswers={chAnswers} chPlayers={chPlayers} playerId={playerId} onGameEnd={handleGameEnd} setChAnswers={setChAnswers} />;
       case "rankd-results":     return <RankdResultsScreen onNav={navigate} sessionCode={viewResultsCode} sessions={sessions} gameData={gameResultsData} />;
-      case "learn":             return <LearnScreen role={gameRole} user={user} orgUsers={orgUsers} orgs={orgs} onNav={navigate} onAwardXp={handleAwardXp} pendingLessonId={pendingLessonId} onClearPendingLesson={() => setPendingLessonId(null)} canCreate={perm("actions","create")} canEdit={perm("actions","edit")} canDelete={perm("actions","delete")} canAssign={perm("actions","assign")} tenantId={currentOrg?.id ?? null} isReal={!!user?._isReal} />;
-      case "quizzes":           return <QuizzesScreen role={gameRole} onNav={navigate} quizzes={quizzes} onEditQuiz={handleEditQuiz} onDeleteQuiz={handleDeleteQuiz} onToggleFavorite={handleToggleFavorite} onToggleActive={handleToggleActive} pendingQuizId={pendingQuizId} onClearPendingQuiz={() => setPendingQuizId(null)} canCreate={perm("actions","create")} canEdit={perm("actions","edit")} canDelete={perm("actions","delete")} canLaunch={perm("actions","launch")} />;
+      case "learn":             return <LearnScreen role={gameRole} user={user} orgUsers={orgUsers} orgs={orgs} onNav={navigate} onAwardXp={handleAwardXp} pendingLessonId={pendingLessonId} onClearPendingLesson={() => setPendingLessonId(null)} canCreate={perm("actions","create")} canEdit={perm("actions","edit")} canDelete={perm("actions","delete")} canAssign={perm("actions","assign")} tenantId={currentOrg?.id ?? null} isReal={!!user?._isReal} quizzes={quizzes} />;
+      case "quizzes":           return <QuizzesScreen role={gameRole} onNav={navigate} quizzes={quizzes} onEditQuiz={handleEditQuiz} onDeleteQuiz={handleDeleteQuiz} onToggleFavorite={handleToggleFavorite} onToggleActive={handleToggleActive} pendingQuizId={pendingQuizId} onClearPendingQuiz={() => setPendingQuizId(null)} canCreate={perm("actions","create")} canEdit={perm("actions","edit")} canDelete={perm("actions","delete")} canLaunch={perm("actions","launch")} canAssign={perm("actions","assign")} onAssignQuiz={handleAssignQuiz} orgUsers={orgUsers} orgs={orgs} currentUser={currentUser} tenantId={currentOrg?.id ?? null} isReal={!!user?._isReal} />;
       case "battlecards":       return (isAdminType && perm("actions","edit"))
         ? <BattleCardsAdminScreen categories={bcCategories} cards={battleCards} onSaveCategory={handleSaveBcCategory} onDeleteCategory={handleDeleteBcCategory} onSaveCard={handleSaveBattleCard} onDeleteCard={handleDeleteBattleCard} />
         : <BattleCardsScreen categories={bcCategories} cards={battleCards} />;
@@ -13529,14 +13876,16 @@ export default function App() {
                   transition: "all 0.12s",
                 }}>
                   {item.icon && <span style={{ fontSize: 15, opacity: active ? 1 : 0.7 }}>{item.icon}</span>}
-                  <span style={{ flex: 1 }}>{isAdminType && item.adminLabel ? item.adminLabel : item.label}</span>
-                  {item.badge && !(user?._isReal && item.id === "leaderboard") && (
-                    <span style={{
-                      fontSize: 10, fontWeight: 800, padding: "2px 6px", borderRadius: 10,
-                      background: item.badge === "LIVE" ? "#22C55E" : C.orange,
-                      color: "#fff", letterSpacing: "0.04em",
-                    }}>{item.badge}</span>
-                  )}
+                  <span style={{ flex: 1, display: "flex", alignItems: "center", gap: 6 }}>
+                    <span>{isAdminType && item.adminLabel ? item.adminLabel : item.label}</span>
+                    {item.badge && !(user?._isReal && item.id === "leaderboard") && (
+                      <span style={{
+                        fontSize: 10, fontWeight: 800, padding: "2px 6px", borderRadius: 10,
+                        background: item.badge === "LIVE" ? "#22C55E" : C.orange,
+                        color: "#fff", letterSpacing: "0.04em",
+                      }}>{item.badge}</span>
+                    )}
+                  </span>
                 </button>
               );
             })}
@@ -13590,10 +13939,10 @@ export default function App() {
             <RalliLogo size={28} />
             <span style={{ fontSize: 16, fontWeight: 900, color: C.text }}>ralli</span>
           </div>
-          {role !== "admin" && (
+          {role === "user" && (
             <span style={{ fontSize: 12, fontWeight: 700, color: C.orange }}>{user.xp.toLocaleString()} XP</span>
           )}
-          {role === "admin" && (
+          {isAdminType && (
             <span style={{ fontSize: 12, fontWeight: 700, color: C.green }}>Admin</span>
           )}
           <div style={{
@@ -13612,7 +13961,7 @@ export default function App() {
             height: 56, background: C.white, borderBottom: `1px solid ${C.border}`,
             display: "flex", alignItems: "center", padding: "0 24px", gap: 16, flexShrink: 0,
           }}>
-            {/* Company logo for users; search placeholder for admins/managers.
+            {/* Company logo for users; search placeholder for ralli admin only.
                 Production hook: replace currentOrg?.name with org.logoUrl when
                 asset upload is supported — render <img> instead of text. */}
             {role === "user" ? (
@@ -13624,7 +13973,7 @@ export default function App() {
                   {currentOrg?.name ?? "momence"}
                 </span>
               </div>
-            ) : (
+            ) : isSuperAdmin ? (
               <div style={{
                 flex: 1, display: "flex", alignItems: "center", gap: 10,
                 background: C.inputBg, border: `1px solid ${C.border}`,
@@ -13632,15 +13981,15 @@ export default function App() {
               }}>
                 <span style={{ fontSize: 13, color: C.textMuted }}>Search battle cards, topics, competitors...</span>
               </div>
-            )}
+            ) : null}
             <div style={{ flex: 1 }} />
 
-            {role !== "admin" && (
+            {role === "user" && (
               <div style={{ display: "flex", alignItems: "center", gap: 6, padding: "5px 12px", borderRadius: 20, border: `1px solid ${C.border}` }}>
                 <span style={{ fontSize: 13, fontWeight: 700, color: C.text }}>{user.streak}</span>
               </div>
             )}
-            {role !== "admin" && (
+            {role === "user" && (
               <div style={{ display: "flex", alignItems: "center", gap: 6, padding: "5px 12px", borderRadius: 20, border: `1px solid ${C.border}`, background: C.orangeLight }}>
                 <span style={{ fontSize: 13, fontWeight: 700, color: C.orange }}>{user.xp.toLocaleString()} XP</span>
               </div>
