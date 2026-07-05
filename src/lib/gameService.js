@@ -117,7 +117,14 @@ export async function endGameSession(pin, { scores = [], tenantId = null } = {})
 
   if (!session?.id) return { data: null, error: new Error("session not found") };
 
-  // 2. Save final player scores (ranked by position in scores array)
+  // 2. Mark all active participants as completed (so lobby no longer shows them)
+  await supabase
+    .from("game_session_participants")
+    .update({ status: "completed", last_seen_at: new Date().toISOString() })
+    .eq("session_id", session.id)
+    .in("status", ["active", "joined"]);
+
+  // 3. Save final player scores (ranked by position in scores array)
   if (scores.length > 0) {
     const playerRows = scores.map((p, idx) => ({
       session_id:  session.id,
@@ -185,6 +192,7 @@ export async function getLobbyParticipants(sessionId) {
     .from("game_session_participants")
     .select("*")
     .eq("session_id", sessionId)
+    .in("status", ["active", "joined"])
     .order("joined_at", { ascending: true });
   return { data, error };
 }
@@ -397,7 +405,7 @@ export async function getActiveSessions(tenantId, limit = 30) {
     .from("game_sessions")
     .select("*")
     .eq("tenant_id", tenantId)
-    .in("status", ["waiting", "started", "live", "completed"])
+    .in("status", ["waiting", "started", "live", "active", "paused"])
     .order("created_at", { ascending: false })
     .limit(limit);
 

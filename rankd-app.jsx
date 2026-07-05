@@ -3680,12 +3680,13 @@ function RankdAdminPanel({ onNav, sessions, onLaunch, onViewResults, onRelaunch 
     completed: { bg: C.muted,         text: C.textSub,  label: "Completed" },
   };
 
-  const activeSessions = sessions.filter(s => s.status !== "ended" && s.status !== "completed");
-  const pastSessions   = sessions.filter(s => s.status === "ended"  || s.status === "completed");
+  const TERMINAL_STATUSES = new Set(["ended", "completed", "canceled", "archived"]);
+  const activeSessions = sessions.filter(s => !TERMINAL_STATUSES.has(s.status));
+  const pastSessions   = sessions.filter(s =>  TERMINAL_STATUSES.has(s.status));
 
   const SessionRow = ({ s }) => {
     const sc  = statusColors[s.status] ?? { bg: C.muted, text: C.textSub, label: s.status ?? "Unknown" };
-    const isPast = s.status === "ended" || s.status === "completed";
+    const isPast = TERMINAL_STATUSES.has(s.status);
     return (
       <div style={{
         display: "flex", alignItems: "center", gap: 16, padding: 20, borderRadius: 16,
@@ -13807,8 +13808,14 @@ export default function App() {
     setGameResultsData(data);
     setViewResultsCode(lobbyPin);
     navigate("rankd-results");
+    // Immediately mark session as completed in local state so it moves to
+    // Past Sessions and is excluded from the active lobby without waiting
+    // for the next getActiveSessions poll.
+    setSessions(prev => prev.map(s =>
+      s.code === lobbyPin ? { ...s, status: "completed" } : s
+    ));
     const gameTenantId = currentOrg?.id ?? user?.orgId ?? null;
-    // Persist results to Supabase (fire-and-forget — UI has already navigated)
+    // Persist results + mark participants completed in Supabase (fire-and-forget)
     endGameSession(lobbyPin, {
       scores:   data?.scores ?? [],
       tenantId: gameTenantId,
