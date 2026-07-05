@@ -427,7 +427,7 @@ function InfoTooltip({ text }) {
   );
 }
 
-function HomeScreen({ user, onNav, quizAssignments = [], onResumeLesson, onStartQuiz, orgUsers = [], isReal = false }) {
+function HomeScreen({ user, onNav, quizAssignments = [], onResumeLesson, onStartQuiz, onStartCourse, orgUsers = [], isReal = false, tenantId = null, quizzes = [] }) {
   const firstName = user.name.split(" ")[0];
   const hour = new Date().getHours();
   const greeting = hour < 12 ? "Good morning" : hour < 17 ? "Good afternoon" : "Good evening";
@@ -435,18 +435,80 @@ function HomeScreen({ user, onNav, quizAssignments = [], onResumeLesson, onStart
   // Dynamic date: e.g. "Jun 28"
   const todayLabel = new Date().toLocaleDateString("en-US", { month: "short", day: "numeric" });
 
-  // Outstanding quiz assignments (no passed attempt)
-  const outstanding = quizAssignments.filter(q => !q.attempts?.some(a => a.passed));
-  const pendingCount = outstanding.length;
-
   // Tasks panel visibility
   const [showTasksPanel, setShowTasksPanel] = useState(false);
 
-  // All outstanding items for "In Progress" — show every pending assignment
-  const inProgressItems = outstanding;
+  // ── Real-user assignment data ─────────────────────────────
+  const [homeCourses,     setHomeCourses]     = useState([]);
+  const [homeLessons,     setHomeLessons]     = useState([]);
+  const [homeAssignments, setHomeAssignments] = useState([]);
+  const [homeCompleted,   setHomeCompleted]   = useState(new Set());
+  const [homeLoading,     setHomeLoading]     = useState(isReal);
 
-  // Recommended quiz: first outstanding with no attempts at all
-  const recommendedQuiz = outstanding.find(q => !q.attempts?.length) ?? outstanding[0] ?? null;
+  useEffect(() => {
+    if (!isReal || !tenantId || !user?.id) { setHomeLoading(false); return; }
+    Promise.all([
+      getTenantCourses(tenantId),
+      getTenantLessons(tenantId),
+      getTenantAssignments(tenantId),
+      getLessonCompletions(user.id),
+    ]).then(([{ data: c }, { data: l }, { data: a }, { data: done }]) => {
+      if (c) setHomeCourses(c);
+      if (l) setHomeLessons(l);
+      if (a) setHomeAssignments(a);
+      if (done) setHomeCompleted(done);
+      setHomeLoading(false);
+    });
+  }, [isReal, tenantId, user?.id]); // eslint-disable-line react-hooks/exhaustive-deps
+
+  // ── Unified assignment enrichment ─────────────────────────
+  // For real users: build enriched list from Supabase data.
+  // For demo users: transform quizAssignments into the same shape.
+  const enrichedAssignments = (() => {
+    if (isReal) {
+      const userTeamId = orgUsers.find(u => u.id === user?.id)?.teamId ?? null;
+      const mine = homeAssignments.filter(a =>
+        (a.assignedTo?.type === "group"      && a.assignedTo?.orgId === user?.orgId) ||
+        (a.assignedTo?.type === "individual" && a.assignedTo?.userId === user?.id)   ||
+        (a.assignedTo?.type === "team"       && userTeamId && userTeamId === a.assignedTo?.teamId)
+      );
+      return mine.map(a => {
+        const isCourse = a.contentType === "course";
+        const isLesson = a.contentType === "lesson";
+        const content  = isCourse ? homeCourses.find(c => c.id === a.contentId)
+                       : isLesson ? homeLessons.find(l => l.id === a.contentId)
+                       : quizzes.find(q => q.id === a.contentId);
+        if (!content) return null;
+        let pct = 0, isComplete = false;
+        if (isCourse) {
+          const cls = (content.lessonIds ?? []).map(id => homeLessons.find(l => l.id === id)).filter(Boolean);
+          const done = cls.filter(l => homeCompleted.has(l.id)).length;
+          pct = cls.length ? Math.round((done / cls.length) * 100) : 0;
+          isComplete = cls.length > 0 && pct === 100;
+        } else if (isLesson) {
+          isComplete = homeCompleted.has(content.id);
+          pct = isComplete ? 100 : 0;
+        }
+        const dueStatus = (a.dueAt && a.dueAt !== "Open") ? getDueStatus(a.dueAt) : null;
+        return { ...a, content, contentKind: isCourse ? "course" : isLesson ? "lesson" : "quiz", pct, isComplete, dueStatus };
+      }).filter(Boolean);
+    }
+    // Demo: wrap quizAssignments (outstanding only shown, completed = has passed attempt)
+    return quizAssignments.map(q => {
+      const isComplete = q.attempts?.some(a => a.passed) ?? false;
+      const dueStatus = (q.dueAt && q.dueAt !== "Open") ? getDueStatus(q.dueAt) : null;
+      return { ...q, content: q, contentKind: "quiz", pct: isComplete ? 100 : 0, isComplete, dueStatus, contentType: "quiz", contentId: q.id };
+    });
+  })();
+
+  const pendingAssignments   = enrichedAssignments.filter(x => !x.isComplete);
+  const completedAssignments = enrichedAssignments.filter(x => x.isComplete);
+  const overdueAssignments   = pendingAssignments.filter(x => x.dueStatus?.label === "Overdue");
+  const pendingCount         = pendingAssignments.length;
+
+  // For demo backwards-compat: recommended quiz
+  const outstanding    = quizAssignments.filter(q => !q.attempts?.some(a => a.passed));
+  const recommendedQuiz = !isReal ? (outstanding.find(q => !q.attempts?.length) ?? null) : null;
 
   if (user.role === "admin") {
     // Admin home — unchanged
@@ -514,7 +576,8 @@ function HomeScreen({ user, onNav, quizAssignments = [], onResumeLesson, onStart
           },
           {
             iconBg: C.purple, label: "Assigned Training", value: String(pendingCount), sub: " pending",
-            note: pendingCount === 0 ? "All caught up!" : "", noteColor: C.green,
+            note: pendingCount === 0 ? "All caught up!" : overdueAssignments.length > 0 ? `${overdueAssignments.length} overdue` : `${completedAssignments.length} of ${enrichedAssignments.length} complete`,
+            noteColor: pendingCount === 0 ? C.green : overdueAssignments.length > 0 ? C.red : C.textSub,
             clickable: true,
           },
         ].map((s, i) => (
@@ -539,27 +602,36 @@ function HomeScreen({ user, onNav, quizAssignments = [], onResumeLesson, onStart
       <div style={{ display: "grid", gridTemplateColumns: "1fr 320px", gap: 16 }}>
         <div style={{ display: "flex", flexDirection: "column", gap: 14 }}>
 
-          {/* In Progress — show outstanding quiz assignments */}
-          {inProgressItems.length === 0 ? (
+          {/* In Progress / Upcoming — all pending assignments */}
+          {homeLoading ? (
+            <Card><p style={{ margin: 0, fontSize: 14, color: C.textSub }}>Loading assignments…</p></Card>
+          ) : pendingAssignments.length === 0 ? (
             <Card>
               <div style={{ display: "flex", alignItems: "center", gap: 6, marginBottom: 10 }}>
                 <div style={{ width: 8, height: 8, borderRadius: 2, background: C.green }} />
                 <span style={{ fontSize: 11, fontWeight: 700, color: C.green, letterSpacing: "0.06em" }}>ALL CAUGHT UP</span>
               </div>
-              <p style={{ margin: 0, fontSize: 14, color: C.textSub }}>No outstanding assignments. Check the Quizzes or Learn tabs for more content.</p>
+              <p style={{ margin: 0, fontSize: 14, color: C.textSub }}>No outstanding assignments. Check the Learn or Quizzes tabs for more content.</p>
             </Card>
-          ) : inProgressItems.map((qa) => {
-            const lastAttempt = qa.attempts[qa.attempts.length - 1] ?? null;
-            const dueStatus   = getDueStatus(qa.dueAt);
-            const progress    = getDueProgress(qa.assignedAt, qa.dueAt);
-            const hasAttempt  = qa.attempts.length > 0;
-            const progressPct = lastAttempt ? Math.round((lastAttempt.score ?? 0)) : 0;
-            const barColor    = progress > 80 ? C.red : progress > 50 ? C.orange : C.green;
+          ) : pendingAssignments.map((item) => {
+            const { content, contentKind, pct, dueStatus } = item;
+            const typeColor  = contentKind === "course" ? (content.color ?? C.orange) : contentKind === "quiz" ? C.purple : LESSON_TYPE_COLORS[content.type] ?? C.blue;
+            const typeLabel  = contentKind === "course" ? "COURSE" : contentKind === "quiz" ? "QUIZ" : `LESSON · ${(content.type ?? "").toUpperCase()}`;
+            const timeProgress = (item.assignedAtRaw && item.dueAt && item.dueAt !== "Open")
+              ? getDueProgress(item.assignedAtRaw, item.dueAt) : 0;
+            const barColor   = dueStatus?.label === "Overdue" ? C.red : timeProgress > 80 ? C.red : timeProgress > 50 ? C.orange : C.green;
+            const handleAction = () => {
+              if (contentKind === "quiz")   onStartQuiz?.(content.id);
+              else if (contentKind === "course") onStartCourse?.(content.id);
+              else onResumeLesson?.(content.id);
+            };
+            const actionLabel = pct > 0 ? "Resume →" : "Begin →";
             return (
-              <Card key={qa.id}>
+              <Card key={item.id}>
                 <div style={{ display: "flex", alignItems: "center", gap: 6, marginBottom: 12 }}>
-                  <div style={{ width: 8, height: 8, borderRadius: 2, background: C.purple }} />
-                  <span style={{ fontSize: 11, fontWeight: 700, color: C.purple, letterSpacing: "0.06em" }}>ASSIGNED QUIZ</span>
+                  <div style={{ width: 8, height: 8, borderRadius: 2, background: typeColor }} />
+                  <span style={{ fontSize: 11, fontWeight: 700, color: typeColor, letterSpacing: "0.06em" }}>{typeLabel}</span>
+                  {item.required && <span style={{ fontSize: 10, fontWeight: 700, padding: "2px 6px", borderRadius: 4, background: C.redBg, color: C.red }}>REQUIRED</span>}
                   {dueStatus && (
                     <span style={{ fontSize: 10, fontWeight: 700, padding: "2px 7px", borderRadius: 4, background: dueStatus.color + "18", color: dueStatus.color, marginLeft: "auto" }}>
                       {dueStatus.label}
@@ -568,39 +640,38 @@ function HomeScreen({ user, onNav, quizAssignments = [], onResumeLesson, onStart
                 </div>
                 <div style={{ display: "flex", justifyContent: "space-between", alignItems: "flex-start", gap: 12 }}>
                   <div style={{ flex: 1, minWidth: 0 }}>
-                    <div style={{ fontSize: 16, fontWeight: 700, color: C.text }}>{qa.title}</div>
+                    <div style={{ fontSize: 16, fontWeight: 700, color: C.text }}>{content.title ?? content.name}</div>
                     <div style={{ display: "flex", gap: 12, marginTop: 5, fontSize: 12, color: C.textSub }}>
-                      <span>{qa.questions?.length ?? 0} questions</span>
-                      <span style={{ color: C.orange, fontWeight: 600 }}>+{qa.xp} XP</span>
-                      <span>{qa.track}</span>
+                      {contentKind === "course" && <span>{(content.lessonIds ?? []).length} lessons</span>}
+                      {contentKind === "lesson" && content.duration && <span>⏱ {content.duration}</span>}
+                      {contentKind === "quiz"   && <span>{(content.questions ?? []).length} questions</span>}
+                      {(content.xp || content.xp === 0) && <span style={{ color: C.orange, fontWeight: 600 }}>+{content.xp} XP</span>}
+                      {item.dueAt && item.dueAt !== "Open" && <span>Due {item.dueAt}</span>}
                     </div>
                   </div>
-                  {hasAttempt && (
+                  {pct > 0 && (
                     <div style={{ textAlign: "right", flexShrink: 0 }}>
-                      <div style={{ fontSize: 20, fontWeight: 800, color: C.orange }}>{progressPct}%</div>
-                      <div style={{ fontSize: 10, color: C.textSub }}>last attempt</div>
+                      <div style={{ fontSize: 20, fontWeight: 800, color: typeColor }}>{pct}%</div>
+                      <div style={{ fontSize: 10, color: C.textSub }}>complete</div>
                     </div>
                   )}
                 </div>
-                <div style={{ marginTop: 12, marginBottom: 14 }}>
-                  <div style={{ display: "flex", justifyContent: "space-between", marginBottom: 4 }}>
-                    <span style={{ fontSize: 10, color: C.textSub }}>Time elapsed</span>
-                    <span style={{ fontSize: 10, fontWeight: 700, color: barColor }}>{progress}%</span>
+                {(pct > 0 || timeProgress > 0) && (
+                  <div style={{ marginTop: 12, marginBottom: 14 }}>
+                    <ProgressBar value={pct > 0 ? pct : timeProgress} color={pct > 0 ? typeColor : barColor} height={5} />
                   </div>
-                  <ProgressBar value={progress} color={barColor} height={5} />
+                )}
+                <div style={{ marginTop: pct > 0 || timeProgress > 0 ? 0 : 12 }}>
+                  <button onClick={handleAction} style={{ padding: "9px 18px", borderRadius: 8, border: "none", cursor: "pointer", background: typeColor, color: "#fff", fontSize: 13, fontWeight: 700 }}>
+                    {actionLabel}
+                  </button>
                 </div>
-                <button
-                  onClick={() => onStartQuiz?.(qa.id)}
-                  style={{ padding: "9px 18px", borderRadius: 8, border: "none", cursor: "pointer", background: C.purple, color: "#fff", fontSize: 13, fontWeight: 700 }}
-                >
-                  {hasAttempt ? "Retake Quiz →" : "Start Quiz →"}
-                </button>
               </Card>
             );
           })}
 
-          {/* Recommended Quiz — first quiz with no attempts */}
-          {recommendedQuiz && !inProgressItems.includes(recommendedQuiz) && (
+          {/* Demo: Recommended quiz for non-real users */}
+          {!isReal && recommendedQuiz && (
             <Card>
               <div style={{ display: "flex", alignItems: "center", gap: 6, marginBottom: 12 }}>
                 <div style={{ width: 8, height: 8, borderRadius: 2, background: C.purple }} />
@@ -614,10 +685,7 @@ function HomeScreen({ user, onNav, quizAssignments = [], onResumeLesson, onStart
                     <span style={{ fontSize: 12, fontWeight: 600, color: C.orange }}>+{recommendedQuiz.xp} XP</span>
                   </div>
                 </div>
-                <button
-                  onClick={() => onStartQuiz?.(recommendedQuiz.id)}
-                  style={{ padding: "8px 16px", borderRadius: 8, border: `1px solid ${C.orangeBorder}`, background: C.orangeLight, color: C.orange, fontSize: 13, fontWeight: 600, cursor: "pointer", flexShrink: 0 }}
-                >
+                <button onClick={() => onStartQuiz?.(recommendedQuiz.id)} style={{ padding: "8px 16px", borderRadius: 8, border: `1px solid ${C.orangeBorder}`, background: C.orangeLight, color: C.orange, fontSize: 13, fontWeight: 600, cursor: "pointer", flexShrink: 0 }}>
                   Start Quiz →
                 </button>
               </div>
@@ -684,33 +752,42 @@ function HomeScreen({ user, onNav, quizAssignments = [], onResumeLesson, onStart
               <button onClick={() => setShowTasksPanel(false)} style={{ background: C.muted, border: "none", borderRadius: 8, width: 32, height: 32, fontSize: 16, cursor: "pointer", color: C.textSub, display: "flex", alignItems: "center", justifyContent: "center" }}>✕</button>
             </div>
             <div style={{ padding: "16px 24px", display: "flex", flexDirection: "column", gap: 12 }}>
-              {outstanding.length === 0 ? (
+              {pendingAssignments.length === 0 ? (
                 <div style={{ padding: 40, textAlign: "center", color: C.textSub }}>
                   <div style={{ fontSize: 15, fontWeight: 700, color: C.text, marginBottom: 4 }}>All caught up!</div>
                   <div style={{ fontSize: 13 }}>No outstanding assignments.</div>
                 </div>
-              ) : outstanding.map(qa => {
-                const dueStatus = getDueStatus(qa.dueAt);
-                const progress  = getDueProgress(qa.assignedAt, qa.dueAt);
-                const barColor  = progress > 80 ? C.red : progress > 50 ? C.orange : C.green;
-                const hasAttempt = qa.attempts.length > 0;
+              ) : pendingAssignments.map(item => {
+                const { content, contentKind, pct, dueStatus } = item;
+                const typeColor = contentKind === "course" ? (content.color ?? C.orange) : contentKind === "quiz" ? C.purple : LESSON_TYPE_COLORS[content.type] ?? C.blue;
+                const timeProgress = (item.assignedAtRaw && item.dueAt && item.dueAt !== "Open")
+                  ? getDueProgress(item.assignedAtRaw, item.dueAt) : 0;
+                const barColor = dueStatus?.label === "Overdue" ? C.red : timeProgress > 80 ? C.red : timeProgress > 50 ? C.orange : C.green;
+                const handleAction = () => {
+                  setShowTasksPanel(false);
+                  if (contentKind === "quiz")        onStartQuiz?.(content.id);
+                  else if (contentKind === "course") onStartCourse?.(content.id);
+                  else                               onResumeLesson?.(content.id);
+                };
                 return (
-                  <div key={qa.id} style={{ background: C.pageBg, borderRadius: 12, padding: "14px 16px", border: `1px solid ${C.border}` }}>
+                  <div key={item.id} style={{ background: C.pageBg, borderRadius: 12, padding: "14px 16px", border: `1px solid ${C.border}` }}>
                     <div style={{ display: "flex", justifyContent: "space-between", alignItems: "flex-start", gap: 8, marginBottom: 8 }}>
                       <div style={{ flex: 1, minWidth: 0 }}>
-                        <div style={{ fontSize: 13, fontWeight: 700, color: C.text, marginBottom: 2 }}>{qa.title}</div>
-                        <div style={{ fontSize: 11, color: C.textSub }}>{qa.track} · {qa.questions?.length ?? 0} questions · +{qa.xp} XP</div>
+                        <div style={{ fontSize: 11, fontWeight: 700, color: typeColor, letterSpacing: "0.05em", marginBottom: 2 }}>
+                          {contentKind === "course" ? "COURSE" : contentKind === "quiz" ? "QUIZ" : "LESSON"}
+                        </div>
+                        <div style={{ fontSize: 13, fontWeight: 700, color: C.text, marginBottom: 2 }}>{content.title ?? content.name}</div>
+                        {item.dueAt && item.dueAt !== "Open" && <div style={{ fontSize: 11, color: C.textSub }}>Due {item.dueAt}</div>}
                       </div>
                       {dueStatus && <span style={{ fontSize: 10, fontWeight: 700, padding: "2px 7px", borderRadius: 4, background: dueStatus.color + "18", color: dueStatus.color, flexShrink: 0 }}>{dueStatus.label}</span>}
                     </div>
-                    <div style={{ marginBottom: 10 }}>
-                      <ProgressBar value={progress} color={barColor} height={4} />
-                    </div>
-                    <button
-                      onClick={() => { setShowTasksPanel(false); onStartQuiz?.(qa.id); }}
-                      style={{ padding: "7px 14px", borderRadius: 7, border: "none", cursor: "pointer", background: C.purple, color: "#fff", fontSize: 12, fontWeight: 700 }}
-                    >
-                      {hasAttempt ? "Retake →" : "Start →"}
+                    {(pct > 0 || timeProgress > 0) && (
+                      <div style={{ marginBottom: 10 }}>
+                        <ProgressBar value={pct > 0 ? pct : timeProgress} color={pct > 0 ? typeColor : barColor} height={4} />
+                      </div>
+                    )}
+                    <button onClick={handleAction} style={{ padding: "7px 14px", borderRadius: 7, border: "none", cursor: "pointer", background: typeColor, color: "#fff", fontSize: 12, fontWeight: 700 }}>
+                      {pct > 0 ? "Resume →" : "Begin →"}
                     </button>
                   </div>
                 );
@@ -5401,7 +5478,7 @@ const INITIAL_ASSIGNMENTS = [
 const LESSON_TYPE_ICONS  = { video:"", text:"", image:"", flipcard:"", quiz:"", recording:"", interactive:"" };
 const LESSON_TYPE_COLORS = { video:C.blue, text:C.green, image:C.blue, flipcard:C.purple, quiz:C.purple, recording:C.red, interactive:C.orange };
 
-function LearnScreen({ role, user, orgUsers = [], orgs = [], onNav, onAwardXp, pendingLessonId, onClearPendingLesson, canCreate = true, canEdit = true, canDelete = true, canAssign = true, tenantId = null, isReal = false, quizzes = [] }) {
+function LearnScreen({ role, user, orgUsers = [], orgs = [], onNav, onAwardXp, pendingLessonId, onClearPendingLesson, pendingCourseId, onClearPendingCourse, canCreate = true, canEdit = true, canDelete = true, canAssign = true, tenantId = null, isReal = false, quizzes = [] }) {
   const isAdmin = role === "admin";
   const [tab, setTab]           = useState(isAdmin ? "courses" : "assigned");
   const [courses, setCourses]   = useState(INITIAL_LEARN_COURSES);
@@ -5543,6 +5620,14 @@ function LearnScreen({ role, user, orgUsers = [], orgs = [], onNav, onAwardXp, p
     }
   }, [pendingLessonId]); // eslint-disable-line react-hooks/exhaustive-deps
 
+  // Deep-link: open a specific course from HomeScreen assignment card.
+  // Retries when courses load (courses may not be ready on first render).
+  useEffect(() => {
+    if (!pendingCourseId || isAdmin) return;
+    const course = courses.find(c => c.id === pendingCourseId);
+    if (course) { setActiveCourse(course); onClearPendingCourse?.(); }
+  }, [pendingCourseId, courses]); // eslint-disable-line react-hooks/exhaustive-deps
+
   // ── ARCHIVE / RESTORE HANDLERS (admin view) ──────────────
   const handleArchiveCourse = async (courseId) => {
     const course = courses.find(c => c.id === courseId);
@@ -5621,7 +5706,9 @@ function LearnScreen({ role, user, orgUsers = [], orgs = [], onNav, onAwardXp, p
       const doneCount = cls.filter(l => completedLessons.has(l.id)).length;
       // Availability timing: find this user's assignment for the course and compute per-lesson unlock dates
       const courseAssignment = myAssignments.find(a => a.contentType === "course" && a.contentId === activeCourse.id);
-      const assignedDate = courseAssignment?.assignedAt ? new Date(courseAssignment.assignedAt) : null;
+      const assignedDate = courseAssignment?.assignedAtRaw
+        ? new Date(courseAssignment.assignedAtRaw)
+        : courseAssignment?.assignedAt ? new Date(courseAssignment.assignedAt) : null;
       const todayMs = new Date().setHours(0, 0, 0, 0);
       const lessonSchedule = activeCourse.lessonSchedule ?? {};
       const getLessonAvailability = (lessonId) => {
@@ -13134,6 +13221,7 @@ export default function App() {
   const [editingQuiz,      setEditingQuiz]      = useState(null);
   // Deep-link pending actions from HomeScreen
   const [pendingLessonId,  setPendingLessonId]  = useState(null);
+  const [pendingCourseId,  setPendingCourseId]  = useState(null);
   const [pendingQuizId,    setPendingQuizId]    = useState(null);
   const [orgs,             setOrgs]             = useState(INITIAL_ORGS);
   const [orgUsers,         setOrgUsers]         = useState(INITIAL_ORG_USERS);
@@ -13974,7 +14062,7 @@ export default function App() {
       }} />;
       case "home":              return isOrgAdmin
         ? <LeadershipDashboardScreen currentOrg={currentOrg} orgUsers={orgUsers} isReal={!!user?._isReal} />
-        : <HomeScreen user={user} onNav={navigate} quizAssignments={user?._isReal ? [] : USER_QUIZ_ASSIGNMENTS_SEED} onResumeLesson={(id) => { setPendingLessonId(id); navigate("learn"); }} onStartQuiz={(id) => { setPendingQuizId(id); navigate("quizzes"); }} orgUsers={orgUsers} isReal={!!user?._isReal} />;
+        : <HomeScreen user={user} onNav={navigate} quizAssignments={user?._isReal ? [] : USER_QUIZ_ASSIGNMENTS_SEED} onResumeLesson={(id) => { setPendingLessonId(id); navigate("learn"); }} onStartCourse={(id) => { setPendingCourseId(id); navigate("learn"); }} onStartQuiz={(id) => { setPendingQuizId(id); navigate("quizzes"); }} orgUsers={orgUsers} isReal={!!user?._isReal} tenantId={currentOrg?.id ?? null} quizzes={quizzes} />;
       case "rankd":             return <RankdScreen onNav={navigate} onJoin={handleEnterPin} sessions={sessions} onLaunch={handleLaunch} onViewResults={handleViewResults} onRelaunch={handleRelaunch} role={gameRole} currentUser={currentUser} />;
       case "rankd-new":         return <NewSessionScreen onNav={navigate} quizzes={quizzes} onCreateSession={handleCreateSession} />;
       case "rankd-quiz-builder":return <QuizBuilderScreen onNav={navigate} onSave={handleSaveQuiz} initialQuiz={editingQuiz} onEditQuiz={handleEditQuiz} />;
@@ -13982,7 +14070,7 @@ export default function App() {
       case "rankd-lobby":       return <RankdLobbyScreen onNav={navigate} pin={lobbyPin} playerName={lobbyPlayerName} playerEmoji={lobbyPlayerEmoji} sessionName={lobbySessionName} role={gameRole} sessions={sessions} currentUser={currentUser} onGameStart={handleGameStart} chPlayers={chPlayers} broadcast={broadcast} playerId={playerId} chMsg={chMsg} />;
       case "rankd-game":        return <RankdGameScreen onNav={navigate} sessionName={lobbySessionName} role={gameRole} playerName={lobbyPlayerName ?? user.name} questions={gameQuestions ?? GAME_QUESTIONS} demoMode={gameRole === "admin" && sessions.find(s => s.code === lobbyPin)?.demoMode !== false} pin={lobbyPin} sessionDbId={sessions.find(s => s.code === lobbyPin)?.dbId ?? null} tenantId={currentOrg?.id ?? user?.orgId ?? null} broadcast={broadcast} chMsg={chMsg} chAnswers={chAnswers} chPlayers={chPlayers} playerId={playerId} onGameEnd={handleGameEnd} setChAnswers={setChAnswers} />;
       case "rankd-results":     return <RankdResultsScreen onNav={navigate} sessionCode={viewResultsCode} sessions={sessions} gameData={gameResultsData} />;
-      case "learn":             return <LearnScreen role={gameRole} user={user} orgUsers={orgUsers} orgs={orgs} onNav={navigate} onAwardXp={handleAwardXp} pendingLessonId={pendingLessonId} onClearPendingLesson={() => setPendingLessonId(null)} canCreate={perm("actions","create")} canEdit={perm("actions","edit")} canDelete={perm("actions","delete")} canAssign={perm("actions","assign")} tenantId={currentOrg?.id ?? null} isReal={!!user?._isReal} quizzes={quizzes} />;
+      case "learn":             return <LearnScreen role={gameRole} user={user} orgUsers={orgUsers} orgs={orgs} onNav={navigate} onAwardXp={handleAwardXp} pendingLessonId={pendingLessonId} onClearPendingLesson={() => setPendingLessonId(null)} pendingCourseId={pendingCourseId} onClearPendingCourse={() => setPendingCourseId(null)} canCreate={perm("actions","create")} canEdit={perm("actions","edit")} canDelete={perm("actions","delete")} canAssign={perm("actions","assign")} tenantId={currentOrg?.id ?? null} isReal={!!user?._isReal} quizzes={quizzes} />;
       case "quizzes":           return <QuizzesScreen role={gameRole} onNav={navigate} quizzes={quizzes} onEditQuiz={handleEditQuiz} onDeleteQuiz={handleDeleteQuiz} onToggleFavorite={handleToggleFavorite} onToggleActive={handleToggleActive} pendingQuizId={pendingQuizId} onClearPendingQuiz={() => setPendingQuizId(null)} canCreate={perm("actions","create")} canEdit={perm("actions","edit")} canDelete={perm("actions","delete")} canLaunch={perm("actions","launch")} canAssign={perm("actions","assign")} onAssignQuiz={handleAssignQuiz} orgUsers={orgUsers} orgs={orgs} currentUser={currentUser} tenantId={currentOrg?.id ?? null} isReal={!!user?._isReal} />;
       case "battlecards":       return (isAdminType && perm("actions","edit"))
         ? <BattleCardsAdminScreen categories={bcCategories} cards={battleCards} onSaveCategory={handleSaveBcCategory} onDeleteCategory={handleDeleteBcCategory} onSaveCard={handleSaveBattleCard} onDeleteCard={handleDeleteBattleCard} />
