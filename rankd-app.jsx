@@ -364,6 +364,71 @@ function Card({ children, style = {}, onClick }) {
   );
 }
 
+// ── SHARED LOADING / EMPTY / ERROR STATES ────────────────────────────────────
+// Reusable across all first-load real-user screens.
+// Demo mode: these components are never shown (data is always present from seed).
+
+function LoadingState({ rows = 3, message = "Loading…" }) {
+  return (
+    <>
+      <style>{`@keyframes ralliShimmer{0%{background-position:-600px 0}100%{background-position:600px 0}}`}</style>
+      <div style={{ display: "flex", flexDirection: "column", gap: 10 }}>
+        {message && <div style={{ fontSize: 13, color: C.textMuted, marginBottom: 4 }}>{message}</div>}
+        {Array.from({ length: rows }, (_, i) => (
+          <div key={i} style={{
+            height: 52, borderRadius: 12,
+            background: "linear-gradient(90deg, #f5f5f4 25%, #ece9e4 50%, #f5f5f4 75%)",
+            backgroundSize: "1200px 100%",
+            animation: "ralliShimmer 1.5s ease-in-out infinite",
+            opacity: Math.max(0.4, 1 - i * 0.18),
+          }} />
+        ))}
+      </div>
+    </>
+  );
+}
+
+function EmptyState({ icon = "📭", title = "Nothing here yet", message = "", action = null }) {
+  return (
+    <div style={{
+      background: C.white, borderRadius: 14, border: `1px solid ${C.border}`,
+      display: "flex", flexDirection: "column", alignItems: "center",
+      justifyContent: "center", padding: "56px 40px", textAlign: "center", gap: 12,
+    }}>
+      <div style={{
+        width: 52, height: 52, borderRadius: 14, background: C.orangeLight,
+        display: "flex", alignItems: "center", justifyContent: "center", fontSize: 22,
+      }}>{icon}</div>
+      <div style={{ fontSize: 16, fontWeight: 800, color: C.text }}>{title}</div>
+      {message && <p style={{ margin: 0, fontSize: 13, color: C.textSub, maxWidth: 320, lineHeight: 1.6 }}>{message}</p>}
+      {action}
+    </div>
+  );
+}
+
+function ErrorState({ message = "Something went wrong.", onRetry = null }) {
+  return (
+    <div style={{
+      background: "#FEF2F2", borderRadius: 14, border: "1px solid #FCA5A5",
+      display: "flex", flexDirection: "column", alignItems: "center",
+      justifyContent: "center", padding: "44px 32px", textAlign: "center", gap: 10,
+    }}>
+      <div style={{
+        width: 40, height: 40, borderRadius: 10, background: "#FEE2E2",
+        display: "flex", alignItems: "center", justifyContent: "center",
+        fontSize: 16, fontWeight: 900, color: "#B91C1C",
+      }}>✕</div>
+      <div style={{ fontSize: 14, fontWeight: 700, color: "#B91C1C" }}>{message}</div>
+      {onRetry && (
+        <button onClick={onRetry} style={{
+          marginTop: 4, padding: "7px 18px", borderRadius: 8, border: "none",
+          background: C.orange, color: "#fff", fontSize: 13, fontWeight: 700, cursor: "pointer",
+        }}>Try again</button>
+      )}
+    </div>
+  );
+}
+
 // Shown to org admins on screens that require team data to be meaningful.
 function OrgAdminEmptyScreen({ feature = "this feature", onGoToTeam }) {
   return (
@@ -5495,6 +5560,7 @@ const LESSON_TYPE_COLORS = { video:C.blue, text:C.green, image:C.blue, flipcard:
 
 function LearnScreen({ role, user, orgUsers = [], orgs = [], onNav, onAwardXp, pendingLessonId, onClearPendingLesson, pendingCourseId, onClearPendingCourse, canCreate = true, canEdit = true, canDelete = true, canAssign = true, tenantId = null, isReal = false, quizzes = [] }) {
   const isAdmin = role === "admin";
+  const toast   = useToast();
   const [tab, setTab]           = useState(isAdmin ? "courses" : "assigned");
   // Real users start with empty arrays — seed data would flash before DB load completes
   const [courses, setCourses]   = useState(isReal ? [] : INITIAL_LEARN_COURSES);
@@ -6517,7 +6583,7 @@ function LearnScreen({ role, user, orgUsers = [], orgs = [], onNav, onAwardXp, p
           onSave={async (c) => {
             if (isReal && tenantId) {
               const { data: saved, error } = await upsertCourse(tenantId, c, user?.id);
-              if (error) console.error("[ralli] upsertCourse failed:", error);
+              if (error) { console.error("[ralli] upsertCourse failed:", error); toast.error("Failed to save course. Please try again."); }
               const canonical = saved ?? { ...c, id: c.id || "lc" + Date.now() };
               setCourses(prev => courseModal === "new"
                 ? [...prev, canonical]
@@ -6529,13 +6595,14 @@ function LearnScreen({ role, user, orgUsers = [], orgs = [], onNav, onAwardXp, p
                 setCourses(prev => prev.map(x => x.id === c.id ? c : x));
               }
             }
+            toast.success("Course saved.");
             setCourseModal(null);
           }}
           onClose={() => setCourseModal(null)}
           onCreateLesson={async (newLesson) => {
             if (isReal && tenantId) {
               const { data: saved, error } = await upsertLesson(tenantId, newLesson, user?.id);
-              if (error) console.error("[ralli] upsertLesson (inline) failed:", error);
+              if (error) { console.error("[ralli] upsertLesson (inline) failed:", error); toast.error("Failed to create lesson. Please try again."); }
               const withId = saved ?? { ...newLesson, id: "ll" + Date.now() };
               setLessons(prev => [...prev, withId]);
               return withId.id;
@@ -6554,7 +6621,7 @@ function LearnScreen({ role, user, orgUsers = [], orgs = [], onNav, onAwardXp, p
           onSave={async (l) => {
             if (isReal && tenantId) {
               const { data: saved, error } = await upsertLesson(tenantId, l, user?.id);
-              if (error) console.error("[ralli] upsertLesson failed:", error);
+              if (error) { console.error("[ralli] upsertLesson failed:", error); toast.error("Failed to save lesson. Please try again."); }
               const canonical = saved ?? { ...l, id: l.id || "ll" + Date.now() };
               setLessons(prev => !l.id || l.id.startsWith("ll")
                 ? [...prev, canonical]
@@ -6567,6 +6634,7 @@ function LearnScreen({ role, user, orgUsers = [], orgs = [], onNav, onAwardXp, p
                 setLessons(prev => prev.map(x => x.id === l.id ? l : x));
               }
             }
+            toast.success("Lesson saved.");
             setLessonModal(null);
           }}
           onClose={() => setLessonModal(null)}
@@ -6587,12 +6655,14 @@ function LearnScreen({ role, user, orgUsers = [], orgs = [], onNav, onAwardXp, p
           onAssign={async (assignment) => {
             if (isReal && tenantId) {
               const { data: saved, error } = await dbCreateAssignment(tenantId, assignment, user?.id);
-              if (error) console.error("[ralli] createAssignment failed:", error);
+              if (error) { console.error("[ralli] createAssignment failed:", error); toast.error("Failed to create assignment. Please try again."); }
+              else { toast.success("Assignment created."); }
               const canonical = saved ?? { ...assignment, id: "a" + Date.now(), assignedAt: "Today" };
               // Guard: if createAssignment returned an existing row, don't add it twice to state
               setAssignments(prev => prev.some(a => a.id === canonical.id) ? prev : [...prev, canonical]);
             } else {
               setAssignments(prev => [...prev, { ...assignment, id: "a" + Date.now(), assignedAt: "Today" }]);
+              toast.success("Assignment created.");
             }
             setAssignModal(null);
             setTab("assignments");
@@ -9246,7 +9316,7 @@ function BattleCardDetail({ card, onBack, actions }) {
   );
 }
 
-function BattleCardsScreen({ categories = INITIAL_BC_CATEGORIES, cards = INITIAL_BATTLE_CARDS }) {
+function BattleCardsScreen({ categories = INITIAL_BC_CATEGORIES, cards = INITIAL_BATTLE_CARDS, isLoading = false, isReal = false }) {
   // view: "home" | "category" | "detail"
   const [view,       setView]       = useState("home");
   const [activeCat,  setActiveCat]  = useState(null); // BC_CATEGORIES id
@@ -9323,6 +9393,35 @@ function BattleCardsScreen({ categories = INITIAL_BC_CATEGORIES, cards = INITIAL
             ))}
           </div>
         )}
+      </div>
+    );
+  }
+
+  // ── LOADING / EMPTY GUARDS (real users only) ──
+  if (isLoading) {
+    return (
+      <div style={{ display: "flex", flexDirection: "column", gap: 20 }}>
+        <div>
+          <h2 style={{ margin: 0, fontSize: 22, fontWeight: 800, color: C.text }}>Battle Cards</h2>
+          <p style={{ margin: "4px 0 0", fontSize: 13, color: C.textSub }}>Competitive intelligence at your fingertips</p>
+        </div>
+        <LoadingState rows={4} message="Loading battle cards…" />
+      </div>
+    );
+  }
+
+  if (isReal && categories.length === 0 && cards.length === 0) {
+    return (
+      <div style={{ display: "flex", flexDirection: "column", gap: 20 }}>
+        <div>
+          <h2 style={{ margin: 0, fontSize: 22, fontWeight: 800, color: C.text }}>Battle Cards</h2>
+          <p style={{ margin: "4px 0 0", fontSize: 13, color: C.textSub }}>Competitive intelligence at your fingertips</p>
+        </div>
+        <EmptyState
+          icon="🃏"
+          title="No battle cards yet"
+          message="Your admin hasn't added any battle cards. Check back after your team configures your content library."
+        />
       </div>
     );
   }
@@ -9620,6 +9719,7 @@ function LeadershipDashboardScreen({ currentOrg, orgUsers = [], isReal = false }
   const realMembers = orgUsers.filter(u => u._isReal);
   const hasRealData = !isReal || realMembers.length > 0;
   const [liveData,     setLiveData]     = useState(null);   // null = not yet loaded
+  const [loading,      setLoading]      = useState(isReal); // true while Supabase fetch in flight
   const [trendPeriod,  setTrendPeriod]  = useState("weekly");
   const [peopleFilter, setPeopleFilter] = useState("all"); // all | top | improved | promotion | coaching
   const [teamFilter,   setTeamFilter]   = useState("all"); // all | team id
@@ -9627,14 +9727,14 @@ function LeadershipDashboardScreen({ currentOrg, orgUsers = [], isReal = false }
   // Load real readiness scores from Supabase when available
   useEffect(() => {
     const tid = currentOrg?.id;
-    if (!isReal || !tid) return;
+    if (!isReal || !tid) { setLoading(false); return; }
     supabase
       .from("readiness_scores")
       .select("user_id, score, computed_at")
       .eq("tenant_id", tid)
       .order("computed_at", { ascending: false })
       .then(({ data: rows }) => {
-        if (!rows || rows.length === 0) return; // keep LEADERSHIP_SEED as fallback
+        if (!rows || rows.length === 0) { setLoading(false); return; } // no data yet — show EmptyState
         // Deduplicate — take the most recent row per user (handles pre-migration multi-row data)
         const seen = new Set();
         const unique = rows.filter(r => { if (seen.has(r.user_id)) return false; seen.add(r.user_id); return true; });
@@ -9658,9 +9758,32 @@ function LeadershipDashboardScreen({ currentOrg, orgUsers = [], isReal = false }
           teams:   [],   // team breakdown requires team assignments — leave empty for now
           people,
         });
+        setLoading(false);
       })
-      .catch(e => console.error("[ralli] LeadershipDashboard readiness fetch failed:", e));
+      .catch(e => { console.error("[ralli] LeadershipDashboard readiness fetch failed:", e); setLoading(false); });
   }, [isReal, currentOrg?.id]); // eslint-disable-line react-hooks/exhaustive-deps
+
+  // Loading / empty guards — real users only. Demo always falls through to LEADERSHIP_SEED.
+  if (loading) {
+    return (
+      <div style={{ display: "flex", flexDirection: "column", gap: 20 }}>
+        <h2 style={{ margin: 0, fontSize: 22, fontWeight: 800, color: C.text }}>Leadership Dashboard</h2>
+        <LoadingState rows={5} message="Loading readiness data…" />
+      </div>
+    );
+  }
+  if (isReal && !liveData) {
+    return (
+      <div style={{ display: "flex", flexDirection: "column", gap: 20 }}>
+        <h2 style={{ margin: 0, fontSize: 22, fontWeight: 800, color: C.text }}>Leadership Dashboard</h2>
+        <EmptyState
+          icon="📊"
+          title="No readiness data yet"
+          message="Readiness scores appear after your team completes lessons, quizzes, and games. Check back soon."
+        />
+      </div>
+    );
+  }
 
   // Use live data when available; fall back to LEADERSHIP_SEED for demo / no data yet
   const data = liveData ?? LEADERSHIP_SEED;
@@ -10173,6 +10296,7 @@ function ProgressScreen({ currentUser = null, isReal = false, tenantId = null })
     { week: "W23", xp: 1340 }, { week: "W24", xp: 680 },
   ];
   const [loading,   setLoading]   = useState(isReal);
+  const [error,     setError]     = useState(null);
   const [weeklyXp,  setWeeklyXp]  = useState(DEMO_WEEKS);
   const [stats, setStats] = useState({
     xp:            currentUser?.xp      ?? 2340,
@@ -10236,8 +10360,7 @@ function ProgressScreen({ currentUser = null, isReal = false, tenantId = null })
 
       setLoading(false);
     }).catch(() => {
-      // On failure: zero out lesson/quiz counts so real users don't see demo stats
-      setStats(prev => ({ ...prev, lessonsDone: 0, lessonsTotal: 0, quizzesPassed: 0 }));
+      setError("Could not load your progress. Please refresh and try again.");
       setLoading(false);
     });
   }, [isReal, tenantId, currentUser?.id]); // eslint-disable-line react-hooks/exhaustive-deps
@@ -10248,7 +10371,14 @@ function ProgressScreen({ currentUser = null, isReal = false, tenantId = null })
   if (loading) return (
     <div style={{ display: "flex", flexDirection: "column", gap: 20 }}>
       <h2 style={{ margin: 0, fontSize: 22, fontWeight: 800, color: C.text }}>My Progress</h2>
-      <div style={{ padding: 60, textAlign: "center", color: C.textMuted, fontSize: 14 }}>Loading your progress…</div>
+      <LoadingState rows={4} message="Loading your progress…" />
+    </div>
+  );
+
+  if (error) return (
+    <div style={{ display: "flex", flexDirection: "column", gap: 20 }}>
+      <h2 style={{ margin: 0, fontSize: 22, fontWeight: 800, color: C.text }}>My Progress</h2>
+      <ErrorState message={error} />
     </div>
   );
 
@@ -10365,7 +10495,7 @@ function LeaderboardScreen({ currentUser, isReal = false, tenantId = null }) {
           <h2 style={{ margin: 0, fontSize: 22, fontWeight: 800, color: C.text }}>Leaderboard</h2>
           <p style={{ margin: "4px 0 0", fontSize: 13, color: C.textSub }}>Team rankings based on total points earned</p>
         </div>
-        <div style={{ padding: 60, textAlign: "center", color: C.textMuted, fontSize: 14 }}>Loading rankings…</div>
+        <LoadingState rows={5} message="Loading rankings…" />
       </div>
     );
   }
@@ -10377,13 +10507,11 @@ function LeaderboardScreen({ currentUser, isReal = false, tenantId = null }) {
           <h2 style={{ margin: 0, fontSize: 22, fontWeight: 800, color: C.text }}>Leaderboard</h2>
           <p style={{ margin: "4px 0 0", fontSize: 13, color: C.textSub }}>Team rankings based on total points earned</p>
         </div>
-        <div style={{ background: C.white, borderRadius: 12, border: `1px solid ${C.border}`, display: "flex", flexDirection: "column", alignItems: "center", justifyContent: "center", padding: "60px 40px", textAlign: "center", gap: 12 }}>
-          <div style={{ width: 56, height: 56, borderRadius: 14, background: C.orangeLight, display: "flex", alignItems: "center", justifyContent: "center", fontSize: 24 }}>🏆</div>
-          <div style={{ fontSize: 16, fontWeight: 800, color: C.text }}>No rankings yet</div>
-          <p style={{ margin: 0, fontSize: 13, color: C.textSub, maxWidth: 300, lineHeight: 1.6 }}>
-            Rankings appear once your team starts completing lessons, quizzes, and live games.
-          </p>
-        </div>
+        <EmptyState
+          icon="🏆"
+          title="No rankings yet"
+          message="Rankings appear once your team starts completing lessons, quizzes, and live games."
+        />
       </div>
     );
   }
@@ -13265,9 +13393,8 @@ function InsightsScreen({ user, isReal = false, tenantId = null, orgUsers = [], 
   if (loading) {
     return (
       <div style={{ flex: 1, overflow: "auto", padding: "32px 32px 80px", maxWidth: 860, margin: "0 auto", width: "100%" }}>
-        <div style={{ fontSize: 22, fontWeight: 700, color: C.text, marginBottom: 8 }}>Insights</div>
-        <div style={{ color: C.textSub, fontSize: 13, marginBottom: 32 }}>Loading your performance data...</div>
-        {[1,2,3].map(i => <div key={i} style={{ ...cardStyle, height: 80, marginBottom: 16, background: C.muted, border: "none" }} />)}
+        <div style={{ fontSize: 22, fontWeight: 700, color: C.text, marginBottom: 20 }}>Insights</div>
+        <LoadingState rows={3} message="Loading your performance data…" />
       </div>
     );
   }
@@ -13275,8 +13402,8 @@ function InsightsScreen({ user, isReal = false, tenantId = null, orgUsers = [], 
   if (error) {
     return (
       <div style={{ flex: 1, overflow: "auto", padding: "32px 32px 80px", maxWidth: 860, margin: "0 auto", width: "100%" }}>
-        <div style={{ fontSize: 22, fontWeight: 700, color: C.text, marginBottom: 8 }}>Insights</div>
-        <div style={{ ...cardStyle, color: C.textSub, fontSize: 13 }}>{error}</div>
+        <div style={{ fontSize: 22, fontWeight: 700, color: C.text, marginBottom: 20 }}>Insights</div>
+        <ErrorState message={error} />
       </div>
     );
   }
@@ -13285,10 +13412,12 @@ function InsightsScreen({ user, isReal = false, tenantId = null, orgUsers = [], 
   if (isReal && !displayPerf) {
     return (
       <div style={{ flex: 1, overflow: "auto", padding: "32px 32px 80px", maxWidth: 860, margin: "0 auto", width: "100%" }}>
-        <div style={{ fontSize: 22, fontWeight: 700, color: C.text, marginBottom: 8 }}>Insights</div>
-        <div style={{ ...cardStyle, color: C.textSub, fontSize: 13 }}>
-          No performance data yet. Complete a lesson, quiz, or game to see your readiness score.
-        </div>
+        <div style={{ fontSize: 22, fontWeight: 700, color: C.text, marginBottom: 20 }}>Insights</div>
+        <EmptyState
+          icon="📈"
+          title="No data yet"
+          message="Complete a lesson, quiz, or game to see your readiness score and performance insights."
+        />
       </div>
     );
   }
@@ -13907,6 +14036,96 @@ function UserSettingsScreen({ user, profile, notifPrefs, onSaveProfile, onSaveNo
   );
 }
 
+// ── TOAST SYSTEM ──────────────────────────────────────────────────────────────
+// Provider-free: module-level event bus so useToast() works from any component
+// without a wrapping ToastProvider. Render <ToastContainer /> once at App root.
+
+const _toastSubs = new Set();
+let   _toastId   = 0;
+
+function _emitToast(type, message) {
+  const id = ++_toastId;
+  _toastSubs.forEach(fn => fn({ id, type, message }));
+}
+
+function useToast() {
+  return {
+    success: (msg) => _emitToast("success", msg),
+    error:   (msg) => _emitToast("error",   msg),
+    warning: (msg) => _emitToast("warning", msg),
+    info:    (msg) => _emitToast("info",    msg),
+  };
+}
+
+const TOAST_CFG = {
+  success: { bg: "#F0FDF4", border: "#86EFAC", fg: "#15803D", icon: "✓" },
+  error:   { bg: "#FEF2F2", border: "#FCA5A5", fg: "#B91C1C", icon: "✕" },
+  warning: { bg: "#FFFBEB", border: "#FCD34D", fg: "#92400E", icon: "!" },
+  info:    { bg: "#EFF6FF", border: "#93C5FD", fg: "#1D4ED8", icon: "i" },
+};
+
+function ToastContainer() {
+  const [toasts, setToasts] = useState([]);
+
+  useEffect(() => {
+    const sub = (t) => {
+      setToasts(prev => [...prev, t]);
+      setTimeout(() => setToasts(prev => prev.filter(x => x.id !== t.id)), 4000);
+    };
+    _toastSubs.add(sub);
+    return () => _toastSubs.delete(sub);
+  }, []);
+
+  const dismiss = (id) => setToasts(prev => prev.filter(t => t.id !== id));
+
+  if (!toasts.length) return null;
+  return (
+    <>
+      <style>{`@keyframes ralliToastIn{from{opacity:0;transform:translateY(8px)}to{opacity:1;transform:translateY(0)}}`}</style>
+      <div style={{
+        position: "fixed", bottom: 24, right: 24, zIndex: 9999,
+        display: "flex", flexDirection: "column", gap: 10,
+        pointerEvents: "none",
+      }}>
+        {toasts.map(t => {
+          const c = TOAST_CFG[t.type] ?? TOAST_CFG.info;
+          return (
+            <div key={t.id} role="alert" style={{
+              pointerEvents: "auto",
+              display: "flex", alignItems: "flex-start", gap: 10,
+              padding: "11px 14px", borderRadius: 10,
+              background: c.bg, border: `1px solid ${c.border}`,
+              boxShadow: "0 4px 16px rgba(0,0,0,0.10)",
+              maxWidth: 360, minWidth: 240,
+              animation: "ralliToastIn 0.2s ease",
+              fontFamily: "'Plus Jakarta Sans',sans-serif",
+            }}>
+              <span style={{
+                width: 18, height: 18, borderRadius: "50%",
+                background: c.border, color: c.fg,
+                display: "flex", alignItems: "center", justifyContent: "center",
+                fontSize: 10, fontWeight: 900, flexShrink: 0, marginTop: 1,
+              }}>{c.icon}</span>
+              <span style={{ flex: 1, fontSize: 13, lineHeight: 1.45, color: c.fg, fontWeight: 500 }}>
+                {t.message}
+              </span>
+              <button
+                onClick={() => dismiss(t.id)}
+                aria-label="Dismiss"
+                style={{
+                  background: "none", border: "none", cursor: "pointer",
+                  color: c.fg, opacity: 0.45, padding: 0, fontSize: 14,
+                  lineHeight: 1, flexShrink: 0, marginTop: 1,
+                }}
+              >✕</button>
+            </div>
+          );
+        })}
+      </div>
+    </>
+  );
+}
+
 // ── App Error Boundary ────────────────────────────────────────────────────────
 // Prevents render crashes (e.g. undefined field access) from showing a blank page.
 // Shows a recovery screen with the error message and a reload button instead.
@@ -13953,6 +14172,7 @@ export default function App() {
     document.body.style.fontFamily = "'Plus Jakarta Sans', sans-serif";
   }, []);
   const mobile = useMobile();
+  const toast  = useToast();
   const [currentUser,      setCurrentUser]      = useState(null);
   const [screen,           setScreen]           = useState("home");
   const [sessions,         setSessions]         = useState(INITIAL_SESSIONS);
@@ -14022,6 +14242,8 @@ export default function App() {
       return saved ? JSON.parse(saved) : INITIAL_BATTLE_CARDS;
     } catch { return INITIAL_BATTLE_CARDS; }
   });
+  // Loading flag for BattleCardsScreen — true while Supabase BC fetch is in flight.
+  const [bcLoading, setBcLoading] = useState(false);
 
   // BC data loaded after const user/currentOrg are declared (see useEffect below line 13866)
 
@@ -14052,13 +14274,11 @@ export default function App() {
     if (!user?._isReal || !tid) return;
     setBcCategories([]);  // clear seed immediately; DB result fills in below
     setBattleCards([]);
-    getTenantBcCategories(tid).then(({ data }) => {
-      if (data) setBcCategories(data);
-      // on null (RLS/network error): state stays [], not demo data
-    }).catch(e => console.error("[ralli] getTenantBcCategories failed:", e));
-    getTenantBattleCards(tid).then(({ data }) => {
-      if (data) setBattleCards(data);
-    }).catch(e => console.error("[ralli] getTenantBattleCards failed:", e));
+    setBcLoading(true);
+    Promise.allSettled([
+      getTenantBcCategories(tid).then(({ data }) => { if (data) setBcCategories(data); }),
+      getTenantBattleCards(tid).then(({ data }) => { if (data) setBattleCards(data); }),
+    ]).finally(() => setBcLoading(false));
   }, [user?._isReal, currentOrg?.id, user?.orgId]); // eslint-disable-line react-hooks/exhaustive-deps
 
   // Map NAV featureKey → tenant_settings.feature_access key
@@ -14089,8 +14309,11 @@ export default function App() {
         .update({ role_permissions: updated })
         .eq("tenant_id", currentOrg.id)
         .then(({ error }) => {
-          if (error) console.error("[ralli] save rolePermissions failed:", error);
+          if (error) { console.error("[ralli] save rolePermissions failed:", error); toast.error("Failed to save permissions."); }
+          else { toast.success("Permissions saved."); }
         });
+    } else {
+      toast.success("Permissions saved.");
     }
   };
 
@@ -14581,9 +14804,10 @@ export default function App() {
     const tid = currentOrg?.id ?? user?.orgId ?? null;
     if (user?._isReal && tid) {
       const { data, error } = await dbSaveBcCategory(tid, cat, user.id);
-      if (error) { console.error("[ralli] saveBcCategory failed:", error); return; }
+      if (error) { console.error("[ralli] saveBcCategory failed:", error); toast.error("Failed to save category. Please try again."); return; }
       if (data) {
         setBcCategories(prev => prev.find(c => c.id === data.id) ? prev.map(c => c.id === data.id ? data : c) : [...prev, data]);
+        toast.success("Category saved.");
         return;
       }
     }
@@ -14593,18 +14817,20 @@ export default function App() {
       try { localStorage.setItem(bcCatKey, JSON.stringify(next)); } catch {}
       return next;
     });
+    toast.success("Category saved.");
   };
   const handleDeleteBcCategory = async (id) => {
     const tid = currentOrg?.id ?? user?.orgId ?? null;
     if (user?._isReal && tid) {
       const { error } = await dbDeleteBcCategory(tid, id);
-      if (error) { console.error("[ralli] deleteBcCategory failed:", error); return; }
+      if (error) { console.error("[ralli] deleteBcCategory failed:", error); toast.error("Failed to delete category. Please try again."); return; }
     }
     setBcCategories(prev => {
       const next = prev.filter(c => c.id !== id);
       if (!user?._isReal) { try { localStorage.setItem(bcCatKey, JSON.stringify(next)); } catch {} }
       return next;
     });
+    toast.success("Category deleted.");
   };
 
   // ── Battle card CRUD ──
@@ -14612,9 +14838,10 @@ export default function App() {
     const tid = currentOrg?.id ?? user?.orgId ?? null;
     if (user?._isReal && tid) {
       const { data, error } = await dbSaveBattleCard(tid, card, user.id);
-      if (error) { console.error("[ralli] saveBattleCard failed:", error); return; }
+      if (error) { console.error("[ralli] saveBattleCard failed:", error); toast.error("Failed to save battle card. Please try again."); return; }
       if (data) {
         setBattleCards(prev => prev.find(c => c.id === data.id) ? prev.map(c => c.id === data.id ? data : c) : [...prev, data]);
+        toast.success("Battle card saved.");
         return;
       }
     }
@@ -14624,18 +14851,20 @@ export default function App() {
       try { localStorage.setItem(bcCardsKey, JSON.stringify(next)); } catch {}
       return next;
     });
+    toast.success("Battle card saved.");
   };
   const handleDeleteBattleCard = async (id) => {
     const tid = currentOrg?.id ?? user?.orgId ?? null;
     if (user?._isReal && tid) {
       const { error } = await dbDeleteBattleCard(tid, id);
-      if (error) { console.error("[ralli] deleteBattleCard failed:", error); return; }
+      if (error) { console.error("[ralli] deleteBattleCard failed:", error); toast.error("Failed to delete battle card. Please try again."); return; }
     }
     setBattleCards(prev => {
       const next = prev.filter(c => c.id !== id);
       if (!user?._isReal) { try { localStorage.setItem(bcCardsKey, JSON.stringify(next)); } catch {} }
       return next;
     });
+    toast.success("Battle card deleted.");
   };
 
   // ── Quiz CRUD ──
@@ -14645,11 +14874,12 @@ export default function App() {
     const orgId = currentOrg?.id ?? user?.orgId ?? null;
     if (user?._isReal && orgId) {
       const { data: saved, error } = await upsertQuiz(orgId, quiz, user.id);
-      if (error) console.error("[ralli] upsertQuiz failed:", error);
+      if (error) { console.error("[ralli] upsertQuiz failed:", error); toast.error("Failed to save quiz. Please try again."); }
       // Only use saved (with stable DB UUID) if the upsert succeeded.
       // If it failed, don't silently add a non-persisted quiz to state for real users.
       if (!saved) {
         console.error("[ralli] handleSaveQuiz: upsert returned no data, aborting state update");
+        toast.error("Quiz save failed. Please try again.");
         setEditingQuiz(null);
         setScreen("quizzes");
         return;
@@ -14661,6 +14891,7 @@ export default function App() {
           : [...prev, canonical]
       ); // real users: no localStorage write — Supabase is source of truth
       setEditingQuiz(null);
+      toast.success("Quiz saved.");
       setScreen("quizzes");
       return;
     }
@@ -14673,6 +14904,7 @@ export default function App() {
       return updated;
     });
     setEditingQuiz(null);
+    toast.success("Quiz saved.");
     setScreen("quizzes");
   };
 
@@ -14686,9 +14918,10 @@ export default function App() {
       if (!user?._isReal) { try { localStorage.setItem("ralli_quizzes", JSON.stringify(updated)); } catch {} }
       return updated;
     });
+    toast.success("Quiz deleted.");
     // Fire-and-forget DB delete for real users (only UUIDs are in the DB)
     if (user?._isReal && id && !id.startsWith("quiz_") && !id.startsWith("sq_")) {
-      dbDeleteQuiz(id).then(({ error }) => { if (error) console.error("[ralli] deleteQuiz failed:", error); });
+      dbDeleteQuiz(id).then(({ error }) => { if (error) { console.error("[ralli] deleteQuiz failed:", error); toast.error("Failed to delete quiz."); } });
     }
   };
 
@@ -14704,7 +14937,7 @@ export default function App() {
     });
     if (user?._isReal && orgId) {
       upsertQuiz(orgId, toggled, user?.id)
-        .then(({ error }) => { if (error) console.error("[ralli] toggleFavorite upsert failed:", error); });
+        .then(({ error }) => { if (error) { console.error("[ralli] toggleFavorite upsert failed:", error); toast.error("Failed to update favorite."); } });
     }
   };
 
@@ -14720,7 +14953,7 @@ export default function App() {
     });
     if (user?._isReal && orgId) {
       upsertQuiz(orgId, toggled, user?.id)
-        .then(({ error }) => { if (error) console.error("[ralli] toggleActive upsert failed:", error); });
+        .then(({ error }) => { if (error) { console.error("[ralli] toggleActive upsert failed:", error); toast.error("Failed to update quiz status."); } });
     }
   };
 
@@ -14728,7 +14961,10 @@ export default function App() {
     const tenantId = currentOrg?.id ?? null;
     if (user?._isReal && tenantId) {
       const { error } = await dbCreateAssignment(tenantId, assignment, user?.id);
-      if (error) console.error("[ralli] quiz createAssignment failed:", error);
+      if (error) { console.error("[ralli] quiz createAssignment failed:", error); toast.error("Failed to assign quiz. Please try again."); }
+      else { toast.success("Quiz assigned."); }
+    } else {
+      toast.success("Quiz assigned.");
     }
   };
 
@@ -14970,7 +15206,7 @@ export default function App() {
       case "quizzes":           return <QuizzesScreen role={gameRole} onNav={navigate} quizzes={quizzes} onEditQuiz={handleEditQuiz} onDeleteQuiz={handleDeleteQuiz} onToggleFavorite={handleToggleFavorite} onToggleActive={handleToggleActive} pendingQuizId={pendingQuizId} onClearPendingQuiz={() => setPendingQuizId(null)} canCreate={perm("actions","create")} canEdit={perm("actions","edit")} canDelete={perm("actions","delete")} canLaunch={perm("actions","launch")} canAssign={perm("actions","assign")} onAssignQuiz={handleAssignQuiz} orgUsers={orgUsers} orgs={orgs} currentUser={currentUser} tenantId={currentOrg?.id ?? null} isReal={!!user?._isReal} quizzesReady={quizzesReady} />;
       case "battlecards":       return (isAdminType && perm("actions","edit"))
         ? <BattleCardsAdminScreen categories={bcCategories} cards={battleCards} onSaveCategory={handleSaveBcCategory} onDeleteCategory={handleDeleteBcCategory} onSaveCard={handleSaveBattleCard} onDeleteCard={handleDeleteBattleCard} />
-        : <BattleCardsScreen categories={bcCategories} cards={battleCards} />;
+        : <BattleCardsScreen categories={bcCategories} cards={battleCards} isLoading={bcLoading} isReal={!!user?._isReal} />;
       case "insights":           return <InsightsScreen user={user} isReal={!!user?._isReal} tenantId={currentOrg?.id ?? null} orgUsers={orgUsers} isAdmin={isAdminType} />;
       case "progress":          return isAdminType
         ? <LeadershipDashboardScreen currentOrg={currentOrg} orgUsers={orgUsers} isReal={!!user?._isReal} />
@@ -15254,6 +15490,7 @@ export default function App() {
           })}
         </div>
       )}
+      <ToastContainer />
     </div>
     </AppErrorBoundary>
   );
