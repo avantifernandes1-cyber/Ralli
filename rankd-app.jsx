@@ -6575,7 +6575,8 @@ function LearnScreen({ role, user, orgUsers = [], orgs = [], onNav, onAwardXp, p
               const { data: saved, error } = await dbCreateAssignment(tenantId, assignment, user?.id);
               if (error) console.error("[ralli] createAssignment failed:", error);
               const canonical = saved ?? { ...assignment, id: "a" + Date.now(), assignedAt: "Today" };
-              setAssignments(prev => [...prev, canonical]);
+              // Guard: if createAssignment returned an existing row, don't add it twice to state
+              setAssignments(prev => prev.some(a => a.id === canonical.id) ? prev : [...prev, canonical]);
             } else {
               setAssignments(prev => [...prev, { ...assignment, id: "a" + Date.now(), assignedAt: "Today" }]);
             }

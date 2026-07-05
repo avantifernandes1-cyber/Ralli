@@ -340,13 +340,36 @@ export async function getTenantAssignments(tenantId) {
  * @returns {Promise<{ data: Object|null, error: Object|null }>}
  */
 export async function createAssignment(tenantId, assignment, userId) {
+  const assignedTo = assignment.assignedTo ?? {};
+  const targetType = assignedTo.type;
+  const targetKey  = targetType === "team"       ? "teamId"
+                   : targetType === "individual" ? "userId"
+                   : targetType === "group"      ? "orgId"
+                   : null;
+  const targetId   = targetKey ? assignedTo[targetKey] : null;
+
+  // Dedup: if the same content is already assigned to the same target, return the
+  // existing row rather than inserting a duplicate.
+  if (targetId) {
+    const { data: existing } = await supabase
+      .from("tenant_assignments")
+      .select("*")
+      .eq("tenant_id",           tenantId)
+      .eq("content_type",        assignment.contentType)
+      .eq("content_id",          assignment.contentId)
+      .eq("assigned_to->>type",  targetType)
+      .eq(`assigned_to->>${targetKey}`, targetId)
+      .maybeSingle();
+    if (existing) return { data: dbToAssignment(existing), error: null };
+  }
+
   const { data, error } = await supabase
     .from("tenant_assignments")
     .insert({
       tenant_id:    tenantId,
       content_type: assignment.contentType,
       content_id:   assignment.contentId,
-      assigned_to:  assignment.assignedTo ?? {},
+      assigned_to:  assignedTo,
       due_at:       assignment.dueAt && assignment.dueAt !== "Open" ? assignment.dueAt : null,
       required:     assignment.required ?? false,
       assigned_by:  userId ?? null,
