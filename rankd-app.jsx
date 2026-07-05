@@ -5505,6 +5505,8 @@ function LearnScreen({ role, user, orgUsers = [], orgs = [], onNav, onAwardXp, p
   const [archivedLessons,   setArchivedLessons]   = useState([]);
   const [tenantCompletions, setTenantCompletions] = useState([]); // manager/admin only
   const [selectedAssignmentId, setSelectedAssignmentId] = useState(null); // manager click-through
+  const [assignTimeframe,  setAssignTimeframe]  = useState("all"); // "all" | "week" | "month" | "custom"
+  const [assignDateRange,  setAssignDateRange]  = useState({ start: "", end: "" }); // ISO date strings for custom range
 
   // ── Load content from Supabase for real users ────────────────────────────
   useEffect(() => {
@@ -6226,13 +6228,38 @@ function LearnScreen({ role, user, orgUsers = [], orgs = [], onNav, onAwardXp, p
           );
         }
 
-        // Summary stats (always over all rows, not search-filtered)
+        // ── Timeframe filter ───────────────────────────────────────────────
+        // Filters rows by the assignment's created date (assignedAtRaw).
+        // Rows with no date are always included.
+        const timeframeFilter = (row) => {
+          if (assignTimeframe === "all") return true;
+          const raw = row.a.assignedAtRaw;
+          if (!raw) return true;
+          const d   = new Date(raw);
+          if (isNaN(d)) return true;
+          const now = Date.now();
+          if (assignTimeframe === "week")  return d >= new Date(now - 7  * 86400000);
+          if (assignTimeframe === "month") return d >= new Date(now - 30 * 86400000);
+          if (assignTimeframe === "custom") {
+            const start = assignDateRange.start ? new Date(assignDateRange.start) : null;
+            const end   = assignDateRange.end   ? new Date(assignDateRange.end + "T23:59:59") : null;
+            if (start && d < start) return false;
+            if (end   && d > end)   return false;
+            return true;
+          }
+          return true;
+        };
+
+        const filteredRows = allRows.filter(timeframeFilter);
+
+        // Summary stats — computed from timeframe-filtered rows (not raw assignment count).
+        // "Active" = not_started + in_progress + overdue (excludes completed).
         const statCounts = {
-          total:       assignments.length,
-          not_started: allRows.filter(r => r.status === "not_started").length,
-          in_progress: allRows.filter(r => r.status === "in_progress").length,
-          completed:   allRows.filter(r => r.status === "completed").length,
-          overdue:     allRows.filter(r => r.status === "overdue").length,
+          active:      filteredRows.filter(r => r.status !== "completed").length,
+          not_started: filteredRows.filter(r => r.status === "not_started").length,
+          in_progress: filteredRows.filter(r => r.status === "in_progress").length,
+          completed:   filteredRows.filter(r => r.status === "completed").length,
+          overdue:     filteredRows.filter(r => r.status === "overdue").length,
         };
 
         // Detail view when an assignment is selected
@@ -6241,12 +6268,12 @@ function LearnScreen({ role, user, orgUsers = [], orgs = [], onNav, onAwardXp, p
           ? (detailAssignment.contentType === "course" ? courses.find(c => c.id === detailAssignment.contentId) : lessons.find(l => l.id === detailAssignment.contentId))
           : null;
 
-        // Rows to show: detail-filtered or search-filtered
+        // Rows to show: timeframe + search filtered, or detail-drilled
         const searchedRows = sq
-          ? allRows.filter(r => r.content?.title.toLowerCase().includes(sq) || r.u?.name?.toLowerCase().includes(sq))
-          : allRows;
+          ? filteredRows.filter(r => r.content?.title.toLowerCase().includes(sq) || r.u?.name?.toLowerCase().includes(sq))
+          : filteredRows;
         const visibleRows = selectedAssignmentId
-          ? allRows.filter(r => r.a.id === selectedAssignmentId)
+          ? filteredRows.filter(r => r.a.id === selectedAssignmentId)
           : searchedRows;
 
         const renderTable = (rows) => (
@@ -6312,22 +6339,57 @@ function LearnScreen({ role, user, orgUsers = [], orgs = [], onNav, onAwardXp, p
 
         return (
           <div>
-            {/* Summary stats — only show in list view, not detail view */}
+            {/* Timeframe filters + summary stats — list view only */}
             {!selectedAssignmentId && (
-              <div style={{ display: "grid", gridTemplateColumns: "repeat(5, 1fr)", gap: 10, marginBottom: 20 }}>
-                {[
-                  { label: "Total Assigned", count: statCounts.total,       color: C.text    },
-                  { label: "Not Started",    count: statCounts.not_started,  color: C.textSub },
-                  { label: "In Progress",    count: statCounts.in_progress,  color: C.blue    },
-                  { label: "Completed",      count: statCounts.completed,    color: C.green   },
-                  { label: "Overdue",        count: statCounts.overdue,      color: C.red     },
-                ].map(({ label, count, color }) => (
-                  <div key={label} style={{ background: C.white, borderRadius: 10, padding: "14px 16px", border: `1px solid ${C.border}` }}>
-                    <div style={{ fontSize: 22, fontWeight: 800, color, marginBottom: 3 }}>{count}</div>
-                    <div style={{ fontSize: 11, fontWeight: 600, color: C.textSub, lineHeight: 1.3 }}>{label}</div>
-                  </div>
-                ))}
-              </div>
+              <>
+                {/* Timeframe filter row */}
+                <div style={{ display: "flex", alignItems: "center", gap: 8, marginBottom: 16, flexWrap: "wrap" }}>
+                  {[
+                    { id: "all",   label: "All time" },
+                    { id: "week",  label: "This week" },
+                    { id: "month", label: "This month" },
+                    { id: "custom", label: "Custom range" },
+                  ].map(({ id, label }) => (
+                    <button key={id} onClick={() => setAssignTimeframe(id)} style={{
+                      padding: "5px 12px", borderRadius: 99, border: `1.5px solid ${assignTimeframe === id ? C.orange : C.border}`,
+                      background: assignTimeframe === id ? C.orangeLight : C.white,
+                      fontSize: 12, fontWeight: 600, color: assignTimeframe === id ? C.orange : C.textSub,
+                      cursor: "pointer", transition: "all 0.15s",
+                    }}>{label}</button>
+                  ))}
+                  {assignTimeframe === "custom" && (
+                    <div style={{ display: "flex", alignItems: "center", gap: 6, marginLeft: 4 }}>
+                      <input
+                        type="date" value={assignDateRange.start}
+                        onChange={e => setAssignDateRange(p => ({ ...p, start: e.target.value }))}
+                        style={{ padding: "4px 8px", borderRadius: 7, border: `1px solid ${C.border}`, fontSize: 12, color: C.text, background: C.white }}
+                      />
+                      <span style={{ fontSize: 12, color: C.textSub }}>to</span>
+                      <input
+                        type="date" value={assignDateRange.end}
+                        onChange={e => setAssignDateRange(p => ({ ...p, end: e.target.value }))}
+                        style={{ padding: "4px 8px", borderRadius: 7, border: `1px solid ${C.border}`, fontSize: 12, color: C.text, background: C.white }}
+                      />
+                    </div>
+                  )}
+                </div>
+
+                {/* Summary stat cards */}
+                <div style={{ display: "grid", gridTemplateColumns: "repeat(5, 1fr)", gap: 10, marginBottom: 20 }}>
+                  {[
+                    { label: "Active",      count: statCounts.active,       color: C.text,    title: "Not started + in progress + overdue" },
+                    { label: "Not Started", count: statCounts.not_started,  color: C.textSub, title: "Assigned, no progress yet" },
+                    { label: "In Progress", count: statCounts.in_progress,  color: C.blue,    title: "Started but not complete" },
+                    { label: "Completed",   count: statCounts.completed,    color: C.green,   title: "Finished" },
+                    { label: "Overdue",     count: statCounts.overdue,      color: C.red,     title: "Past due date, not complete" },
+                  ].map(({ label, count, color, title }) => (
+                    <div key={label} title={title} style={{ background: C.white, borderRadius: 10, padding: "14px 16px", border: `1px solid ${C.border}` }}>
+                      <div style={{ fontSize: 22, fontWeight: 800, color, marginBottom: 3 }}>{count}</div>
+                      <div style={{ fontSize: 11, fontWeight: 600, color: C.textSub, lineHeight: 1.3 }}>{label}</div>
+                    </div>
+                  ))}
+                </div>
+              </>
             )}
 
             {/* Detail view header */}
