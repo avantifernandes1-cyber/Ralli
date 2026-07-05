@@ -14045,11 +14045,16 @@ export default function App() {
 
   // ── Load BC data from Supabase for real users ─────────────────────────────
   // Placed here so user + currentOrg are already declared above.
+  // Clear demo/localStorage data immediately so real users never see seed categories,
+  // even if the DB call fails — empty state is safer than misleading demo content.
   useEffect(() => {
     const tid = currentOrg?.id ?? user?.orgId ?? null;
     if (!user?._isReal || !tid) return;
+    setBcCategories([]);  // clear seed immediately; DB result fills in below
+    setBattleCards([]);
     getTenantBcCategories(tid).then(({ data }) => {
       if (data) setBcCategories(data);
+      // on null (RLS/network error): state stays [], not demo data
     }).catch(e => console.error("[ralli] getTenantBcCategories failed:", e));
     getTenantBattleCards(tid).then(({ data }) => {
       if (data) setBattleCards(data);
@@ -14078,7 +14083,15 @@ export default function App() {
 
   const handleSaveRolePermissions = (updated) => {
     setRolePermissions(updated);
-    saveRolePermissions(currentOrg?.id, updated);
+    saveRolePermissions(currentOrg?.id, updated); // localStorage — demo users + offline fallback
+    if (user?._isReal && currentOrg?.id) {
+      supabase.from("tenant_settings")
+        .update({ role_permissions: updated })
+        .eq("tenant_id", currentOrg.id)
+        .then(({ error }) => {
+          if (error) console.error("[ralli] save rolePermissions failed:", error);
+        });
+    }
   };
 
   // Convenience: check permission for the current user's role.
@@ -14192,9 +14205,26 @@ export default function App() {
       })
       .catch(e => console.error("[ralli] load profile prefs failed:", e));
 
-    // Feature access — load tenant_settings.feature_access so nav reflects Ralli Admin overrides
-    supabase.from("tenant_settings").select("feature_access").eq("tenant_id", tenantId).single()
-      .then(({ data: ts }) => { if (ts?.feature_access) setTenantFeatureAccess(ts.feature_access); });
+    // Feature access + role permissions — load from tenant_settings for real users.
+    // role_permissions was localStorage-only; now persisted in the DB column added in migration 004.
+    supabase.from("tenant_settings").select("feature_access, role_permissions").eq("tenant_id", tenantId).single()
+      .then(({ data: ts }) => {
+        if (ts?.feature_access) setTenantFeatureAccess(ts.feature_access);
+        // Deep-merge: DB values take precedence, but any new default keys are always present.
+        if (ts?.role_permissions && Object.keys(ts.role_permissions).length > 0) {
+          const db = ts.role_permissions;
+          setRolePermissions({
+            user: {
+              features: { ...DEFAULT_ROLE_PERMISSIONS.user.features,     ...(db.user?.features    ?? {}) },
+              actions:  { ...DEFAULT_ROLE_PERMISSIONS.user.actions,      ...(db.user?.actions     ?? {}) },
+            },
+            orgAdmin: {
+              features: { ...DEFAULT_ROLE_PERMISSIONS.orgAdmin.features, ...(db.orgAdmin?.features ?? {}) },
+              actions:  { ...DEFAULT_ROLE_PERMISSIONS.orgAdmin.actions,  ...(db.orgAdmin?.actions  ?? {}) },
+            },
+          });
+        }
+      });
   }, [currentUser?.id, currentUser?._isReal]); // eslint-disable-line react-hooks/exhaustive-deps
 
   // ── Load orgAdmin's own tenant into orgs[] ────────────────────────────────

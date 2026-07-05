@@ -72,6 +72,10 @@ export async function awardPoints(tenantId, userId, sourceType, sourceId, points
     points,
     reason,
   });
+  // 23505 = unique_violation — idx_upe_lesson_course_dedup caught a duplicate lesson/course award.
+  // This is intentional idempotency: silently succeed so callers never see a spurious error.
+  // Quiz retakes are unaffected — the partial index only covers source_type IN ('lesson','course').
+  if (error?.code === "23505") return { error: null };
   if (error) console.error("[ralli] awardPoints failed:", { sourceType, sourceId, points, reason, error });
   return { error };
 }
