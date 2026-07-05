@@ -14151,6 +14151,7 @@ export default function App() {
         setCurrentUser(null);
         setOrgs(INITIAL_ORGS);     // restore seed tenants so demo accounts work
         setOrgUsers(INITIAL_ORG_USERS);
+        setQuizzesReady(false);    // reset so next real user waits for their quiz load
       }
     });
 
