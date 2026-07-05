@@ -455,13 +455,14 @@ export async function getCachedInsight(tenantId, scope, scopeId, { maxAgeHours =
  * @param {{ summary: string, recommendations: Array }} insight
  */
 export async function saveInsightCache(tenantId, scope, scopeId, insight) {
-  const { error } = await supabase.from("ai_insights").insert({
+  const { error } = await supabase.from("ai_insights").upsert({
     tenant_id:       tenantId,
     scope,
     scope_id:        scopeId,
     summary:         insight.summary,
     recommendations: insight.recommendations ?? [],
-  });
+    generated_at:    new Date().toISOString(),
+  }, { onConflict: "tenant_id,scope,scope_id" });
   return { error };
 }
 

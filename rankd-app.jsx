@@ -13263,6 +13263,18 @@ function InsightsScreen({ user, isReal = false, tenantId = null, orgUsers = [], 
     );
   }
 
+  // Guard: real user with no org context or data not yet available
+  if (isReal && !displayPerf) {
+    return (
+      <div style={{ flex: 1, overflow: "auto", padding: "32px 32px 80px", maxWidth: 860, margin: "0 auto", width: "100%" }}>
+        <div style={{ fontSize: 22, fontWeight: 700, color: C.text, marginBottom: 8 }}>Insights</div>
+        <div style={{ ...cardStyle, color: C.textSub, fontSize: 13 }}>
+          No performance data yet. Complete a lesson, quiz, or game to see your readiness score.
+        </div>
+      </div>
+    );
+  }
+
   return (
     <div style={{ flex: 1, overflow: "auto", padding: "32px 32px 80px", maxWidth: 860, margin: "0 auto", width: "100%" }}>
 
