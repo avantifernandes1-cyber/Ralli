@@ -582,3 +582,229 @@ export async function getTenantQuizAttempts(tenantId) {
     .order("created_at", { ascending: false });
   return { data, error };
 }
+
+// ─────────────────────────────────────────────────────────────────────────────
+// BATTLE CARDS
+// Replaces localStorage-only storage. All tenant members can read; only
+// managers/admins can write. Shape mirrors the in-app BC object:
+//   Category: { id, label, description }
+//   Card:     { id, categoryId, title, subtitle, summary, strength, weakness,
+//               ourWin, talkTrack, tags, content: [{heading,body}] }
+// ─────────────────────────────────────────────────────────────────────────────
+
+/** Normalise a DB category row → app shape */
+function dbToCategory(row) {
+  return {
+    id:          row.id,
+    label:       row.label,
+    description: row.description ?? "",
+  };
+}
+
+/** Normalise app category → DB insert/update shape */
+function categoryToDb(tenantId, cat, userId) {
+  return {
+    tenant_id:   tenantId,
+    label:       cat.label,
+    description: cat.description ?? "",
+    created_by:  userId ?? null,
+    updated_at:  new Date().toISOString(),
+  };
+}
+
+/** Normalise a DB card row → app shape */
+function dbToCard(row) {
+  return {
+    id:          row.id,
+    categoryId:  row.category_id ?? "",
+    title:       row.title,
+    subtitle:    row.subtitle ?? "",
+    summary:     row.summary ?? "",
+    strength:    row.strength ?? "",
+    weakness:    row.weakness ?? "",
+    ourWin:      row.our_win ?? "",
+    talkTrack:   row.talk_track ?? "",
+    tags:        row.tags ?? [],
+    content:     row.content ?? [],
+    updatedAt:   row.updated_at?.split("T")[0] ?? "",
+  };
+}
+
+/** Normalise app card → DB insert/update shape */
+function cardToDb(tenantId, card, userId) {
+  return {
+    tenant_id:   tenantId,
+    category_id: card.categoryId || null,
+    title:       card.title,
+    subtitle:    card.subtitle ?? "",
+    summary:     card.summary ?? "",
+    strength:    card.strength ?? "",
+    weakness:    card.weakness ?? "",
+    our_win:     card.ourWin ?? "",
+    talk_track:  card.talkTrack ?? "",
+    tags:        card.tags ?? [],
+    content:     card.content ?? [],
+    created_by:  userId ?? null,
+    updated_at:  new Date().toISOString(),
+  };
+}
+
+/**
+ * Fetch all battle card categories for a tenant.
+ * @param {string} tenantId
+ * @returns {Promise<{ data: Array|null, error: Object|null }>}
+ */
+export async function getTenantBcCategories(tenantId) {
+  if (!tenantId) return { data: [], error: null };
+  const { data, error } = await supabase
+    .from("tenant_bc_categories")
+    .select("id, label, description")
+    .eq("tenant_id", tenantId)
+    .order("created_at", { ascending: true });
+  return { data: data ? data.map(dbToCategory) : null, error };
+}
+
+/**
+ * Fetch all battle cards for a tenant.
+ * @param {string} tenantId
+ * @returns {Promise<{ data: Array|null, error: Object|null }>}
+ */
+export async function getTenantBattleCards(tenantId) {
+  if (!tenantId) return { data: [], error: null };
+  const { data, error } = await supabase
+    .from("tenant_battle_cards")
+    .select("id, category_id, title, subtitle, summary, strength, weakness, our_win, talk_track, tags, content, updated_at")
+    .eq("tenant_id", tenantId)
+    .order("title", { ascending: true });
+  return { data: data ? data.map(dbToCard) : null, error };
+}
+
+/**
+ * Create or update a battle card category.
+ * If cat.id is a UUID (from DB), updates. Otherwise inserts (new category).
+ *
+ * @param {string} tenantId
+ * @param {{ id?: string, label: string, description?: string }} cat
+ * @param {string} [userId]
+ * @returns {Promise<{ data: Object|null, error: Object|null }>}
+ */
+export async function saveBcCategory(tenantId, cat, userId) {
+  const isExisting = cat.id && !cat.id.startsWith("cat_") && cat.id.length === 36;
+  const payload = categoryToDb(tenantId, cat, userId);
+
+  if (isExisting) {
+    const { data, error } = await supabase
+      .from("tenant_bc_categories")
+      .update(payload)
+      .eq("id", cat.id)
+      .eq("tenant_id", tenantId)
+      .select("id, label, description")
+      .single();
+    return { data: data ? dbToCategory(data) : null, error };
+  } else {
+    const { data, error } = await supabase
+      .from("tenant_bc_categories")
+      .insert(payload)
+      .select("id, label, description")
+      .single();
+    return { data: data ? dbToCategory(data) : null, error };
+  }
+}
+
+/**
+ * Delete a battle card category by ID.
+ * Cards in this category will have category_id set to NULL (ON DELETE SET NULL).
+ *
+ * @param {string} tenantId
+ * @param {string} catId
+ * @returns {Promise<{ error: Object|null }>}
+ */
+export async function deleteBcCategory(tenantId, catId) {
+  const { error } = await supabase
+    .from("tenant_bc_categories")
+    .delete()
+    .eq("id", catId)
+    .eq("tenant_id", tenantId);
+  return { error };
+}
+
+/**
+ * Create or update a battle card.
+ * If card.id is a UUID (from DB), updates. Otherwise inserts.
+ *
+ * @param {string} tenantId
+ * @param {Object} card
+ * @param {string} [userId]
+ * @returns {Promise<{ data: Object|null, error: Object|null }>}
+ */
+export async function saveBattleCard(tenantId, card, userId) {
+  const isExisting = card.id && !card.id.startsWith("bc_") && card.id.length === 36;
+  const payload = cardToDb(tenantId, card, userId);
+
+  const selectCols = "id, category_id, title, subtitle, summary, strength, weakness, our_win, talk_track, tags, content, updated_at";
+
+  if (isExisting) {
+    const { data, error } = await supabase
+      .from("tenant_battle_cards")
+      .update(payload)
+      .eq("id", card.id)
+      .eq("tenant_id", tenantId)
+      .select(selectCols)
+      .single();
+    return { data: data ? dbToCard(data) : null, error };
+  } else {
+    const { data, error } = await supabase
+      .from("tenant_battle_cards")
+      .insert(payload)
+      .select(selectCols)
+      .single();
+    return { data: data ? dbToCard(data) : null, error };
+  }
+}
+
+/**
+ * Delete a battle card by ID.
+ *
+ * @param {string} tenantId
+ * @param {string} cardId
+ * @returns {Promise<{ error: Object|null }>}
+ */
+export async function deleteBattleCard(tenantId, cardId) {
+  const { error } = await supabase
+    .from("tenant_battle_cards")
+    .delete()
+    .eq("id", cardId)
+    .eq("tenant_id", tenantId);
+  return { error };
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// USER PROFILE PREFERENCES
+// nickname, avatar_emoji, profile_pic_url, notif_prefs — previously localStorage
+// ─────────────────────────────────────────────────────────────────────────────
+
+/**
+ * Update a user's profile preferences in Supabase.
+ * Accepts a partial object — only the provided keys are written.
+ *
+ * @param {string} userId
+ * @param {{ nickname?: string, avatarEmoji?: string, profilePicUrl?: string, notifPrefs?: Object }} prefs
+ * @returns {Promise<{ error: Object|null }>}
+ */
+export async function updateUserProfile(userId, prefs = {}) {
+  if (!userId) return { error: null };
+
+  const update = {};
+  if (prefs.nickname    !== undefined) update.nickname         = prefs.nickname    || null;
+  if (prefs.avatarEmoji !== undefined) update.avatar_emoji     = prefs.avatarEmoji || null;
+  if (prefs.profilePicUrl !== undefined) update.profile_pic_url = prefs.profilePicUrl || null;
+  if (prefs.notifPrefs  !== undefined) update.notif_prefs      = prefs.notifPrefs;
+
+  if (Object.keys(update).length === 0) return { error: null };
+
+  const { error } = await supabase
+    .from("profiles")
+    .update(update)
+    .eq("id", userId);
+  return { error };
+}

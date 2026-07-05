@@ -463,3 +463,17 @@ export async function saveInsightCache(tenantId, scope, scopeId, insight) {
   });
   return { error };
 }
+
+/**
+ * Fire-and-forget readiness score update.
+ * Call this after any scoring event (lesson complete, quiz complete, game end).
+ * Non-blocking — errors are silently logged so they never interrupt the user flow.
+ *
+ * @param {string} tenantId
+ * @param {string} userId
+ */
+export function triggerReadinessUpdate(tenantId, userId) {
+  if (!tenantId || !userId) return;
+  computeAndSaveReadinessScore(tenantId, userId)
+    .catch(e => console.error("[ralli] triggerReadinessUpdate failed:", e));
+}

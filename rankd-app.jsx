@@ -50,12 +50,21 @@ import {
   restoreLesson as restoreLessonService,
   getArchivedContent,
   getTenantLessonCompletions,
+  saveQuizAttempt,
+  getUserQuizAttempts,
+  getTenantBcCategories,
+  getTenantBattleCards,
+  saveBcCategory   as dbSaveBcCategory,
+  deleteBcCategory as dbDeleteBcCategory,
+  saveBattleCard   as dbSaveBattleCard,
+  deleteBattleCard as dbDeleteBattleCard,
+  updateUserProfile as dbUpdateUserProfile,
 } from "./src/lib/contentService.js";
 import { getProfile, createMissingProfile, getTenantProfiles } from "./src/lib/profileService.js";
 import { sendInviteEmail } from "./src/lib/emailService.js";
 import { provisionTenant, buildInviteUrl, normalizeProvisionedOrg, createMemberInvite } from "./src/lib/provisioningService.js";
-import { awardLessonPoints, awardCoursePoints, awardQuizPoints, awardGamePointsForSession } from "./src/lib/scoringService.js";
-import { saveQuizAttempt } from "./src/lib/contentService.js";
+import { awardLessonPoints, awardCoursePoints, awardQuizPoints, awardGamePointsForSession, getLeaderboard } from "./src/lib/scoringService.js";
+import { triggerReadinessUpdate } from "./src/lib/insightsService.js";
 
 // ── MOBILE HOOK ────────────────────────────────────────────
 function useMobile() {
@@ -446,6 +455,15 @@ function HomeScreen({ user, onNav, quizAssignments = [], onResumeLesson, onStart
   const [homeCompleted,   setHomeCompleted]   = useState(new Set());
   const [homeLoading,     setHomeLoading]     = useState(isReal);
 
+  // ── Leaderboard sidebar — reads from user_point_events (single source of truth)
+  const [homeLbRows, setHomeLbRows] = useState([]);
+  useEffect(() => {
+    if (!isReal || !tenantId) return;
+    getLeaderboard(tenantId, user?.id).then(({ data }) => {
+      if (data) setHomeLbRows(data.slice(0, 5));
+    });
+  }, [isReal, tenantId, user?.id]); // eslint-disable-line react-hooks/exhaustive-deps
+
   useEffect(() => {
     if (!isReal || !tenantId || !user?.id) { setHomeLoading(false); return; }
     Promise.all([
@@ -696,14 +714,10 @@ function HomeScreen({ user, onNav, quizAssignments = [], onResumeLesson, onStart
 
         {/* Leaderboard sidebar */}
         {(() => {
-          // For real users: build leaderboard from already-loaded orgUsers (no extra Supabase calls).
+          // For real users: homeLbRows loaded from user_point_events (single source of truth).
           // For demo users: use the hardcoded mock data.
           const lbData = isReal
-            ? orgUsers
-                .filter(u => u.orgId === user.orgId)
-                .sort((a, b) => (b.xp ?? 0) - (a.xp ?? 0))
-                .slice(0, 5)
-                .map((u, i) => ({ ...u, rank: i + 1, score: u.xp ?? 0, isMe: u.id === user.id || u.name === user.name, change: 0 }))
+            ? homeLbRows.map(r => ({ ...r, score: r.total }))
             : leaderboardData.map(p => ({ ...p, isMe: p.name === user.name }));
           return (
             <Card style={{ padding: 0, overflow: "hidden" }}>
@@ -5569,6 +5583,7 @@ function LearnScreen({ role, user, orgUsers = [], orgs = [], onNav, onAwardXp, p
       if (tid) {
         awardLessonPoints(tid, uid, id, { dueAt: lessonAssignment?.dueAt })
           .catch(e => console.error("[ralli] awardLessonPoints failed:", e));
+        triggerReadinessUpdate(tid, uid);
       }
 
       // Detect course completion — check if any course containing this lesson is now fully done
@@ -8127,6 +8142,8 @@ function QuizzesScreen({ role, onNav, quizzes, onEditQuiz, onDeleteQuiz, onToggl
     // Assignment state — seed for demo; replaced with real data when isReal
     const [assignments, setAssignments] = useState(isReal ? [] : USER_QUIZ_ASSIGNMENTS_SEED);
     const [assignmentsLoaded, setAssignmentsLoaded] = useState(!isReal);
+    // Attempt history keyed by quiz_id — source of truth for retake detection
+    const [userQuizAttempts, setUserQuizAttempts] = useState({});
 
     // Load quiz assignments from Supabase for real users
     useEffect(() => {
@@ -8159,6 +8176,21 @@ function QuizzesScreen({ role, onNav, quizzes, onEditQuiz, onDeleteQuiz, onToggl
         setAssignmentsLoaded(true);
       });
     }, [tenantId, isReal, currentUser?.id]); // eslint-disable-line react-hooks/exhaustive-deps
+
+    // Load quiz attempt history from Supabase (for retake detection / attemptNum)
+    useEffect(() => {
+      if (!isReal || !tenantId || !currentUser?.id) return;
+      getUserQuizAttempts(tenantId, currentUser.id).then(({ data }) => {
+        if (!data) return;
+        const byQuiz = {};
+        data.forEach(a => {
+          if (!byQuiz[a.quiz_id]) byQuiz[a.quiz_id] = [];
+          byQuiz[a.quiz_id].push(a);
+        });
+        setUserQuizAttempts(byQuiz);
+      });
+    }, [tenantId, isReal, currentUser?.id]); // eslint-disable-line react-hooks/exhaustive-deps
+
     // view: "list" | "taking" | "results"
     const [view,         setView]         = useState("list");
     const [activeId,     setActiveId]     = useState(null);
@@ -8173,9 +8205,11 @@ function QuizzesScreen({ role, onNav, quizzes, onEditQuiz, onDeleteQuiz, onToggl
     const viewResults= (id, attempt) => { setActiveId(id); setActiveAttempt(attempt); setView("results"); };
 
     // Deep-link: if navigated here from HomeScreen with a pending quiz, open it on mount.
+    // Check DB-loaded assignments first; fall back to seed for demo accounts.
     useEffect(() => {
       if (pendingQuizId) {
-        const exists = USER_QUIZ_ASSIGNMENTS_SEED.find(q => q.id === pendingQuizId);
+        const exists = assignments.find(q => q.id === pendingQuizId)
+                    ?? USER_QUIZ_ASSIGNMENTS_SEED.find(q => q.id === pendingQuizId);
         if (exists) startQuiz(pendingQuizId);
         onClearPendingQuiz?.();
       }
@@ -8190,7 +8224,8 @@ function QuizzesScreen({ role, onNav, quizzes, onEditQuiz, onDeleteQuiz, onToggl
       setView("results");
       // Award quiz XP + persist attempt for real users
       if (isReal && currentUser?.id && tenantId) {
-        const previousAttempts = assignments.find(q => q.id === activeId)?.attempts ?? [];
+        // previousAttempts from DB — not assignments[].attempts (which is always [])
+        const previousAttempts = userQuizAttempts[activeId] ?? [];
         const isRetake = previousAttempts.length > 0;
         awardQuizPoints(tenantId, currentUser.id, activeId, attempt, { isRetake })
           .catch(e => console.error("[ralli] awardQuizPoints failed:", e));
@@ -8200,6 +8235,12 @@ function QuizzesScreen({ role, onNav, quizzes, onEditQuiz, onDeleteQuiz, onToggl
           attemptNum: previousAttempts.length + 1,
           answers:    attempt.answers ?? [],
         }).catch(e => console.error("[ralli] saveQuizAttempt failed:", e));
+        // Optimistically update local attempt map so immediate re-open shows correct retake state
+        setUserQuizAttempts(prev => ({
+          ...prev,
+          [activeId]: [...(prev[activeId] ?? []), { quiz_id: activeId, score: attempt.score, passed: attempt.passed }],
+        }));
+        triggerReadinessUpdate(tenantId, currentUser.id);
       }
     };
 
@@ -8249,17 +8290,18 @@ function QuizzesScreen({ role, onNav, quizzes, onEditQuiz, onDeleteQuiz, onToggl
       : assignments;
 
     // ── Tab filter ──
+    // For real users, attempt history comes from userQuizAttempts (DB-backed).
+    // quiz.attempts is always [] for real users — only used as demo fallback.
     const tabFiltered = searchFiltered.filter(quiz => {
-      const lastAttempt = quiz.attempts[quiz.attempts.length - 1] ?? null;
-      const isDone = lastAttempt?.passed;
-      const hasTried = quiz.attempts.length > 0;
+      const attempts = userQuizAttempts[quiz.id] ?? quiz.attempts;
+      const isDone   = attempts.some(a => a.passed);
       if (tab === "todo")      return !isDone;
       if (tab === "completed") return isDone;
       return true;
     });
 
-    const todoCount      = searchFiltered.filter(q => !(q.attempts[q.attempts.length-1]?.passed)).length;
-    const completedCount = searchFiltered.filter(q =>  (q.attempts[q.attempts.length-1]?.passed)).length;
+    const todoCount      = searchFiltered.filter(q => !(userQuizAttempts[q.id] ?? q.attempts).some(a => a.passed)).length;
+    const completedCount = searchFiltered.filter(q =>  (userQuizAttempts[q.id] ?? q.attempts).some(a => a.passed)).length;
 
     return (
       <div style={{ display: "flex", flexDirection: "column", gap: 20 }}>
@@ -9545,10 +9587,48 @@ const LEADERSHIP_SEED = {
 function LeadershipDashboardScreen({ currentOrg, orgUsers = [], isReal = false }) {
   const realMembers = orgUsers.filter(u => u._isReal);
   const hasRealData = !isReal || realMembers.length > 0;
-  const data        = LEADERSHIP_SEED; // swap for API data
+  const [liveData,     setLiveData]     = useState(null);   // null = not yet loaded
   const [trendPeriod,  setTrendPeriod]  = useState("weekly");
   const [peopleFilter, setPeopleFilter] = useState("all"); // all | top | improved | promotion | coaching
   const [teamFilter,   setTeamFilter]   = useState("all"); // all | team id
+
+  // Load real readiness scores from Supabase when available
+  useEffect(() => {
+    const tid = currentOrg?.id;
+    if (!isReal || !tid) return;
+    supabase
+      .from("readiness_scores")
+      .select("user_id, score, updated_at")
+      .eq("tenant_id", tid)
+      .order("score", { ascending: false })
+      .then(({ data: rows }) => {
+        if (!rows || rows.length === 0) return; // keep LEADERSHIP_SEED as fallback
+        // Build people array from orgUsers + readiness_scores rows
+        const people = rows.map((r, i) => {
+          const member = orgUsers.find(u => u.id === r.user_id);
+          return {
+            id:            r.user_id,
+            name:          member?.name ?? "Team Member",
+            title:         member?.title ?? member?.role ?? "Rep",
+            readinessScore: r.score ?? 0,
+            previousScore:  r.score ?? 0, // no prior-period data yet
+            trend:         0,
+            color:         ["#6366f1","#f59e0b","#10b981","#ec4899","#3b82f6"][i % 5],
+          };
+        });
+        // Company-level aggregate
+        const avg = people.length ? Math.round(people.reduce((s, p) => s + p.readinessScore, 0) / people.length) : 0;
+        setLiveData({
+          company: { readinessScore: avg, previousScore: avg, targetScore: 90, trend: [] },
+          teams:   [],   // team breakdown requires team assignments — leave empty for now
+          people,
+        });
+      })
+      .catch(e => console.error("[ralli] LeadershipDashboard readiness fetch failed:", e));
+  }, [isReal, currentOrg?.id]); // eslint-disable-line react-hooks/exhaustive-deps
+
+  // Use live data when available; fall back to LEADERSHIP_SEED for demo / no data yet
+  const data = liveData ?? LEADERSHIP_SEED;
 
   // ── helpers ──
   const scoreColor = (s) => s >= 85 ? C.trueGreen : s >= 70 ? C.orange : C.red;
@@ -13795,21 +13875,24 @@ export default function App() {
     } catch { return SAMPLE_QUIZZES; }
   });
 
-  // Battle card categories — production hook: replace with /api/battle-card-categories
+  // Battle card categories — demo: localStorage; real users: Supabase tenant_bc_categories
   const [bcCategories, setBcCategories] = useState(() => {
+    if (/* real user check deferred to useEffect */ false) return [];
     try {
       const saved = localStorage.getItem("ralli_bc_categories");
       return saved ? JSON.parse(saved) : INITIAL_BC_CATEGORIES;
     } catch { return INITIAL_BC_CATEGORIES; }
   });
 
-  // Battle cards — production hook: replace with /api/battle-cards
+  // Battle cards — demo: localStorage; real users: Supabase tenant_battle_cards
   const [battleCards, setBattleCards] = useState(() => {
     try {
       const saved = localStorage.getItem("ralli_battle_cards");
       return saved ? JSON.parse(saved) : INITIAL_BATTLE_CARDS;
     } catch { return INITIAL_BATTLE_CARDS; }
   });
+
+  // BC data loaded after const user/currentOrg are declared (see useEffect below line 13866)
 
   const user = currentUser;
   const role = user?.role;
@@ -13828,6 +13911,19 @@ export default function App() {
   // Tenant feature_access overrides — loaded from tenant_settings for real users.
   // Ralli Admin can toggle these per-tenant; they override the plan-based defaults.
   const [tenantFeatureAccess, setTenantFeatureAccess] = useState(null); // null = not yet loaded
+
+  // ── Load BC data from Supabase for real users ─────────────────────────────
+  // Placed here so user + currentOrg are already declared above.
+  useEffect(() => {
+    const tid = currentOrg?.id ?? user?.orgId ?? null;
+    if (!user?._isReal || !tid) return;
+    getTenantBcCategories(tid).then(({ data }) => {
+      if (data) setBcCategories(data);
+    }).catch(e => console.error("[ralli] getTenantBcCategories failed:", e));
+    getTenantBattleCards(tid).then(({ data }) => {
+      if (data) setBattleCards(data);
+    }).catch(e => console.error("[ralli] getTenantBattleCards failed:", e));
+  }, [user?._isReal, currentOrg?.id, user?.orgId]); // eslint-disable-line react-hooks/exhaustive-deps
 
   // Map NAV featureKey → tenant_settings.feature_access key
   const FEATURE_KEY_MAP = { games: "games", learn: "learn", leaderboard: "learn", progress: "analytics", battlecards: "battle_cards", quizzes: "learn", dashboard: null };
@@ -13869,6 +13965,13 @@ export default function App() {
         let profile = await getProfile(session.user.id);
         if (!profile) profile = await createMissingProfile(session.user);
         if (profile) {
+          // Load real XP total from user_point_events (canonical source; profiles.xp is stale)
+          if (profile.orgId) {
+            getLeaderboard(profile.orgId, profile.id).then(({ data }) => {
+              const row = data?.find(r => r.userId === profile.id || r.id === profile.id);
+              if (row?.total != null) setCurrentUser(prev => prev ? { ...prev, xp: row.total } : prev);
+            }).catch(() => {});
+          }
           setCurrentUser(profile);
           if (isRalliAdmin(profile.role)) {
             setScreen("organizations");
@@ -13924,11 +14027,27 @@ export default function App() {
       if (data !== null) setQuizzes(data);
     });
 
-    // Battle cards — real orgs start blank; use tenant-scoped localStorage keys
-    const savedCats  = localStorage.getItem(`ralli_bc_categories_${tenantId}`);
-    const savedCards = localStorage.getItem(`ralli_bc_cards_${tenantId}`);
-    setBcCategories(savedCats  ? JSON.parse(savedCats)  : []);
-    setBattleCards(savedCards  ? JSON.parse(savedCards) : []);
+    // Profile prefs — load from Supabase (nickname, avatarEmoji, notifPrefs)
+    // BC data is loaded in a separate useEffect keyed on currentOrg.id
+    supabase.from("profiles")
+      .select("nickname, avatar_emoji, profile_pic_url, notif_prefs")
+      .eq("id", currentUser.id)
+      .single()
+      .then(({ data: p }) => {
+        if (!p) return;
+        if (p.nickname || p.avatar_emoji || p.profile_pic_url) {
+          setUserProfile(prev => ({
+            ...prev,
+            ...(p.nickname        ? { nickname:      p.nickname }        : {}),
+            ...(p.avatar_emoji    ? { avatarEmoji:   p.avatar_emoji }    : {}),
+            ...(p.profile_pic_url ? { profilePicUrl: p.profile_pic_url } : {}),
+          }));
+        }
+        if (p.notif_prefs && typeof p.notif_prefs === "object") {
+          setNotifPrefs(prev => ({ ...prev, ...p.notif_prefs }));
+        }
+      })
+      .catch(e => console.error("[ralli] load profile prefs failed:", e));
 
     // Feature access — load tenant_settings.feature_access so nav reflects Ralli Admin overrides
     supabase.from("tenant_settings").select("feature_access").eq("tenant_id", tenantId).single()
@@ -13952,13 +14071,11 @@ export default function App() {
       });
   }, [currentUser?.id]); // eslint-disable-line react-hooks/exhaustive-deps
 
-  // ── Load tenant + orgUsers for real regular users ─────────────────────────
-  // When role=user logs in (invite or normal login), currentOrg is null because
-  // orgs[] only has seed data. Load the real tenant so currentOrg resolves
-  // (needed for userPlan, feature gating, org badge in sidebar) and load
-  // their teammates so team-scoped components show real data.
+  // ── Load tenant + orgUsers for all real users ────────────────────────────
+  // Runs for any _isReal user (role=user, orgAdmin, etc.) so that orgUsers
+  // is populated for HomeScreen leaderboard, InsightsScreen, and Assign modals.
   useEffect(() => {
-    if (!currentUser?._isReal || currentUser.role !== "user" || !currentUser.orgId) return;
+    if (!currentUser?._isReal || !currentUser.orgId) return;
     const tenantId = currentUser.orgId;
 
     // Load tenant row → currentOrg, userPlan
@@ -14237,60 +14354,100 @@ export default function App() {
     return data;
   };
 
-  // ── XP award — Production hook: replace with /api/xp/award ──
+  // ── XP award — updates in-memory state only.
+  // Source of truth for XP is user_point_events (written by scoringService).
+  // profiles.xp is legacy — do not write it to avoid divergence with game points.
   const handleAwardXp = (amount) => {
     if (!amount || !currentUser) return;
     const newXp = (currentUser.xp || 0) + amount;
     setCurrentUser(prev => prev ? { ...prev, xp: newXp } : prev);
-    // Persist to Supabase for real users (fire-and-forget)
-    if (currentUser._isReal) {
-      supabase.from("profiles").update({ xp: newXp }).eq("id", currentUser.id)
-        .then(({ error }) => { if (error) console.error("[ralli] XP persist failed:", error); });
-    }
   };
 
   const handleSaveProfile = (updated) => {
     const next = { ...userProfile, ...updated };
     setUserProfile(next);
     try { localStorage.setItem(`ralli_profile_${user.id}`, JSON.stringify(next)); } catch {}
+    // Persist to Supabase for real users so prefs survive across devices/sessions
+    if (user?._isReal && user.id) {
+      dbUpdateUserProfile(user.id, {
+        nickname:      updated.nickname      ?? userProfile.nickname,
+        avatarEmoji:   updated.avatarEmoji   ?? userProfile.avatarEmoji,
+        profilePicUrl: updated.profilePicUrl ?? userProfile.profilePicUrl,
+      }).catch(e => console.error("[ralli] updateUserProfile failed:", e));
+    }
   };
 
   const handleSaveNotifs = (updated) => {
     setNotifPrefs(updated);
     try { localStorage.setItem(`ralli_notifs_${user.id}`, JSON.stringify(updated)); } catch {}
+    // Persist to Supabase for real users
+    if (user?._isReal && user.id) {
+      dbUpdateUserProfile(user.id, { notifPrefs: updated })
+        .catch(e => console.error("[ralli] updateUserProfile (notifPrefs) failed:", e));
+    }
   };
 
   // ── Battle card category CRUD ──
   const bcCatKey   = currentOrg?.id ? `ralli_bc_categories_${currentOrg.id}` : "ralli_bc_categories";
   const bcCardsKey = currentOrg?.id ? `ralli_bc_cards_${currentOrg.id}`      : "ralli_battle_cards";
 
-  const handleSaveBcCategory = (cat) => {
+  const handleSaveBcCategory = async (cat) => {
+    const tid = currentOrg?.id ?? user?.orgId ?? null;
+    if (user?._isReal && tid) {
+      const { data, error } = await dbSaveBcCategory(tid, cat, user.id);
+      if (error) { console.error("[ralli] saveBcCategory failed:", error); return; }
+      if (data) {
+        setBcCategories(prev => prev.find(c => c.id === data.id) ? prev.map(c => c.id === data.id ? data : c) : [...prev, data]);
+        return;
+      }
+    }
+    // Demo fallback
     setBcCategories(prev => {
       const next = prev.find(c => c.id === cat.id) ? prev.map(c => c.id === cat.id ? cat : c) : [...prev, cat];
       try { localStorage.setItem(bcCatKey, JSON.stringify(next)); } catch {}
       return next;
     });
   };
-  const handleDeleteBcCategory = (id) => {
+  const handleDeleteBcCategory = async (id) => {
+    const tid = currentOrg?.id ?? user?.orgId ?? null;
+    if (user?._isReal && tid) {
+      const { error } = await dbDeleteBcCategory(tid, id);
+      if (error) { console.error("[ralli] deleteBcCategory failed:", error); return; }
+    }
     setBcCategories(prev => {
       const next = prev.filter(c => c.id !== id);
-      try { localStorage.setItem(bcCatKey, JSON.stringify(next)); } catch {}
+      if (!user?._isReal) { try { localStorage.setItem(bcCatKey, JSON.stringify(next)); } catch {} }
       return next;
     });
   };
 
   // ── Battle card CRUD ──
-  const handleSaveBattleCard = (card) => {
+  const handleSaveBattleCard = async (card) => {
+    const tid = currentOrg?.id ?? user?.orgId ?? null;
+    if (user?._isReal && tid) {
+      const { data, error } = await dbSaveBattleCard(tid, card, user.id);
+      if (error) { console.error("[ralli] saveBattleCard failed:", error); return; }
+      if (data) {
+        setBattleCards(prev => prev.find(c => c.id === data.id) ? prev.map(c => c.id === data.id ? data : c) : [...prev, data]);
+        return;
+      }
+    }
+    // Demo fallback
     setBattleCards(prev => {
       const next = prev.find(c => c.id === card.id) ? prev.map(c => c.id === card.id ? card : c) : [...prev, card];
       try { localStorage.setItem(bcCardsKey, JSON.stringify(next)); } catch {}
       return next;
     });
   };
-  const handleDeleteBattleCard = (id) => {
+  const handleDeleteBattleCard = async (id) => {
+    const tid = currentOrg?.id ?? user?.orgId ?? null;
+    if (user?._isReal && tid) {
+      const { error } = await dbDeleteBattleCard(tid, id);
+      if (error) { console.error("[ralli] deleteBattleCard failed:", error); return; }
+    }
     setBattleCards(prev => {
       const next = prev.filter(c => c.id !== id);
-      try { localStorage.setItem(bcCardsKey, JSON.stringify(next)); } catch {}
+      if (!user?._isReal) { try { localStorage.setItem(bcCardsKey, JSON.stringify(next)); } catch {} }
       return next;
     });
   };
@@ -14557,6 +14714,8 @@ export default function App() {
     if (user?._isReal && gameTenantId && lobbyPin) {
       awardGamePointsForSession(gameTenantId, lobbyPin, data?.scores ?? [])
         .catch(e => console.error("[ralli] awardGamePointsForSession failed:", e));
+      // Trigger readiness update for the host — individual participant updates happen server-side
+      triggerReadinessUpdate(gameTenantId, user.id);
     }
   };
 
