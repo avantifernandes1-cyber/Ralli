@@ -8164,7 +8164,7 @@ function QuizLibraryGrid({ quizzes, onEditQuiz, onNav, onDeleteQuiz, onToggleFav
 }
 
 // ── QuizzesScreen (user branch rewritten, admin branch preserved) ─────────────
-function QuizzesScreen({ role, onNav, quizzes, onEditQuiz, onDeleteQuiz, onToggleFavorite, onToggleActive, pendingQuizId, onClearPendingQuiz, canCreate = true, canEdit = true, canDelete = true, canLaunch = true, canAssign = true, onAssignQuiz, orgUsers = [], orgs = [], currentUser = null, tenantId = null, isReal = false }) {
+function QuizzesScreen({ role, onNav, quizzes, onEditQuiz, onDeleteQuiz, onToggleFavorite, onToggleActive, pendingQuizId, onClearPendingQuiz, canCreate = true, canEdit = true, canDelete = true, canLaunch = true, canAssign = true, onAssignQuiz, orgUsers = [], orgs = [], currentUser = null, tenantId = null, isReal = false, quizzesReady = false }) {
 
   // ── USER VIEW ─────────────────────────────────────────────────────────────
   if (role === "user") {
@@ -8174,9 +8174,12 @@ function QuizzesScreen({ role, onNav, quizzes, onEditQuiz, onDeleteQuiz, onToggl
     // Attempt history keyed by quiz_id — source of truth for retake detection
     const [userQuizAttempts, setUserQuizAttempts] = useState({});
 
-    // Load quiz assignments from Supabase for real users
+    // Load quiz assignments from Supabase for real users.
+    // Gated on quizzesReady so the merge always has access to the full quizzes array —
+    // prevents the race where assignments resolve before getTenantQuizzes finishes.
     useEffect(() => {
       if (!isReal || !tenantId || !currentUser) return;
+      if (!quizzesReady) return; // wait for App-level quiz load to complete first
       getTenantAssignments(tenantId).then(({ data }) => {
         if (!data) { setAssignmentsLoaded(true); return; }
         const userTeamId = currentUser.teamId ?? null;
@@ -8204,7 +8207,7 @@ function QuizzesScreen({ role, onNav, quizzes, onEditQuiz, onDeleteQuiz, onToggl
         setAssignments(merged);
         setAssignmentsLoaded(true);
       });
-    }, [tenantId, isReal, currentUser?.id]); // eslint-disable-line react-hooks/exhaustive-deps
+    }, [tenantId, isReal, currentUser?.id, quizzesReady]); // eslint-disable-line react-hooks/exhaustive-deps
 
     // Load quiz attempt history from Supabase (for retake detection / attemptNum)
     useEffect(() => {
@@ -13992,13 +13995,16 @@ export default function App() {
   // Stable player ID for this session
   const [playerId] = useState(() => Math.random().toString(36).slice(2));
 
-  // Quizzes — persisted to localStorage
+  // Quizzes — demo users: persist to localStorage; real users: Supabase only
   const [quizzes, setQuizzes] = useState(() => {
     try {
       const saved = localStorage.getItem("ralli_quizzes");
       return saved ? JSON.parse(saved) : SAMPLE_QUIZZES;
     } catch { return SAMPLE_QUIZZES; }
   });
+  // True once getTenantQuizzes has resolved for the current real user session.
+  // QuizzesScreen waits for this before merging assignments so the race is avoided.
+  const [quizzesReady, setQuizzesReady] = useState(false);
 
   // Battle card categories — demo: localStorage; real users: Supabase tenant_bc_categories
   const [bcCategories, setBcCategories] = useState(() => {
@@ -14153,12 +14159,15 @@ export default function App() {
       if (data) setSessions(data);
     });
 
-    // Quizzes — real tenants load from Supabase.
-    // Only replace state if the query succeeded (data !== null).
-    // A null result means RLS/network error — keep whatever localStorage init loaded.
+    // Quizzes — real users: clear seed/demo data immediately, then load from Supabase.
+    // Clearing prevents demo quiz flash while the DB fetch is in-flight.
+    // setQuizzesReady(true) signals QuizzesScreen that quizzes are resolved so it
+    // can safely merge quiz assignments without hitting a race condition.
+    setQuizzes([]);
     getTenantQuizzes(tenantId).then(({ data, error }) => {
       if (error) console.error("[ralli] getTenantQuizzes failed:", error);
       if (data !== null) setQuizzes(data);
+      setQuizzesReady(true); // signal even on error so QuizzesScreen doesn't hang
     });
 
     // Profile prefs — load from Supabase (nickname, avatarEmoji, notifPrefs)
@@ -14615,13 +14624,11 @@ export default function App() {
         return;
       }
       const canonical = saved;
-      setQuizzes(prev => {
-        const updated = prev.find(q => q.id === quiz.id || q.id === canonical.id)
+      setQuizzes(prev =>
+        prev.find(q => q.id === quiz.id || q.id === canonical.id)
           ? prev.map(q => (q.id === quiz.id || q.id === canonical.id) ? canonical : q)
-          : [...prev, canonical];
-        try { localStorage.setItem("ralli_quizzes", JSON.stringify(updated)); } catch {}
-        return updated;
-      });
+          : [...prev, canonical]
+      ); // real users: no localStorage write — Supabase is source of truth
       setEditingQuiz(null);
       setScreen("quizzes");
       return;
@@ -14645,7 +14652,7 @@ export default function App() {
   const handleDeleteQuiz = (id) => {
     setQuizzes(prev => {
       const updated = prev.filter(q => q.id !== id);
-      try { localStorage.setItem("ralli_quizzes", JSON.stringify(updated)); } catch {}
+      if (!user?._isReal) { try { localStorage.setItem("ralli_quizzes", JSON.stringify(updated)); } catch {} }
       return updated;
     });
     // Fire-and-forget DB delete for real users (only UUIDs are in the DB)
@@ -14655,19 +14662,35 @@ export default function App() {
   };
 
   const handleToggleFavorite = (id) => {
+    const orgId = currentOrg?.id ?? user?.orgId ?? null;
+    const current = quizzes.find(q => q.id === id);
+    if (!current) return;
+    const toggled = { ...current, favorite: !current.favorite };
     setQuizzes(prev => {
-      const updated = prev.map(q => q.id === id ? { ...q, favorite: !q.favorite } : q);
-      try { localStorage.setItem("ralli_quizzes", JSON.stringify(updated)); } catch {}
+      const updated = prev.map(q => q.id === id ? toggled : q);
+      if (!user?._isReal) { try { localStorage.setItem("ralli_quizzes", JSON.stringify(updated)); } catch {} }
       return updated;
     });
+    if (user?._isReal && orgId) {
+      upsertQuiz(orgId, toggled, user?.id)
+        .then(({ error }) => { if (error) console.error("[ralli] toggleFavorite upsert failed:", error); });
+    }
   };
 
   const handleToggleActive = (id) => {
+    const orgId = currentOrg?.id ?? user?.orgId ?? null;
+    const current = quizzes.find(q => q.id === id);
+    if (!current) return;
+    const toggled = { ...current, status: current.status === "inactive" ? "active" : "inactive" };
     setQuizzes(prev => {
-      const updated = prev.map(q => q.id === id ? { ...q, status: q.status === "inactive" ? "active" : "inactive" } : q);
-      try { localStorage.setItem("ralli_quizzes", JSON.stringify(updated)); } catch {}
+      const updated = prev.map(q => q.id === id ? toggled : q);
+      if (!user?._isReal) { try { localStorage.setItem("ralli_quizzes", JSON.stringify(updated)); } catch {} }
       return updated;
     });
+    if (user?._isReal && orgId) {
+      upsertQuiz(orgId, toggled, user?.id)
+        .then(({ error }) => { if (error) console.error("[ralli] toggleActive upsert failed:", error); });
+    }
   };
 
   const handleAssignQuiz = async (assignment) => {
@@ -14913,7 +14936,7 @@ export default function App() {
       case "rankd-game":        return <RankdGameScreen onNav={navigate} sessionName={lobbySessionName} role={gameRole} playerName={lobbyPlayerName ?? user.name} questions={gameQuestions ?? GAME_QUESTIONS} demoMode={gameRole === "admin" && sessions.find(s => s.code === lobbyPin)?.demoMode !== false} pin={lobbyPin} sessionDbId={sessions.find(s => s.code === lobbyPin)?.dbId ?? null} tenantId={currentOrg?.id ?? user?.orgId ?? null} broadcast={broadcast} chMsg={chMsg} chAnswers={chAnswers} chPlayers={chPlayers} playerId={playerId} onGameEnd={handleGameEnd} setChAnswers={setChAnswers} />;
       case "rankd-results":     return <RankdResultsScreen onNav={navigate} sessionCode={viewResultsCode} sessions={sessions} gameData={gameResultsData} />;
       case "learn":             return <LearnScreen role={gameRole} user={user} orgUsers={orgUsers} orgs={orgs} onNav={navigate} onAwardXp={handleAwardXp} pendingLessonId={pendingLessonId} onClearPendingLesson={() => setPendingLessonId(null)} pendingCourseId={pendingCourseId} onClearPendingCourse={() => setPendingCourseId(null)} canCreate={perm("actions","create")} canEdit={perm("actions","edit")} canDelete={perm("actions","delete")} canAssign={perm("actions","assign")} tenantId={currentOrg?.id ?? null} isReal={!!user?._isReal} quizzes={quizzes} />;
-      case "quizzes":           return <QuizzesScreen role={gameRole} onNav={navigate} quizzes={quizzes} onEditQuiz={handleEditQuiz} onDeleteQuiz={handleDeleteQuiz} onToggleFavorite={handleToggleFavorite} onToggleActive={handleToggleActive} pendingQuizId={pendingQuizId} onClearPendingQuiz={() => setPendingQuizId(null)} canCreate={perm("actions","create")} canEdit={perm("actions","edit")} canDelete={perm("actions","delete")} canLaunch={perm("actions","launch")} canAssign={perm("actions","assign")} onAssignQuiz={handleAssignQuiz} orgUsers={orgUsers} orgs={orgs} currentUser={currentUser} tenantId={currentOrg?.id ?? null} isReal={!!user?._isReal} />;
+      case "quizzes":           return <QuizzesScreen role={gameRole} onNav={navigate} quizzes={quizzes} onEditQuiz={handleEditQuiz} onDeleteQuiz={handleDeleteQuiz} onToggleFavorite={handleToggleFavorite} onToggleActive={handleToggleActive} pendingQuizId={pendingQuizId} onClearPendingQuiz={() => setPendingQuizId(null)} canCreate={perm("actions","create")} canEdit={perm("actions","edit")} canDelete={perm("actions","delete")} canLaunch={perm("actions","launch")} canAssign={perm("actions","assign")} onAssignQuiz={handleAssignQuiz} orgUsers={orgUsers} orgs={orgs} currentUser={currentUser} tenantId={currentOrg?.id ?? null} isReal={!!user?._isReal} quizzesReady={quizzesReady} />;
       case "battlecards":       return (isAdminType && perm("actions","edit"))
         ? <BattleCardsAdminScreen categories={bcCategories} cards={battleCards} onSaveCategory={handleSaveBcCategory} onDeleteCategory={handleDeleteBcCategory} onSaveCard={handleSaveBattleCard} onDeleteCard={handleDeleteBattleCard} />
         : <BattleCardsScreen categories={bcCategories} cards={battleCards} />;
