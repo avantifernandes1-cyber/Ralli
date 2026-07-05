@@ -122,29 +122,31 @@ export async function deleteLesson(lessonId) {
 /** Normalise a DB row → app course shape */
 function dbToCourse(row) {
   return {
-    id:          row.id,
-    title:       row.title,
-    description: row.description ?? "",
-    lessonIds:   row.lesson_ids ?? [],
-    emoji:       row.emoji ?? "📚",
-    color:       row.color ?? "#FF6B35",
-    status:      row.status ?? "active",
-    createdAt:   row.created_at,
+    id:             row.id,
+    title:          row.title,
+    description:    row.description ?? "",
+    lessonIds:      row.lesson_ids ?? [],
+    lessonSchedule: row.lesson_schedule ?? {}, // { [lessonId]: { available_after_days: number } }
+    emoji:          row.emoji ?? "📚",
+    color:          row.color ?? "#FF6B35",
+    status:         row.status ?? "active",
+    createdAt:      row.created_at,
   };
 }
 
 /** Normalise an app course → DB payload */
 function courseToDb(course, tenantId, userId) {
   return {
-    tenant_id:   tenantId,
-    title:       course.title,
-    description: course.description ?? null,
-    lesson_ids:  course.lessonIds ?? [],
-    emoji:       course.emoji ?? null,
-    color:       course.color ?? null,
-    status:      course.status ?? "active",
-    created_by:  userId ?? null,
-    updated_at:  new Date().toISOString(),
+    tenant_id:       tenantId,
+    title:           course.title,
+    description:     course.description ?? null,
+    lesson_ids:      course.lessonIds ?? [],
+    lesson_schedule: course.lessonSchedule ?? {},
+    emoji:           course.emoji ?? null,
+    color:           course.color ?? null,
+    status:          course.status ?? "active",
+    created_by:      userId ?? null,
+    updated_at:      new Date().toISOString(),
   };
 }
 

@@ -5619,6 +5619,18 @@ function LearnScreen({ role, user, orgUsers = [], orgs = [], onNav, onAwardXp, p
     if (activeCourse) {
       const cls = activeCourse.lessonIds.map(id => lessons.find(l => l.id === id)).filter(Boolean);
       const doneCount = cls.filter(l => completedLessons.has(l.id)).length;
+      // Availability timing: find this user's assignment for the course and compute per-lesson unlock dates
+      const courseAssignment = myAssignments.find(a => a.contentType === "course" && a.contentId === activeCourse.id);
+      const assignedDate = courseAssignment?.assignedAt ? new Date(courseAssignment.assignedAt) : null;
+      const todayMs = new Date().setHours(0, 0, 0, 0);
+      const lessonSchedule = activeCourse.lessonSchedule ?? {};
+      const getLessonAvailability = (lessonId) => {
+        const days = lessonSchedule[lessonId]?.available_after_days ?? 0;
+        if (!assignedDate || days === 0) return { locked: false, availableDate: null };
+        const base = new Date(assignedDate); base.setHours(0, 0, 0, 0);
+        const availMs = base.getTime() + days * 86400000;
+        return { locked: todayMs < availMs, availableDate: new Date(availMs) };
+      };
       const pct = Math.round((doneCount / Math.max(cls.length, 1)) * 100);
       const totalXp = cls.reduce((s, l) => s + (l.xp || 0), 0);
       const bonusXp = Math.round(totalXp * 0.2);
@@ -5641,8 +5653,8 @@ function LearnScreen({ role, user, orgUsers = [], orgs = [], onNav, onAwardXp, p
                   {isComplete && <span style={{ color: C.green, fontWeight: 700 }}>✓ Complete</span>}
                 </div>
               </div>
-              {!isComplete && cls.find(l => !completedLessons.has(l.id)) && (
-                <button onClick={() => openLesson(cls.find(l => !completedLessons.has(l.id)), activeCourse)} style={{ padding: "9px 18px", borderRadius: 8, border: "none", background: C.orange, color: "#fff", fontSize: 13, fontWeight: 700, cursor: "pointer", flexShrink: 0 }}>
+              {!isComplete && cls.find(l => !completedLessons.has(l.id) && !getLessonAvailability(l.id).locked) && (
+                <button onClick={() => openLesson(cls.find(l => !completedLessons.has(l.id) && !getLessonAvailability(l.id).locked), activeCourse)} style={{ padding: "9px 18px", borderRadius: 8, border: "none", background: C.orange, color: "#fff", fontSize: 13, fontWeight: 700, cursor: "pointer", flexShrink: 0 }}>
                   {doneCount > 0 ? "Continue →" : "Start →"}
                 </button>
               )}
@@ -5660,22 +5672,31 @@ function LearnScreen({ role, user, orgUsers = [], orgs = [], onNav, onAwardXp, p
           <div style={{ display: "flex", flexDirection: "column", gap: 10 }}>
             {cls.map((l, i) => {
               const done = completedLessons.has(l.id);
-              const isNextUp = !done && (i === 0 || completedLessons.has(cls[i - 1]?.id));
+              const { locked, availableDate } = getLessonAvailability(l.id);
+              const isNextUp = !done && !locked && (i === 0 || completedLessons.has(cls[i - 1]?.id));
               const typeColor = LESSON_TYPE_COLORS[l.type] ?? C.orange;
+              const availLabel = availableDate
+                ? availableDate.toLocaleDateString("en-US", { month: "short", day: "numeric" })
+                : null;
               return (
-                <Card key={l.id} style={{ display: "flex", alignItems: "center", gap: 14, opacity: done ? 0.75 : 1 }}>
-                  <div style={{ width: 36, height: 36, borderRadius: 8, flexShrink: 0, background: typeColor + "20", border: `1px solid ${typeColor}30`, display: "flex", alignItems: "center", justifyContent: "center", fontSize: 16 }}>
-                    {done ? <span style={{ color: C.green, fontWeight: 800, fontSize: 14 }}>✓</span> : LESSON_TYPE_ICONS[l.type]}
+                <Card key={l.id} style={{ display: "flex", alignItems: "center", gap: 14, opacity: done ? 0.75 : locked ? 0.5 : 1 }}>
+                  <div style={{ width: 36, height: 36, borderRadius: 8, flexShrink: 0, background: locked ? C.muted : typeColor + "20", border: `1px solid ${locked ? C.border : typeColor + "30"}`, display: "flex", alignItems: "center", justifyContent: "center", fontSize: 16 }}>
+                    {done ? <span style={{ color: C.green, fontWeight: 800, fontSize: 14 }}>✓</span> : locked ? <span style={{ fontSize: 13 }}>🔒</span> : null}
                   </div>
                   <div style={{ flex: 1, minWidth: 0 }}>
-                    <div style={{ fontSize: 11, fontWeight: 700, color: typeColor, letterSpacing: "0.06em", marginBottom: 1 }}>{l.type.toUpperCase()} · {l.duration}</div>
+                    <div style={{ fontSize: 11, fontWeight: 700, color: locked ? C.textMuted : typeColor, letterSpacing: "0.06em", marginBottom: 1 }}>{l.type.toUpperCase()} · {l.duration}</div>
                     <div style={{ fontSize: 14, fontWeight: 700, color: C.text, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{l.title}</div>
                   </div>
                   <div style={{ display: "flex", alignItems: "center", gap: 10, flexShrink: 0 }}>
-                    <span style={{ fontSize: 12, color: C.orange, fontWeight: 700 }}>{l.xp} XP</span>
-                    <button onClick={() => openLesson(l, activeCourse)} style={{ padding: "7px 14px", borderRadius: 7, border: done ? `1px solid ${C.border}` : "none", background: done ? C.white : isNextUp ? C.orange : C.text, color: done ? C.textSub : "#fff", fontSize: 12, fontWeight: 700, cursor: "pointer" }}>
-                      {done ? "Review" : isNextUp ? (i === 0 && doneCount === 0 ? "Start" : "Continue") : "View"}
-                    </button>
+                    <span style={{ fontSize: 12, color: locked ? C.textMuted : C.orange, fontWeight: 700 }}>{locked ? "" : `${l.xp} XP`}</span>
+                    {locked
+                      ? <span style={{ fontSize: 11, color: C.textSub, fontWeight: 600, padding: "7px 10px", borderRadius: 7, background: C.muted, border: `1px solid ${C.border}` }}>
+                          {availLabel ? `Available ${availLabel}` : "Locked"}
+                        </span>
+                      : <button onClick={() => openLesson(l, activeCourse)} style={{ padding: "7px 14px", borderRadius: 7, border: done ? `1px solid ${C.border}` : "none", background: done ? C.white : isNextUp ? C.orange : C.text, color: done ? C.textSub : "#fff", fontSize: 12, fontWeight: 700, cursor: "pointer" }}>
+                          {done ? "Review" : isNextUp ? (i === 0 && doneCount === 0 ? "Start" : "Continue") : "View"}
+                        </button>
+                    }
                   </div>
                 </Card>
               );
@@ -6019,9 +6040,6 @@ function LearnScreen({ role, user, orgUsers = [], orgs = [], onNav, onAwardXp, p
         <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fill, minmax(300px, 1fr))", gap: 16 }}>
           {filteredLessons.map(lesson => (
             <Card key={lesson.id} style={{ opacity: lesson.status === "inactive" ? 0.6 : 1, display: "flex", flexDirection: "column" }}>
-              <div style={{ fontSize: 10, fontWeight: 700, color: LESSON_TYPE_COLORS[lesson.type], letterSpacing: "0.08em", textTransform: "uppercase", marginBottom: 8 }}>
-                {lesson.type}{lesson.status === "inactive" ? " · Inactive" : ""}
-              </div>
               <h3 style={{ margin: "0 0 6px", fontSize: 14, fontWeight: 700, color: C.text, lineHeight: 1.3 }}>{lesson.title}</h3>
               <p style={{ margin: "0 0 12px", fontSize: 12, color: C.textMuted, lineHeight: 1.55, flex: 1 }}>{lesson.description}</p>
               <div style={{ display: "flex", gap: 12, fontSize: 12, color: C.textSub, marginBottom: 14 }}>
@@ -6163,9 +6181,11 @@ function LearnScreen({ role, user, orgUsers = [], orgs = [], onNav, onAwardXp, p
                 <div key={`${a.id}-${u.id}-${i}`} style={{ display: "grid", gridTemplateColumns: "2fr 1.2fr 0.8fr 1fr 0.8fr 80px", gap: 10, padding: "13px 16px", background: C.white, borderTop: `1px solid ${C.border}`, alignItems: "center" }}>
                   {/* Content — clickable to drill into this assignment */}
                   <div style={{ display: "flex", alignItems: "center", gap: 10, minWidth: 0 }}>
-                    <div style={{ width: 30, height: 30, borderRadius: 7, background: tColor + "20", flexShrink: 0, display: "flex", alignItems: "center", justifyContent: "center", fontSize: 13 }}>
-                      {contentIcon}
-                    </div>
+                    {contentIcon && (
+                      <div style={{ width: 30, height: 30, borderRadius: 7, background: tColor + "20", flexShrink: 0, display: "flex", alignItems: "center", justifyContent: "center", fontSize: 13 }}>
+                        {contentIcon}
+                      </div>
+                    )}
                     <div style={{ minWidth: 0 }}>
                       <button
                         onClick={() => setSelectedAssignmentId(selectedAssignmentId === a.id ? null : a.id)}
@@ -6229,7 +6249,9 @@ function LearnScreen({ role, user, orgUsers = [], orgs = [], onNav, onAwardXp, p
               <div style={{ display: "flex", alignItems: "center", gap: 12, marginBottom: 16, padding: "12px 16px", background: C.white, borderRadius: 10, border: `1px solid ${C.border}` }}>
                 <button onClick={() => setSelectedAssignmentId(null)} style={{ background: "none", border: "none", cursor: "pointer", color: C.textSub, fontSize: 13, fontWeight: 700, display: "flex", alignItems: "center", gap: 6, padding: 0, flexShrink: 0 }}>← All Assignments</button>
                 <span style={{ color: C.border, fontSize: 18 }}>|</span>
-                <span style={{ fontSize: 15 }}>{detailAssignment?.contentType === "course" ? detailContent.emoji : detailAssignment?.contentType === "quiz" ? "📋" : LESSON_TYPE_ICONS[detailContent.type]}</span>
+                {(detailAssignment?.contentType === "quiz" || (detailAssignment?.contentType === "course" && detailContent.emoji)) && (
+                  <span style={{ fontSize: 15 }}>{detailAssignment?.contentType === "course" ? detailContent.emoji : "📋"}</span>
+                )}
                 <div style={{ flex: 1, minWidth: 0 }}>
                   <div style={{ fontSize: 14, fontWeight: 700, color: C.text }}>{detailContent.title ?? detailContent.name}</div>
                   <div style={{ fontSize: 11, color: C.textSub }}>{detailAssignment?.contentType === "course" ? "Course" : detailAssignment?.contentType === "quiz" ? "Quiz" : "Lesson"}{detailAssignment?.required ? " · Required" : ""} · {visibleRows.length} rep{visibleRows.length !== 1 ? "s" : ""}</div>
@@ -6266,7 +6288,7 @@ function LearnScreen({ role, user, orgUsers = [], orgs = [], onNav, onAwardXp, p
               <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
                 {archivedCourses.map(c => (
                   <Card key={c.id} style={{ display: "flex", alignItems: "center", gap: 14, opacity: 0.72 }}>
-                    <div style={{ width: 36, height: 36, borderRadius: 8, background: (c.color ?? C.orange) + "20", flexShrink: 0, display: "flex", alignItems: "center", justifyContent: "center", fontSize: 18 }}>{c.emoji}</div>
+                    {c.emoji && <div style={{ width: 36, height: 36, borderRadius: 8, background: (c.color ?? C.orange) + "20", flexShrink: 0, display: "flex", alignItems: "center", justifyContent: "center", fontSize: 18 }}>{c.emoji}</div>}
                     <div style={{ flex: 1, minWidth: 0 }}>
                       <div style={{ fontSize: 13, fontWeight: 700, color: C.text }}>{c.title}</div>
                       <div style={{ fontSize: 11, color: C.textSub }}>Course · {c.lessonIds?.length ?? 0} lessons</div>
@@ -6283,7 +6305,6 @@ function LearnScreen({ role, user, orgUsers = [], orgs = [], onNav, onAwardXp, p
               <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
                 {archivedLessons.map(l => (
                   <Card key={l.id} style={{ display: "flex", alignItems: "center", gap: 14, opacity: 0.72 }}>
-                    <div style={{ width: 36, height: 36, borderRadius: 8, background: (LESSON_TYPE_COLORS[l.type] ?? C.orange) + "20", flexShrink: 0, display: "flex", alignItems: "center", justifyContent: "center", fontSize: 18 }}>{LESSON_TYPE_ICONS[l.type]}</div>
                     <div style={{ flex: 1, minWidth: 0 }}>
                       <div style={{ fontSize: 13, fontWeight: 700, color: C.text }}>{l.title}</div>
                       <div style={{ fontSize: 11, color: C.textSub }}>{(l.type ?? "").toUpperCase()} · {l.duration}</div>
@@ -6636,27 +6657,33 @@ function LessonViewerScreen({ lesson, courseTitle, onBack, completed, onComplete
 function CourseBuilderModal({ course, lessons, onSave, onClose, onCreateLesson }) {
   const EMOJIS = ["", "", "", "", "", "", "", ""];
   const COLORS = [C.orange, C.blue, C.purple, C.green, C.red, "#F59E0B"];
-  const SCHEDULE_OPTIONS = [
-    { value: "immediately", label: "Immediately" },
-    { value: "day1",        label: "Day 1" },
-    { value: "day2",        label: "Day 2" },
-    { value: "week1",       label: "Week 1" },
-    { value: "custom",      label: "Custom" },
-  ];
   const [title,    setTitle]    = useState(course?.title ?? "");
   const [desc,     setDesc]     = useState(course?.description ?? "");
   const [emoji,    setEmoji]    = useState(course?.emoji ?? "");
   const [color,    setColor]    = useState(course?.color ?? C.orange);
   const [required, setRequired] = useState(course?.required ?? false);
   const [selectedLessons, setSelectedLessons] = useState(course?.lessonIds ?? []);
-  const [schedule, setSchedule] = useState(course?.lessonSchedule ?? {}); // { [lessonId]: { timing, customDays } }
+  // schedule: { [lessonId]: { available_after_days: number } }
+  const [schedule, setSchedule] = useState(() => {
+    const s = course?.lessonSchedule ?? {};
+    // Normalise any old string-timing format to integer days
+    const result = {};
+    for (const [id, val] of Object.entries(s)) {
+      if (typeof val?.available_after_days === "number") {
+        result[id] = { available_after_days: val.available_after_days };
+      } else if (val?.timing) {
+        const dayMap = { immediately: 0, day1: 1, day2: 2, week1: 7, custom: val.customDays ?? 1 };
+        result[id] = { available_after_days: dayMap[val.timing] ?? 0 };
+      }
+    }
+    return result;
+  });
   const [localLessons, setLocalLessons] = useState(lessons); // includes newly-created ones
   const [showNewLesson, setShowNewLesson] = useState(false);
 
   const toggleLesson = (id) => setSelectedLessons(prev => prev.includes(id) ? prev.filter(x => x !== id) : [...prev, id]);
 
-  const setTiming = (id, timing) => setSchedule(prev => ({ ...prev, [id]: { ...prev[id], timing } }));
-  const setCustomDays = (id, days) => setSchedule(prev => ({ ...prev, [id]: { ...prev[id], customDays: Number(days) } }));
+  const setDays = (id, days) => setSchedule(prev => ({ ...prev, [id]: { available_after_days: Math.max(0, parseInt(days, 10) || 0) } }));
 
   const handleSave = () => {
     if (!title.trim()) return;
@@ -6758,7 +6785,6 @@ function CourseBuilderModal({ course, lessons, onSave, onClose, onCreateLesson }
           {localLessons.map((l, i) => {
             const sel = selectedLessons.includes(l.id);
             const order = selectedLessons.indexOf(l.id) + 1;
-            const timing = schedule[l.id]?.timing ?? "immediately";
             return (
               <div key={l.id} style={{ borderRadius: 10, border: `2px solid ${sel ? C.orange : C.border}`, background: sel ? C.orangeLight : C.pageBg, overflow: "hidden" }}>
                 <div onClick={() => toggleLesson(l.id)} style={{ display: "flex", alignItems: "center", gap: 12, padding: "10px 14px", cursor: "pointer" }}>
@@ -6770,7 +6796,6 @@ function CourseBuilderModal({ course, lessons, onSave, onClose, onCreateLesson }
                   }}>
                     {sel ? order : i + 1}
                   </div>
-                  <span style={{ fontSize: 14 }}>{LESSON_TYPE_ICONS[l.type]}</span>
                   <div style={{ flex: 1 }}>
                     <div style={{ fontSize: 13, fontWeight: 700, color: sel ? C.orange : C.text }}>{l.title}</div>
                     <div style={{ fontSize: 11, color: C.textSub }}>{l.duration} · {l.xp} XP</div>
@@ -6778,26 +6803,17 @@ function CourseBuilderModal({ course, lessons, onSave, onClose, onCreateLesson }
                   {sel && <span style={{ fontSize: 14, color: C.orange }}>✓</span>}
                 </div>
                 {sel && (
-                  <div style={{ display: "flex", alignItems: "center", gap: 8, padding: "0 14px 10px", paddingLeft: 62 }} onClick={e => e.stopPropagation()}>
-                    <span style={{ fontSize: 11, color: C.textSub, fontWeight: 600 }}>Schedule:</span>
-                    <select
-                      value={timing}
-                      onChange={e => setTiming(l.id, e.target.value)}
-                      style={{ fontSize: 11, padding: "3px 8px", borderRadius: 6, border: `1px solid ${C.border}`, background: C.white, color: C.text }}
-                    >
-                      {SCHEDULE_OPTIONS.map(o => <option key={o.value} value={o.value}>{o.label}</option>)}
-                    </select>
-                    {timing === "custom" && (
-                      <>
-                        <input
-                          type="number" min={1} max={365}
-                          value={schedule[l.id]?.customDays ?? 1}
-                          onChange={e => setCustomDays(l.id, e.target.value)}
-                          style={{ width: 52, fontSize: 11, padding: "3px 6px", borderRadius: 6, border: `1px solid ${C.border}`, background: C.white }}
-                        />
-                        <span style={{ fontSize: 11, color: C.textSub }}>days after assignment</span>
-                      </>
-                    )}
+                  <div style={{ display: "flex", alignItems: "center", gap: 8, padding: "0 14px 10px", paddingLeft: 50 }} onClick={e => e.stopPropagation()}>
+                    <span style={{ fontSize: 11, color: C.textSub, fontWeight: 600 }}>Available after</span>
+                    <input
+                      type="number" min={0} max={365}
+                      value={schedule[l.id]?.available_after_days ?? 0}
+                      onChange={e => setDays(l.id, e.target.value)}
+                      style={{ width: 52, fontSize: 11, padding: "3px 6px", borderRadius: 6, border: `1px solid ${C.border}`, background: C.white, textAlign: "center" }}
+                    />
+                    <span style={{ fontSize: 11, color: C.textSub }}>
+                      {(schedule[l.id]?.available_after_days ?? 0) === 0 ? "days (immediately)" : "days after assignment"}
+                    </span>
                   </div>
                 )}
               </div>
@@ -7077,7 +7093,9 @@ function AssignContentModal({ contentType, contentId, content, orgUsers, orgs, c
 
         {content && (
           <div style={{ display: "flex", alignItems: "center", gap: 10, padding: "10px 14px", background: C.pageBg, borderRadius: 10, marginBottom: 24 }}>
-            <span style={{ fontSize: 20 }}>{contentType === "course" ? content.emoji : contentType === "quiz" ? "📋" : LESSON_TYPE_ICONS[content.type]}</span>
+            {(contentType === "quiz" || (contentType === "course" && content.emoji)) && (
+              <span style={{ fontSize: 20 }}>{contentType === "course" ? content.emoji : "📋"}</span>
+            )}
             <div>
               <div style={{ fontSize: 13, fontWeight: 700, color: C.text }}>{content.title ?? content.name}</div>
               <div style={{ fontSize: 11, color: C.textSub }}>{contentType === "course" ? `${content.lessonIds?.length ?? 0} lessons` : contentType === "quiz" ? `${content.questions?.length ?? 0} questions` : `${content.duration} · ${content.type}`}</div>
