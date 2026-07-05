@@ -9374,12 +9374,24 @@ function BattleCardsScreen({ categories = INITIAL_BC_CATEGORIES, cards = INITIAL
   const allCardsSorted = [...cards].sort((a, b) => a.title.localeCompare(b.title));
 
   const filtered = search.trim()
-    ? allCardsSorted.filter(c =>
-        c.title.toLowerCase().includes(search.toLowerCase()) ||
-        c.subtitle.toLowerCase().includes(search.toLowerCase()) ||
-        c.summary.toLowerCase().includes(search.toLowerCase()) ||
-        c.tags?.some(t => t.includes(search.toLowerCase()))
-      )
+    ? (() => {
+        const q = search.toLowerCase();
+        return allCardsSorted.filter(c => {
+          const catLabel = categories.find(cat => cat.id === c.categoryId)?.label ?? "";
+          return (
+            c.title?.toLowerCase().includes(q) ||
+            c.subtitle?.toLowerCase().includes(q) ||
+            c.summary?.toLowerCase().includes(q) ||
+            catLabel.toLowerCase().includes(q) ||
+            c.talkTrack?.toLowerCase().includes(q) ||
+            c.strength?.toLowerCase().includes(q) ||
+            c.weakness?.toLowerCase().includes(q) ||
+            c.ourWin?.toLowerCase().includes(q) ||
+            c.tags?.some(t => t.toLowerCase().includes(q)) ||
+            c.content?.some(s => s.heading?.toLowerCase().includes(q) || s.body?.toLowerCase().includes(q))
+          );
+        });
+      })()
     : allCardsSorted;
 
   // ── DETAIL VIEW ──
@@ -9479,7 +9491,7 @@ function BattleCardsScreen({ categories = INITIAL_BC_CATEGORIES, cards = INITIAL
       <div style={{ display: "flex", alignItems: "center", gap: 10, padding: "10px 14px", borderRadius: 10, background: C.cardBg, border: `1px solid ${C.creamBorder}`, maxWidth: 420 }}>
         <span style={{ fontSize: 13, color: C.textMuted }}>Search</span>
         <input
-          type="text" value={search} placeholder="Cards, topics, competitors…"
+          type="text" value={search} placeholder="Search battle cards…"
           onChange={e => setSearch(e.target.value)}
           style={{ flex: 1, border: "none", background: "transparent", fontSize: 13, color: C.text, outline: "none", fontFamily: "inherit" }}
         />
@@ -9495,9 +9507,11 @@ function BattleCardsScreen({ categories = INITIAL_BC_CATEGORIES, cards = INITIAL
             {filtered.length} result{filtered.length !== 1 ? "s" : ""}
           </p>
           {filtered.length === 0 ? (
-            <div style={{ padding: "40px 32px", textAlign: "center", borderRadius: 16, border: `2px dashed ${C.creamBorder}`, background: C.cardBg }}>
-              <p style={{ margin: 0, fontSize: 14, fontWeight: 700, color: C.text }}>No results for "{search}"</p>
-            </div>
+            <EmptyState
+              icon="🔍"
+              title={`No results for "${search}"`}
+              message="Try a competitor name, category, or keyword from the card content."
+            />
           ) : (
             <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
               {filtered.map(card => (
