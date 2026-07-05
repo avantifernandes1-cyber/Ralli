@@ -730,7 +730,19 @@ export async function saveBcCategory(tenantId, cat, userId) {
       .insert(payload)
       .select("id, label, description")
       .single();
-    return { data: data ? dbToCategory(data) : null, error };
+    if (error) return { data: null, error };
+    if (data) return { data: dbToCategory(data), error: null };
+    // Supabase can return null data when RLS blocks the post-insert SELECT.
+    // Fall back to a separate SELECT to retrieve the newly-created row.
+    const { data: fetched } = await supabase
+      .from("tenant_bc_categories")
+      .select("id, label, description")
+      .eq("tenant_id", tenantId)
+      .eq("label", cat.label)
+      .order("created_at", { ascending: false })
+      .limit(1)
+      .maybeSingle();
+    return { data: fetched ? dbToCategory(fetched) : null, error: null };
   }
 }
 

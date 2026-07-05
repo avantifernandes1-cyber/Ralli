@@ -4116,7 +4116,7 @@ function RankdNameEntryScreen({ onNav, pin, sessionName, onConfirm, defaultName,
 
 // ── RANKD LOBBY SCREEN ───────────────────────────────────────
 
-function RankdLobbyScreen({ onNav, pin, playerName, playerEmoji, sessionName, role, sessions = [], currentUser, onGameStart, chPlayers, broadcast, playerId, chMsg }) {
+function RankdLobbyScreen({ onNav, pin, playerName, playerEmoji, sessionName, role, sessions = [], currentUser, onGameStart, chPlayers, broadcast, playerId, chMsg, onHostEnd }) {
   const mobile = useMobile();
   const session     = sessions.find(s => s.code === pin);
   const sessionDbId = session?.dbId ?? null;
@@ -4448,12 +4448,19 @@ function RankdLobbyScreen({ onNav, pin, playerName, playerEmoji, sessionName, ro
         )}
       </div>
 
-      {/* Leave */}
+      {/* Leave / End */}
       <div style={{ padding: "0 28px 24px", textAlign: "center" }}>
-        <button onClick={() => onNav("rankd")} style={{
-          fontSize: 13, color: C.textMuted, background: "transparent",
-          border: "none", cursor: "pointer", display: "inline-flex", alignItems: "center", gap: 5,
-        }}>✕ Leave game</button>
+        {role === "admin" ? (
+          <button onClick={() => { if (onHostEnd) onHostEnd(); else onNav("rankd"); }} style={{
+            fontSize: 13, color: C.red, background: "transparent",
+            border: `1px solid ${C.red}30`, borderRadius: 8, padding: "8px 18px", cursor: "pointer",
+          }}>End Session</button>
+        ) : (
+          <button onClick={() => onNav("rankd")} style={{
+            fontSize: 13, color: C.textMuted, background: "transparent",
+            border: "none", cursor: "pointer", display: "inline-flex", alignItems: "center", gap: 5,
+          }}>✕ Leave game</button>
+        )}
       </div>
 
       <style>{`
@@ -6122,10 +6129,33 @@ function LearnScreen({ role, user, orgUsers = [], orgs = [], onNav, onAwardXp, p
     return content?.title.toLowerCase().includes(sq);
   });
 
+  // Count only non-fully-completed assignments for the tab badge
+  const activeAssignmentCount = uniqueAssignments.filter(a => {
+    let users = [];
+    if (a.assignedTo?.type === "individual") {
+      const u = orgUsers.find(x => x.id === a.assignedTo.userId);
+      if (u) users = [u];
+    } else if (a.assignedTo?.type === "team") {
+      users = a.assignedTo.teamId ? orgUsers.filter(u => u.teamId === a.assignedTo.teamId) : [];
+    } else if (a.assignedTo?.type === "group") {
+      users = orgUsers.filter(u => !["ralli_admin", "superadmin", "orgAdmin"].includes(u.role));
+    }
+    if (!users.length) return true;
+    if (a.contentType === "quiz") return true;
+    return users.some(u => {
+      const comps = tenantCompletions.filter(c => c.profileId === u.id);
+      if (a.contentType === "lesson") return !comps.some(c => c.lessonId === a.contentId);
+      const course = courses.find(c => c.id === a.contentId);
+      if (!course) return true;
+      const cls = (course.lessonIds ?? []).map(id => lessons.find(l => l.id === id)).filter(Boolean);
+      return cls.some(l => !comps.some(c => c.lessonId === l.id));
+    });
+  }).length;
+
   const TABS = [
     { id: "courses",     label: "Courses",     count: filteredCourses.length },
     { id: "lessons",     label: "Lessons",     count: filteredLessons.length },
-    { id: "assignments", label: "Assignments", count: uniqueAssignments.length },
+    { id: "assignments", label: "Assignments", count: activeAssignmentCount },
     { id: "archived",    label: "Archived",    count: archivedCourses.length + archivedLessons.length },
   ];
 
@@ -6634,9 +6664,9 @@ function LearnScreen({ role, user, orgUsers = [], orgs = [], onNav, onAwardXp, p
               const { data: saved, error } = await upsertLesson(tenantId, l, user?.id);
               if (error) { console.error("[ralli] upsertLesson failed:", error); toast.error("Failed to save lesson. Please try again."); }
               const canonical = saved ?? { ...l, id: l.id || "ll" + Date.now() };
-              setLessons(prev => !l.id || l.id.startsWith("ll")
-                ? [...prev, canonical]
-                : prev.map(x => x.id === l.id ? canonical : x));
+              setLessons(prev => prev.some(x => x.id === l.id)
+                ? prev.map(x => x.id === l.id ? canonical : x)
+                : [...prev, canonical]);
             } else {
               const withId = { ...l, id: "ll" + Date.now() };
               if (!l.id) {
@@ -6786,9 +6816,47 @@ function LessonBlock({ block, cardStyle }) {
 
   if (block.type === "text") {
     if (!c.body) return null;
+    // Minimal markdown renderer: **bold**, *italic*, __underline__, - bullets, 1. numbered
+    const parseInline = (text) => {
+      const parts = [];
+      let rest = text, k = 0;
+      while (rest) {
+        const m = rest.match(/(\*\*(.+?)\*\*)|(__(.+?)__)|(\*(.+?)\*)/);
+        if (!m) { parts.push(rest); break; }
+        if (m.index > 0) parts.push(rest.slice(0, m.index));
+        if (m[1]) parts.push(<strong key={k++}>{m[2]}</strong>);
+        else if (m[3]) parts.push(<u key={k++}>{m[4]}</u>);
+        else parts.push(<em key={k++}>{m[6]}</em>);
+        rest = rest.slice(m.index + m[0].length);
+      }
+      return parts;
+    };
+    const renderBody = (text) => {
+      const lines = text.split("\n");
+      const out = [];
+      let i = 0;
+      while (i < lines.length) {
+        if (lines[i].startsWith("- ")) {
+          const items = [];
+          while (i < lines.length && lines[i].startsWith("- ")) { items.push(lines[i].slice(2)); i++; }
+          out.push(<ul key={i} style={{ margin: "4px 0 8px", paddingLeft: 22 }}>{items.map((t, j) => <li key={j} style={{ fontSize: 14, lineHeight: 1.8, color: C.text }}>{parseInline(t)}</li>)}</ul>);
+        } else if (/^\d+\.\s/.test(lines[i])) {
+          const items = [];
+          while (i < lines.length && /^\d+\.\s/.test(lines[i])) { items.push(lines[i].replace(/^\d+\.\s/, "")); i++; }
+          out.push(<ol key={i} style={{ margin: "4px 0 8px", paddingLeft: 22 }}>{items.map((t, j) => <li key={j} style={{ fontSize: 14, lineHeight: 1.8, color: C.text }}>{parseInline(t)}</li>)}</ol>);
+        } else if (lines[i] === "") {
+          out.push(<br key={i} />);
+          i++;
+        } else {
+          out.push(<p key={i} style={{ margin: "0 0 6px", fontSize: 14, lineHeight: 1.8, color: C.text }}>{parseInline(lines[i])}</p>);
+          i++;
+        }
+      }
+      return out;
+    };
     return withHeader(
       <div style={style}>
-        <pre style={{ margin: 0, fontSize: 14, lineHeight: 1.8, color: C.text, fontFamily: "inherit", whiteSpace: "pre-wrap", wordBreak: "break-word" }}>{c.body}</pre>
+        <div style={{ wordBreak: "break-word" }}>{renderBody(c.body)}</div>
       </div>
     );
   }
@@ -7109,29 +7177,16 @@ function CourseBuilderModal({ course, lessons, onSave, onClose, onCreateLesson }
           ))}
         </div>
 
-        {/* Emoji & Color pickers */}
-        <div style={{ display: "flex", gap: 20, marginBottom: 20 }}>
-          <div style={{ flex: 1 }}>
-            <label style={{ fontSize: 12, fontWeight: 700, color: C.textSub, display: "block", marginBottom: 8 }}>ICON</label>
-            <div style={{ display: "flex", gap: 6, flexWrap: "wrap" }}>
-              {EMOJIS.map(e => (
-                <button key={e} onClick={() => setEmoji(e)} style={{
-                  width: 36, height: 36, borderRadius: 8, border: `2px solid ${emoji === e ? C.orange : C.border}`,
-                  background: emoji === e ? C.orangeLight : C.white, fontSize: 18, cursor: "pointer",
-                }}>{e}</button>
-              ))}
-            </div>
-          </div>
-          <div>
-            <label style={{ fontSize: 12, fontWeight: 700, color: C.textSub, display: "block", marginBottom: 8 }}>COLOR</label>
-            <div style={{ display: "flex", gap: 6 }}>
-              {COLORS.map(col => (
-                <button key={col} onClick={() => setColor(col)} style={{
-                  width: 28, height: 28, borderRadius: "50%", border: `3px solid ${color === col ? C.text : "transparent"}`,
-                  background: col, cursor: "pointer",
-                }} />
-              ))}
-            </div>
+        {/* Color picker */}
+        <div style={{ marginBottom: 20 }}>
+          <label style={{ fontSize: 12, fontWeight: 700, color: C.textSub, display: "block", marginBottom: 8 }}>COLOR</label>
+          <div style={{ display: "flex", gap: 6 }}>
+            {COLORS.map(col => (
+              <button key={col} onClick={() => setColor(col)} style={{
+                width: 28, height: 28, borderRadius: "50%", border: `3px solid ${color === col ? C.text : "transparent"}`,
+                background: col, cursor: "pointer",
+              }} />
+            ))}
           </div>
         </div>
 
@@ -7230,6 +7285,34 @@ function BlockEditor({ block, onChange, onRemove, onMoveUp, onMoveDown, isFirst,
   const setHeader     = (val)      => onChange({ ...block, header: val });
   const setType       = (t)        => onChange({ ...block, type: t, content: {} });
 
+  // Formatting toolbar helpers for text blocks
+  const bodyRef = React.useRef(null);
+  const wrapSel = (before, after) => {
+    const ta = bodyRef.current;
+    if (!ta) return;
+    const s = ta.selectionStart, e = ta.selectionEnd;
+    const body = c.body ?? "";
+    const next = body.slice(0, s) + before + body.slice(s, e) + after + body.slice(e);
+    setC("body", next);
+    setTimeout(() => { ta.selectionStart = s + before.length; ta.selectionEnd = e + before.length; ta.focus(); }, 0);
+  };
+  const insertPrefix = (prefix) => {
+    const ta = bodyRef.current;
+    if (!ta) return;
+    const pos = ta.selectionStart;
+    const body = c.body ?? "";
+    const lineStart = body.lastIndexOf("\n", pos - 1) + 1;
+    const next = body.slice(0, lineStart) + prefix + body.slice(lineStart);
+    setC("body", next);
+    setTimeout(() => { ta.selectionStart = ta.selectionEnd = pos + prefix.length; ta.focus(); }, 0);
+  };
+  const fmtBtn = (label, title, action, labelStyle) => (
+    <button key={title} type="button" onClick={action} title={title} style={{
+      padding: "3px 8px", borderRadius: 5, border: `1px solid ${C.border}`,
+      background: C.white, fontSize: 12, cursor: "pointer", color: C.textSub, lineHeight: 1.4, ...labelStyle,
+    }}>{label}</button>
+  );
+
   const inputStyle = { width: "100%", padding: "9px 12px", borderRadius: 8, border: `1px solid ${C.border}`, fontSize: 13, color: C.text, background: C.pageBg, boxSizing: "border-box" };
   const taStyle    = { ...inputStyle, resize: "vertical", lineHeight: 1.5 };
   const blockColor = LESSON_TYPE_COLORS[block.type] ?? C.orange;
@@ -7265,9 +7348,18 @@ function BlockEditor({ block, onChange, onRemove, onMoveUp, onMoveDown, isFirst,
 
       {/* Type-specific fields */}
       {block.type === "text" && (
-        <textarea value={c.body ?? ""} onChange={e => setC("body", e.target.value)}
-          placeholder="Write lesson content here…" rows={6}
-          style={{ ...taStyle, fontFamily: "monospace", fontSize: 13 }} />
+        <>
+          <div style={{ display: "flex", gap: 5, marginBottom: 6, flexWrap: "wrap" }}>
+            {fmtBtn(<b>B</b>,  "Bold",          () => wrapSel("**", "**"))}
+            {fmtBtn(<i>I</i>,  "Italic",         () => wrapSel("*",  "*" ))}
+            {fmtBtn(<u>U</u>,  "Underline",       () => wrapSel("__", "__"))}
+            {fmtBtn("• —",     "Bullet list",     () => insertPrefix("- "))}
+            {fmtBtn("1.",      "Numbered list",   () => insertPrefix("1. "))}
+          </div>
+          <textarea ref={bodyRef} value={c.body ?? ""} onChange={e => setC("body", e.target.value)}
+            placeholder="Write lesson content here… (supports **bold**, *italic*, __underline__, - bullet, 1. numbered)" rows={6}
+            style={{ ...taStyle, fontFamily: "inherit", fontSize: 13 }} />
+        </>
       )}
       {block.type === "image" && (
         <>
@@ -7347,6 +7439,7 @@ function LessonBuilderModal({ lesson, onSave, onClose }) {
   const [dur,    setDur]    = useState(lesson?.duration ?? "15 min");
   const [xp,     setXp]     = useState(lesson?.xp ?? 100);
   const [status, setStatus] = useState(lesson?.status ?? "active");
+  const [preview, setPreview] = useState(false);
 
   // Blocks — load from lesson (new format) or synthesise from legacy content
   const [blocks, setBlocks] = useState(() => getBlocks(lesson ?? {}));
@@ -7386,10 +7479,30 @@ function LessonBuilderModal({ lesson, onSave, onClose }) {
         {/* Header */}
         <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", marginBottom: 24 }}>
           <h3 style={{ margin: 0, fontSize: 18, fontWeight: 800, color: C.text }}>{lesson ? "Edit Lesson" : "New Lesson"}</h3>
-          <button onClick={onClose} style={{ background: "none", border: "none", fontSize: 20, cursor: "pointer", color: C.textMuted }}>×</button>
+          <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
+            <button onClick={() => setPreview(p => !p)} style={{
+              padding: "6px 14px", borderRadius: 8, border: `1px solid ${C.border}`,
+              background: preview ? C.orange : C.white, color: preview ? "#fff" : C.textSub,
+              fontSize: 12, fontWeight: 700, cursor: "pointer",
+            }}>{preview ? "← Edit" : "Preview"}</button>
+            <button onClick={onClose} style={{ background: "none", border: "none", fontSize: 20, cursor: "pointer", color: C.textMuted }}>×</button>
+          </div>
         </div>
 
-        {/* Metadata */}
+        {/* Preview mode */}
+        {preview && (
+          <div style={{ borderRadius: 12, border: `1px solid ${C.border}`, background: C.pageBg, padding: "20px 24px", marginBottom: 20, minHeight: 200 }}>
+            <h2 style={{ margin: "0 0 6px", fontSize: 18, fontWeight: 800, color: C.text }}>{title || "Untitled Lesson"}</h2>
+            {desc && <p style={{ margin: "0 0 20px", fontSize: 13, color: C.textSub }}>{desc}</p>}
+            {blocks.length === 0 && <p style={{ color: C.textMuted, fontSize: 13 }}>No content blocks yet.</p>}
+            {blocks.map((block, i) => (
+              <LessonBlock key={block.id ?? i} block={block} />
+            ))}
+          </div>
+        )}
+
+        {/* Metadata (hidden in preview) */}
+        {!preview && <>
         <label style={{ fontSize: 12, fontWeight: 700, color: C.textSub, display: "block", marginBottom: 6 }}>LESSON TITLE</label>
         <input value={title} onChange={e => setTitle(e.target.value)} placeholder="e.g. Cold Call Opening Framework"
           style={{ ...inputStyle, fontWeight: 600, fontSize: 14, marginBottom: 14 }} />
@@ -7453,6 +7566,7 @@ function LessonBuilderModal({ lesson, onSave, onClose }) {
             </select>
           </div>
         </div>
+        </>}
 
         <div style={{ display: "flex", gap: 10 }}>
           <button onClick={onClose} style={{ flex: 1, padding: "11px", borderRadius: 8, border: `1px solid ${C.border}`, background: C.white, color: C.text, fontSize: 13, fontWeight: 600, cursor: "pointer" }}>Cancel</button>
@@ -7561,9 +7675,6 @@ function AssignContentModal({ contentType, contentId, content, orgUsers, orgs, c
 
         {content && (
           <div style={{ display: "flex", alignItems: "center", gap: 10, padding: "10px 14px", background: C.pageBg, borderRadius: 10, marginBottom: 24 }}>
-            {(contentType === "quiz" || (contentType === "course" && content.emoji)) && (
-              <span style={{ fontSize: 20 }}>{contentType === "course" ? content.emoji : "📋"}</span>
-            )}
             <div>
               <div style={{ fontSize: 13, fontWeight: 700, color: C.text }}>{content.title ?? content.name}</div>
               <div style={{ fontSize: 11, color: C.textSub }}>{contentType === "course" ? `${content.lessonIds?.length ?? 0} lessons` : contentType === "quiz" ? `${content.questions?.length ?? 0} questions` : `${content.duration} · ${content.type}`}</div>
@@ -8913,11 +9024,11 @@ function BattleCardsAdminScreen({ categories, cards, onSaveCategory, onDeleteCat
   const [catDraft, setCatDraft] = useState(blankCat);
   const openNewCat  = () => { setCatDraft(blankCat()); setEditingCat("new"); setShowCatForm(true); };
   const openEditCat = (cat) => { setCatDraft({ ...cat }); setEditingCat(cat.id); setShowCatForm(true); };
-  const saveCat     = () => {
+  const saveCat     = async () => {
     if (!catDraft.label.trim()) return;
-    onSaveCategory({ ...catDraft, label: catDraft.label.trim() });
+    const saved = await onSaveCategory({ ...catDraft, label: catDraft.label.trim() });
     setShowCatForm(false);
-    if (editingCat === "new") setActiveCatId(catDraft.id);
+    if (editingCat === "new") setActiveCatId(saved?.id ?? catDraft.id);
   };
 
   // ── Confirm delete ──────────────────────────────────────────────────────────
@@ -14849,20 +14960,28 @@ export default function App() {
     const tid = currentOrg?.id ?? user?.orgId ?? null;
     if (user?._isReal && tid) {
       const { data, error } = await dbSaveBcCategory(tid, cat, user.id);
-      if (error) { console.error("[ralli] saveBcCategory failed:", error); toast.error("Failed to save category. Please try again."); return; }
-      if (data) {
-        setBcCategories(prev => prev.find(c => c.id === data.id) ? prev.map(c => c.id === data.id ? data : c) : [...prev, data]);
-        toast.success("Category saved.");
-        return;
-      }
+      if (error) { console.error("[ralli] saveBcCategory failed:", error); toast.error("Failed to save category. Please try again."); return null; }
+      // data may be null if RLS blocks SELECT after INSERT; treat as success and use local cat shape
+      const canonical = data ?? { ...cat, id: cat.id };
+      setBcCategories(prev => {
+        const byRealId = data ? prev.find(c => c.id === data.id) : null;
+        const byTempId = prev.find(c => c.id === cat.id);
+        if (byRealId) return prev.map(c => c.id === canonical.id ? canonical : c);
+        if (byTempId) return prev.map(c => c.id === cat.id ? canonical : c);
+        return [...prev, canonical];
+      });
+      toast.success("Category saved.");
+      return canonical;
     }
     // Demo fallback
+    const canonical = cat;
     setBcCategories(prev => {
-      const next = prev.find(c => c.id === cat.id) ? prev.map(c => c.id === cat.id ? cat : c) : [...prev, cat];
+      const next = prev.find(c => c.id === cat.id) ? prev.map(c => c.id === cat.id ? canonical : c) : [...prev, canonical];
       try { localStorage.setItem(bcCatKey, JSON.stringify(next)); } catch {}
       return next;
     });
     toast.success("Category saved.");
+    return canonical;
   };
   const handleDeleteBcCategory = async (id) => {
     const tid = currentOrg?.id ?? user?.orgId ?? null;
@@ -15005,10 +15124,13 @@ export default function App() {
   const handleAssignQuiz = async (assignment) => {
     const tenantId = currentOrg?.id ?? null;
     if (user?._isReal && tenantId) {
-      const { error } = await dbCreateAssignment(tenantId, assignment, user?.id);
-      if (error) { console.error("[ralli] quiz createAssignment failed:", error); toast.error("Failed to assign quiz. Please try again."); }
-      else { toast.success("Quiz assigned."); }
+      const { data: saved, error } = await dbCreateAssignment(tenantId, assignment, user?.id);
+      if (error) { console.error("[ralli] quiz createAssignment failed:", error); toast.error("Failed to assign quiz. Please try again."); return; }
+      const canonical = saved ?? { ...assignment, id: "a" + Date.now(), assignedAt: "Today" };
+      setAssignments(prev => prev.some(a => a.id === canonical.id) ? prev : [...prev, canonical]);
+      toast.success("Quiz assigned.");
     } else {
+      setAssignments(prev => [...prev, { ...assignment, id: "a" + Date.now(), assignedAt: "Today" }]);
       toast.success("Quiz assigned.");
     }
   };
@@ -15244,7 +15366,7 @@ export default function App() {
       case "rankd-new":         return <NewSessionScreen onNav={navigate} quizzes={quizzes} onCreateSession={handleCreateSession} />;
       case "rankd-quiz-builder":return <QuizBuilderScreen onNav={navigate} onSave={handleSaveQuiz} initialQuiz={editingQuiz} onEditQuiz={handleEditQuiz} />;
       case "rankd-name-entry":  return <RankdNameEntryScreen onNav={navigate} pin={lobbyPin} sessionName={lobbySessionName} onConfirm={handleEnterName} defaultName={userProfile.nickname?.trim() || user?.name || ""} defaultAvatar={userProfile.avatarEmoji} />;
-      case "rankd-lobby":       return <RankdLobbyScreen onNav={navigate} pin={lobbyPin} playerName={lobbyPlayerName} playerEmoji={lobbyPlayerEmoji} sessionName={lobbySessionName} role={gameRole} sessions={sessions} currentUser={currentUser} onGameStart={handleGameStart} chPlayers={chPlayers} broadcast={broadcast} playerId={playerId} chMsg={chMsg} />;
+      case "rankd-lobby":       return <RankdLobbyScreen onNav={navigate} pin={lobbyPin} playerName={lobbyPlayerName} playerEmoji={lobbyPlayerEmoji} sessionName={lobbySessionName} role={gameRole} sessions={sessions} currentUser={currentUser} onGameStart={handleGameStart} chPlayers={chPlayers} broadcast={broadcast} playerId={playerId} chMsg={chMsg} onHostEnd={async () => { await endGameSession(lobbyPin, { tenantId: currentOrg?.id ?? null }); navigate("rankd"); }} />;
       case "rankd-game":        return <RankdGameScreen onNav={navigate} sessionName={lobbySessionName} role={gameRole} playerName={lobbyPlayerName ?? user.name} questions={gameQuestions ?? GAME_QUESTIONS} demoMode={gameRole === "admin" && sessions.find(s => s.code === lobbyPin)?.demoMode !== false} pin={lobbyPin} sessionDbId={sessions.find(s => s.code === lobbyPin)?.dbId ?? null} tenantId={currentOrg?.id ?? user?.orgId ?? null} broadcast={broadcast} chMsg={chMsg} chAnswers={chAnswers} chPlayers={chPlayers} playerId={playerId} onGameEnd={handleGameEnd} setChAnswers={setChAnswers} />;
       case "rankd-results":     return <RankdResultsScreen onNav={navigate} sessionCode={viewResultsCode} sessions={sessions} gameData={gameResultsData} />;
       case "learn":             return <LearnScreen role={gameRole} user={user} orgUsers={orgUsers} orgs={orgs} onNav={navigate} onAwardXp={handleAwardXp} pendingLessonId={pendingLessonId} onClearPendingLesson={() => setPendingLessonId(null)} pendingCourseId={pendingCourseId} onClearPendingCourse={() => setPendingCourseId(null)} canCreate={perm("actions","create")} canEdit={perm("actions","edit")} canDelete={perm("actions","delete")} canAssign={perm("actions","assign")} tenantId={currentOrg?.id ?? null} isReal={!!user?._isReal} quizzes={quizzes} />;
