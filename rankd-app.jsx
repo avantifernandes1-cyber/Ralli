@@ -6025,7 +6025,21 @@ function LearnScreen({ role, user, orgUsers = [], orgs = [], onNav, onAwardXp, p
   const sq = search.toLowerCase();
   const filteredCourses = courses.filter(c => c.status !== "archived" && (!sq || c.title.toLowerCase().includes(sq) || c.description.toLowerCase().includes(sq)));
   const filteredLessons = lessons.filter(l => l.status !== "archived" && (!sq || l.title.toLowerCase().includes(sq) || l.description.toLowerCase().includes(sq)));
-  const filteredAssign  = assignments.filter(a => {
+  // Dedup by (contentType, contentId, assignedTo.type, targetId) — neutralises historical duplicate rows
+  const uniqueAssignments = (() => {
+    const seen = new Set();
+    return assignments.filter(a => {
+      const at = a.assignedTo;
+      const tid = at?.type === "team"       ? (at.teamId   ?? "")
+                : at?.type === "individual" ? (at.userId   ?? "")
+                : (at?.orgId ?? "");
+      const key = `${a.contentType}:${a.contentId}:${at?.type ?? ""}:${tid}`;
+      if (seen.has(key)) return false;
+      seen.add(key);
+      return true;
+    });
+  })();
+  const filteredAssign  = uniqueAssignments.filter(a => {
     if (!sq) return true;
     const content = a.contentType === "course" ? courses.find(c => c.id === a.contentId) : lessons.find(l => l.id === a.contentId);
     return content?.title.toLowerCase().includes(sq);
@@ -6034,7 +6048,7 @@ function LearnScreen({ role, user, orgUsers = [], orgs = [], onNav, onAwardXp, p
   const TABS = [
     { id: "courses",     label: "Courses",     count: filteredCourses.length },
     { id: "lessons",     label: "Lessons",     count: filteredLessons.length },
-    { id: "assignments", label: "Assignments", count: assignments.length },
+    { id: "assignments", label: "Assignments", count: uniqueAssignments.length },
     { id: "archived",    label: "Archived",    count: archivedCourses.length + archivedLessons.length },
   ];
 
@@ -6194,7 +6208,7 @@ function LearnScreen({ role, user, orgUsers = [], orgs = [], onNav, onAwardXp, p
         };
 
         // Expand assignments into per-rep rows
-        const allRows = assignments.flatMap(a => {
+        const allRows = uniqueAssignments.flatMap(a => {
           const isCourse = a.contentType === "course";
           const isQuiz   = a.contentType === "quiz";
           const content  = isCourse
