@@ -4877,6 +4877,7 @@ function NewSessionScreen({ onNav, quizzes, onCreateSession }) {
   const [selectedId,  setSelectedId]  = useState(quizzes[0]?.id ?? null);
   const [sessionName, setSessionName] = useState(quizzes[0]?.name ?? "");
   const [demoMode,    setDemoMode]    = useState(false);
+  const [creating,    setCreating]    = useState(false);
 
   const selectedQuiz = quizzes.find(q => q.id === selectedId);
 
@@ -4885,19 +4886,25 @@ function NewSessionScreen({ onNav, quizzes, onCreateSession }) {
     setSessionName(quiz.name);
   };
 
-  const handleCreate = () => {
-    if (!selectedQuiz || !sessionName.trim()) return;
-    const pin = String(Math.floor(100000 + Math.random() * 900000));
-    onCreateSession({
-      code: pin,
-      name: sessionName.trim(),
-      quizId: selectedQuiz.id,
-      questionCount: selectedQuiz.questions.length,
-      status: "waiting",
-      playerCount: 0,
-      demoMode,
-      players: [],
-    });
+  const handleCreate = async () => {
+    if (!selectedQuiz || !sessionName.trim() || creating) return;
+    setCreating(true);
+    try {
+      await onCreateSession({
+        code: String(Math.floor(100000 + Math.random() * 900000)),
+        name: sessionName.trim(),
+        quizId: selectedQuiz.id,
+        questionCount: selectedQuiz.questions.length,
+        status: "waiting",
+        playerCount: 0,
+        demoMode,
+        players: [],
+      });
+    } finally {
+      // Navigation fires setScreen inside onCreateSession; setCreating(false) is a
+      // safety reset in case of an error (component stays mounted on failure).
+      setCreating(false);
+    }
   };
 
   return (
@@ -5024,12 +5031,16 @@ function NewSessionScreen({ onNav, quizzes, onCreateSession }) {
               {selectedQuiz.questions.length} questions · {demoMode ? "Demo mode" : "Live mode"} · PIN auto-generated on create
             </p>
           </div>
-          <button onClick={handleCreate} style={{
-            padding: "12px 28px", borderRadius: 14, border: "none", cursor: "pointer",
-            fontSize: 14, fontWeight: 900, background: C.orange, color: "#fff",
-            boxShadow: "0 4px 20px rgba(253,191,36,0.28)", flexShrink: 0,
+          <button onClick={handleCreate} disabled={creating} style={{
+            padding: "12px 28px", borderRadius: 14, border: "none",
+            cursor: creating ? "not-allowed" : "pointer",
+            fontSize: 14, fontWeight: 900,
+            background: creating ? C.orange + "99" : C.orange,
+            color: "#fff",
+            boxShadow: creating ? "none" : "0 4px 20px rgba(253,191,36,0.28)",
+            flexShrink: 0,
           }}>
-            Create Session →
+            {creating ? "Launching…" : "Create Session →"}
           </button>
         </div>
       )}
@@ -8145,7 +8156,7 @@ function QuizResultsView({ quiz, attempt, onRetake, onBack }) {
 // ── QuizLibraryGrid ──────────────────────────────────────────────────────────
 // Admin/Manager quiz list. Displays each quiz with edit, delete, favorite, and
 // active-toggle actions. Production hook: replace callbacks with API mutations.
-function QuizLibraryGrid({ quizzes, onEditQuiz, onNav, onDeleteQuiz, onToggleFavorite, onToggleActive, onAssign, canEdit = true, canDelete = true, canAssign = true }) {
+function QuizLibraryGrid({ quizzes, onEditQuiz, onNav, onDeleteQuiz, onToggleFavorite, onToggleActive, onAssign, onLaunchQuiz, canEdit = true, canDelete = true, canAssign = true, canLaunch = false }) {
   const [confirmDelete, setConfirmDelete] = useState(null); // quiz id pending delete confirm
 
   return (
@@ -8191,6 +8202,15 @@ function QuizLibraryGrid({ quizzes, onEditQuiz, onNav, onDeleteQuiz, onToggleFav
                 style={{ fontSize: 11, fontWeight: 700, padding: "4px 10px", borderRadius: 6, border: `1px solid ${C.border}`, background: inactive ? C.muted : C.greenBg, color: inactive ? C.textMuted : C.trueGreen, cursor: "pointer" }}
               >{inactive ? "Inactive" : "Active"}</button>
 
+              {/* Launch */}
+              {canLaunch && onLaunchQuiz && (
+                <button
+                  onClick={() => onLaunchQuiz(quiz)}
+                  title="Launch as live game"
+                  style={{ fontSize: 12, fontWeight: 700, padding: "6px 14px", borderRadius: 8, border: "none", background: C.green, color: "#fff", cursor: "pointer" }}
+                >▶ Launch</button>
+              )}
+
               {/* Assign */}
               {canAssign && onAssign && (
                 <button
@@ -8234,7 +8254,7 @@ function QuizLibraryGrid({ quizzes, onEditQuiz, onNav, onDeleteQuiz, onToggleFav
 }
 
 // ── QuizzesScreen (user branch rewritten, admin branch preserved) ─────────────
-function QuizzesScreen({ role, onNav, quizzes, onEditQuiz, onDeleteQuiz, onToggleFavorite, onToggleActive, pendingQuizId, onClearPendingQuiz, canCreate = true, canEdit = true, canDelete = true, canLaunch = true, canAssign = true, onAssignQuiz, orgUsers = [], orgs = [], currentUser = null, tenantId = null, isReal = false, quizzesReady = false }) {
+function QuizzesScreen({ role, onNav, quizzes, onEditQuiz, onDeleteQuiz, onToggleFavorite, onToggleActive, pendingQuizId, onClearPendingQuiz, canCreate = true, canEdit = true, canDelete = true, canLaunch = true, canAssign = true, onAssignQuiz, onLaunchQuiz, orgUsers = [], orgs = [], currentUser = null, tenantId = null, isReal = false, quizzesReady = false }) {
 
   // ── USER VIEW ─────────────────────────────────────────────────────────────
   if (role === "user") {
@@ -8337,10 +8357,14 @@ function QuizzesScreen({ role, onNav, quizzes, onEditQuiz, onDeleteQuiz, onToggl
           attemptNum: previousAttempts.length + 1,
           answers:    attempt.answers ?? [],
         }).catch(e => console.error("[ralli] saveQuizAttempt failed:", e));
-        // Optimistically update local attempt map so immediate re-open shows correct retake state
+        // Optimistically update local attempt map so immediate re-open shows correct retake state.
+        // Prepend (DESC order to match DB) and include answers so QuizResultsView works from the list.
         setUserQuizAttempts(prev => ({
           ...prev,
-          [activeId]: [...(prev[activeId] ?? []), { quiz_id: activeId, score: attempt.score, passed: attempt.passed }],
+          [activeId]: [
+            { quiz_id: activeId, score: attempt.score, passed: attempt.passed, answers: attempt.answers ?? [] },
+            ...(prev[activeId] ?? []),
+          ],
         }));
         triggerReadinessUpdate(tenantId, currentUser.id);
       }
@@ -8455,9 +8479,14 @@ function QuizzesScreen({ role, onNav, quizzes, onEditQuiz, onDeleteQuiz, onToggl
         ) : (
           <div style={{ display: "flex", flexDirection: "column", gap: 12 }}>
             {tabFiltered.map(quiz => {
-              const lastAttempt = quiz.attempts[quiz.attempts.length - 1] ?? null;
+              // For real users, use DB-backed attempt history (keyed by quiz_id, ordered DESC).
+              // For demo users, fall back to quiz.attempts (ordered ascending, last = most recent).
+              const attempts    = userQuizAttempts[quiz.id] ?? quiz.attempts;
+              const lastAttempt = attempts.length > 0
+                ? (userQuizAttempts[quiz.id] != null ? attempts[0] : attempts[attempts.length - 1])
+                : null;
               const isPassed    = lastAttempt?.passed ?? false;
-              const hasTried    = quiz.attempts.length > 0;
+              const hasTried    = attempts.length > 0;
               const dueStatus   = getDueStatus(quiz.dueAt);
               const progress    = getDueProgress(quiz.assignedAt, quiz.dueAt);
 
@@ -8570,6 +8599,17 @@ function QuizzesScreen({ role, onNav, quizzes, onEditQuiz, onDeleteQuiz, onToggl
           canEdit={canEdit}
           canDelete={canDelete}
           canAssign={canAssign}
+          canLaunch={canLaunch}
+          onLaunchQuiz={canLaunch && onLaunchQuiz ? (quiz) => onLaunchQuiz({
+            code:          String(Math.floor(100000 + Math.random() * 900000)),
+            name:          quiz.name,
+            quizId:        quiz.id,
+            questionCount: quiz.questions?.length ?? 0,
+            status:        "waiting",
+            playerCount:   0,
+            demoMode:      false,
+            players:       [],
+          }) : null}
         />
       )}
 
@@ -14688,50 +14728,41 @@ export default function App() {
   };
 
   const handleUpdateOrg = async (orgId, fields) => {
-    // Build update payload — only include defined fields
-    const payload = { updated_at: new Date().toISOString() };
-    if (fields.name      != null) payload.name         = fields.name.trim() || null;
-    if (fields.plan      != null) payload.plan         = fields.plan.toLowerCase();
-    if (fields.seatLimit != null) payload.seat_limit   = parseInt(fields.seatLimit) || null;
-    if (fields.status    != null) payload.status       = fields.status;
-    if (fields.domain    !== undefined) payload.domain       = fields.domain?.trim() || null;
-    if (fields.adminEmail !== undefined) payload.admin_email = fields.adminEmail?.trim().toLowerCase() || null;
+    // Use update_tenant RPC (migration 009) — SECURITY DEFINER, accepts both
+    // 'ralli_admin' and 'superadmin' role aliases, and handles feature_access
+    // reset atomically when plan changes. NULL params leave fields unchanged.
+    const { data: result, error } = await supabase.rpc("update_tenant", {
+      p_tenant_id:   orgId,
+      p_name:        fields.name       != null ? (fields.name.trim() || null)                          : null,
+      p_plan:        fields.plan       != null ? fields.plan.toLowerCase()                              : null,
+      p_seat_limit:  fields.seatLimit  != null ? (parseInt(fields.seatLimit) || null)                  : null,
+      p_status:      fields.status     != null ? fields.status                                          : null,
+      p_domain:      fields.domain    !== undefined ? (fields.domain?.trim() ?? null)                  : null,
+      p_admin_email: fields.adminEmail !== undefined ? (fields.adminEmail?.trim().toLowerCase() || null): null,
+    });
+    if (error) { console.error("[ralli] update_tenant RPC failed:", error); throw error; }
 
-    const { data, error } = await supabase.from("tenants")
-      .update(payload)
-      .eq("id", orgId)
-      .select()
-      .single();
-    if (error) { console.error("[ralli] handleUpdateOrg failed:", error); throw error; }
-
-    // When plan changes, reset tenant_settings.feature_access to plan defaults
-    if (fields.plan != null) {
-      const planFeatures = getPlanFeaturesJS(fields.plan);
-      const { error: settErr } = await supabase.from("tenant_settings")
-        .update({ feature_access: planFeatures, updated_at: new Date().toISOString() })
-        .eq("tenant_id", orgId);
-      if (settErr) console.warn("[ralli] feature_access reset failed:", settErr.message);
-    }
-
+    // result is the JSONB object returned by the RPC:
+    // { tenantId, name, plan, seatLimit, status, domain, adminEmail, updatedAt }
     setOrgs(prev => prev.map(o => o.id === orgId ? {
       ...o,
-      name:       data.name        ?? o.name,
-      plan:       data.plan ? (data.plan.charAt(0).toUpperCase() + data.plan.slice(1)) : o.plan,
-      seats:      data.seat_limit  ?? o.seats,
-      seatLimit:  data.seat_limit  ?? o.seatLimit,
-      status:     data.status      ?? o.status,
-      domain:     data.domain      ?? o.domain,
-      adminEmail: data.admin_email ?? o.adminEmail,
+      name:       result.name       ?? o.name,
+      plan:       result.plan ? (result.plan.charAt(0).toUpperCase() + result.plan.slice(1)) : o.plan,
+      seats:      result.seatLimit  ?? o.seats,
+      seatLimit:  result.seatLimit  ?? o.seatLimit,
+      status:     result.status     ?? o.status,
+      domain:     result.domain     ?? o.domain,
+      adminEmail: result.adminEmail ?? o.adminEmail,
     } : o));
 
     return {
-      tenantId:   data.id,
-      name:       data.name,
-      plan:       data.plan,
-      seatLimit:  data.seat_limit,
-      status:     data.status,
-      domain:     data.domain,
-      adminEmail: data.admin_email,
+      tenantId:   result.tenantId,
+      name:       result.name,
+      plan:       result.plan,
+      seatLimit:  result.seatLimit,
+      status:     result.status,
+      domain:     result.domain,
+      adminEmail: result.adminEmail,
     };
   };
 
@@ -15203,7 +15234,7 @@ export default function App() {
       case "rankd-game":        return <RankdGameScreen onNav={navigate} sessionName={lobbySessionName} role={gameRole} playerName={lobbyPlayerName ?? user.name} questions={gameQuestions ?? GAME_QUESTIONS} demoMode={gameRole === "admin" && sessions.find(s => s.code === lobbyPin)?.demoMode !== false} pin={lobbyPin} sessionDbId={sessions.find(s => s.code === lobbyPin)?.dbId ?? null} tenantId={currentOrg?.id ?? user?.orgId ?? null} broadcast={broadcast} chMsg={chMsg} chAnswers={chAnswers} chPlayers={chPlayers} playerId={playerId} onGameEnd={handleGameEnd} setChAnswers={setChAnswers} />;
       case "rankd-results":     return <RankdResultsScreen onNav={navigate} sessionCode={viewResultsCode} sessions={sessions} gameData={gameResultsData} />;
       case "learn":             return <LearnScreen role={gameRole} user={user} orgUsers={orgUsers} orgs={orgs} onNav={navigate} onAwardXp={handleAwardXp} pendingLessonId={pendingLessonId} onClearPendingLesson={() => setPendingLessonId(null)} pendingCourseId={pendingCourseId} onClearPendingCourse={() => setPendingCourseId(null)} canCreate={perm("actions","create")} canEdit={perm("actions","edit")} canDelete={perm("actions","delete")} canAssign={perm("actions","assign")} tenantId={currentOrg?.id ?? null} isReal={!!user?._isReal} quizzes={quizzes} />;
-      case "quizzes":           return <QuizzesScreen role={gameRole} onNav={navigate} quizzes={quizzes} onEditQuiz={handleEditQuiz} onDeleteQuiz={handleDeleteQuiz} onToggleFavorite={handleToggleFavorite} onToggleActive={handleToggleActive} pendingQuizId={pendingQuizId} onClearPendingQuiz={() => setPendingQuizId(null)} canCreate={perm("actions","create")} canEdit={perm("actions","edit")} canDelete={perm("actions","delete")} canLaunch={perm("actions","launch")} canAssign={perm("actions","assign")} onAssignQuiz={handleAssignQuiz} orgUsers={orgUsers} orgs={orgs} currentUser={currentUser} tenantId={currentOrg?.id ?? null} isReal={!!user?._isReal} quizzesReady={quizzesReady} />;
+      case "quizzes":           return <QuizzesScreen role={gameRole} onNav={navigate} quizzes={quizzes} onEditQuiz={handleEditQuiz} onDeleteQuiz={handleDeleteQuiz} onToggleFavorite={handleToggleFavorite} onToggleActive={handleToggleActive} pendingQuizId={pendingQuizId} onClearPendingQuiz={() => setPendingQuizId(null)} canCreate={perm("actions","create")} canEdit={perm("actions","edit")} canDelete={perm("actions","delete")} canLaunch={perm("actions","launch")} canAssign={perm("actions","assign")} onAssignQuiz={handleAssignQuiz} onLaunchQuiz={handleCreateSession} orgUsers={orgUsers} orgs={orgs} currentUser={currentUser} tenantId={currentOrg?.id ?? null} isReal={!!user?._isReal} quizzesReady={quizzesReady} />;
       case "battlecards":       return (isAdminType && perm("actions","edit"))
         ? <BattleCardsAdminScreen categories={bcCategories} cards={battleCards} onSaveCategory={handleSaveBcCategory} onDeleteCategory={handleDeleteBcCategory} onSaveCard={handleSaveBattleCard} onDeleteCard={handleDeleteBattleCard} />
         : <BattleCardsScreen categories={bcCategories} cards={battleCards} isLoading={bcLoading} isReal={!!user?._isReal} />;
