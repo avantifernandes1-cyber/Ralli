@@ -6662,7 +6662,12 @@ function CourseBuilderModal({ course, lessons, onSave, onClose, onCreateLesson }
   const [emoji,    setEmoji]    = useState(course?.emoji ?? "");
   const [color,    setColor]    = useState(course?.color ?? C.orange);
   const [required, setRequired] = useState(course?.required ?? false);
-  const [selectedLessons, setSelectedLessons] = useState(course?.lessonIds ?? []);
+  // Initialise from saved lessonIds: dedupe + filter to IDs that exist in the
+  // current lesson list, matching the same logic used by the course card count.
+  const [selectedLessons, setSelectedLessons] = useState(() => {
+    const knownIds = new Set(lessons.map(l => l.id));
+    return [...new Set(course?.lessonIds ?? [])].filter(id => knownIds.has(id));
+  });
   // schedule: { [lessonId]: { available_after_days: number } }
   const [schedule, setSchedule] = useState(() => {
     const s = course?.lessonSchedule ?? {};
