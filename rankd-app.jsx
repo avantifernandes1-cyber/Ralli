@@ -6561,6 +6561,90 @@ function LessonQuiz({ question, options, correctIdx }) {
   );
 }
 
+// Converts a lesson to an ordered block array.
+// New lessons: content.blocks = [{ id, type, content }]
+// Legacy lessons: synthesise a single block from the old flat content + type fields.
+function getBlocks(lesson) {
+  const c = lesson?.content ?? {};
+  if (Array.isArray(c.blocks) && c.blocks.length > 0) return c.blocks;
+  // Legacy single-type lesson
+  const type = lesson?.type ?? "text";
+  return [{ id: "legacy", type, content: c }];
+}
+
+// Render a single content block. Used by both viewer and previews.
+function LessonBlock({ block, cardStyle }) {
+  const c = block.content ?? {};
+  const style = cardStyle ?? { background: "#fff", borderRadius: 14, padding: 28, border: "1px solid #E5E7EB" };
+  if (block.type === "text") {
+    if (!c.body) return null;
+    return (
+      <div style={style}>
+        <pre style={{ margin: 0, fontSize: 14, lineHeight: 1.8, color: C.text, fontFamily: "inherit", whiteSpace: "pre-wrap", wordBreak: "break-word" }}>{c.body}</pre>
+      </div>
+    );
+  }
+  if (block.type === "image") {
+    if (!c.imageUrl) return null;
+    return (
+      <div style={{ ...style, textAlign: "center" }}>
+        <img src={c.imageUrl} alt={c.caption ?? ""} style={{ maxWidth: "100%", maxHeight: 420, borderRadius: 8, objectFit: "contain" }} />
+        {c.caption && <p style={{ margin: "12px 0 0", fontSize: 13, color: C.textSub }}>{c.caption}</p>}
+      </div>
+    );
+  }
+  if (block.type === "video") {
+    const url = c.videoUrl ?? "";
+    const embedUrl = url.replace("watch?v=", "embed/").replace("youtu.be/", "youtube.com/embed/");
+    return (
+      <div style={style}>
+        {url ? (
+          <div style={{ position: "relative", paddingBottom: "56.25%", height: 0, marginBottom: c.notes ? 20 : 0 }}>
+            <iframe src={embedUrl} title="video" frameBorder="0" allowFullScreen
+              style={{ position: "absolute", top: 0, left: 0, width: "100%", height: "100%", borderRadius: 8 }} />
+          </div>
+        ) : null}
+        {c.notes && (
+          <>
+            <div style={{ fontSize: 12, fontWeight: 700, color: C.textSub, marginBottom: 8, letterSpacing: "0.06em" }}>LESSON NOTES</div>
+            <pre style={{ margin: 0, fontSize: 13, color: C.text, lineHeight: 1.7, fontFamily: "inherit", whiteSpace: "pre-wrap" }}>{c.notes}</pre>
+          </>
+        )}
+      </div>
+    );
+  }
+  if (block.type === "flipcard") {
+    if (!c.front && !c.back) return null;
+    return <FlipCard front={c.front ?? ""} back={c.back ?? ""} />;
+  }
+  if (block.type === "quiz") {
+    if (!c.question) return null;
+    return <LessonQuiz question={c.question} options={c.options ?? []} correctIdx={c.correctIdx ?? 0} />;
+  }
+  if (block.type === "recording") {
+    return (
+      <div style={style}>
+        {c.prompt && (
+          <>
+            <div style={{ fontSize: 12, fontWeight: 700, color: C.textSub, marginBottom: 8, letterSpacing: "0.06em" }}>PROMPT</div>
+            <p style={{ margin: "0 0 20px", fontSize: 15, fontWeight: 600, color: C.text, lineHeight: 1.6 }}>{c.prompt}</p>
+          </>
+        )}
+        {c.criteria && (
+          <>
+            <div style={{ fontSize: 12, fontWeight: 700, color: C.textSub, marginBottom: 8, letterSpacing: "0.06em" }}>EVALUATION CRITERIA</div>
+            <p style={{ margin: "0 0 20px", fontSize: 13, color: C.textSub, lineHeight: 1.6 }}>{c.criteria}</p>
+          </>
+        )}
+        <div style={{ padding: "20px", borderRadius: 10, background: C.pageBg, border: `1px dashed ${C.border}`, textAlign: "center" }}>
+          <div style={{ fontSize: 13, color: C.textSub }}>Recording submission coming soon</div>
+        </div>
+      </div>
+    );
+  }
+  return null;
+}
+
 function LessonViewerScreen({ lesson, courseTitle, onBack, completed, onComplete, nextLesson, onNextLesson }) {
   const [isDone, setIsDone] = React.useState(completed ?? false);
   const [showXp,  setShowXp]  = React.useState(false);
@@ -6615,106 +6699,22 @@ function LessonViewerScreen({ lesson, courseTitle, onBack, completed, onComplete
         </div>
       )}
 
-      {/* Type-specific content */}
+      {/* Content blocks — renders all blocks in order */}
       {(() => {
-        const c = lesson.content ?? {};
         const cardStyle = { background: C.white, borderRadius: 14, padding: 28, border: `1px solid ${C.border}` };
-        const emptyNote = (msg) => (
-          <div style={{ ...cardStyle, textAlign: "center", color: C.textSub, fontSize: 14, padding: 48 }}>{msg}</div>
-        );
-
-        if (lesson.type === "text") {
-          if (!c.body) return emptyNote("No content yet.");
+        const blocks = getBlocks(lesson);
+        const rendered = blocks.map((block, i) => {
+          const node = <LessonBlock key={block.id ?? i} block={block} cardStyle={cardStyle} />;
+          return node;
+        }).filter(Boolean);
+        if (rendered.length === 0) {
           return (
-            <div style={{ ...cardStyle }}>
-              <pre style={{ margin: 0, fontSize: 14, lineHeight: 1.8, color: C.text, fontFamily: "inherit", whiteSpace: "pre-wrap", wordBreak: "break-word" }}>{c.body}</pre>
+            <div style={{ ...cardStyle, textAlign: "center", color: C.textSub, fontSize: 14, padding: 48 }}>
+              No content yet.
             </div>
           );
         }
-
-        if (lesson.type === "image") {
-          if (!c.imageUrl) return emptyNote("No image uploaded yet.");
-          return (
-            <div style={{ ...cardStyle, textAlign: "center" }}>
-              <img src={c.imageUrl} alt={c.caption ?? lesson.title} style={{ maxWidth: "100%", maxHeight: 420, borderRadius: 8, objectFit: "contain" }} />
-              {c.caption && <p style={{ margin: "12px 0 0", fontSize: 13, color: C.textSub }}>{c.caption}</p>}
-            </div>
-          );
-        }
-
-        if (lesson.type === "video") {
-          const url = c.videoUrl ?? "";
-          // Convert youtube watch URL to embed
-          const embedUrl = url.replace("watch?v=", "embed/").replace("youtu.be/", "youtube.com/embed/");
-          return (
-            <div style={{ ...cardStyle }}>
-              {url ? (
-                <div style={{ position: "relative", paddingBottom: "56.25%", height: 0, marginBottom: c.notes ? 20 : 0 }}>
-                  <iframe src={embedUrl} title={lesson.title} frameBorder="0" allowFullScreen
-                    style={{ position: "absolute", top: 0, left: 0, width: "100%", height: "100%", borderRadius: 8 }} />
-                </div>
-              ) : (
-                <div style={{ padding: "20px", borderRadius: 10, background: C.pageBg, border: `1px dashed ${C.border}`, textAlign: "center", marginBottom: c.notes ? 20 : 0 }}>
-                  <div style={{ fontSize: 13, color: C.textSub }}>Video coming soon</div>
-                </div>
-              )}
-              {c.notes && (
-                <>
-                  <div style={{ fontSize: 12, fontWeight: 700, color: C.textSub, marginBottom: 8, letterSpacing: "0.06em" }}>LESSON NOTES</div>
-                  <pre style={{ margin: 0, fontSize: 13, color: C.text, lineHeight: 1.7, fontFamily: "inherit", whiteSpace: "pre-wrap" }}>{c.notes}</pre>
-                </>
-              )}
-              {!url && !c.notes && emptyNote("No video URL provided yet.")}
-            </div>
-          );
-        }
-
-        if (lesson.type === "flipcard") {
-          if (!c.front && !c.back) return emptyNote("No flip card content yet.");
-          return <FlipCard front={c.front ?? ""} back={c.back ?? ""} />;
-        }
-
-        if (lesson.type === "quiz") {
-          if (!c.question) return emptyNote("No quiz content yet.");
-          return <LessonQuiz question={c.question} options={c.options ?? []} correctIdx={c.correctIdx ?? 0} />;
-        }
-
-        if (lesson.type === "recording") {
-          return (
-            <div style={{ ...cardStyle }}>
-              {c.prompt && (
-                <>
-                  <div style={{ fontSize: 12, fontWeight: 700, color: C.textSub, marginBottom: 8, letterSpacing: "0.06em" }}>PROMPT</div>
-                  <p style={{ margin: "0 0 20px", fontSize: 15, fontWeight: 600, color: C.text, lineHeight: 1.6 }}>{c.prompt}</p>
-                </>
-              )}
-              {c.criteria && (
-                <>
-                  <div style={{ fontSize: 12, fontWeight: 700, color: C.textSub, marginBottom: 8, letterSpacing: "0.06em" }}>EVALUATION CRITERIA</div>
-                  <p style={{ margin: "0 0 20px", fontSize: 13, color: C.textSub, lineHeight: 1.6 }}>{c.criteria}</p>
-                </>
-              )}
-              <div style={{ padding: "20px", borderRadius: 10, background: C.pageBg, border: `1px dashed ${C.border}`, textAlign: "center" }}>
-                <div style={{ fontSize: 13, color: C.textSub }}>Recording submission coming soon</div>
-              </div>
-            </div>
-          );
-        }
-
-        // fallback (interactive and other types)
-        if (c.body) {
-          return (
-            <div style={{ ...cardStyle }}>
-              <pre style={{ margin: 0, fontSize: 14, lineHeight: 1.8, color: C.text, fontFamily: "inherit", whiteSpace: "pre-wrap", wordBreak: "break-word" }}>{c.body}</pre>
-            </div>
-          );
-        }
-        return (
-          <div style={{ ...cardStyle, textAlign: "center" }}>
-            <h3 style={{ margin: "0 0 8px", fontSize: 17, fontWeight: 800, color: C.text }}>{lesson.title}</h3>
-            <p style={{ margin: "0 auto 0", fontSize: 14, color: C.textSub }}>{lesson.description}</p>
-          </div>
-        );
+        return <>{rendered}</>;
       })()}
 
       {/* Actions */}
@@ -7012,138 +7012,214 @@ function CourseBuilderModal({ course, lessons, onSave, onClose, onCreateLesson }
 }
 
 // ── LESSON BUILDER MODAL ────────────────────────────────────
+// Inline block editor — renders type-specific fields for one block.
+// Used inside LessonBuilderModal.
+function BlockEditor({ block, onChange, onRemove, onMoveUp, onMoveDown, isFirst, isLast }) {
+  const BLOCK_TYPES   = ["text", "image", "video", "flipcard", "quiz", "recording"];
+  const BLOCK_LABELS  = { text: "Text", image: "Image", video: "Video", flipcard: "Flip Card", quiz: "Quiz", recording: "Recording" };
+  const c             = block.content ?? {};
+  const setC          = (key, val) => onChange({ ...block, content: { ...c, [key]: val } });
+  const setType       = (t)        => onChange({ ...block, type: t, content: {} });
+
+  const inputStyle = { width: "100%", padding: "9px 12px", borderRadius: 8, border: `1px solid ${C.border}`, fontSize: 13, color: C.text, background: C.pageBg, boxSizing: "border-box" };
+  const taStyle    = { ...inputStyle, resize: "vertical", lineHeight: 1.5 };
+  const blockColor = LESSON_TYPE_COLORS[block.type] ?? C.orange;
+
+  return (
+    <div style={{ border: `1.5px solid ${blockColor}30`, borderRadius: 12, padding: 16, background: C.pageBg, position: "relative" }}>
+      {/* Block header */}
+      <div style={{ display: "flex", alignItems: "center", gap: 8, marginBottom: 12 }}>
+        <div style={{ width: 6, height: 6, borderRadius: 2, background: blockColor, flexShrink: 0 }} />
+        <div style={{ display: "flex", gap: 4, flexWrap: "wrap", flex: 1 }}>
+          {BLOCK_TYPES.map(t => (
+            <button key={t} onClick={() => setType(t)} style={{
+              padding: "3px 8px", borderRadius: 6, border: `1.5px solid ${block.type === t ? blockColor : C.border}`,
+              background: block.type === t ? blockColor + "15" : C.white,
+              fontSize: 11, fontWeight: 700, color: block.type === t ? blockColor : C.textSub, cursor: "pointer",
+            }}>{BLOCK_LABELS[t]}</button>
+          ))}
+        </div>
+        <div style={{ display: "flex", gap: 4, flexShrink: 0 }}>
+          {!isFirst  && <button onClick={onMoveUp}   title="Move up"   style={{ padding: "3px 7px", borderRadius: 6, border: `1px solid ${C.border}`, background: C.white, cursor: "pointer", fontSize: 13, color: C.textSub }}>↑</button>}
+          {!isLast   && <button onClick={onMoveDown} title="Move down" style={{ padding: "3px 7px", borderRadius: 6, border: `1px solid ${C.border}`, background: C.white, cursor: "pointer", fontSize: 13, color: C.textSub }}>↓</button>}
+          <button onClick={onRemove} title="Remove block" style={{ padding: "3px 7px", borderRadius: 6, border: `1px solid ${C.border}`, background: C.white, cursor: "pointer", fontSize: 13, color: C.red }}>✕</button>
+        </div>
+      </div>
+
+      {/* Type-specific fields */}
+      {block.type === "text" && (
+        <textarea value={c.body ?? ""} onChange={e => setC("body", e.target.value)}
+          placeholder="Write lesson content here…" rows={6}
+          style={{ ...taStyle, fontFamily: "monospace", fontSize: 13 }} />
+      )}
+      {block.type === "image" && (
+        <>
+          <input value={c.imageUrl ?? ""} onChange={e => setC("imageUrl", e.target.value)}
+            placeholder="Image URL — https://example.com/image.png" style={{ ...inputStyle, marginBottom: 8 }} />
+          {c.imageUrl && <img src={c.imageUrl} alt="preview" onError={e => { e.target.style.display = "none"; }}
+            style={{ width: "100%", maxHeight: 160, objectFit: "cover", borderRadius: 8, marginBottom: 8 }} />}
+          <input value={c.caption ?? ""} onChange={e => setC("caption", e.target.value)}
+            placeholder="Caption (optional)" style={inputStyle} />
+        </>
+      )}
+      {block.type === "video" && (
+        <>
+          <input value={c.videoUrl ?? ""} onChange={e => setC("videoUrl", e.target.value)}
+            placeholder="YouTube or Vimeo URL" style={{ ...inputStyle, marginBottom: 8 }} />
+          <textarea value={c.notes ?? ""} onChange={e => setC("notes", e.target.value)}
+            placeholder="Notes / transcript (optional)" rows={3} style={taStyle} />
+        </>
+      )}
+      {block.type === "flipcard" && (
+        <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 10 }}>
+          <div>
+            <div style={{ fontSize: 11, fontWeight: 700, color: C.textSub, marginBottom: 5 }}>FRONT</div>
+            <textarea value={c.front ?? ""} onChange={e => setC("front", e.target.value)}
+              placeholder="Question, term, or prompt" rows={4} style={taStyle} />
+          </div>
+          <div>
+            <div style={{ fontSize: 11, fontWeight: 700, color: C.textSub, marginBottom: 5 }}>BACK</div>
+            <textarea value={c.back ?? ""} onChange={e => setC("back", e.target.value)}
+              placeholder="Answer, definition, or explanation" rows={4} style={taStyle} />
+          </div>
+        </div>
+      )}
+      {block.type === "quiz" && (() => {
+        const opts    = c.options    ?? ["", "", "", ""];
+        const correct = c.correctIdx ?? 0;
+        const setOpt  = (i, val) => setC("options", opts.map((o, j) => j === i ? val : o));
+        return (
+          <>
+            <input value={c.question ?? ""} onChange={e => setC("question", e.target.value)}
+              placeholder="Question" style={{ ...inputStyle, marginBottom: 10 }} />
+            <div style={{ display: "flex", flexDirection: "column", gap: 6 }}>
+              {opts.map((opt, i) => (
+                <div key={i} style={{ display: "flex", alignItems: "center", gap: 8 }}>
+                  <button onClick={() => setC("correctIdx", i)} style={{
+                    width: 22, height: 22, borderRadius: "50%", flexShrink: 0, cursor: "pointer",
+                    border: `2px solid ${correct === i ? C.green : C.border}`,
+                    background: correct === i ? C.green : C.pageBg,
+                  }} />
+                  <input value={opt} onChange={e => setOpt(i, e.target.value)}
+                    placeholder={`Option ${String.fromCharCode(65 + i)}`} style={{ ...inputStyle, flex: 1 }} />
+                </div>
+              ))}
+            </div>
+          </>
+        );
+      })()}
+      {block.type === "recording" && (
+        <>
+          <textarea value={c.prompt ?? ""} onChange={e => setC("prompt", e.target.value)}
+            placeholder="Recording prompt — what should the rep record?" rows={3}
+            style={{ ...taStyle, marginBottom: 8 }} />
+          <textarea value={c.criteria ?? ""} onChange={e => setC("criteria", e.target.value)}
+            placeholder="Evaluation criteria (optional)" rows={2} style={taStyle} />
+        </>
+      )}
+    </div>
+  );
+}
+
 function LessonBuilderModal({ lesson, onSave, onClose }) {
-  const TYPES = ["text", "image", "video", "flipcard", "quiz", "recording"];
-  const TYPE_LABELS = { text: "Text", image: "Image", video: "Video", flipcard: "Flip Card", quiz: "Quiz", recording: "Recording" };
+  const inputStyle = { width: "100%", padding: "9px 12px", borderRadius: 8, border: `1px solid ${C.border}`, fontSize: 13, color: C.text, background: C.pageBg, boxSizing: "border-box" };
+  const taStyle    = { ...inputStyle, resize: "vertical", lineHeight: 1.5 };
+
   const [title,  setTitle]  = useState(lesson?.title ?? "");
-  const [type,   setType]   = useState(lesson?.type ?? "text");
   const [desc,   setDesc]   = useState(lesson?.description ?? "");
   const [dur,    setDur]    = useState(lesson?.duration ?? "15 min");
   const [xp,     setXp]     = useState(lesson?.xp ?? 100);
   const [status, setStatus] = useState(lesson?.status ?? "active");
-  // Type-specific content
-  const [content, setContent] = useState(lesson?.content ?? {});
-  const setC = (key, val) => setContent(prev => ({ ...prev, [key]: val }));
-  // Quiz options state
-  const [quizOptions, setQuizOptions]     = useState(lesson?.content?.options ?? ["", "", "", ""]);
-  const [quizCorrect, setQuizCorrect]     = useState(lesson?.content?.correctIdx ?? 0);
-  const setOpt = (i, val) => setQuizOptions(prev => prev.map((o, j) => j === i ? val : o));
 
-  const inputStyle = { width: "100%", padding: "9px 12px", borderRadius: 8, border: `1px solid ${C.border}`, fontSize: 13, color: C.text, background: C.pageBg, boxSizing: "border-box" };
-  const taStyle   = { ...inputStyle, resize: "vertical", lineHeight: 1.5 };
+  // Blocks — load from lesson (new format) or synthesise from legacy content
+  const [blocks, setBlocks] = useState(() => getBlocks(lesson ?? {}));
 
-  const buildContent = () => {
-    if (type === "quiz") return { ...content, options: quizOptions, correctIdx: quizCorrect };
-    return content;
-  };
+  const addBlock = (type) => setBlocks(prev => [...prev, { id: "b" + Date.now(), type, content: {} }]);
+  const updateBlock = (i, updated) => setBlocks(prev => prev.map((b, j) => j === i ? updated : b));
+  const removeBlock = (i) => setBlocks(prev => prev.filter((_, j) => j !== i));
+  const moveBlock   = (i, dir) => setBlocks(prev => {
+    const arr = [...prev];
+    const target = i + dir;
+    if (target < 0 || target >= arr.length) return arr;
+    [arr[i], arr[target]] = [arr[target], arr[i]];
+    return arr;
+  });
 
   const handleSave = () => {
     if (!title.trim()) return;
-    onSave({ ...(lesson || {}), title, type, description: desc, duration: dur, xp: Number(xp), status, content: buildContent() });
+    // primary type = first block's type (used for card icon/color)
+    const primaryType = blocks[0]?.type ?? "text";
+    onSave({ ...(lesson || {}), title, type: primaryType, description: desc, duration: dur, xp: Number(xp), status, content: { blocks } });
   };
 
-  // Per-type authoring UI
-  const contentFields = () => {
-    if (type === "text") return (
-      <>
-        <label style={{ fontSize: 12, fontWeight: 700, color: C.textSub, display: "block", marginBottom: 6 }}>CONTENT</label>
-        <textarea value={content.body ?? ""} onChange={e => setC("body", e.target.value)} placeholder="Write the lesson content here. Supports plain text and markdown-style formatting." rows={8} style={{ ...taStyle, marginBottom: 16, fontFamily: "monospace", fontSize: 13 }} />
-      </>
-    );
-    if (type === "image") return (
-      <>
-        <label style={{ fontSize: 12, fontWeight: 700, color: C.textSub, display: "block", marginBottom: 6 }}>IMAGE URL</label>
-        <input value={content.imageUrl ?? ""} onChange={e => setC("imageUrl", e.target.value)} placeholder="https://example.com/image.png" style={{ ...inputStyle, marginBottom: 10 }} />
-        {content.imageUrl && <img src={content.imageUrl} alt="preview" style={{ width: "100%", borderRadius: 8, marginBottom: 10, maxHeight: 180, objectFit: "cover" }} onError={e => { e.target.style.display = "none"; }} />}
-        <label style={{ fontSize: 12, fontWeight: 700, color: C.textSub, display: "block", marginBottom: 6 }}>CAPTION (optional)</label>
-        <input value={content.caption ?? ""} onChange={e => setC("caption", e.target.value)} placeholder="Describe what this image shows" style={{ ...inputStyle, marginBottom: 16 }} />
-      </>
-    );
-    if (type === "video") return (
-      <>
-        <label style={{ fontSize: 12, fontWeight: 700, color: C.textSub, display: "block", marginBottom: 6 }}>VIDEO URL</label>
-        <input value={content.videoUrl ?? ""} onChange={e => setC("videoUrl", e.target.value)} placeholder="https://youtube.com/watch?v=... or https://vimeo.com/..." style={{ ...inputStyle, marginBottom: 10 }} />
-        <label style={{ fontSize: 12, fontWeight: 700, color: C.textSub, display: "block", marginBottom: 6 }}>NOTES / TRANSCRIPT (optional)</label>
-        <textarea value={content.notes ?? ""} onChange={e => setC("notes", e.target.value)} placeholder="Key points, summary, or full transcript" rows={4} style={{ ...taStyle, marginBottom: 16 }} />
-      </>
-    );
-    if (type === "flipcard") return (
-      <>
-        <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 12, marginBottom: 16 }}>
-          <div>
-            <label style={{ fontSize: 12, fontWeight: 700, color: C.textSub, display: "block", marginBottom: 6 }}>FRONT</label>
-            <textarea value={content.front ?? ""} onChange={e => setC("front", e.target.value)} placeholder="Question, term, or prompt" rows={5} style={taStyle} />
-          </div>
-          <div>
-            <label style={{ fontSize: 12, fontWeight: 700, color: C.textSub, display: "block", marginBottom: 6 }}>BACK</label>
-            <textarea value={content.back ?? ""} onChange={e => setC("back", e.target.value)} placeholder="Answer, definition, or explanation" rows={5} style={taStyle} />
-          </div>
-        </div>
-      </>
-    );
-    if (type === "quiz") return (
-      <>
-        <label style={{ fontSize: 12, fontWeight: 700, color: C.textSub, display: "block", marginBottom: 6 }}>QUESTION</label>
-        <input value={content.question ?? ""} onChange={e => setC("question", e.target.value)} placeholder="What is the question?" style={{ ...inputStyle, marginBottom: 12 }} />
-        <label style={{ fontSize: 12, fontWeight: 700, color: C.textSub, display: "block", marginBottom: 6 }}>ANSWER OPTIONS <span style={{ fontWeight: 400, color: C.textMuted }}>(select correct)</span></label>
-        <div style={{ display: "flex", flexDirection: "column", gap: 8, marginBottom: 16 }}>
-          {quizOptions.map((opt, i) => (
-            <div key={i} style={{ display: "flex", alignItems: "center", gap: 8 }}>
-              <button onClick={() => setQuizCorrect(i)} style={{
-                width: 24, height: 24, borderRadius: "50%", flexShrink: 0, cursor: "pointer",
-                border: `2px solid ${quizCorrect === i ? C.green : C.border}`,
-                background: quizCorrect === i ? C.green : C.pageBg,
-              }} />
-              <input value={opt} onChange={e => setOpt(i, e.target.value)} placeholder={`Option ${String.fromCharCode(65 + i)}`} style={{ ...inputStyle, flex: 1 }} />
-            </div>
-          ))}
-        </div>
-      </>
-    );
-    if (type === "recording") return (
-      <>
-        <label style={{ fontSize: 12, fontWeight: 700, color: C.textSub, display: "block", marginBottom: 6 }}>RECORDING PROMPT</label>
-        <textarea value={content.prompt ?? ""} onChange={e => setC("prompt", e.target.value)} placeholder="What should the rep record? e.g. 'Record yourself delivering a 60-second cold call opener.'" rows={4} style={{ ...taStyle, marginBottom: 10 }} />
-        <label style={{ fontSize: 12, fontWeight: 700, color: C.textSub, display: "block", marginBottom: 6 }}>EVALUATION CRITERIA (optional)</label>
-        <textarea value={content.criteria ?? ""} onChange={e => setC("criteria", e.target.value)} placeholder="What will be assessed? e.g. Tone, pace, objection handling..." rows={3} style={{ ...taStyle, marginBottom: 16 }} />
-      </>
-    );
-    return null;
-  };
+  const ADD_TYPES = [
+    { type: "text",      label: "+ Text" },
+    { type: "image",     label: "+ Image" },
+    { type: "video",     label: "+ Video" },
+    { type: "flipcard",  label: "+ Flip Card" },
+    { type: "quiz",      label: "+ Quiz" },
+    { type: "recording", label: "+ Recording" },
+  ];
 
   return (
     <div style={{ position: "fixed", inset: 0, background: "rgba(0,0,0,0.45)", display: "flex", alignItems: "center", justifyContent: "center", zIndex: 1000, padding: 20 }}
       onClick={e => { if (e.target === e.currentTarget) onClose(); }}>
-      <div style={{ background: C.white, borderRadius: 16, padding: 28, width: "100%", maxWidth: 560, maxHeight: "90vh", overflowY: "auto", boxShadow: "0 24px 60px rgba(0,0,0,0.2)" }}>
+      <div style={{ background: C.white, borderRadius: 16, padding: 28, width: "100%", maxWidth: 620, maxHeight: "92vh", overflowY: "auto", boxShadow: "0 24px 60px rgba(0,0,0,0.2)" }}>
+
+        {/* Header */}
         <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", marginBottom: 24 }}>
           <h3 style={{ margin: 0, fontSize: 18, fontWeight: 800, color: C.text }}>{lesson ? "Edit Lesson" : "New Lesson"}</h3>
           <button onClick={onClose} style={{ background: "none", border: "none", fontSize: 20, cursor: "pointer", color: C.textMuted }}>×</button>
         </div>
 
-        <label style={{ fontSize: 12, fontWeight: 700, color: C.textSub, display: "block", marginBottom: 8 }}>LESSON TYPE</label>
-        <div style={{ display: "grid", gridTemplateColumns: "repeat(6, 1fr)", gap: 6, marginBottom: 24 }}>
-          {TYPES.map(t => (
-            <button key={t} onClick={() => setType(t)} style={{
-              padding: "10px 4px", borderRadius: 8,
-              border: `2px solid ${type === t ? LESSON_TYPE_COLORS[t] : C.border}`,
-              background: type === t ? LESSON_TYPE_COLORS[t] + "12" : C.pageBg,
-              cursor: "pointer", display: "flex", flexDirection: "column", alignItems: "center", justifyContent: "center",
-            }}>
-              <span style={{ fontSize: 11, fontWeight: 700, color: type === t ? LESSON_TYPE_COLORS[t] : C.textSub, lineHeight: 1.2, textAlign: "center" }}>{TYPE_LABELS[t]}</span>
-            </button>
+        {/* Metadata */}
+        <label style={{ fontSize: 12, fontWeight: 700, color: C.textSub, display: "block", marginBottom: 6 }}>LESSON TITLE</label>
+        <input value={title} onChange={e => setTitle(e.target.value)} placeholder="e.g. Cold Call Opening Framework"
+          style={{ ...inputStyle, fontWeight: 600, fontSize: 14, marginBottom: 14 }} />
+
+        <label style={{ fontSize: 12, fontWeight: 700, color: C.textSub, display: "block", marginBottom: 6 }}>DESCRIPTION / OBJECTIVES</label>
+        <textarea value={desc} onChange={e => setDesc(e.target.value)} placeholder="What will reps learn?" rows={2}
+          style={{ ...taStyle, marginBottom: 22 }} />
+
+        {/* Content blocks */}
+        <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", marginBottom: 10 }}>
+          <label style={{ fontSize: 12, fontWeight: 700, color: C.textSub }}>CONTENT BLOCKS ({blocks.length})</label>
+        </div>
+        <div style={{ display: "flex", flexDirection: "column", gap: 10, marginBottom: 14 }}>
+          {blocks.map((block, i) => (
+            <BlockEditor
+              key={block.id ?? i}
+              block={block}
+              onChange={(updated) => updateBlock(i, updated)}
+              onRemove={() => removeBlock(i)}
+              onMoveUp={() => moveBlock(i, -1)}
+              onMoveDown={() => moveBlock(i, 1)}
+              isFirst={i === 0}
+              isLast={i === blocks.length - 1}
+            />
+          ))}
+          {blocks.length === 0 && (
+            <div style={{ padding: "24px", borderRadius: 10, border: `1.5px dashed ${C.border}`, textAlign: "center", color: C.textSub, fontSize: 13 }}>
+              No content blocks yet. Add one below.
+            </div>
+          )}
+        </div>
+
+        {/* Add block buttons */}
+        <div style={{ display: "flex", flexWrap: "wrap", gap: 6, marginBottom: 22 }}>
+          {ADD_TYPES.map(({ type, label }) => (
+            <button key={type} onClick={() => addBlock(type)} style={{
+              padding: "6px 12px", borderRadius: 8,
+              border: `1.5px solid ${LESSON_TYPE_COLORS[type] ?? C.border}`,
+              background: (LESSON_TYPE_COLORS[type] ?? C.orange) + "10",
+              color: LESSON_TYPE_COLORS[type] ?? C.text,
+              fontSize: 12, fontWeight: 700, cursor: "pointer",
+            }}>{label}</button>
           ))}
         </div>
 
-        <label style={{ fontSize: 12, fontWeight: 700, color: C.textSub, display: "block", marginBottom: 6 }}>LESSON TITLE</label>
-        <input value={title} onChange={e => setTitle(e.target.value)} placeholder="e.g. Cold Call Opening Framework" style={{ ...inputStyle, fontWeight: 600, fontSize: 14, marginBottom: 16 }} />
-
-        <label style={{ fontSize: 12, fontWeight: 700, color: C.textSub, display: "block", marginBottom: 6 }}>DESCRIPTION / OBJECTIVES</label>
-        <textarea value={desc} onChange={e => setDesc(e.target.value)} placeholder="What will reps learn?" rows={2} style={{ ...taStyle, marginBottom: 20 }} />
-
-        {/* Type-specific content authoring */}
-        {contentFields()}
-
-        <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr 1fr", gap: 12, marginBottom: 20 }}>
+        {/* Settings row */}
+        <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr 1fr", gap: 12, marginBottom: 22 }}>
           <div>
             <label style={{ fontSize: 12, fontWeight: 700, color: C.textSub, display: "block", marginBottom: 6 }}>DURATION</label>
             <input value={dur} onChange={e => setDur(e.target.value)} placeholder="20 min" style={inputStyle} />
