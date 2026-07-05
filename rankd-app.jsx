@@ -9612,13 +9612,16 @@ function LeadershipDashboardScreen({ currentOrg, orgUsers = [], isReal = false }
     if (!isReal || !tid) return;
     supabase
       .from("readiness_scores")
-      .select("user_id, score, updated_at")
+      .select("user_id, score, computed_at")
       .eq("tenant_id", tid)
-      .order("score", { ascending: false })
+      .order("computed_at", { ascending: false })
       .then(({ data: rows }) => {
         if (!rows || rows.length === 0) return; // keep LEADERSHIP_SEED as fallback
+        // Deduplicate — take the most recent row per user (handles pre-migration multi-row data)
+        const seen = new Set();
+        const unique = rows.filter(r => { if (seen.has(r.user_id)) return false; seen.add(r.user_id); return true; });
         // Build people array from orgUsers + readiness_scores rows
-        const people = rows.map((r, i) => {
+        const people = unique.map((r, i) => {
           const member = orgUsers.find(u => u.id === r.user_id);
           return {
             id:            r.user_id,

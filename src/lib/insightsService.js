@@ -193,7 +193,7 @@ export async function computeAndSaveReadinessScore(tenantId, userId, opts = {}) 
   const { data: perf, error: perfError } = await getUserPerformance(tenantId, userId, opts);
   if (perfError || !perf) return { data: null, error: perfError };
 
-  const { error: insertError } = await supabase.from("readiness_scores").insert({
+  const { error: upsertError } = await supabase.from("readiness_scores").upsert({
     tenant_id:         tenantId,
     user_id:           userId,
     score:             perf.score,
@@ -206,9 +206,10 @@ export async function computeAndSaveReadinessScore(tenantId, userId, opts = {}) 
     quizzes_attempted: perf.quizzesAttempted,
     games_played:      perf.gamesPlayed,
     window_days:       opts.windowDays ?? 30,
-  });
+    computed_at:       new Date().toISOString(),
+  }, { onConflict: "tenant_id,user_id" });
 
-  return { data: perf, error: insertError };
+  return { data: perf, error: upsertError };
 }
 
 // ── Rules-based recommendations ───────────────────────────────────────────────
