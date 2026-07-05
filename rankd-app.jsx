@@ -63,7 +63,7 @@ import {
 import { getProfile, createMissingProfile, getTenantProfiles } from "./src/lib/profileService.js";
 import { sendInviteEmail } from "./src/lib/emailService.js";
 import { provisionTenant, buildInviteUrl, normalizeProvisionedOrg, createMemberInvite } from "./src/lib/provisioningService.js";
-import { awardLessonPoints, awardCoursePoints, awardQuizPoints, awardGamePointsForSession, getLeaderboard } from "./src/lib/scoringService.js";
+import { awardLessonPoints, awardCoursePoints, awardQuizPoints, awardGamePointsForSession, getLeaderboard, computeUserMeta, getUserStreak } from "./src/lib/scoringService.js";
 import { triggerReadinessUpdate } from "./src/lib/insightsService.js";
 
 // ── MOBILE HOOK ────────────────────────────────────────────
@@ -562,7 +562,7 @@ function HomeScreen({ user, onNav, quizAssignments = [], onResumeLesson, onStart
       <div>
         {user.streak && (
           <div style={{ display: "flex", alignItems: "center", gap: 6, marginBottom: 4 }}>
-            <span style={{ fontSize: 13, fontWeight: 600, color: C.orange }}>{user.streak}-day streak</span>
+            <span style={{ fontSize: 13, fontWeight: 600, color: C.orange }}>{user.streak ?? 0}-day streak</span>
             <span style={{ fontSize: 13, color: C.textSub }}>Keep it going</span>
           </div>
         )}
@@ -5496,9 +5496,11 @@ const LESSON_TYPE_COLORS = { video:C.blue, text:C.green, image:C.blue, flipcard:
 function LearnScreen({ role, user, orgUsers = [], orgs = [], onNav, onAwardXp, pendingLessonId, onClearPendingLesson, pendingCourseId, onClearPendingCourse, canCreate = true, canEdit = true, canDelete = true, canAssign = true, tenantId = null, isReal = false, quizzes = [] }) {
   const isAdmin = role === "admin";
   const [tab, setTab]           = useState(isAdmin ? "courses" : "assigned");
-  const [courses, setCourses]   = useState(INITIAL_LEARN_COURSES);
-  const [lessons, setLessons]   = useState(INITIAL_LEARN_LESSONS);
-  const [assignments, setAssignments] = useState(INITIAL_ASSIGNMENTS);
+  // Real users start with empty arrays — seed data would flash before DB load completes
+  const [courses, setCourses]   = useState(isReal ? [] : INITIAL_LEARN_COURSES);
+  const [lessons, setLessons]   = useState(isReal ? [] : INITIAL_LEARN_LESSONS);
+  const [assignments, setAssignments] = useState(isReal ? [] : INITIAL_ASSIGNMENTS);
+  const [isLearnLoading, setIsLearnLoading] = useState(isReal); // cleared once DB load resolves
 
   // Modals
   const [courseModal, setCourseModal]   = useState(null); // null | "new" | course object
@@ -5534,7 +5536,8 @@ function LearnScreen({ role, user, orgUsers = [], orgs = [], onNav, onAwardXp, p
       setCourses(dbCourses ?? []);
       setLessons(dbLessons ?? []);
       setAssignments(dbAssignments ?? []);
-    });
+      setIsLearnLoading(false);
+    }).catch(() => setIsLearnLoading(false));
     // Load archived content and all tenant completions for manager view
     if (isAdmin) {
       getArchivedContent(tenantId).then(({ data }) => {
@@ -5691,6 +5694,17 @@ function LearnScreen({ role, user, orgUsers = [], orgs = [], onNav, onAwardXp, p
 
   // ── USER VIEW ─────────────────────────────────────────────
   if (!isAdmin) {
+    // Guard: real users wait for DB load rather than seeing seed data flash
+    if (isLearnLoading) return (
+      <div style={{ display: "flex", flexDirection: "column", gap: 20 }}>
+        <div>
+          <h2 style={{ margin: 0, fontSize: 22, fontWeight: 800, color: C.text }}>My Learning</h2>
+          <p style={{ margin: "4px 0 0", fontSize: 13, color: C.textSub }}>Loading your assignments…</p>
+        </div>
+        <div style={{ padding: 60, textAlign: "center", color: C.textMuted, fontSize: 14 }}>Loading…</div>
+      </div>
+    );
+
     const userTeamId = orgUsers.find(u => u.id === user?.id)?.teamId ?? null;
     const myAssignments = assignments.filter(a =>
       (a.assignedTo.type === "group"      && a.assignedTo.orgId === user?.orgId)  ||
@@ -9637,7 +9651,7 @@ function LeadershipDashboardScreen({ currentOrg, orgUsers = [], isReal = false }
   const deltaLabel = (d) => d > 0 ? `+${d}` : `${d}`;
   const deltaColor = (d) => d > 0 ? C.trueGreen : d < 0 ? C.red : C.textMuted;
 
-  const trendPoints = data.trends[trendPeriod];
+  const trendPoints = data.trends?.[trendPeriod] ?? [];
   const maxTrendVal = 100;
 
   // people filtered
@@ -10132,12 +10146,90 @@ function LeadershipDashboardScreen({ currentOrg, orgUsers = [], isReal = false }
 
 // ── PROGRESS SCREEN ─────────────────────────────────────────
 
-function ProgressScreen() {
-  const weeks = [
+function ProgressScreen({ currentUser = null, isReal = false, tenantId = null }) {
+  const DEMO_WEEKS = [
     { week: "W20", xp: 820 }, { week: "W21", xp: 1100 }, { week: "W22", xp: 950 },
     { week: "W23", xp: 1340 }, { week: "W24", xp: 680 },
   ];
-  const maxXp = Math.max(...weeks.map(w => w.xp));
+  const [loading,   setLoading]   = useState(isReal);
+  const [weeklyXp,  setWeeklyXp]  = useState(DEMO_WEEKS);
+  const [stats, setStats] = useState({
+    xp:            currentUser?.xp      ?? 2340,
+    streak:        currentUser?.streak  ?? 7,
+    level:         currentUser?.level   ?? 14,
+    xpNext:        currentUser?.xpNext  ?? 3000,
+    lessonsDone:   4,
+    lessonsTotal:  7,
+    quizzesPassed: 3,
+  });
+
+  useEffect(() => {
+    if (!isReal || !currentUser?.id || !tenantId) { setLoading(false); return; }
+    const uid = currentUser.id;
+
+    Promise.all([
+      getLessonCompletions(uid),
+      getUserQuizAttempts(tenantId, uid),
+      supabase.from("tenant_lessons").select("id", { count: "exact", head: true }).eq("tenant_id", tenantId),
+      supabase.from("user_point_events")
+        .select("points, created_at")
+        .eq("tenant_id", tenantId)
+        .eq("user_id", uid)
+        .gte("created_at", new Date(Date.now() - 35 * 86_400_000).toISOString()),
+    ]).then(([
+      { data: completedSet },
+      { data: attempts },
+      { count: totalLessons },
+      { data: recentEvents },
+    ]) => {
+      const lessonsDone   = completedSet?.size ?? 0;
+      const lessonsTotal  = totalLessons ?? 0;
+      const quizzesPassed = new Set((attempts ?? []).filter(a => a.passed).map(a => a.quiz_id)).size;
+
+      setStats({
+        xp:            currentUser.xp      ?? 0,
+        streak:        currentUser.streak  ?? 0,
+        level:         currentUser.level   ?? 1,
+        xpNext:        currentUser.xpNext  ?? 1000,
+        lessonsDone,
+        lessonsTotal,
+        quizzesPassed,
+      });
+
+      // Build weekly XP buckets (last 5 ISO weeks)
+      if (recentEvents?.length) {
+        const buckets = {};
+        recentEvents.forEach(e => {
+          const d = new Date(e.created_at);
+          // Simple ISO week: day-of-year / 7
+          const start = new Date(Date.UTC(d.getUTCFullYear(), 0, 1));
+          const wk = Math.ceil(((d - start) / 86_400_000 + start.getUTCDay() + 1) / 7);
+          const key = `W${String(wk).padStart(2, "0")}`;
+          buckets[key] = (buckets[key] ?? 0) + (e.points ?? 0);
+        });
+        const sorted = Object.entries(buckets).sort(([a], [b]) => a.localeCompare(b)).slice(-5);
+        if (sorted.length > 0) setWeeklyXp(sorted.map(([week, xp]) => ({ week, xp })));
+      } else {
+        setWeeklyXp([]);
+      }
+
+      setLoading(false);
+    }).catch(() => {
+      // On failure: zero out lesson/quiz counts so real users don't see demo stats
+      setStats(prev => ({ ...prev, lessonsDone: 0, lessonsTotal: 0, quizzesPassed: 0 }));
+      setLoading(false);
+    });
+  }, [isReal, tenantId, currentUser?.id]); // eslint-disable-line react-hooks/exhaustive-deps
+
+  const maxXp    = Math.max(...weeklyXp.map(w => w.xp), 1);
+  const xpToNext = Math.max((stats.xpNext - stats.xp), 0);
+
+  if (loading) return (
+    <div style={{ display: "flex", flexDirection: "column", gap: 20 }}>
+      <h2 style={{ margin: 0, fontSize: 22, fontWeight: 800, color: C.text }}>My Progress</h2>
+      <div style={{ padding: 60, textAlign: "center", color: C.textMuted, fontSize: 14 }}>Loading your progress…</div>
+    </div>
+  );
 
   return (
     <div style={{ display: "flex", flexDirection: "column", gap: 20 }}>
@@ -10145,10 +10237,10 @@ function ProgressScreen() {
 
       <div style={{ display: "grid", gridTemplateColumns: "repeat(4, 1fr)", gap: 14 }}>
         {[
-          { label: "Total XP", value: "2,340", icon: "", color: C.orange },
-          { label: "Lessons Done", value: "4/7", icon: "", color: C.blue },
-          { label: "Quizzes Passed", value: "3", icon: "✅", color: C.green },
-          { label: "Current Streak", value: "7 days", icon: "", color: C.red },
+          { label: "Total XP",       value: stats.xp.toLocaleString(), icon: "", color: C.orange },
+          { label: "Lessons Done",   value: stats.lessonsTotal ? `${stats.lessonsDone}/${stats.lessonsTotal}` : `${stats.lessonsDone}`, icon: "", color: C.blue },
+          { label: "Quizzes Passed", value: String(stats.quizzesPassed), icon: "✅", color: C.green },
+          { label: "Current Streak", value: `${stats.streak} ${stats.streak === 1 ? "day" : "days"}`, icon: "", color: C.red },
         ].map((s, i) => (
           <Card key={i}>
             {s.icon && <div style={{ fontSize: 22, marginBottom: 8 }}>{s.icon}</div>}
@@ -10162,25 +10254,28 @@ function ProgressScreen() {
         {/* XP Chart */}
         <Card>
           <div style={{ fontSize: 15, fontWeight: 700, color: C.text, marginBottom: 20 }}>Weekly XP</div>
-          <div style={{ display: "flex", alignItems: "flex-end", gap: 12, height: 120 }}>
-            {weeks.map((w, i) => (
-              <div key={i} style={{ flex: 1, display: "flex", flexDirection: "column", alignItems: "center", gap: 6 }}>
-                <div style={{ fontSize: 11, fontWeight: 600, color: C.orange }}>{i === weeks.length - 1 ? "" : ""}</div>
-                <div style={{
-                  width: "100%", background: i === weeks.length - 1 ? C.orangeLight : C.orange,
-                  border: `2px solid ${C.orange}`,
-                  borderRadius: "6px 6px 0 0",
-                  height: `${(w.xp / maxXp) * 100}px`,
-                  display: "flex", alignItems: "flex-start", justifyContent: "center", paddingTop: 6,
-                }}>
-                  <span style={{ fontSize: 10, fontWeight: 700, color: i === weeks.length - 1 ? C.orange : "#fff" }}>
-                    {w.xp}
-                  </span>
+          {weeklyXp.length === 0 ? (
+            <div style={{ padding: "40px 0", textAlign: "center", color: C.textMuted, fontSize: 13 }}>No XP earned yet — complete a lesson or quiz to get started.</div>
+          ) : (
+            <div style={{ display: "flex", alignItems: "flex-end", gap: 12, height: 120 }}>
+              {weeklyXp.map((w, i) => (
+                <div key={i} style={{ flex: 1, display: "flex", flexDirection: "column", alignItems: "center", gap: 6 }}>
+                  <div style={{
+                    width: "100%", background: i === weeklyXp.length - 1 ? C.orangeLight : C.orange,
+                    border: `2px solid ${C.orange}`,
+                    borderRadius: "6px 6px 0 0",
+                    height: `${Math.max((w.xp / maxXp) * 100, 4)}px`,
+                    display: "flex", alignItems: "flex-start", justifyContent: "center", paddingTop: 6,
+                  }}>
+                    <span style={{ fontSize: 10, fontWeight: 700, color: i === weeklyXp.length - 1 ? C.orange : "#fff" }}>
+                      {w.xp}
+                    </span>
+                  </div>
+                  <div style={{ fontSize: 11, color: C.textSub }}>{w.week}</div>
                 </div>
-                <div style={{ fontSize: 11, color: C.textSub }}>{w.week}</div>
-              </div>
-            ))}
-          </div>
+              ))}
+            </div>
+          )}
         </Card>
 
         {/* Level progress */}
@@ -10188,20 +10283,20 @@ function ProgressScreen() {
           <div style={{ fontSize: 15, fontWeight: 700, color: C.text, marginBottom: 20 }}>Level Progress</div>
           <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 12 }}>
             <div>
-              <div style={{ fontSize: 32, fontWeight: 900, color: C.orange }}>14</div>
+              <div style={{ fontSize: 32, fontWeight: 900, color: C.orange }}>{stats.level}</div>
               <div style={{ fontSize: 12, color: C.textSub }}>Current Level</div>
             </div>
             <div style={{ fontSize: 32, color: C.textMuted }}>→</div>
             <div style={{ textAlign: "right" }}>
-              <div style={{ fontSize: 32, fontWeight: 900, color: C.textSub }}>15</div>
+              <div style={{ fontSize: 32, fontWeight: 900, color: C.textSub }}>{stats.level + 1}</div>
               <div style={{ fontSize: 12, color: C.textSub }}>Next Level</div>
             </div>
           </div>
-          <ProgressBar value={2340} max={3000} color={C.orange} height={10} />
+          <ProgressBar value={stats.xp % 1000} max={1000} color={C.orange} height={10} />
           <div style={{ display: "flex", justifyContent: "space-between", fontSize: 12, color: C.textSub, marginTop: 8 }}>
-            <span>2,340 XP</span>
-            <span style={{ color: C.orange, fontWeight: 600 }}>660 XP to go</span>
-            <span>3,000 XP</span>
+            <span>{stats.xp.toLocaleString()} XP</span>
+            <span style={{ color: C.orange, fontWeight: 600 }}>{xpToNext.toLocaleString()} XP to go</span>
+            <span>{stats.xpNext.toLocaleString()} XP</span>
           </div>
         </Card>
       </div>
@@ -13965,14 +14060,23 @@ export default function App() {
         let profile = await getProfile(session.user.id);
         if (!profile) profile = await createMissingProfile(session.user);
         if (profile) {
-          // Load real XP total from user_point_events (canonical source; profiles.xp is stale)
+          // Load real XP, level, xpNext, streak from user_point_events (canonical source)
           if (profile.orgId) {
             getLeaderboard(profile.orgId, profile.id).then(({ data }) => {
               const row = data?.find(r => r.userId === profile.id || r.id === profile.id);
-              if (row?.total != null) setCurrentUser(prev => prev ? { ...prev, xp: row.total } : prev);
+              if (row?.total != null) {
+                const { level, xpNext } = computeUserMeta(row.total);
+                setCurrentUser(prev => prev ? { ...prev, xp: row.total, level, xpNext } : prev);
+              }
+            }).catch(() => {});
+            getUserStreak(profile.orgId, profile.id).then(streak => {
+              setCurrentUser(prev => prev ? { ...prev, streak } : prev);
             }).catch(() => {});
           }
-          setCurrentUser(profile);
+          // Pre-compute level/xpNext from profile.xp so first render is consistent.
+          // Async patches (getLeaderboard, getUserStreak) will update with real values.
+          const { level: profileLevel, xpNext: profileXpNext } = computeUserMeta(profile.xp ?? 0);
+          setCurrentUser({ ...profile, level: profileLevel, xpNext: profileXpNext });
           if (isRalliAdmin(profile.role)) {
             setScreen("organizations");
             setOrgs([]); // clear seed/mock orgs — ralli admin sees only real Supabase tenants
@@ -14089,6 +14193,7 @@ export default function App() {
     }
 
     // Load tenant members → orgUsers (for leaderboard, assign screens, etc.)
+    // XP is loaded from profiles first (fast), then patched from user_point_events (canonical).
     supabase.from("profiles").select("*").eq("tenant_id", tenantId).neq("status", "inactive")
       .then(({ data: members }) => {
         if (!members?.length) return;
@@ -14100,7 +14205,7 @@ export default function App() {
           orgId: m.tenant_id,
           teamId: m.team_id ?? null,
           color: m.color ?? "#F97316",
-          xp: m.xp ?? 0,
+          xp: m.xp ?? 0,  // patched below from user_point_events
           streak: m.streak ?? 0,
           status: m.status ?? "active",
           _isReal: true,
@@ -14110,6 +14215,16 @@ export default function App() {
           ...prev.filter(u => u.orgId !== tenantId && !u._isReal),
           ...realMembers,
         ]);
+        // Patch XP from user_point_events (canonical source; profiles.xp is stale)
+        getLeaderboard(tenantId).then(({ data: lbRows }) => {
+          if (!lbRows?.length) return;
+          const xpMap = Object.fromEntries(lbRows.map(r => [r.userId, r.total]));
+          setOrgUsers(prev => prev.map(u =>
+            u.orgId === tenantId && u._isReal && xpMap[u.id] != null
+              ? { ...u, xp: xpMap[u.id] }
+              : u
+          ));
+        }).catch(e => console.error("[ralli] orgUsers XP patch failed:", e));
       });
   }, [currentUser?.id]); // eslint-disable-line react-hooks/exhaustive-deps
 
@@ -14360,7 +14475,8 @@ export default function App() {
   const handleAwardXp = (amount) => {
     if (!amount || !currentUser) return;
     const newXp = (currentUser.xp || 0) + amount;
-    setCurrentUser(prev => prev ? { ...prev, xp: newXp } : prev);
+    const { level, xpNext } = computeUserMeta(newXp);
+    setCurrentUser(prev => prev ? { ...prev, xp: newXp, level, xpNext } : prev);
   };
 
   const handleSaveProfile = (updated) => {
@@ -14774,7 +14890,7 @@ export default function App() {
       case "insights":           return <InsightsScreen user={user} isReal={!!user?._isReal} tenantId={currentOrg?.id ?? null} orgUsers={orgUsers} isAdmin={isAdminType} />;
       case "progress":          return isAdminType
         ? <LeadershipDashboardScreen currentOrg={currentOrg} orgUsers={orgUsers} isReal={!!user?._isReal} />
-        : <ProgressScreen />;
+        : <ProgressScreen currentUser={user} isReal={!!user?._isReal} tenantId={currentOrg?.id ?? null} />;
       case "leaderboard":       return <LeaderboardScreen currentUser={user} isReal={!!user?._isReal} tenantId={currentOrg?.id ?? null} />;
       case "organizations":     return selectedOrg
         ? <OrgDetailScreen org={selectedOrg} orgUsers={orgUsers} onBack={() => setSelectedOrg(null)} onAddUser={handleAddUser} onDeactivateOrg={handleDeactivateOrg} onReactivateOrg={handleReactivateOrg} onDeleteOrg={handleDeleteOrg} onCancelOrg={handleCancelOrg} onUpdateOrg={handleUpdateOrg} onUpdateMember={handleUpdateMember} onRemoveMember={handleRemoveMember} onCancelInvite={handleCancelInvite} onResendMemberInvite={handleResendMemberInvite} />
@@ -14829,7 +14945,7 @@ export default function App() {
                   <span style={{ fontWeight: 700, color: C.text, letterSpacing: "0.02em" }}>{user.level != null ? `Level ${user.level}` : "Level 1"}</span>
                   <span style={{ color: C.orangeDeep, fontWeight: 700 }}>{(user.xp ?? 0).toLocaleString()} XP</span>
                 </div>
-                <ProgressBar value={user.xp ?? 0} max={user.xpNext ?? 1000} color={C.orange} height={4} trackColor="rgba(11,18,32,0.07)" />
+                <ProgressBar value={(user.xp ?? 0) % 1000} max={1000} color={C.orange} height={4} trackColor="rgba(11,18,32,0.07)" />
                 {user.xpNext != null && (
                   <div style={{ fontSize: 10, color: C.textMuted, marginTop: 6 }}>
                     {(user.xpNext - (user.xp ?? 0)).toLocaleString()} XP to Level {(user.level ?? 1) + 1}
@@ -14905,7 +15021,7 @@ export default function App() {
               <div style={{ minWidth: 0, flex: 1 }}>
                 <div style={{ fontSize: 12, fontWeight: 600, color: C.text, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{user.name}</div>
                 <div style={{ fontSize: 10, color: isSuperAdmin ? "#8B5CF6" : isOrgAdmin ? "#059669" : C.textMuted, marginTop: 1 }}>
-                  {isSuperAdmin ? "ralli admin" : isOrgAdmin ? "Manager" : `${user.streak}-day streak`}
+                  {isSuperAdmin ? "ralli admin" : isOrgAdmin ? "Manager" : `${user.streak ?? 0}-day streak`}
                 </div>
               </div>
               <button

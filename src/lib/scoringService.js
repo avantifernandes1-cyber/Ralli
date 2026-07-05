@@ -333,3 +333,50 @@ export async function getLeaderboard(tenantId, currentUserId = null) {
 
   return { data: rows, error: null };
 }
+
+// ── USER META HELPERS ────────────────────────────────────────────────────────
+
+/**
+ * Derive level + xpNext from a raw XP total.
+ * Level thresholds: Level 1 = 0–999, Level 2 = 1000–1999, etc.
+ * Pure function — safe to call anywhere without side effects.
+ */
+export function computeUserMeta(xp = 0) {
+  const level = Math.floor(xp / 1000) + 1;
+  const xpNext = level * 1000;
+  return { level, xpNext };
+}
+
+/**
+ * Compute consecutive-day streak for a user from user_point_events.
+ * A streak counts backward from today (or yesterday if today has no activity yet).
+ * Returns 0 if there are no events or the most recent event is older than yesterday.
+ */
+export async function getUserStreak(tenantId, userId) {
+  if (!tenantId || !userId) return 0;
+  const { data, error } = await supabase
+    .from("user_point_events")
+    .select("created_at")
+    .eq("tenant_id", tenantId)
+    .eq("user_id", userId)
+    .order("created_at", { ascending: false });
+  if (error || !data?.length) return 0;
+
+  // Unique UTC day strings, newest first
+  const days = [...new Set(data.map(e => e.created_at.slice(0, 10)))].sort().reverse();
+
+  const today     = new Date().toISOString().slice(0, 10);
+  const yesterday = new Date(Date.now() - 86_400_000).toISOString().slice(0, 10);
+
+  // Streak must begin today or yesterday
+  if (days[0] !== today && days[0] !== yesterday) return 0;
+
+  let streak = 1;
+  for (let i = 1; i < days.length; i++) {
+    const diffMs  = new Date(days[i - 1]) - new Date(days[i]);
+    const diffDay = diffMs / 86_400_000;
+    if (diffDay === 1) streak++;
+    else break;
+  }
+  return streak;
+}
