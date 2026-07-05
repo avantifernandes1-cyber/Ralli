@@ -5610,16 +5610,14 @@ function LearnScreen({ role, user, orgUsers = [], orgs = [], onNav, onAwardXp, p
     setActiveCourse(null);
   };
 
-  // Deep-link: if navigated here from HomeScreen with a pending lesson, open it on mount.
-  // Production hook: useEffect fires once; pendingLessonId comes from App state.
+  // Deep-link: if navigated here from HomeScreen with a pending lesson, open it.
+  // Retries when lessons load (Supabase fetch may not be complete on first render).
   useEffect(() => {
-    if (pendingLessonId && !isAdmin) {
-      const lesson = lessons.find(l => l.id === pendingLessonId)
-        ?? INITIAL_LEARN_LESSONS.find(l => l.id === pendingLessonId);
-      if (lesson) openLesson(lesson);
-      onClearPendingLesson?.();
-    }
-  }, [pendingLessonId]); // eslint-disable-line react-hooks/exhaustive-deps
+    if (!pendingLessonId || isAdmin) return;
+    const lesson = lessons.find(l => l.id === pendingLessonId)
+      ?? INITIAL_LEARN_LESSONS.find(l => l.id === pendingLessonId);
+    if (lesson) { openLesson(lesson); onClearPendingLesson?.(); }
+  }, [pendingLessonId, lessons]); // eslint-disable-line react-hooks/exhaustive-deps
 
   // Deep-link: open a specific course from HomeScreen assignment card.
   // Retries when courses load (courses may not be ready on first render).
@@ -6501,8 +6499,16 @@ function LearnScreen({ role, user, orgUsers = [], orgs = [], onNav, onAwardXp, p
 }
 
 // ── LESSON VIEWER (user) ────────────────────────────────────
+const FlipIcon = ({ color }) => (
+  <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke={color} strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round" style={{ flexShrink: 0 }}>
+    <path d="M21 12a9 9 0 1 1-9-9c2.52 0 4.93 1 6.74 2.74L21 8"/>
+    <path d="M21 3v5h-5"/>
+  </svg>
+);
+
 function FlipCard({ front, back }) {
   const [flipped, setFlipped] = React.useState(false);
+  const accentColor = flipped ? LESSON_TYPE_COLORS.flipcard : C.textMuted;
   return (
     <div onClick={() => setFlipped(f => !f)} style={{
       cursor: "pointer", minHeight: 200, borderRadius: 14, padding: 32,
@@ -6512,8 +6518,9 @@ function FlipCard({ front, back }) {
       transition: "background 0.2s, border-color 0.2s",
       userSelect: "none",
     }}>
-      <div style={{ fontSize: 11, fontWeight: 700, color: flipped ? LESSON_TYPE_COLORS.flipcard : C.textMuted, letterSpacing: "0.1em" }}>
-        {flipped ? "BACK" : "FRONT"} — tap to flip
+      <div style={{ display: "flex", alignItems: "center", gap: 6, fontSize: 11, fontWeight: 700, color: accentColor, letterSpacing: "0.1em" }}>
+        {flipped ? "BACK" : "FRONT"}
+        <FlipIcon color={accentColor} />
       </div>
       <div style={{ fontSize: 18, fontWeight: 700, color: C.text, lineHeight: 1.5, maxWidth: 440 }}>
         {flipped ? back : front}
@@ -6577,9 +6584,22 @@ function getBlocks(lesson) {
 function LessonBlock({ block, cardStyle }) {
   const c = block.content ?? {};
   const style = cardStyle ?? { background: "#fff", borderRadius: 14, padding: 28, border: "1px solid #E5E7EB" };
+  const header = block.header?.trim() || null;
+
+  const withHeader = (node) => {
+    if (!node) return null;
+    if (!header) return node;
+    return (
+      <div>
+        <div style={{ fontSize: 13, fontWeight: 700, color: C.text, marginBottom: 10, letterSpacing: "-0.01em" }}>{header}</div>
+        {node}
+      </div>
+    );
+  };
+
   if (block.type === "text") {
     if (!c.body) return null;
-    return (
+    return withHeader(
       <div style={style}>
         <pre style={{ margin: 0, fontSize: 14, lineHeight: 1.8, color: C.text, fontFamily: "inherit", whiteSpace: "pre-wrap", wordBreak: "break-word" }}>{c.body}</pre>
       </div>
@@ -6587,7 +6607,7 @@ function LessonBlock({ block, cardStyle }) {
   }
   if (block.type === "image") {
     if (!c.imageUrl) return null;
-    return (
+    return withHeader(
       <div style={{ ...style, textAlign: "center" }}>
         <img src={c.imageUrl} alt={c.caption ?? ""} style={{ maxWidth: "100%", maxHeight: 420, borderRadius: 8, objectFit: "contain" }} />
         {c.caption && <p style={{ margin: "12px 0 0", fontSize: 13, color: C.textSub }}>{c.caption}</p>}
@@ -6597,7 +6617,7 @@ function LessonBlock({ block, cardStyle }) {
   if (block.type === "video") {
     const url = c.videoUrl ?? "";
     const embedUrl = url.replace("watch?v=", "embed/").replace("youtu.be/", "youtube.com/embed/");
-    return (
+    return withHeader(
       <div style={style}>
         {url ? (
           <div style={{ position: "relative", paddingBottom: "56.25%", height: 0, marginBottom: c.notes ? 20 : 0 }}>
@@ -6616,14 +6636,14 @@ function LessonBlock({ block, cardStyle }) {
   }
   if (block.type === "flipcard") {
     if (!c.front && !c.back) return null;
-    return <FlipCard front={c.front ?? ""} back={c.back ?? ""} />;
+    return withHeader(<FlipCard front={c.front ?? ""} back={c.back ?? ""} />);
   }
   if (block.type === "quiz") {
     if (!c.question) return null;
-    return <LessonQuiz question={c.question} options={c.options ?? []} correctIdx={c.correctIdx ?? 0} />;
+    return withHeader(<LessonQuiz question={c.question} options={c.options ?? []} correctIdx={c.correctIdx ?? 0} />);
   }
   if (block.type === "recording") {
-    return (
+    return withHeader(
       <div style={style}>
         {c.prompt && (
           <>
@@ -7020,6 +7040,7 @@ function BlockEditor({ block, onChange, onRemove, onMoveUp, onMoveDown, isFirst,
   const BLOCK_LABELS  = { text: "Text", image: "Image", video: "Video", flipcard: "Flip Card", quiz: "Quiz", recording: "Recording" };
   const c             = block.content ?? {};
   const setC          = (key, val) => onChange({ ...block, content: { ...c, [key]: val } });
+  const setHeader     = (val)      => onChange({ ...block, header: val });
   const setType       = (t)        => onChange({ ...block, type: t, content: {} });
 
   const inputStyle = { width: "100%", padding: "9px 12px", borderRadius: 8, border: `1px solid ${C.border}`, fontSize: 13, color: C.text, background: C.pageBg, boxSizing: "border-box" };
@@ -7046,6 +7067,14 @@ function BlockEditor({ block, onChange, onRemove, onMoveUp, onMoveDown, isFirst,
           <button onClick={onRemove} title="Remove block" style={{ padding: "3px 7px", borderRadius: 6, border: `1px solid ${C.border}`, background: C.white, cursor: "pointer", fontSize: 13, color: C.red }}>✕</button>
         </div>
       </div>
+
+      {/* Optional section header */}
+      <input
+        value={block.header ?? ""}
+        onChange={e => setHeader(e.target.value)}
+        placeholder="Section header (optional)"
+        style={{ ...inputStyle, marginBottom: 12, fontWeight: 600 }}
+      />
 
       {/* Type-specific fields */}
       {block.type === "text" && (
