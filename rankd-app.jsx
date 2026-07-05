@@ -224,22 +224,27 @@ function useGameChannel(pin, role) {
 
 const C = {
   // Backgrounds
-  pageBg:        "#F7F8FA",        // --background
+  pageBg:        "#F6F7F9",        // --background (cool neutral, like Linear)
   sidebar:       "#FFFFFF",        // --sidebar (white)
-  sidebarAccent: "#FFF3C7",        // --sidebar-accent (light yellow)
-  sidebarBorder: "rgba(11,18,32,0.08)",
+  sidebarAccent: "#FFFBEF",        // --sidebar-accent (softer yellow tint)
+  sidebarBorder: "rgba(11,18,32,0.05)",
   white:         "#FFFFFF",
-  muted:         "#FFF3C7",        // --muted
+  muted:         "#FFFBEF",        // --muted
 
   // Borders
-  border:    "rgba(11,18,32,0.1)",
-  inputBg:   "#F7F8FA",
+  border:    "rgba(11,18,32,0.08)",
+  inputBg:   "#F8F9FA",
+
+  // Shadows
+  shadowSm: "0 1px 2px rgba(11,18,32,0.05), 0 1px 4px rgba(11,18,32,0.04)",
+  shadowMd: "0 2px 8px rgba(11,18,32,0.07), 0 1px 2px rgba(11,18,32,0.04)",
+  shadowLg: "0 8px 24px rgba(11,18,32,0.09), 0 2px 6px rgba(11,18,32,0.05)",
 
   // Brand — Ralli Sunshine yellow
   orange:        "#FDBF24",        // --primary (golden yellow)
   orangeAmber:   "#FDBF24",
   orangeDeep:    "#CC9800",        // darker yellow
-  orangeLight:   "#FFF3C7",        // --secondary/accent
+  orangeLight:   "#FFFBEF",        // --secondary/accent
   orangeBorder:  "#FFD86A",
   orangeDark:    "#CC9800",
   orangeGlow:    "rgba(253,191,36,0.15)",
@@ -260,8 +265,8 @@ const C = {
   yellow:  "#FDBF24",
 
   // Semantic bg tints
-  greenBg:  "#FFF3C7",
-  limeBg:   "#FFF3C7",
+  greenBg:  "#FFFBEF",
+  limeBg:   "#FFFBEF",
   redBg:    "#FEF2F2",
   blueBg:   "#F0F9FF",
   purpleBg: "#F5F3FF",
@@ -279,7 +284,10 @@ const C = {
   trueGreenBg:"#DCFCE7",
   gamePurple: "#7C3AED",
 
-  radius: 12,
+  radius:   14,
+  radiusSm:  8,
+  radiusMd: 12,
+  radiusLg: 20,
 };
 
 // ── FEATURE ACCESS + ROLE PERMISSIONS ────────────────────────────────────────
@@ -336,8 +344,9 @@ function ProgressBar({ value, max = 100, color = C.orange, height = 6, trackColo
 function Card({ children, style = {}, onClick }) {
   return (
     <div onClick={onClick} style={{
-      background: C.white, borderRadius: 12,
+      background: C.white, borderRadius: 16,
       border: `1px solid ${C.border}`,
+      boxShadow: C.shadowSm,
       padding: 20, ...style,
     }}>
       {children}
@@ -348,20 +357,25 @@ function Card({ children, style = {}, onClick }) {
 // Shown to org admins on screens that require team data to be meaningful.
 function OrgAdminEmptyScreen({ feature = "this feature", onGoToTeam }) {
   return (
-    <div style={{ display: "flex", flexDirection: "column", alignItems: "center", justifyContent: "center", minHeight: 380, gap: 16, textAlign: "center", padding: 40 }}>
-      <div style={{ width: 64, height: 64, borderRadius: 16, background: C.orangeLight, display: "flex", alignItems: "center", justifyContent: "center", fontSize: 28 }}>
-        🏗️
+    <div style={{ display: "flex", flexDirection: "column", alignItems: "center", justifyContent: "center", minHeight: 380, gap: 20, textAlign: "center", padding: 40 }}>
+      <div style={{ width: 56, height: 56, borderRadius: 16, background: C.orangeLight, border: `1px solid ${C.border}`, display: "flex", alignItems: "center", justifyContent: "center" }}>
+        <svg width="24" height="24" viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg">
+          <rect x="3" y="3" width="8" height="8" rx="2" fill={C.orange} opacity="0.7"/>
+          <rect x="13" y="3" width="8" height="8" rx="2" fill={C.orange} opacity="0.4"/>
+          <rect x="3" y="13" width="8" height="8" rx="2" fill={C.orange} opacity="0.4"/>
+          <rect x="13" y="13" width="8" height="8" rx="2" fill={C.orange} opacity="0.7"/>
+        </svg>
       </div>
       <div>
-        <div style={{ fontSize: 18, fontWeight: 800, color: C.text, marginBottom: 6 }}>Nothing here yet</div>
-        <p style={{ margin: 0, fontSize: 13, color: C.textSub, maxWidth: 320, lineHeight: 1.6 }}>
+        <div style={{ fontSize: 15, fontWeight: 700, color: C.text, marginBottom: 6 }}>Nothing here yet</div>
+        <p style={{ margin: 0, fontSize: 13, color: C.textMuted, maxWidth: 300, lineHeight: 1.6 }}>
           Come back to {feature} once your team is set up and your reps start using ralli.
         </p>
       </div>
       {onGoToTeam && (
         <button
           onClick={onGoToTeam}
-          style={{ padding: "10px 20px", borderRadius: 10, border: "none", background: C.orange, color: "#fff", fontSize: 13, fontWeight: 700, cursor: "pointer" }}
+          style={{ padding: "10px 22px", borderRadius: 99, border: "none", background: C.orange, color: "#fff", fontSize: 13, fontWeight: 700, cursor: "pointer", boxShadow: C.shadowSm }}
         >
           Go to Team →
         </button>
@@ -374,9 +388,9 @@ function Tag({ children, color = C.orange, bg }) {
   return (
     <span style={{
       display: "inline-flex", alignItems: "center",
-      padding: "2px 8px", borderRadius: 6,
-      fontSize: 11, fontWeight: 600,
-      color, background: bg || color + "18",
+      padding: "3px 10px", borderRadius: 99,
+      fontSize: 11, fontWeight: 600, letterSpacing: "0.01em",
+      color, background: bg || color + "15",
     }}>
       {children}
     </span>
@@ -13907,36 +13921,38 @@ export default function App() {
       {!fullScreen && !mobile && (
         <div style={{ width: 220, flexShrink: 0, background: C.sidebar, borderRight: `1px solid ${C.sidebarBorder}`, display: "flex", flexDirection: "column" }}>
           {/* Logo */}
-          <div style={{ padding: "22px 20px 16px" }}>
+          <div style={{ padding: "20px 18px 14px" }}>
             <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
-              <RalliLogo size={36} />
+              <RalliLogo size={34} />
               <div>
-                <div style={{ fontSize: 18, fontWeight: 900, color: C.text, letterSpacing: "-0.3px" }}>ralli</div>
-                <div style={{ fontSize: 9, fontWeight: 700, color: C.orange, letterSpacing: "0.08em" }}>Focus. Grow. Succeed.</div>
+                <div style={{ fontSize: 17, fontWeight: 900, color: C.text, letterSpacing: "-0.5px" }}>ralli</div>
+                <div style={{ fontSize: 9, fontWeight: 600, color: C.textMuted, letterSpacing: "0.06em", textTransform: "uppercase" }}>Sales Readiness</div>
               </div>
             </div>
             {/* Org badge — shown for org users */}
             {currentOrg && (
-              <div style={{ marginTop: 10, padding: "6px 10px", background: C.orangeLight, borderRadius: 8, display: "flex", alignItems: "center", gap: 6 }}>
-                <span style={{ fontSize: 11, fontWeight: 700, color: C.textSub, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{currentOrg.name}</span>
+              <div style={{ marginTop: 12, padding: "5px 10px", background: C.pageBg, borderRadius: 8, border: `1px solid ${C.border}`, display: "flex", alignItems: "center", gap: 6 }}>
+                <div style={{ width: 6, height: 6, borderRadius: "50%", background: C.orange, flexShrink: 0 }} />
+                <span style={{ fontSize: 11, fontWeight: 600, color: C.textSub, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{currentOrg.name}</span>
               </div>
             )}
             {isSuperAdmin && (
-              <div style={{ marginTop: 10, padding: "6px 10px", background: "rgba(139,92,246,0.1)", borderRadius: 8, display: "flex", alignItems: "center", gap: 6 }}>
-                <span style={{ fontSize: 11, fontWeight: 700, color: "#7C3AED" }}>ralli platform</span>
+              <div style={{ marginTop: 12, padding: "5px 10px", background: "rgba(139,92,246,0.06)", borderRadius: 8, border: "1px solid rgba(139,92,246,0.15)", display: "flex", alignItems: "center", gap: 6 }}>
+                <div style={{ width: 6, height: 6, borderRadius: "50%", background: "#8B5CF6", flexShrink: 0 }} />
+                <span style={{ fontSize: 11, fontWeight: 600, color: "#7C3AED" }}>ralli platform</span>
               </div>
             )}
 
             {/* Level bar — reps only */}
             {user.role === "user" && (
-              <div style={{ marginTop: 16, padding: "12px 14px", background: C.orangeLight, borderRadius: 10 }}>
-                <div style={{ display: "flex", justifyContent: "space-between", fontSize: 11, marginBottom: 6 }}>
-                  <span style={{ fontWeight: 700, color: C.text }}>{user.level != null ? `LEVEL ${user.level}` : "LEVEL 1"}</span>
-                  <span style={{ color: C.orangeDark, fontWeight: 700 }}>{(user.xp ?? 0).toLocaleString()} XP</span>
+              <div style={{ marginTop: 14, padding: "12px 14px", background: C.pageBg, borderRadius: 12, border: `1px solid ${C.border}` }}>
+                <div style={{ display: "flex", justifyContent: "space-between", fontSize: 11, marginBottom: 7 }}>
+                  <span style={{ fontWeight: 700, color: C.text, letterSpacing: "0.02em" }}>{user.level != null ? `Level ${user.level}` : "Level 1"}</span>
+                  <span style={{ color: C.orangeDeep, fontWeight: 700 }}>{(user.xp ?? 0).toLocaleString()} XP</span>
                 </div>
-                <ProgressBar value={user.xp ?? 0} max={user.xpNext ?? 1000} color={C.orange} height={5} trackColor="rgba(11,18,32,0.1)" />
+                <ProgressBar value={user.xp ?? 0} max={user.xpNext ?? 1000} color={C.orange} height={4} trackColor="rgba(11,18,32,0.07)" />
                 {user.xpNext != null && (
-                  <div style={{ fontSize: 10, color: C.textMuted, marginTop: 5 }}>
+                  <div style={{ fontSize: 10, color: C.textMuted, marginTop: 6 }}>
                     {(user.xpNext - (user.xp ?? 0)).toLocaleString()} XP to Level {(user.level ?? 1) + 1}
                   </div>
                 )}
@@ -13945,7 +13961,7 @@ export default function App() {
           </div>
 
           {/* Nav */}
-          <nav style={{ flex: 1, padding: "4px 12px", overflowY: "auto" }}>
+          <nav style={{ flex: 1, padding: "4px 10px", overflowY: "auto" }}>
             {[
               // Super admin gets org management nav
               ...(isSuperAdmin ? [
@@ -13966,22 +13982,25 @@ export default function App() {
             ].map(item => {
               const active = screen === item.id || (screen.startsWith("rankd-") && item.id === "rankd");
               return (
-                <button key={item.id} onClick={() => navigate(item.id)} style={{
+                <button key={item.id} onClick={() => navigate(item.id)}
+                  onMouseEnter={e => { if (!active) e.currentTarget.style.background = C.pageBg; }}
+                  onMouseLeave={e => { if (!active) e.currentTarget.style.background = "transparent"; }}
+                  style={{
                   width: "100%", display: "flex", alignItems: "center", gap: 10,
-                  padding: "9px 10px", borderRadius: 8, border: "none",
-                  cursor: "pointer", marginBottom: 2,
+                  padding: "8px 10px", borderRadius: 10, border: "none",
+                  cursor: "pointer", marginBottom: 1,
                   background: active ? C.sidebarAccent : "transparent",
                   color: active ? C.textSidebarActive : C.textSidebar,
-                  fontSize: 13, fontWeight: 700, textAlign: "left",
-                  borderLeft: `3px solid ${active ? C.orange : "transparent"}`,
-                  transition: "all 0.12s",
+                  fontSize: 13, fontWeight: active ? 700 : 500, textAlign: "left",
+                  transition: "background 0.1s, color 0.1s",
                 }}>
-                  {item.icon && <span style={{ fontSize: 15, opacity: active ? 1 : 0.7 }}>{item.icon}</span>}
+                  {active && <div style={{ width: 3, height: 14, borderRadius: 99, background: C.orange, flexShrink: 0, marginRight: -2 }} />}
+                  {item.icon && <span style={{ fontSize: 15, opacity: active ? 1 : 0.6 }}>{item.icon}</span>}
                   <span style={{ flex: 1, display: "flex", alignItems: "center", gap: 6 }}>
                     <span>{isAdminType && item.adminLabel ? item.adminLabel : item.label}</span>
                     {item.badge && !(user?._isReal && item.id === "leaderboard") && (
                       <span style={{
-                        fontSize: 10, fontWeight: 800, padding: "2px 6px", borderRadius: 10,
+                        fontSize: 9, fontWeight: 700, padding: "2px 7px", borderRadius: 99,
                         background: item.badge === "LIVE" ? "#22C55E" : C.orange,
                         color: "#fff", letterSpacing: "0.04em",
                       }}>{item.badge}</span>
@@ -13993,21 +14012,21 @@ export default function App() {
           </nav>
 
           {/* Bottom user card */}
-          <div style={{ padding: "12px 16px", borderTop: `1px solid ${C.sidebarBorder}` }}>
-            <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
+          <div style={{ padding: "10px 12px 14px", borderTop: `1px solid ${C.sidebarBorder}` }}>
+            <div style={{ display: "flex", alignItems: "center", gap: 10, padding: "8px 10px", borderRadius: 12, background: C.pageBg }}>
               <div
                 onClick={() => navigate("settings")}
                 title="Open Settings"
                 style={{
-                  width: 36, height: 36, borderRadius: "50%",
+                  width: 32, height: 32, borderRadius: "50%",
                   background: user.color, display: "flex", alignItems: "center", justifyContent: "center",
-                  fontSize: 13, fontWeight: 800, color: "#fff", flexShrink: 0,
-                  cursor: "pointer",
+                  fontSize: 12, fontWeight: 800, color: "#fff", flexShrink: 0,
+                  cursor: "pointer", boxShadow: "0 1px 3px rgba(0,0,0,0.15)",
                 }}>{user.initials}</div>
               <div style={{ minWidth: 0, flex: 1 }}>
-                <div style={{ fontSize: 13, fontWeight: 700, color: C.text }}>{user.name}</div>
-                <div style={{ fontSize: 11, color: isSuperAdmin ? "#7C3AED" : isOrgAdmin ? "#059669" : C.orangeDark }}>
-                  {isSuperAdmin ? "ralli admin" : isOrgAdmin ? `Manager · ${currentOrg?.name ?? ""}` : `${user.streak}-day streak`}
+                <div style={{ fontSize: 12, fontWeight: 600, color: C.text, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{user.name}</div>
+                <div style={{ fontSize: 10, color: isSuperAdmin ? "#8B5CF6" : isOrgAdmin ? "#059669" : C.textMuted, marginTop: 1 }}>
+                  {isSuperAdmin ? "ralli admin" : isOrgAdmin ? "Manager" : `${user.streak}-day streak`}
                 </div>
               </div>
               <button
@@ -14017,13 +14036,13 @@ export default function App() {
                 }}
                 title="Sign out"
                 style={{
-                  background: C.muted, border: "none", borderRadius: 6,
-                  color: C.textMuted, fontSize: 14, cursor: "pointer",
-                  width: 28, height: 28, display: "flex", alignItems: "center", justifyContent: "center",
-                  flexShrink: 0, transition: "background 0.12s",
+                  background: "transparent", border: `1px solid ${C.border}`, borderRadius: 7,
+                  color: C.textMuted, fontSize: 13, cursor: "pointer",
+                  width: 26, height: 26, display: "flex", alignItems: "center", justifyContent: "center",
+                  flexShrink: 0, transition: "all 0.1s",
                 }}
-                onMouseEnter={e => e.currentTarget.style.background = C.orangeLight}
-                onMouseLeave={e => e.currentTarget.style.background = C.muted}
+                onMouseEnter={e => { e.currentTarget.style.background = C.white; e.currentTarget.style.color = C.text; }}
+                onMouseLeave={e => { e.currentTarget.style.background = "transparent"; e.currentTarget.style.color = C.textMuted; }}
               >↩</button>
             </div>
           </div>
@@ -14059,8 +14078,10 @@ export default function App() {
         {/* Desktop top bar */}
         {!fullScreen && !mobile && (
           <div style={{
-            height: 56, background: C.white, borderBottom: `1px solid ${C.border}`,
-            display: "flex", alignItems: "center", padding: "0 24px", gap: 16, flexShrink: 0,
+            height: 56, background: C.white,
+            borderBottom: `1px solid ${C.sidebarBorder}`,
+            boxShadow: "0 1px 0 rgba(11,18,32,0.04)",
+            display: "flex", alignItems: "center", padding: "0 28px", gap: 16, flexShrink: 0,
           }}>
             {/* Company logo for users; search placeholder for ralli admin only.
                 Production hook: replace currentOrg?.name with org.logoUrl when
@@ -14086,34 +14107,36 @@ export default function App() {
             <div style={{ flex: 1 }} />
 
             {role === "user" && (
-              <div style={{ display: "flex", alignItems: "center", gap: 6, padding: "5px 12px", borderRadius: 20, border: `1px solid ${C.border}` }}>
-                <span style={{ fontSize: 13, fontWeight: 700, color: C.text }}>{user.streak}</span>
+              <div style={{ display: "flex", alignItems: "center", gap: 5, padding: "4px 11px", borderRadius: 99, border: `1px solid ${C.border}`, background: C.pageBg }}>
+                <span style={{ fontSize: 12, color: C.textMuted }}>🔥</span>
+                <span style={{ fontSize: 12, fontWeight: 600, color: C.text }}>{user.streak}d</span>
               </div>
             )}
             {role === "user" && (
-              <div style={{ display: "flex", alignItems: "center", gap: 6, padding: "5px 12px", borderRadius: 20, border: `1px solid ${C.border}`, background: C.orangeLight }}>
-                <span style={{ fontSize: 13, fontWeight: 700, color: C.orange }}>{user.xp.toLocaleString()} XP</span>
+              <div style={{ display: "flex", alignItems: "center", gap: 5, padding: "4px 12px", borderRadius: 99, border: `1px solid ${C.orangeBorder}`, background: C.orangeLight }}>
+                <span style={{ fontSize: 12, fontWeight: 700, color: C.orangeDeep }}>{user.xp.toLocaleString()} XP</span>
               </div>
             )}
             {isSuperAdmin && (
-              <div style={{ display: "flex", alignItems: "center", gap: 6, padding: "5px 12px", borderRadius: 20, border: "1px solid rgba(139,92,246,0.3)", background: "rgba(139,92,246,0.08)" }}>
-                <span style={{ fontSize: 13, fontWeight: 700, color: "#8B5CF6" }}>ralli admin</span>
+              <div style={{ display: "flex", alignItems: "center", gap: 5, padding: "4px 12px", borderRadius: 99, border: "1px solid rgba(139,92,246,0.2)", background: "rgba(139,92,246,0.06)" }}>
+                <span style={{ fontSize: 12, fontWeight: 600, color: "#8B5CF6" }}>ralli admin</span>
               </div>
             )}
-            {isOrgAdmin && (
-              <div style={{ display: "flex", alignItems: "center", gap: 6, padding: "5px 12px", borderRadius: 20, border: `1px solid ${C.border}`, background: C.green + "12" }}>
-                <span style={{ fontSize: 13, fontWeight: 700, color: C.green }}>{currentOrg?.name ?? "Manager"}</span>
+            {isOrgAdmin && currentOrg && (
+              <div style={{ display: "flex", alignItems: "center", gap: 5, padding: "4px 12px", borderRadius: 99, border: `1px solid ${C.border}`, background: C.pageBg }}>
+                <span style={{ fontSize: 12, fontWeight: 600, color: C.textSub }}>{currentOrg.name}</span>
               </div>
             )}
             {role === "user" && currentOrg && (
-              <div style={{ display: "flex", alignItems: "center", gap: 6, padding: "5px 12px", borderRadius: 20, border: `1px solid ${C.border}` }}>
-                <span style={{ fontSize: 13, fontWeight: 600, color: C.textSub }}>{currentOrg.name}</span>
+              <div style={{ display: "flex", alignItems: "center", gap: 5, padding: "4px 12px", borderRadius: 99, border: `1px solid ${C.border}`, background: C.pageBg }}>
+                <span style={{ fontSize: 12, fontWeight: 500, color: C.textMuted }}>{currentOrg.name}</span>
               </div>
             )}
             <div style={{
-              width: 34, height: 34, borderRadius: "50%", background: user.color,
+              width: 32, height: 32, borderRadius: "50%", background: user.color,
               display: "flex", alignItems: "center", justifyContent: "center",
-              fontSize: 13, fontWeight: 800, color: "#fff", cursor: "pointer",
+              fontSize: 12, fontWeight: 800, color: "#fff", cursor: "pointer",
+              boxShadow: "0 1px 3px rgba(0,0,0,0.15)",
             }}>{user.initials}</div>
           </div>
         )}
