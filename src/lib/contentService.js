@@ -30,8 +30,9 @@ function dbToLesson(row) {
     duration:    row.duration ?? "",
     xp:          row.xp ?? 100,
     status:      row.status ?? "active",
-    videoUrl:    row.content?.videoUrl ?? "",
-    notes:       row.content?.notes    ?? "",
+    content:     row.content ?? {},           // full JSONB — body, imageUrl, front/back, question, etc.
+    videoUrl:    row.content?.videoUrl ?? "", // kept for backward compat
+    notes:       row.content?.notes    ?? "", // kept for backward compat
     createdAt:   row.created_at,
   };
 }
@@ -46,10 +47,7 @@ function lessonToDb(lesson, tenantId, userId) {
     duration:    lesson.duration ?? null,
     xp:          lesson.xp ?? 100,
     status:      lesson.status ?? "active",
-    content:     {
-      videoUrl: lesson.videoUrl ?? null,
-      notes:    lesson.notes    ?? null,
-    },
+    content:     lesson.content ?? {},        // store the full content object as authored
     created_by:  userId ?? null,
     updated_at:  new Date().toISOString(),
   };
@@ -307,15 +305,16 @@ export async function deleteQuiz(quizId) {
 /** Normalise a DB row → app assignment shape */
 function dbToAssignment(row) {
   return {
-    id:          row.id,
-    contentType: row.content_type,
-    contentId:   row.content_id,
-    assignedTo:  row.assigned_to ?? {},
-    dueAt:       row.due_at ?? "Open",
-    required:    row.required ?? false,
-    assignedAt:  row.assigned_at
+    id:             row.id,
+    contentType:    row.content_type,
+    contentId:      row.content_id,
+    assignedTo:     row.assigned_to ?? {},
+    dueAt:          row.due_at ?? "Open",
+    required:       row.required ?? false,
+    assignedAt:     row.assigned_at
       ? new Date(row.assigned_at).toLocaleDateString("en-US", { month: "short", day: "numeric" })
       : "—",
+    assignedAtRaw:  row.assigned_at ?? null, // ISO string — used for availability date math
   };
 }
 
@@ -515,4 +514,71 @@ export async function markLessonComplete(profileId, lessonId, tenantId = null) {
       { onConflict: "profile_id,lesson_id" }
     );
   return { error };
+}
+
+
+// ─────────────────────────────────────────────────────────────────────────────
+// QUIZ ATTEMPTS
+// ─────────────────────────────────────────────────────────────────────────────
+
+/**
+ * Persist a quiz attempt to Supabase.
+ * Called immediately after scoring so insights have real accuracy data.
+ *
+ * @param {string} tenantId
+ * @param {string} userId
+ * @param {string} quizId
+ * @param {{ score: number, passed: boolean, answers: Array, attemptNum?: number }} attempt
+ * @returns {Promise<{ data: Object|null, error: Object|null }>}
+ */
+export async function saveQuizAttempt(tenantId, userId, quizId, attempt) {
+  if (!tenantId || !userId || !quizId) return { data: null, error: new Error("Missing required params") };
+  const { data, error } = await supabase
+    .from("quiz_attempts")
+    .insert({
+      tenant_id:   tenantId,
+      user_id:     userId,
+      quiz_id:     quizId,
+      score:       attempt.score ?? 0,
+      passed:      attempt.passed ?? false,
+      attempt_num: attempt.attemptNum ?? 1,
+      answers:     attempt.answers ?? [],
+    })
+    .select()
+    .maybeSingle();
+  return { data, error };
+}
+
+/**
+ * Fetch all quiz attempts for a user within a tenant.
+ * Used by insightsService to compute quiz accuracy per topic.
+ *
+ * @param {string} tenantId
+ * @param {string} userId
+ * @returns {Promise<{ data: Array|null, error: Object|null }>}
+ */
+export async function getUserQuizAttempts(tenantId, userId) {
+  const { data, error } = await supabase
+    .from("quiz_attempts")
+    .select("id, quiz_id, score, passed, attempt_num, answers, created_at")
+    .eq("tenant_id", tenantId)
+    .eq("user_id", userId)
+    .order("created_at", { ascending: false });
+  return { data, error };
+}
+
+/**
+ * Fetch all quiz attempts for all users in a tenant.
+ * Used by managers/admins for team-level insights.
+ *
+ * @param {string} tenantId
+ * @returns {Promise<{ data: Array|null, error: Object|null }>}
+ */
+export async function getTenantQuizAttempts(tenantId) {
+  const { data, error } = await supabase
+    .from("quiz_attempts")
+    .select("id, user_id, quiz_id, score, passed, attempt_num, created_at")
+    .eq("tenant_id", tenantId)
+    .order("created_at", { ascending: false });
+  return { data, error };
 }

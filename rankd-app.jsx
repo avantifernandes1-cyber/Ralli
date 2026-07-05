@@ -55,6 +55,7 @@ import { getProfile, createMissingProfile, getTenantProfiles } from "./src/lib/p
 import { sendInviteEmail } from "./src/lib/emailService.js";
 import { provisionTenant, buildInviteUrl, normalizeProvisionedOrg, createMemberInvite } from "./src/lib/provisioningService.js";
 import { awardLessonPoints, awardCoursePoints, awardQuizPoints, awardGamePointsForSession } from "./src/lib/scoringService.js";
+import { saveQuizAttempt } from "./src/lib/contentService.js";
 
 // ── MOBILE HOOK ────────────────────────────────────────────
 function useMobile() {
@@ -8096,12 +8097,18 @@ function QuizzesScreen({ role, onNav, quizzes, onEditQuiz, onDeleteQuiz, onToggl
       ));
       setActiveAttempt(attempt);
       setView("results");
-      // Award quiz XP for real users
+      // Award quiz XP + persist attempt for real users
       if (isReal && currentUser?.id && tenantId) {
         const previousAttempts = assignments.find(q => q.id === activeId)?.attempts ?? [];
         const isRetake = previousAttempts.length > 0;
         awardQuizPoints(tenantId, currentUser.id, activeId, attempt, { isRetake })
           .catch(e => console.error("[ralli] awardQuizPoints failed:", e));
+        saveQuizAttempt(tenantId, currentUser.id, activeId, {
+          score:      attempt.score,
+          passed:     attempt.passed,
+          attemptNum: previousAttempts.length + 1,
+          answers:    attempt.answers ?? [],
+        }).catch(e => console.error("[ralli] saveQuizAttempt failed:", e));
       }
     };
 
@@ -12855,6 +12862,368 @@ const INITIAL_ORGS     = SEED_TENANTS;       // alias — app screens reference 
 const INITIAL_ORG_USERS = SEED_USERS;        // alias — app screens reference INITIAL_ORG_USERS
 const USERS             = SEED_USERS;        // alias — used by LoginScreen
 
+
+// ── InsightsScreen ────────────────────────────────────────────────────────────
+// Role-aware AI Insights screen.
+// User: personal readiness score + recommendations
+// Manager/Admin: team overview + per-member readiness
+//
+// Data flow:
+//   1. Fetch aggregated performance via insightsService
+//   2. Compute rules-based recommendations (client-side, always works)
+//   3. Optionally fetch AI prose summary via /api/ai-insights (graceful fallback)
+//   4. Cache AI result in ai_insights table to avoid redundant calls
+// ─────────────────────────────────────────────────────────────────────────────
+function InsightsScreen({ user, isReal = false, tenantId = null, orgUsers = [], isAdmin = false }) {
+  const [loading,  setLoading]  = useState(isReal);
+  const [perf,     setPerf]     = useState(null);
+  const [teamData, setTeamData] = useState(null);
+  const [recs,     setRecs]     = useState([]);
+  const [aiSummary,     setAiSummary]     = useState(null);
+  const [aiAvailable,   setAiAvailable]   = useState(false);
+  const [aiLoading,     setAiLoading]     = useState(false);
+  const [error,    setError]    = useState(null);
+
+  // Lazy import to avoid circular deps at module load time
+  const [insightsSvc, setInsightsSvc] = useState(null);
+  useEffect(() => {
+    import("./src/lib/insightsService.js").then(m => setInsightsSvc(m));
+  }, []);
+
+  // Load performance data
+  useEffect(() => {
+    if (!isReal || !tenantId || !user?.id || !insightsSvc) {
+      setLoading(false);
+      return;
+    }
+    setLoading(true);
+    const load = async () => {
+      try {
+        if (isAdmin) {
+          // Manager/Admin: fetch team insights
+          const { data: team, error: teamErr } = await insightsSvc.getTeamInsights(tenantId);
+          if (teamErr) { setError("Could not load team insights."); return; }
+          setTeamData(team);
+          // Also load own perf if available
+          const { data: myPerf } = await insightsSvc.getUserPerformance(tenantId, user.id);
+          if (myPerf) {
+            setPerf(myPerf);
+            setRecs(insightsSvc.getRecommendations(myPerf));
+          }
+        } else {
+          const { data: myPerf, error: perfErr } = await insightsSvc.getUserPerformance(tenantId, user.id);
+          if (perfErr || !myPerf) { setError("Could not load your insights."); return; }
+          setPerf(myPerf);
+          setRecs(insightsSvc.getRecommendations(myPerf));
+
+          // Persist readiness score in background (non-blocking)
+          insightsSvc.computeAndSaveReadinessScore(tenantId, user.id)
+            .catch(() => {});
+
+          // Try cached AI insight first
+          const { data: cached } = await insightsSvc.getCachedInsight(tenantId, "user", user.id);
+          if (cached?.summary) {
+            setAiSummary(cached.summary);
+            setAiAvailable(true);
+            return;
+          }
+
+          // Request fresh AI summary
+          setAiLoading(true);
+          try {
+            const res = await fetch("/api/ai-insights", {
+              method: "POST",
+              headers: { "Content-Type": "application/json" },
+              body: JSON.stringify({ scope: "user", data: myPerf, recs: insightsSvc.getRecommendations(myPerf) }),
+            });
+            if (res.ok) {
+              const json = await res.json();
+              setAiAvailable(json.aiAvailable ?? false);
+              if (json.summary) {
+                setAiSummary(json.summary);
+                insightsSvc.saveInsightCache(tenantId, "user", user.id, { summary: json.summary, recommendations: json.recommendations ?? [] })
+                  .catch(() => {});
+              }
+            }
+          } catch (_) { /* AI unavailable — silent fail, recs still shown */ }
+          setAiLoading(false);
+        }
+      } finally {
+        setLoading(false);
+      }
+    };
+    load();
+  }, [isReal, tenantId, user?.id, insightsSvc, isAdmin]);
+
+  const band = insightsSvc?.getReadinessBand ?? (s => ({ label: s >= 85 ? "High" : s >= 65 ? "On Track" : "At Risk", color: s >= 85 ? "#22c55e" : s >= 65 ? "#f59e0b" : "#ef4444", bg: s >= 85 ? "#f0fdf4" : s >= 65 ? "#fffbeb" : "#fef2f2" }));
+
+  // ── Mock data for demo users ──
+  const mockPerf = {
+    score: 72, learningScore: 68, quizScore: 79, gameScore: 65,
+    totalXp: 540, recentXp: 240, lessonsCompleted: 5, coursesCompleted: 1,
+    quizzesAttempted: 4, quizzesPassed: 3, avgQuizScore: 77, passRate: 75, gamesPlayed: 2,
+  };
+  const mockRecs = [
+    { priority: "high",   type: "quiz",   action: "Retake your lowest-scoring quiz", reason: "Raising quiz scores has the biggest impact on your readiness score." },
+    { priority: "medium", type: "lesson", action: "Complete 2 more lessons this week", reason: "You've completed 5 lessons — 10 is the baseline for a high learning score." },
+    { priority: "low",    type: "game",   action: "Join a live game session", reason: "Live games reinforce knowledge and contribute to your readiness score." },
+  ];
+  const displayPerf = perf ?? (isReal ? null : mockPerf);
+  const displayRecs = recs.length > 0 ? recs : (isReal ? [] : mockRecs);
+
+  const cardStyle = { background: C.white, borderRadius: 14, padding: 24, border: `1px solid ${C.border}` };
+  const sectionHead = { fontSize: 11, fontWeight: 700, color: C.textMuted, letterSpacing: "0.08em", textTransform: "uppercase", marginBottom: 16 };
+  const PRIORITY_COLOR = { high: "#ef4444", medium: "#f59e0b", low: "#22c55e" };
+
+  if (loading) {
+    return (
+      <div style={{ flex: 1, overflow: "auto", padding: "32px 32px 80px", maxWidth: 860, margin: "0 auto", width: "100%" }}>
+        <div style={{ fontSize: 22, fontWeight: 700, color: C.text, marginBottom: 8 }}>Insights</div>
+        <div style={{ color: C.textSub, fontSize: 13, marginBottom: 32 }}>Loading your performance data...</div>
+        {[1,2,3].map(i => <div key={i} style={{ ...cardStyle, height: 80, marginBottom: 16, background: C.muted, border: "none" }} />)}
+      </div>
+    );
+  }
+
+  if (error) {
+    return (
+      <div style={{ flex: 1, overflow: "auto", padding: "32px 32px 80px", maxWidth: 860, margin: "0 auto", width: "100%" }}>
+        <div style={{ fontSize: 22, fontWeight: 700, color: C.text, marginBottom: 8 }}>Insights</div>
+        <div style={{ ...cardStyle, color: C.textSub, fontSize: 13 }}>{error}</div>
+      </div>
+    );
+  }
+
+  return (
+    <div style={{ flex: 1, overflow: "auto", padding: "32px 32px 80px", maxWidth: 860, margin: "0 auto", width: "100%" }}>
+
+      {/* Header */}
+      <div style={{ marginBottom: 32 }}>
+        <div style={{ fontSize: 22, fontWeight: 700, color: C.text, marginBottom: 4 }}>Insights</div>
+        <div style={{ color: C.textSub, fontSize: 13 }}>
+          {isAdmin ? "Team readiness overview based on real activity data." : "Your readiness score and recommended actions."}
+        </div>
+      </div>
+
+      {/* ── USER VIEW ── */}
+      {!isAdmin && displayPerf && (() => {
+        const b = band(displayPerf.score);
+        return (
+          <div style={{ display: "flex", flexDirection: "column", gap: 20 }}>
+
+            {/* Readiness score card */}
+            <div style={{ ...cardStyle, display: "flex", gap: 32, alignItems: "flex-start", flexWrap: "wrap" }}>
+              {/* Score ring */}
+              <div style={{ display: "flex", flexDirection: "column", alignItems: "center", gap: 8, minWidth: 100 }}>
+                <div style={{ width: 96, height: 96, borderRadius: "50%", background: b.bg, border: `4px solid ${b.color}`, display: "flex", flexDirection: "column", alignItems: "center", justifyContent: "center" }}>
+                  <span style={{ fontSize: 26, fontWeight: 800, color: b.color }}>{displayPerf.score}</span>
+                </div>
+                <span style={{ fontSize: 12, fontWeight: 700, color: b.color, background: b.bg, padding: "2px 10px", borderRadius: 99 }}>{b.label}</span>
+              </div>
+
+              {/* Component breakdown */}
+              <div style={{ flex: 1, display: "flex", flexDirection: "column", gap: 12, minWidth: 200 }}>
+                <div style={{ fontSize: 14, fontWeight: 700, color: C.text, marginBottom: 4 }}>Readiness Score</div>
+                {[
+                  { label: "Learning", score: displayPerf.learningScore, detail: `${displayPerf.lessonsCompleted} lesson${displayPerf.lessonsCompleted !== 1 ? "s" : ""}, ${displayPerf.coursesCompleted} course${displayPerf.coursesCompleted !== 1 ? "s" : ""}`, weight: "35%" },
+                  { label: "Quizzes",  score: displayPerf.quizScore,    detail: `${displayPerf.avgQuizScore}% avg, ${displayPerf.quizzesPassed}/${displayPerf.quizzesAttempted} passed`, weight: "40%" },
+                  { label: "Games",    score: displayPerf.gameScore,    detail: `${displayPerf.gamesPlayed} game${displayPerf.gamesPlayed !== 1 ? "s" : ""} played`, weight: "25%" },
+                ].map(({ label, score, detail, weight }) => (
+                  <div key={label}>
+                    <div style={{ display: "flex", justifyContent: "space-between", alignItems: "baseline", marginBottom: 4 }}>
+                      <span style={{ fontSize: 12, fontWeight: 600, color: C.text }}>{label} <span style={{ fontSize: 11, fontWeight: 400, color: C.textMuted }}>({weight})</span></span>
+                      <span style={{ fontSize: 12, fontWeight: 700, color: C.text }}>{score}</span>
+                    </div>
+                    <div style={{ height: 5, borderRadius: 99, background: C.muted, overflow: "hidden" }}>
+                      <div style={{ height: "100%", borderRadius: 99, background: C.orange, width: `${score}%`, transition: "width 0.5s" }} />
+                    </div>
+                    <div style={{ fontSize: 11, color: C.textMuted, marginTop: 2 }}>{detail}</div>
+                  </div>
+                ))}
+              </div>
+
+              {/* XP */}
+              <div style={{ display: "flex", flexDirection: "column", gap: 8, alignItems: "flex-end", minWidth: 80 }}>
+                <div style={{ textAlign: "right" }}>
+                  <div style={{ fontSize: 20, fontWeight: 800, color: C.text }}>{displayPerf.totalXp.toLocaleString()}</div>
+                  <div style={{ fontSize: 11, color: C.textMuted }}>Total XP</div>
+                </div>
+                {displayPerf.recentXp > 0 && (
+                  <div style={{ fontSize: 11, fontWeight: 600, color: "#22c55e", background: "#f0fdf4", padding: "2px 8px", borderRadius: 99 }}>
+                    +{displayPerf.recentXp} this period
+                  </div>
+                )}
+              </div>
+            </div>
+
+            {/* AI Summary */}
+            <div style={cardStyle}>
+              <div style={sectionHead}>AI Summary</div>
+              {aiLoading ? (
+                <div style={{ fontSize: 13, color: C.textMuted, fontStyle: "italic" }}>Generating summary...</div>
+              ) : aiSummary ? (
+                <div style={{ fontSize: 14, color: C.text, lineHeight: 1.6 }}>{aiSummary}</div>
+              ) : (
+                <div style={{ fontSize: 13, color: C.textMuted, fontStyle: "italic" }}>
+                  {isReal
+                    ? "AI summary unavailable. Configure OPENAI_API_KEY in Vercel environment variables to enable."
+                    : "AI summaries are based on real activity data. Complete lessons and quizzes to generate your summary."}
+                </div>
+              )}
+            </div>
+
+            {/* Recommendations */}
+            {displayRecs.length > 0 && (
+              <div style={cardStyle}>
+                <div style={sectionHead}>Recommended Actions</div>
+                <div style={{ display: "flex", flexDirection: "column", gap: 12 }}>
+                  {displayRecs.map((rec, i) => (
+                    <div key={i} style={{ display: "flex", gap: 12, alignItems: "flex-start" }}>
+                      <div style={{ width: 8, height: 8, borderRadius: "50%", background: PRIORITY_COLOR[rec.priority] ?? C.orange, flexShrink: 0, marginTop: 5 }} />
+                      <div>
+                        <div style={{ fontSize: 13, fontWeight: 600, color: C.text, marginBottom: 2 }}>{rec.action}</div>
+                        <div style={{ fontSize: 12, color: C.textSub }}>{rec.reason}</div>
+                      </div>
+                    </div>
+                  ))}
+                </div>
+              </div>
+            )}
+
+            {/* Activity stats */}
+            <div style={{ ...cardStyle }}>
+              <div style={sectionHead}>Activity Summary</div>
+              <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(120px, 1fr))", gap: 16 }}>
+                {[
+                  { label: "Lessons Done",  value: displayPerf.lessonsCompleted },
+                  { label: "Courses Done",  value: displayPerf.coursesCompleted },
+                  { label: "Quizzes Taken", value: displayPerf.quizzesAttempted },
+                  { label: "Quizzes Passed",value: displayPerf.quizzesPassed },
+                  { label: "Avg Quiz Score",value: `${displayPerf.avgQuizScore}%` },
+                  { label: "Games Played",  value: displayPerf.gamesPlayed },
+                ].map(({ label, value }) => (
+                  <div key={label} style={{ textAlign: "center", padding: "12px 8px", background: C.pageBg, borderRadius: 10 }}>
+                    <div style={{ fontSize: 20, fontWeight: 800, color: C.text }}>{value}</div>
+                    <div style={{ fontSize: 11, color: C.textMuted, marginTop: 2 }}>{label}</div>
+                  </div>
+                ))}
+              </div>
+            </div>
+          </div>
+        );
+      })()}
+
+      {/* ── ADMIN / MANAGER VIEW ── */}
+      {isAdmin && (() => {
+        const team = teamData;
+        if (!team) {
+          return (
+            <div style={{ ...cardStyle, textAlign: "center", padding: 48, color: C.textSub }}>
+              <div style={{ fontSize: 32, marginBottom: 12 }}></div>
+              <div style={{ fontSize: 14, fontWeight: 600, color: C.text, marginBottom: 6 }}>No readiness data yet</div>
+              <div style={{ fontSize: 13, color: C.textMuted }}>Readiness scores appear once team members start completing lessons and quizzes.</div>
+            </div>
+          );
+        }
+        const distribution = team.distribution ?? { high: 0, onTrack: 0, atRisk: 0 };
+        const distBars = [
+          { label: "High (85+)",    count: distribution.high,    color: "#22c55e" },
+          { label: "On Track (65+)",count: distribution.onTrack, color: "#f59e0b" },
+          { label: "At Risk (<65)", count: distribution.atRisk,  color: "#ef4444" },
+        ];
+
+        return (
+          <div style={{ display: "flex", flexDirection: "column", gap: 20 }}>
+
+            {/* Team summary */}
+            <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(160px, 1fr))", gap: 16 }}>
+              {[
+                { label: "Team Avg Score",   value: team.avgScore ?? 0,          suffix: "/100" },
+                { label: "Members Tracked",  value: team.totalMembers ?? 0 },
+                { label: "At Risk",          value: team.atRisk?.length ?? 0,    color: "#ef4444" },
+                { label: "Top Performers",   value: team.topPerformers?.length ?? 0, color: "#22c55e" },
+              ].map(({ label, value, suffix = "", color }) => (
+                <div key={label} style={{ ...cardStyle, textAlign: "center" }}>
+                  <div style={{ fontSize: 28, fontWeight: 800, color: color ?? C.text }}>{value}{suffix}</div>
+                  <div style={{ fontSize: 12, color: C.textMuted, marginTop: 4 }}>{label}</div>
+                </div>
+              ))}
+            </div>
+
+            {/* Score distribution */}
+            <div style={cardStyle}>
+              <div style={sectionHead}>Score Distribution</div>
+              <div style={{ display: "flex", flexDirection: "column", gap: 12 }}>
+                {distBars.map(({ label, count, color }) => {
+                  const pct = team.totalMembers ? Math.round((count / team.totalMembers) * 100) : 0;
+                  return (
+                    <div key={label}>
+                      <div style={{ display: "flex", justifyContent: "space-between", marginBottom: 4 }}>
+                        <span style={{ fontSize: 12, fontWeight: 600, color: C.text }}>{label}</span>
+                        <span style={{ fontSize: 12, fontWeight: 700, color }}>{count} ({pct}%)</span>
+                      </div>
+                      <div style={{ height: 6, borderRadius: 99, background: C.muted, overflow: "hidden" }}>
+                        <div style={{ height: "100%", borderRadius: 99, background: color, width: `${pct}%`, transition: "width 0.5s" }} />
+                      </div>
+                    </div>
+                  );
+                })}
+              </div>
+            </div>
+
+            {/* Member list */}
+            {team.members?.length > 0 && (
+              <div style={cardStyle}>
+                <div style={sectionHead}>Member Scores</div>
+                <div style={{ display: "flex", flexDirection: "column", gap: 1 }}>
+                  {[...team.members]
+                    .sort((a, b) => b.score - a.score)
+                    .map((m, i) => {
+                      const mb = band(m.score);
+                      const memberProfile = orgUsers.find(u => u.id === m.user_id);
+                      const name = memberProfile?.name ?? memberProfile?.email ?? `User ${i + 1}`;
+                      const initials = name.split(" ").map(w => w[0] ?? "").join("").slice(0, 2).toUpperCase();
+                      return (
+                        <div key={m.user_id} style={{ display: "flex", alignItems: "center", gap: 12, padding: "10px 0", borderBottom: i < team.members.length - 1 ? `1px solid ${C.border}` : "none" }}>
+                          <div style={{ width: 32, height: 32, borderRadius: "50%", background: C.orangeLight, display: "flex", alignItems: "center", justifyContent: "center", fontSize: 11, fontWeight: 700, color: C.orange, flexShrink: 0 }}>{initials}</div>
+                          <div style={{ flex: 1, minWidth: 0 }}>
+                            <div style={{ fontSize: 13, fontWeight: 600, color: C.text, whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis" }}>{name}</div>
+                            <div style={{ fontSize: 11, color: C.textMuted }}>{m.quizzes_passed ?? 0}/{m.quizzes_attempted ?? 0} quizzes passed · {m.lessons_completed ?? 0} lessons</div>
+                          </div>
+                          <div style={{ display: "flex", alignItems: "center", gap: 6, flexShrink: 0 }}>
+                            <span style={{ fontSize: 15, fontWeight: 800, color: mb.color }}>{m.score}</span>
+                            <span style={{ fontSize: 10, fontWeight: 600, color: mb.color, background: mb.bg, padding: "2px 6px", borderRadius: 99 }}>{mb.label}</span>
+                          </div>
+                        </div>
+                      );
+                    })}
+                </div>
+              </div>
+            )}
+
+            {/* Empty state for new teams */}
+            {!team.members?.length && (
+              <div style={{ ...cardStyle, textAlign: "center", padding: 40, color: C.textSub }}>
+                <div style={{ fontSize: 13 }}>No readiness scores computed yet. Scores are generated as team members complete lessons, quizzes, and games.</div>
+              </div>
+            )}
+          </div>
+        );
+      })()}
+
+      {/* Demo user without mock data */}
+      {!isReal && !displayPerf && (
+        <div style={{ ...cardStyle, textAlign: "center", padding: 48 }}>
+          <div style={{ fontSize: 32, marginBottom: 12 }}></div>
+          <div style={{ fontSize: 14, fontWeight: 600, color: C.text, marginBottom: 6 }}>Insights powered by real data</div>
+          <div style={{ fontSize: 13, color: C.textMuted }}>Complete lessons, quizzes, and games to generate your readiness score and personalized recommendations.</div>
+        </div>
+      )}
+    </div>
+  );
+}
+
+
 // featureKey  — gates by subscription plan (FEATURE_CONFIG)
 // permKey     — gates by admin-controlled role permission (rolePermissions.features)
 //               defaults to item.id when not specified
@@ -12864,6 +13233,7 @@ const NAV_ITEMS = [
   { id: "learn",       label: "Learn",        icon: "", featureKey: "learn",     permKey: "learn" },
   { id: "quizzes",     label: "Quizzes",      icon: "", featureKey: "learn",     permKey: "quizzes" },
   { id: "battlecards", label: "Battle Cards", icon: "", featureKey: "learn",     permKey: "battlecards" },
+  { id: "insights",    label: "Insights",     icon: "", featureKey: "progress",  permKey: "progress" },
   { id: "progress",    label: "Progress",     adminLabel: "Leadership",  icon: "", featureKey: "progress",    permKey: "progress" },
   { id: "leaderboard", label: "Leaderboard",  icon: "", badge: "#3", featureKey: "leaderboard", permKey: "leaderboard" },
   { id: "settings",    label: "Settings",     icon: "", permKey: "settings" },
@@ -14151,6 +14521,7 @@ export default function App() {
       case "battlecards":       return (isAdminType && perm("actions","edit"))
         ? <BattleCardsAdminScreen categories={bcCategories} cards={battleCards} onSaveCategory={handleSaveBcCategory} onDeleteCategory={handleDeleteBcCategory} onSaveCard={handleSaveBattleCard} onDeleteCard={handleDeleteBattleCard} />
         : <BattleCardsScreen categories={bcCategories} cards={battleCards} />;
+      case "insights":           return <InsightsScreen user={user} isReal={!!user?._isReal} tenantId={currentOrg?.id ?? null} orgUsers={orgUsers} isAdmin={isAdminType} />;
       case "progress":          return isAdminType
         ? <LeadershipDashboardScreen currentOrg={currentOrg} orgUsers={orgUsers} isReal={!!user?._isReal} />
         : <ProgressScreen />;
