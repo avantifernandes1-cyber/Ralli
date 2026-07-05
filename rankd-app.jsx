@@ -5971,33 +5971,30 @@ function LearnScreen({ role, user, orgUsers = [], orgs = [], onNav, onAwardXp, p
             return (
               <Card key={course.id} style={{ display: "flex", flexDirection: "column", gap: 0, padding: 0, overflow: "hidden" }}>
                 {/* Color header */}
-                <div style={{ height: 6, background: course.color }} />
-                <div style={{ padding: 20 }}>
-                  <div style={{ display: "flex", alignItems: "flex-start", justifyContent: "space-between", marginBottom: 12 }}>
-                    <div style={{ fontSize: 32 }}>{course.emoji}</div>
-                    <div style={{ display: "flex", gap: 6, flexWrap: "wrap", justifyContent: "flex-end" }}>
-                      {canEdit && <button onClick={() => setCourseModal(course)} style={{ padding: "5px 10px", borderRadius: 7, border: `1px solid ${C.border}`, background: C.white, color: C.textSub, fontSize: 12, fontWeight: 600, cursor: "pointer" }}>Edit</button>}
-                      {canAssign && <button onClick={() => setAssignModal({ contentType: "course", contentId: course.id })} style={{ padding: "5px 10px", borderRadius: 7, border: "none", background: C.orange, color: "#fff", fontSize: 12, fontWeight: 700, cursor: "pointer" }}>Assign</button>}
-                      {canEdit && <button onClick={() => handleArchiveCourse(course.id)} style={{ padding: "5px 10px", borderRadius: 7, border: `1px solid rgba(239,68,68,0.25)`, background: "transparent", color: C.red, fontSize: 12, fontWeight: 600, cursor: "pointer" }}>Archive</button>}
-                    </div>
-                  </div>
-                  <h3 style={{ margin: "0 0 6px", fontSize: 16, fontWeight: 800, color: C.text }}>{course.title}</h3>
-                  <p style={{ margin: "0 0 14px", fontSize: 12, color: C.textSub, lineHeight: 1.5 }}>{course.description}</p>
+                <div style={{ height: 5, background: course.color }} />
+                <div style={{ padding: 20, display: "flex", flexDirection: "column", flex: 1 }}>
+                  <h3 style={{ margin: "0 0 6px", fontSize: 15, fontWeight: 700, color: C.text, lineHeight: 1.3 }}>{course.title}</h3>
+                  <p style={{ margin: "0 0 12px", fontSize: 12, color: C.textMuted, lineHeight: 1.55 }}>{course.description}</p>
                   <div style={{ display: "flex", gap: 12, fontSize: 12, color: C.textSub, marginBottom: 14 }}>
                     <span>{courseLessons.length} lessons</span>
-                    <span>⏱ {totalMin} min</span>
+                    <span>{totalMin} min</span>
                     <span>{courseLessons.reduce((s, l) => s + (l.xp || 0), 0)} XP</span>
                   </div>
                   {/* Lesson list preview */}
-                  <div style={{ display: "flex", flexDirection: "column", gap: 6 }}>
+                  <div style={{ display: "flex", flexDirection: "column", gap: 5, marginBottom: 16 }}>
                     {courseLessons.map((l, i) => (
-                      <div key={l.id} style={{ display: "flex", alignItems: "center", gap: 8, padding: "7px 10px", background: C.pageBg, borderRadius: 8 }}>
-                        <span style={{ fontSize: 11, fontWeight: 700, color: C.textMuted, width: 18 }}>{i + 1}</span>
-                        <span style={{ fontSize: 12 }}>{LESSON_TYPE_ICONS[l.type]}</span>
-                        <span style={{ fontSize: 12, fontWeight: 600, color: C.text, flex: 1, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{l.title}</span>
-                        <span style={{ fontSize: 11, color: C.textSub, flexShrink: 0 }}>{l.duration}</span>
+                      <div key={l.id} style={{ display: "flex", alignItems: "center", gap: 8, padding: "6px 10px", background: C.pageBg, borderRadius: 8, border: `1px solid ${C.border}` }}>
+                        <span style={{ fontSize: 11, fontWeight: 600, color: C.textMuted, width: 16, flexShrink: 0 }}>{i + 1}</span>
+                        <span style={{ fontSize: 12, fontWeight: 500, color: C.text, flex: 1, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{l.title}</span>
+                        <span style={{ fontSize: 11, color: C.textMuted, flexShrink: 0 }}>{l.duration}</span>
                       </div>
                     ))}
+                  </div>
+                  {/* Actions — bottom aligned */}
+                  <div style={{ display: "flex", gap: 6, marginTop: "auto", paddingTop: 4 }}>
+                    {canEdit && <button onClick={() => setCourseModal(course)} style={{ flex: 1, padding: "6px 0", borderRadius: 8, border: `1px solid ${C.border}`, background: C.white, color: C.textSub, fontSize: 12, fontWeight: 600, cursor: "pointer" }}>Edit</button>}
+                    {canAssign && <button onClick={() => setAssignModal({ contentType: "course", contentId: course.id })} style={{ flex: 1, padding: "6px 0", borderRadius: 8, border: "none", background: C.orange, color: "#fff", fontSize: 12, fontWeight: 700, cursor: "pointer" }}>Assign</button>}
+                    {canEdit && <button onClick={() => handleArchiveCourse(course.id)} style={{ flex: 1, padding: "6px 0", borderRadius: 8, border: `1px solid rgba(239,68,68,0.2)`, background: "transparent", color: C.red, fontSize: 12, fontWeight: 600, cursor: "pointer" }}>Archive</button>}
                   </div>
                 </div>
               </Card>
@@ -6021,30 +6018,21 @@ function LearnScreen({ role, user, orgUsers = [], orgs = [], onNav, onAwardXp, p
       {tab === "lessons" && (
         <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fill, minmax(300px, 1fr))", gap: 16 }}>
           {filteredLessons.map(lesson => (
-            <Card key={lesson.id} style={{ opacity: lesson.status === "inactive" ? 0.6 : 1 }}>
-              <div style={{ display: "flex", alignItems: "flex-start", justifyContent: "space-between", marginBottom: 12 }}>
-                <div style={{
-                  width: 42, height: 42, borderRadius: 10, flexShrink: 0,
-                  background: LESSON_TYPE_COLORS[lesson.type] + "20",
-                  border: `1px solid ${LESSON_TYPE_COLORS[lesson.type]}30`,
-                  display: "flex", alignItems: "center", justifyContent: "center", fontSize: 20,
-                }}>
-                  {LESSON_TYPE_ICONS[lesson.type]}
-                </div>
-                <div style={{ display: "flex", gap: 5, flexWrap: "wrap" }}>
-                  {canEdit && <button onClick={() => setLessonModal(lesson)} style={{ padding: "4px 9px", borderRadius: 7, border: `1px solid ${C.border}`, background: C.white, color: C.textSub, fontSize: 11, fontWeight: 600, cursor: "pointer" }}>Edit</button>}
-                  {canAssign && <button onClick={() => setAssignModal({ contentType: "lesson", contentId: lesson.id })} style={{ padding: "4px 9px", borderRadius: 7, border: "none", background: C.orange, color: "#fff", fontSize: 11, fontWeight: 700, cursor: "pointer" }}>Assign</button>}
-                  {canEdit && <button onClick={() => handleArchiveLesson(lesson.id)} style={{ padding: "4px 9px", borderRadius: 7, border: `1px solid rgba(239,68,68,0.25)`, background: "transparent", color: C.red, fontSize: 11, fontWeight: 600, cursor: "pointer" }}>Archive</button>}
-                </div>
+            <Card key={lesson.id} style={{ opacity: lesson.status === "inactive" ? 0.6 : 1, display: "flex", flexDirection: "column" }}>
+              <div style={{ fontSize: 10, fontWeight: 700, color: LESSON_TYPE_COLORS[lesson.type], letterSpacing: "0.08em", textTransform: "uppercase", marginBottom: 8 }}>
+                {lesson.type}{lesson.status === "inactive" ? " · Inactive" : ""}
               </div>
-              <div style={{ fontSize: 11, fontWeight: 700, color: LESSON_TYPE_COLORS[lesson.type], letterSpacing: "0.06em", marginBottom: 4 }}>
-                {lesson.type.toUpperCase()} {lesson.status === "inactive" ? "· INACTIVE" : ""}
-              </div>
-              <h3 style={{ margin: "0 0 6px", fontSize: 14, fontWeight: 800, color: C.text }}>{lesson.title}</h3>
-              <p style={{ margin: "0 0 12px", fontSize: 12, color: C.textSub, lineHeight: 1.5 }}>{lesson.description}</p>
-              <div style={{ display: "flex", gap: 10, fontSize: 12, color: C.textSub }}>
-                <span>⏱ {lesson.duration}</span>
+              <h3 style={{ margin: "0 0 6px", fontSize: 14, fontWeight: 700, color: C.text, lineHeight: 1.3 }}>{lesson.title}</h3>
+              <p style={{ margin: "0 0 12px", fontSize: 12, color: C.textMuted, lineHeight: 1.55, flex: 1 }}>{lesson.description}</p>
+              <div style={{ display: "flex", gap: 12, fontSize: 12, color: C.textSub, marginBottom: 14 }}>
+                <span>{lesson.duration}</span>
                 <span>{lesson.xp} XP</span>
+              </div>
+              {/* Actions — bottom aligned */}
+              <div style={{ display: "flex", gap: 6 }}>
+                {canEdit && <button onClick={() => setLessonModal(lesson)} style={{ flex: 1, padding: "6px 0", borderRadius: 8, border: `1px solid ${C.border}`, background: C.white, color: C.textSub, fontSize: 11, fontWeight: 600, cursor: "pointer" }}>Edit</button>}
+                {canAssign && <button onClick={() => setAssignModal({ contentType: "lesson", contentId: lesson.id })} style={{ flex: 1, padding: "6px 0", borderRadius: 8, border: "none", background: C.orange, color: "#fff", fontSize: 11, fontWeight: 700, cursor: "pointer" }}>Assign</button>}
+                {canEdit && <button onClick={() => handleArchiveLesson(lesson.id)} style={{ flex: 1, padding: "6px 0", borderRadius: 8, border: `1px solid rgba(239,68,68,0.2)`, background: "transparent", color: C.red, fontSize: 11, fontWeight: 600, cursor: "pointer" }}>Archive</button>}
               </div>
             </Card>
           ))}
