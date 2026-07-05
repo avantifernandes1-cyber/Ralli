@@ -6680,15 +6680,26 @@ function CourseBuilderModal({ course, lessons, onSave, onClose, onCreateLesson }
   });
   const [localLessons, setLocalLessons] = useState(lessons); // includes newly-created ones
   const [showNewLesson, setShowNewLesson] = useState(false);
+  const [showExistingPicker, setShowExistingPicker] = useState(false);
+  const [pickerSearch, setPickerSearch] = useState("");
 
-  const toggleLesson = (id) => setSelectedLessons(prev => prev.includes(id) ? prev.filter(x => x !== id) : [...prev, id]);
+  // Always dedupe on write so count is always accurate
+  const toggleLesson = (id) => setSelectedLessons(prev => {
+    if (prev.includes(id)) return prev.filter(x => x !== id);
+    return [...new Set([...prev, id])];
+  });
+  const removeLesson = (id) => setSelectedLessons(prev => prev.filter(x => x !== id));
 
   const setDays = (id, days) => setSchedule(prev => ({ ...prev, [id]: { available_after_days: Math.max(0, parseInt(days, 10) || 0) } }));
 
+  // Dedupe before saving
   const handleSave = () => {
     if (!title.trim()) return;
-    onSave({ ...(course || {}), title, description: desc, emoji, color, required, lessonIds: selectedLessons, lessonSchedule: schedule });
+    onSave({ ...(course || {}), title, description: desc, emoji, color, required, lessonIds: [...new Set(selectedLessons)], lessonSchedule: schedule });
   };
+
+  // Dedupe for display
+  const uniqueSelected = [...new Set(selectedLessons)];
 
   if (showNewLesson) {
     return (
@@ -6701,12 +6712,78 @@ function CourseBuilderModal({ course, lessons, onSave, onClose, onCreateLesson }
             ? await onCreateLesson(l)
             : ("ll" + Date.now());
           const created = { ...l, id: newId };
-          setLocalLessons(prev => [...prev, created]);
-          setSelectedLessons(prev => [...prev, newId]);
+          setLocalLessons(prev => {
+            if (prev.some(x => x.id === newId)) return prev;
+            return [...prev, created];
+          });
+          setSelectedLessons(prev => [...new Set([...prev, newId])]);
           setShowNewLesson(false);
         }}
         onClose={() => setShowNewLesson(false)}
       />
+    );
+  }
+
+  if (showExistingPicker) {
+    const q = pickerSearch.toLowerCase();
+    const filtered = localLessons.filter(l =>
+      !q || l.title?.toLowerCase().includes(q) || l.description?.toLowerCase().includes(q)
+    );
+    return (
+      <div style={{ position: "fixed", inset: 0, background: "rgba(0,0,0,0.45)", display: "flex", alignItems: "center", justifyContent: "center", zIndex: 1000, padding: 20 }}>
+        <div style={{ background: C.white, borderRadius: 16, padding: 24, width: "100%", maxWidth: 560, maxHeight: "85vh", display: "flex", flexDirection: "column", boxShadow: "0 24px 60px rgba(0,0,0,0.2)" }}>
+          {/* Header */}
+          <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", marginBottom: 16 }}>
+            <h3 style={{ margin: 0, fontSize: 16, fontWeight: 800, color: C.text }}>Add Existing Lesson</h3>
+            <button onClick={() => setShowExistingPicker(false)} style={{ background: "none", border: "none", fontSize: 20, cursor: "pointer", color: C.textMuted }}>×</button>
+          </div>
+          {/* Search */}
+          <input
+            autoFocus
+            value={pickerSearch}
+            onChange={e => setPickerSearch(e.target.value)}
+            placeholder="Search lessons by title or description…"
+            style={{ width: "100%", padding: "9px 12px", borderRadius: 8, border: `1px solid ${C.border}`, fontSize: 13, color: C.text, background: C.pageBg, marginBottom: 12, boxSizing: "border-box" }}
+          />
+          {/* Lesson list */}
+          <div style={{ flex: 1, overflowY: "auto", display: "flex", flexDirection: "column", gap: 6, paddingRight: 2 }}>
+            {filtered.length === 0 && (
+              <div style={{ padding: 32, textAlign: "center", color: C.textSub, fontSize: 13 }}>
+                {localLessons.length === 0 ? "No lessons yet — create one first." : "No lessons match your search."}
+              </div>
+            )}
+            {filtered.map(l => {
+              const sel = selectedLessons.includes(l.id);
+              const typeColor = LESSON_TYPE_COLORS[l.type] ?? C.orange;
+              return (
+                <div key={l.id} onClick={() => toggleLesson(l.id)} style={{
+                  display: "flex", alignItems: "center", gap: 12, padding: "10px 14px", borderRadius: 10, cursor: "pointer",
+                  border: `2px solid ${sel ? C.orange : C.border}`, background: sel ? C.orangeLight : C.pageBg,
+                }}>
+                  <div style={{
+                    width: 20, height: 20, borderRadius: "50%", flexShrink: 0,
+                    background: sel ? C.orange : C.muted, border: `2px solid ${sel ? C.orange : C.border}`,
+                    display: "flex", alignItems: "center", justifyContent: "center",
+                  }}>
+                    {sel && <span style={{ fontSize: 10, color: "#fff", fontWeight: 800 }}>✓</span>}
+                  </div>
+                  <div style={{ flex: 1, minWidth: 0 }}>
+                    <div style={{ fontSize: 13, fontWeight: 700, color: sel ? C.orange : C.text, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{l.title}</div>
+                    <div style={{ fontSize: 11, color: C.textSub }}>{(l.type ?? "").toUpperCase()} · {l.duration} · {l.xp} XP</div>
+                  </div>
+                </div>
+              );
+            })}
+          </div>
+          {/* Done */}
+          <button
+            onClick={() => { setShowExistingPicker(false); setPickerSearch(""); }}
+            style={{ marginTop: 16, padding: "11px", borderRadius: 8, border: "none", background: C.orange, color: "#fff", fontSize: 13, fontWeight: 700, cursor: "pointer" }}
+          >
+            Done — {uniqueSelected.length} lesson{uniqueSelected.length !== 1 ? "s" : ""} selected
+          </button>
+        </div>
+      </div>
     );
   }
 
@@ -6770,55 +6847,61 @@ function CourseBuilderModal({ course, lessons, onSave, onClose, onCreateLesson }
           fontSize: 13, color: C.text, background: C.pageBg, resize: "vertical", marginBottom: 20, boxSizing: "border-box", lineHeight: 1.5,
         }} />
 
-        <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", marginBottom: 10 }}>
-          <label style={{ fontSize: 12, fontWeight: 700, color: C.textSub }}>
-            LESSONS ({selectedLessons.length} selected)
-          </label>
-          {onCreateLesson && (
-            <button onClick={() => setShowNewLesson(true)} style={{
-              padding: "5px 12px", borderRadius: 7, border: `1px solid ${C.border}`,
-              background: C.pageBg, color: C.textSub, fontSize: 12, fontWeight: 600, cursor: "pointer",
-            }}>+ New Lesson</button>
-          )}
-        </div>
-        <div style={{ display: "flex", flexDirection: "column", gap: 8, maxHeight: 300, overflowY: "auto", paddingRight: 4 }}>
-          {localLessons.map((l, i) => {
-            const sel = selectedLessons.includes(l.id);
-            const order = selectedLessons.indexOf(l.id) + 1;
-            return (
-              <div key={l.id} style={{ borderRadius: 10, border: `2px solid ${sel ? C.orange : C.border}`, background: sel ? C.orangeLight : C.pageBg, overflow: "hidden" }}>
-                <div onClick={() => toggleLesson(l.id)} style={{ display: "flex", alignItems: "center", gap: 12, padding: "10px 14px", cursor: "pointer" }}>
-                  <div style={{
-                    width: 24, height: 24, borderRadius: "50%", flexShrink: 0,
-                    background: sel ? C.orange : C.muted,
-                    display: "flex", alignItems: "center", justifyContent: "center",
-                    fontSize: 11, fontWeight: 800, color: sel ? "#fff" : C.textMuted,
-                  }}>
-                    {sel ? order : i + 1}
+        <label style={{ fontSize: 12, fontWeight: 700, color: C.textSub, display: "block", marginBottom: 10 }}>
+          LESSONS ({uniqueSelected.length} selected)
+        </label>
+
+        {/* Selected lessons — compact ordered list with schedule + remove */}
+        {uniqueSelected.length > 0 && (
+          <div style={{ display: "flex", flexDirection: "column", gap: 6, marginBottom: 12 }}>
+            {uniqueSelected.map((id, i) => {
+              const l = localLessons.find(x => x.id === id);
+              if (!l) return null;
+              return (
+                <div key={id} style={{ borderRadius: 10, border: `1px solid ${C.border}`, background: C.pageBg, overflow: "hidden" }}>
+                  <div style={{ display: "flex", alignItems: "center", gap: 10, padding: "10px 12px" }}>
+                    <div style={{
+                      width: 22, height: 22, borderRadius: "50%", flexShrink: 0,
+                      background: C.orange, display: "flex", alignItems: "center", justifyContent: "center",
+                      fontSize: 10, fontWeight: 800, color: "#fff",
+                    }}>{i + 1}</div>
+                    <div style={{ flex: 1, minWidth: 0 }}>
+                      <div style={{ fontSize: 13, fontWeight: 700, color: C.text, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{l.title}</div>
+                      <div style={{ fontSize: 11, color: C.textSub }}>{l.duration} · {l.xp} XP</div>
+                    </div>
+                    <button onClick={() => removeLesson(id)} style={{ background: "none", border: "none", color: C.textMuted, fontSize: 16, cursor: "pointer", padding: "0 4px", lineHeight: 1, flexShrink: 0 }}>×</button>
                   </div>
-                  <div style={{ flex: 1 }}>
-                    <div style={{ fontSize: 13, fontWeight: 700, color: sel ? C.orange : C.text }}>{l.title}</div>
-                    <div style={{ fontSize: 11, color: C.textSub }}>{l.duration} · {l.xp} XP</div>
-                  </div>
-                  {sel && <span style={{ fontSize: 14, color: C.orange }}>✓</span>}
-                </div>
-                {sel && (
-                  <div style={{ display: "flex", alignItems: "center", gap: 8, padding: "0 14px 10px", paddingLeft: 50 }} onClick={e => e.stopPropagation()}>
+                  {/* Availability timing */}
+                  <div style={{ display: "flex", alignItems: "center", gap: 8, padding: "0 12px 10px 44px" }}>
                     <span style={{ fontSize: 11, color: C.textSub, fontWeight: 600 }}>Available after</span>
                     <input
                       type="number" min={0} max={365}
-                      value={schedule[l.id]?.available_after_days ?? 0}
-                      onChange={e => setDays(l.id, e.target.value)}
-                      style={{ width: 52, fontSize: 11, padding: "3px 6px", borderRadius: 6, border: `1px solid ${C.border}`, background: C.white, textAlign: "center" }}
+                      value={schedule[id]?.available_after_days ?? 0}
+                      onChange={e => setDays(id, e.target.value)}
+                      style={{ width: 48, fontSize: 11, padding: "3px 6px", borderRadius: 6, border: `1px solid ${C.border}`, background: C.white, textAlign: "center" }}
                     />
                     <span style={{ fontSize: 11, color: C.textSub }}>
-                      {(schedule[l.id]?.available_after_days ?? 0) === 0 ? "days (immediately)" : "days after assignment"}
+                      {(schedule[id]?.available_after_days ?? 0) === 0 ? "days (immediately)" : "days after assignment"}
                     </span>
                   </div>
-                )}
-              </div>
-            );
-          })}
+                </div>
+              );
+            })}
+          </div>
+        )}
+
+        {/* Add lesson buttons */}
+        <div style={{ display: "flex", gap: 8 }}>
+          <button onClick={() => setShowExistingPicker(true)} style={{
+            flex: 1, padding: "9px 12px", borderRadius: 8, border: `1px solid ${C.border}`,
+            background: C.pageBg, color: C.text, fontSize: 12, fontWeight: 700, cursor: "pointer", textAlign: "center",
+          }}>+ Add Existing Lesson</button>
+          {onCreateLesson && (
+            <button onClick={() => setShowNewLesson(true)} style={{
+              flex: 1, padding: "9px 12px", borderRadius: 8, border: `1px solid ${C.orange}`,
+              background: C.orangeLight, color: C.orange, fontSize: 12, fontWeight: 700, cursor: "pointer", textAlign: "center",
+            }}>+ Create New Lesson</button>
+          )}
         </div>
 
         <div style={{ display: "flex", gap: 10, marginTop: 24 }}>
