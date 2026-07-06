@@ -7276,6 +7276,68 @@ function CourseBuilderModal({ course, lessons, onSave, onClose, onCreateLesson }
 
 // ── LESSON BUILDER MODAL ────────────────────────────────────
 // Inline block editor — renders type-specific fields for one block.
+// ─── WYSIWYG rich-text helpers (text block editor) ──────────────────────────
+// Converts our markdown subset ↔ contenteditable innerHTML.
+// Supported: **bold**, *italic*, __underline__, - bullets, 1. numbered.
+function mdToHtml(text) {
+  if (!text) return "<p><br></p>";
+  const inline = (s) => s
+    .replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;")
+    .replace(/\*\*(.+?)\*\*/g, "<strong>$1</strong>")
+    .replace(/__(.+?)__/g, "<u>$1</u>")
+    .replace(/\*(.+?)\*/g, "<em>$1</em>");
+  const lines = text.split("\n");
+  let out = "", inUl = false, inOl = false;
+  for (const line of lines) {
+    if (/^- /.test(line)) {
+      if (inOl) { out += "</ol>"; inOl = false; }
+      if (!inUl) { out += "<ul>"; inUl = true; }
+      out += `<li>${inline(line.slice(2))}</li>`;
+    } else if (/^\d+\.\s/.test(line)) {
+      if (inUl) { out += "</ul>"; inUl = false; }
+      if (!inOl) { out += "<ol>"; inOl = true; }
+      out += `<li>${inline(line.replace(/^\d+\.\s/, ""))}</li>`;
+    } else {
+      if (inUl) { out += "</ul>"; inUl = false; }
+      if (inOl) { out += "</ol>"; inOl = false; }
+      out += line === "" ? "<p><br></p>" : `<p>${inline(line)}</p>`;
+    }
+  }
+  if (inUl) out += "</ul>";
+  if (inOl) out += "</ol>";
+  return out;
+}
+function htmlToMd(el) {
+  function walk(node) {
+    if (node.nodeType === 3) {
+      return node.textContent;
+    }
+    const tag = node.nodeName;
+    const inner = () => Array.from(node.childNodes).map(walk).join("");
+    if (tag === "BR")                    return "\n";
+    if (tag === "STRONG" || tag === "B") return `**${inner()}**`;
+    if (tag === "EM"     || tag === "I") return `*${inner()}*`;
+    if (tag === "U")                     return `__${inner()}__`;
+    if (tag === "P" || tag === "DIV") {
+      const text = inner();
+      // <p><br></p> or <div><br></div> = blank line
+      if (text === "\n" || text === "") return "\n";
+      return text + "\n";
+    }
+    if (tag === "SPAN") return inner();
+    if (tag === "UL") {
+      return Array.from(node.children).map(li => `- ${htmlToMd(li)}`).join("\n") + "\n";
+    }
+    if (tag === "OL") {
+      return Array.from(node.children).map((li, i) => `${i + 1}. ${htmlToMd(li)}`).join("\n") + "\n";
+    }
+    if (tag === "LI") return inner();
+    return inner();
+  }
+  const raw = Array.from(el.childNodes).map(walk).join("");
+  return raw.replace(/\n{3,}/g, "\n\n").replace(/^\n+|\n+$/g, "");
+}
+
 // Used inside LessonBuilderModal.
 function BlockEditor({ block, onChange, onRemove, onMoveUp, onMoveDown, isFirst, isLast }) {
   const BLOCK_TYPES   = ["text", "image", "video", "flipcard", "quiz", "recording"];
@@ -7285,31 +7347,27 @@ function BlockEditor({ block, onChange, onRemove, onMoveUp, onMoveDown, isFirst,
   const setHeader     = (val)      => onChange({ ...block, header: val });
   const setType       = (t)        => onChange({ ...block, type: t, content: {} });
 
-  // Formatting toolbar helpers for text blocks
-  const bodyRef = React.useRef(null);
-  const wrapSel = (before, after) => {
-    const ta = bodyRef.current;
-    if (!ta) return;
-    const s = ta.selectionStart, e = ta.selectionEnd;
-    const body = c.body ?? "";
-    const next = body.slice(0, s) + before + body.slice(s, e) + after + body.slice(e);
-    setC("body", next);
-    setTimeout(() => { ta.selectionStart = s + before.length; ta.selectionEnd = e + before.length; ta.focus(); }, 0);
+  // WYSIWYG rich-text for text blocks — contenteditable + execCommand
+  const editRef   = React.useRef(null);
+  // Initialize (or re-initialize when block type switches to "text")
+  React.useEffect(() => {
+    if (block.type !== "text" || !editRef.current) return;
+    editRef.current.innerHTML = mdToHtml(c.body ?? "");
+  }, [block.type]); // eslint-disable-line react-hooks/exhaustive-deps
+  // Sync contenteditable DOM → markdown state
+  const syncToMd = () => {
+    if (!editRef.current) return;
+    setC("body", htmlToMd(editRef.current));
   };
-  const insertPrefix = (prefix) => {
-    const ta = bodyRef.current;
-    if (!ta) return;
-    const pos = ta.selectionStart;
-    const body = c.body ?? "";
-    const lineStart = body.lastIndexOf("\n", pos - 1) + 1;
-    const next = body.slice(0, lineStart) + prefix + body.slice(lineStart);
-    setC("body", next);
-    setTimeout(() => { ta.selectionStart = ta.selectionEnd = pos + prefix.length; ta.focus(); }, 0);
+  const execFmt = (cmd) => {
+    editRef.current?.focus();
+    document.execCommand(cmd, false, null);
+    setTimeout(syncToMd, 0);
   };
-  const fmtBtn = (label, title, action, labelStyle) => (
+  const fmtBtn = (label, title, action) => (
     <button key={title} type="button" onClick={action} title={title} style={{
       padding: "3px 8px", borderRadius: 5, border: `1px solid ${C.border}`,
-      background: C.white, fontSize: 12, cursor: "pointer", color: C.textSub, lineHeight: 1.4, ...labelStyle,
+      background: C.white, fontSize: 12, cursor: "pointer", color: C.textSub, lineHeight: 1.4,
     }}>{label}</button>
   );
 
@@ -7350,15 +7408,29 @@ function BlockEditor({ block, onChange, onRemove, onMoveUp, onMoveDown, isFirst,
       {block.type === "text" && (
         <>
           <div style={{ display: "flex", gap: 5, marginBottom: 6, flexWrap: "wrap" }}>
-            {fmtBtn(<b>B</b>,  "Bold",          () => wrapSel("**", "**"))}
-            {fmtBtn(<i>I</i>,  "Italic",         () => wrapSel("*",  "*" ))}
-            {fmtBtn(<u>U</u>,  "Underline",       () => wrapSel("__", "__"))}
-            {fmtBtn("• —",     "Bullet list",     () => insertPrefix("- "))}
-            {fmtBtn("1.",      "Numbered list",   () => insertPrefix("1. "))}
+            {fmtBtn(<b>B</b>,  "Bold",          () => execFmt("bold"))}
+            {fmtBtn(<i>I</i>,  "Italic",        () => execFmt("italic"))}
+            {fmtBtn(<u>U</u>,  "Underline",     () => execFmt("underline"))}
+            {fmtBtn("•—",      "Bullet list",   () => execFmt("insertUnorderedList"))}
+            {fmtBtn("1.",      "Numbered list", () => execFmt("insertOrderedList"))}
           </div>
-          <textarea ref={bodyRef} value={c.body ?? ""} onChange={e => setC("body", e.target.value)}
-            placeholder="Write lesson content here… (supports **bold**, *italic*, __underline__, - bullet, 1. numbered)" rows={6}
-            style={{ ...taStyle, fontFamily: "inherit", fontSize: 13 }} />
+          <div
+            ref={editRef}
+            contentEditable
+            suppressContentEditableWarning
+            onInput={syncToMd}
+            onBlur={syncToMd}
+            style={{
+              ...inputStyle,
+              minHeight: 120,
+              outline: "none",
+              overflowY: "auto",
+              whiteSpace: "pre-wrap",
+              wordBreak: "break-word",
+              lineHeight: 1.7,
+              cursor: "text",
+            }}
+          />
         </>
       )}
       {block.type === "image" && (
