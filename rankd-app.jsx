@@ -2367,7 +2367,7 @@ function RankdGameScreen({ onNav, sessionName, role, playerName, questions = GAM
               >{openGrades.__showNames ? "Hide Names" : "Show Names"}</button>
             )}
           </div>
-          <p style={{ margin: 0, fontSize: mobile ? 16 : 20, fontWeight: 800, color: C.text }}>{q.text}</p>
+          <p style={{ margin: 0, fontSize: mobile ? 16 : 20, fontWeight: 800, color: C.text }}>{q.text ?? q.q}</p>
           <p style={{ margin: "4px 0 0", fontSize: 12, color: C.textMuted }}>
             {openResponses.length} response{openResponses.length !== 1 ? "s" : ""} collected · anonymous to players
           </p>
@@ -3362,7 +3362,7 @@ function SessionDetailView({ session, onBack }) {
               <div key={q.id} style={{ display: "flex", alignItems: "center", gap: 12, padding: "11px 18px", borderBottom: i < qs.length - 1 ? `1px solid ${C.border}` : "none" }}>
                 <span style={{ fontSize: 11, fontWeight: 700, color: C.textMuted, width: 20, flexShrink: 0 }}>Q{i + 1}</span>
                 <div style={{ flex: 1, minWidth: 0 }}>
-                  <div style={{ fontSize: 12, fontWeight: 600, color: C.text, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{q.text}</div>
+                  <div style={{ fontSize: 12, fontWeight: 600, color: C.text, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{q.text ?? q.q}</div>
                   <div style={{ fontSize: 10, color: C.textSub, marginTop: 1 }}>{q.topic}</div>
                 </div>
                 <span style={{ fontSize: 11, color: C.textSub, flexShrink: 0 }}>{(q.responseMs / 1000).toFixed(1)}s</span>
@@ -3394,7 +3394,7 @@ function SessionDetailView({ session, onBack }) {
                       <span style={{ fontSize: 10, fontWeight: 700, padding: "1px 6px", borderRadius: 4, background: typeColor + "15", color: typeColor }}>{typeLabel}</span>
                       <span style={{ fontSize: 10, fontWeight: 700, padding: "1px 6px", borderRadius: 4, background: C.muted, color: C.textSub }}>{q.topic}</span>
                     </div>
-                    <p style={{ margin: 0, fontSize: 13, fontWeight: 700, color: C.text, lineHeight: 1.4 }}>{q.text}</p>
+                    <p style={{ margin: 0, fontSize: 13, fontWeight: 700, color: C.text, lineHeight: 1.4 }}>{q.text ?? q.q}</p>
                   </div>
                   <div style={{ textAlign: "right", flexShrink: 0 }}>
                     <div style={{ fontSize: 11, fontWeight: 700, color: q.isCorrect ? C.green : C.red }}>{q.isCorrect ? "Correct" : "Incorrect"}</div>
@@ -6007,8 +6007,20 @@ function LearnScreen({ role, user, orgUsers = [], orgs = [], onNav, onAwardXp, p
                         onClick={() => {
                           if (isComplete) { setActiveCourse(content); }
                           else {
-                            const next = courseLessons.find(l => !completedLessons.has(l.id));
+                            // Respect per-lesson availability schedule — don't open locked lessons
+                            const assignedDate = a.assignedAtRaw ? new Date(a.assignedAtRaw)
+                              : a.assignedAt ? new Date(a.assignedAt) : null;
+                            const todayMs = new Date().setHours(0, 0, 0, 0);
+                            const lessonSched = content.lessonSchedule ?? {};
+                            const isLockedLesson = (lessonId) => {
+                              const days = lessonSched[lessonId]?.available_after_days ?? 0;
+                              if (!assignedDate || days === 0) return false;
+                              const base = new Date(assignedDate); base.setHours(0, 0, 0, 0);
+                              return todayMs < base.getTime() + days * 86400000;
+                            };
+                            const next = courseLessons.find(l => !completedLessons.has(l.id) && !isLockedLesson(l.id));
                             if (next) openLesson(next, content);
+                            else setActiveCourse(content); // all next lessons are still locked — show course detail
                           }
                         }}
                         style={{ padding: "9px 18px", borderRadius: 8, border: isComplete ? `1px solid ${C.border}` : "none", cursor: "pointer", background: isComplete ? C.white : pct > 0 ? C.text : C.orange, color: isComplete ? C.textSub : "#fff", fontSize: 12, fontWeight: 700, flexShrink: 0 }}
@@ -8221,7 +8233,7 @@ function QuizTakingView({ quiz, onComplete, onExit }) {
       {/* Question */}
       <Card>
         <div style={{ fontSize: 11, fontWeight: 700, color: C.textMuted, letterSpacing: "0.08em", textTransform: "uppercase", marginBottom: 12 }}>Question {qIdx + 1}</div>
-        <p style={{ margin: "0 0 20px", fontSize: 16, fontWeight: 700, color: C.text, lineHeight: 1.5 }}>{q.text}</p>
+        <p style={{ margin: "0 0 20px", fontSize: 16, fontWeight: 700, color: C.text, lineHeight: 1.5 }}>{q.text ?? q.q}</p>
 
         <div style={{ display: "flex", flexDirection: "column", gap: 10 }}>
           {q.options.map((opt, i) => {
@@ -8303,7 +8315,7 @@ function QuizResultsView({ quiz, attempt, onRetake, onBack }) {
             return (
               <Card key={q.id} style={{ borderLeft: `4px solid ${wasRight ? C.trueGreen : C.red}` }}>
                 <div style={{ display: "flex", alignItems: "flex-start", justifyContent: "space-between", gap: 12, marginBottom: 10 }}>
-                  <p style={{ margin: 0, fontSize: 14, fontWeight: 600, color: C.text, lineHeight: 1.5 }}>{i+1}. {q.text}</p>
+                  <p style={{ margin: 0, fontSize: 14, fontWeight: 600, color: C.text, lineHeight: 1.5 }}>{i+1}. {q.text ?? q.q}</p>
                   <span style={{ fontSize: 12, fontWeight: 700, color: wasRight ? "#166534" : "#991B1B", flexShrink: 0, padding: "2px 8px", borderRadius: 99, background: wasRight ? "#DCFCE7" : "#FEE2E2" }}>{wasRight ? "Correct" : "Incorrect"}</span>
                 </div>
 

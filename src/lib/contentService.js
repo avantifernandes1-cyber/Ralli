@@ -214,7 +214,7 @@ function dbToQuiz(row) {
   return {
     id:         row.id,
     name:       row.name,
-    questions:  row.questions ?? [],
+    questions:  (row.questions ?? []).map(q => ({ ...q, text: q.text ?? q.q ?? "" })),
     status:     row.status ?? "active",
     favorite:   row.is_favorite ?? false,
     tags:       row.tags ?? [],
