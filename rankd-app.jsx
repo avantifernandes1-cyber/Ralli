@@ -849,7 +849,7 @@ function HomeScreen({ user, onNav, quizAssignments = [], onResumeLesson, onStart
           // For demo users: use the hardcoded mock data.
           const lbData = isReal
             ? homeLbRows.map(r => ({ ...r, score: r.total }))
-            : leaderboardData.map(p => ({ ...p, isMe: p.name === user.name }));
+            : leaderboardData.map(p => ({ ...p, isMe: p.userId ? p.userId === user?.id : !!p.isMe }));
           return (
             <Card style={{ padding: 0, overflow: "hidden" }}>
               <div style={{ padding: "16px 20px", borderBottom: `1px solid ${C.border}`, display: "flex", justifyContent: "space-between", alignItems: "center" }}>
@@ -865,7 +865,7 @@ function HomeScreen({ user, onNav, quizAssignments = [], onResumeLesson, onStart
               ) : (
                 <div>
                   {lbData.map((p, i) => (
-                    <div key={p.id ?? i} style={{ display: "flex", alignItems: "center", gap: 12, padding: "12px 20px", background: p.isMe ? C.orangeLight : "transparent", borderBottom: i < lbData.length - 1 ? `1px solid ${C.border}` : "none" }}>
+                    <div key={p.userId ?? p.rank ?? i} style={{ display: "flex", alignItems: "center", gap: 12, padding: "12px 20px", background: p.isMe ? C.orangeLight : "transparent", borderBottom: i < lbData.length - 1 ? `1px solid ${C.border}` : "none" }}>
                       <div style={{ width: 24, height: 24, borderRadius: "50%", background: p.rank === 1 ? "#F5A623" : p.rank === 2 ? "#A8B2C0" : p.rank === 3 ? "#CD7F32" : C.pageBg, display: "flex", alignItems: "center", justifyContent: "center", fontSize: 11, fontWeight: 800, color: p.rank <= 3 ? "#fff" : C.textSub, flexShrink: 0 }}>{p.rank}</div>
                       <Avatar initials={p.initials} size={32} color={p.color} />
                       <div style={{ flex: 1, minWidth: 0 }}>
@@ -11422,7 +11422,7 @@ function LeaderboardScreen({ currentUser, isReal = false, tenantId = null }) {
     });
   }, [tenantId, isReal, currentUser?.id]); // eslint-disable-line react-hooks/exhaustive-deps
 
-  const leaderboard = isReal ? rows : fullLeaderboard.map(p => ({ ...p, isMe: p.name === currentUser?.name }));
+  const leaderboard = isReal ? rows : fullLeaderboard.map(p => ({ ...p, isMe: p.userId ? p.userId === currentUser?.id : !!p.isMe }));
 
   const colGrid = "48px 1fr 90px 80px 80px 72px 72px 72px";
   const colHeader = ["#", "MEMBER", "TOTAL", "QUIZ PTS", "GAME PTS", "LEARN XP", "GAMES", "QUIZZES"];
