@@ -5817,8 +5817,10 @@ function LearnScreen({ role, user, orgUsers = [], orgs = [], onNav, onAwardXp, p
   const [assignModal, setAssignModal]   = useState(null); // null | { contentType, contentId }
   const [activeLesson, setActiveLesson] = useState(null); // { lesson, courseTitle?, nextLesson? }
   const [activeCourse, setActiveCourse] = useState(null); // course object for detail view
-  // Progress & search — persisted per user. Production: replace with API-backed progress store.
+  // Progress — for real users Supabase is the sole source of truth (loaded below).
+  // For demo users, localStorage provides persistence across page refreshes.
   const [completedLessons, setCompletedLessons] = useState(() => {
+    if (isReal) return new Set(); // avoid seeding with stale localStorage IDs
     try {
       const saved = localStorage.getItem(`ralli_learn_progress_${user?.id ?? "guest"}`);
       return saved ? new Set(JSON.parse(saved)) : new Set();
@@ -5865,7 +5867,8 @@ function LearnScreen({ role, user, orgUsers = [], orgs = [], onNav, onAwardXp, p
     if (!isReal || !user?.id) return;
     getLessonCompletions(user.id).then(({ data: dbCompleted }) => {
       if (!dbCompleted) return;
-      setCompletedLessons(prev => new Set([...prev, ...dbCompleted]));
+      // Replace entirely — do not merge with any prior localStorage state.
+      setCompletedLessons(new Set(dbCompleted));
     });
   }, [user?.id, isReal]); // eslint-disable-line react-hooks/exhaustive-deps
 
@@ -5873,7 +5876,10 @@ function LearnScreen({ role, user, orgUsers = [], orgs = [], onNav, onAwardXp, p
     if (completedLessons.has(id)) return;
     setCompletedLessons(prev => {
       const next = new Set([...prev, id]);
-      try { localStorage.setItem(`ralli_learn_progress_${user?.id ?? "guest"}`, JSON.stringify([...next])); } catch {}
+      // Real users: Supabase is source of truth — skip localStorage to avoid stale data accumulation.
+      if (!isReal) {
+        try { localStorage.setItem(`ralli_learn_progress_${user?.id ?? "guest"}`, JSON.stringify([...next])); } catch {}
+      }
       return next;
     });
     const lessonXp = lessons.find(l => l.id === id)?.xp ?? 0;
