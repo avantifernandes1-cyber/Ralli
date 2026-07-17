@@ -5956,13 +5956,22 @@ function LearnScreen({ role, user, orgUsers = [], orgs = [], onNav, onAwardXp, p
   };
 
   // Deep-link: if navigated here from HomeScreen with a pending lesson, open it.
-  // Retries when lessons load (Supabase fetch may not be complete on first render).
+  // For real users: wait for Supabase data before resolving — never fall back to seed content.
+  // For demo users: seed data is the only source, so resolve immediately.
   useEffect(() => {
     if (!pendingLessonId || isAdmin) return;
+    // Block until tenant lessons are loaded so we never open seed content for real users.
+    if (isReal && isLearnLoading) return;
     const lesson = lessons.find(l => l.id === pendingLessonId)
-      ?? INITIAL_LEARN_LESSONS.find(l => l.id === pendingLessonId);
-    if (lesson) { openLesson(lesson); onClearPendingLesson?.(); }
-  }, [pendingLessonId, lessons]); // eslint-disable-line react-hooks/exhaustive-deps
+      ?? (isReal ? null : INITIAL_LEARN_LESSONS.find(l => l.id === pendingLessonId));
+    if (lesson) {
+      openLesson(lesson);
+      onClearPendingLesson?.();
+    } else if (!isLearnLoading) {
+      // Load finished and lesson not found (invalid ID or not accessible) — clear to prevent loops.
+      onClearPendingLesson?.();
+    }
+  }, [pendingLessonId, lessons, isLearnLoading]); // eslint-disable-line react-hooks/exhaustive-deps
 
   // Deep-link: open a specific course from HomeScreen assignment card.
   // Retries when courses load (courses may not be ready on first render).
