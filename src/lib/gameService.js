@@ -425,3 +425,29 @@ export async function getActiveSessions(tenantId, limit = 30) {
 
   return { data: normalised, error: null };
 }
+
+/**
+ * Fetch everything needed to restore a host's in-progress game session.
+ * Runs two parallel queries: session metadata and all saved answers.
+ *
+ * @param {string} sessionId - UUID of the game_session row
+ * @returns {Promise<{ session: { data: Object|null, error: Object|null }, answers: { data: Object[]|null, error: Object|null } }>}
+ */
+export async function getSessionRestoreData(sessionId) {
+  const [sessionResult, answersResult] = await Promise.all([
+    supabase
+      .from("game_sessions")
+      .select("id, phase, current_question_index, paused, status, pin, name, quiz_id, question_count, player_count, tenant_id")
+      .eq("id", sessionId)
+      .single(),
+    supabase
+      .from("game_answers")
+      .select("player_id, question_idx, points, is_correct, answer")
+      .eq("session_id", sessionId),
+  ]);
+
+  return {
+    session: { data: sessionResult.data ?? null, error: sessionResult.error ?? null },
+    answers: { data: answersResult.data ?? null, error: answersResult.error ?? null },
+  };
+}
