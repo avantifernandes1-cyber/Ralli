@@ -15595,6 +15595,7 @@ export default function App() {
         setSessions(INITIAL_SESSIONS);           // prevent real sessions leaking to next demo user
         setBattleCards(INITIAL_BATTLE_CARDS);    // prevent real BC data leaking to next demo user
         setBcCategories(INITIAL_BC_CATEGORIES);  // prevent real BC categories leaking to next demo user
+        window.location.replace("/login");        // hard-navigate so URL matches the login screen
       }
     });
 
@@ -16507,7 +16508,7 @@ export default function App() {
       case "settings":
         if (isSuperAdmin)  return <RoleAccessScreen rolePermissions={rolePermissions} onSave={handleSaveRolePermissions} currentOrg={currentOrg} />;
         if (isOrgAdmin)    return <OrgAdminSettingsScreen rolePermissions={rolePermissions} onSaveRolePermissions={handleSaveRolePermissions} currentOrg={currentOrg} orgId={user.orgId} orgName={currentOrg?.name ?? "Your Team"} orgUsers={orgUsers} onAddUser={handleAddUser} />;
-        return <UserSettingsScreen user={user} profile={userProfile} notifPrefs={notifPrefs} onSaveProfile={handleSaveProfile} onSaveNotifs={handleSaveNotifs} currentOrg={currentOrg} onSignOut={async () => { if (user?._isReal) { await supabase.auth.signOut(); } else { setCurrentUser(null); setLastSeenAt(null); setNewAssignmentCount(0); setPendingLessonId(null); setPendingCourseId(null); setPendingQuizId(null); setOrgs(INITIAL_ORGS); setOrgUsers(INITIAL_ORG_USERS); setQuizzesReady(false); setSessions(INITIAL_SESSIONS); setBattleCards(INITIAL_BATTLE_CARDS); setBcCategories(INITIAL_BC_CATEGORIES); } setScreen("home"); }} />;
+        return <UserSettingsScreen user={user} profile={userProfile} notifPrefs={notifPrefs} onSaveProfile={handleSaveProfile} onSaveNotifs={handleSaveNotifs} currentOrg={currentOrg} onSignOut={async () => { if (user?._isReal) { await supabase.auth.signOut(); /* SIGNED_OUT handler redirects */ } else { setCurrentUser(null); setLastSeenAt(null); setNewAssignmentCount(0); setPendingLessonId(null); setPendingCourseId(null); setPendingQuizId(null); setOrgs(INITIAL_ORGS); setOrgUsers(INITIAL_ORG_USERS); setQuizzesReady(false); setSessions(INITIAL_SESSIONS); setBattleCards(INITIAL_BATTLE_CARDS); setBcCategories(INITIAL_BC_CATEGORIES); window.location.replace("/login"); } }} />;
       default:                  return <HomeScreen user={user} />;
     }
   };
@@ -16659,8 +16660,9 @@ export default function App() {
                     setSessions(INITIAL_SESSIONS);
                     setBattleCards(INITIAL_BATTLE_CARDS);
                     setBcCategories(INITIAL_BC_CATEGORIES);
+                    window.location.replace("/login");
                   }
-                  setScreen("home");
+                  // Real users: SIGNED_OUT event fires window.location.replace("/login")
                 }}
                 title="Sign out"
                 style={{
