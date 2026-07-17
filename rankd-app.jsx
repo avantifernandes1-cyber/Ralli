@@ -15007,7 +15007,7 @@ function RoleAccessScreen({ rolePermissions, onSave, currentOrg }) {
 // Production hook: replace localStorage reads/writes with API calls to
 // /api/users/:id/profile and /api/users/:id/notification-prefs
 // ─────────────────────────────────────────────────────────────────────────────
-function UserSettingsScreen({ user, profile, notifPrefs, onSaveProfile, onSaveNotifs, currentOrg }) {
+function UserSettingsScreen({ user, profile, notifPrefs, onSaveProfile, onSaveNotifs, currentOrg, onSignOut }) {
   // Local draft state so unsaved changes don't immediately affect the app
   const [nick,   setNick]   = useState(profile.nickname ?? "");
   const [avatar, setAvatar] = useState(profile.avatarEmoji ?? null);
@@ -15205,6 +15205,20 @@ function UserSettingsScreen({ user, profile, notifPrefs, onSaveProfile, onSaveNo
             </div>
           ))}
         </div>
+        {onSignOut && (
+          <div style={{ marginTop: 24, paddingTop: 20, borderTop: `1px solid ${C.creamBorder}` }}>
+            <button
+              onClick={onSignOut}
+              style={{
+                padding: "10px 20px", borderRadius: 10, border: `1px solid ${C.border}`,
+                background: "transparent", color: C.textMuted,
+                fontSize: 13, fontWeight: 600, cursor: "pointer", transition: "all 0.15s",
+              }}
+              onMouseEnter={e => { e.currentTarget.style.background = C.pageBg; e.currentTarget.style.color = C.text; }}
+              onMouseLeave={e => { e.currentTarget.style.background = "transparent"; e.currentTarget.style.color = C.textMuted; }}
+            >Sign out</button>
+          </div>
+        )}
       </Card>
     </div>
   );
@@ -15578,6 +15592,9 @@ export default function App() {
         setOrgs(INITIAL_ORGS);     // restore seed tenants so demo accounts work
         setOrgUsers(INITIAL_ORG_USERS);
         setQuizzesReady(false);    // reset so next real user waits for their quiz load
+        setSessions(INITIAL_SESSIONS);           // prevent real sessions leaking to next demo user
+        setBattleCards(INITIAL_BATTLE_CARDS);    // prevent real BC data leaking to next demo user
+        setBcCategories(INITIAL_BC_CATEGORIES);  // prevent real BC categories leaking to next demo user
       }
     });
 
@@ -16490,7 +16507,7 @@ export default function App() {
       case "settings":
         if (isSuperAdmin)  return <RoleAccessScreen rolePermissions={rolePermissions} onSave={handleSaveRolePermissions} currentOrg={currentOrg} />;
         if (isOrgAdmin)    return <OrgAdminSettingsScreen rolePermissions={rolePermissions} onSaveRolePermissions={handleSaveRolePermissions} currentOrg={currentOrg} orgId={user.orgId} orgName={currentOrg?.name ?? "Your Team"} orgUsers={orgUsers} onAddUser={handleAddUser} />;
-        return <UserSettingsScreen user={user} profile={userProfile} notifPrefs={notifPrefs} onSaveProfile={handleSaveProfile} onSaveNotifs={handleSaveNotifs} currentOrg={currentOrg} />;
+        return <UserSettingsScreen user={user} profile={userProfile} notifPrefs={notifPrefs} onSaveProfile={handleSaveProfile} onSaveNotifs={handleSaveNotifs} currentOrg={currentOrg} onSignOut={async () => { if (user?._isReal) { await supabase.auth.signOut(); } else { setCurrentUser(null); setLastSeenAt(null); setNewAssignmentCount(0); setPendingLessonId(null); setPendingCourseId(null); setPendingQuizId(null); setOrgs(INITIAL_ORGS); setOrgUsers(INITIAL_ORG_USERS); setQuizzesReady(false); setSessions(INITIAL_SESSIONS); setBattleCards(INITIAL_BATTLE_CARDS); setBcCategories(INITIAL_BC_CATEGORIES); } setScreen("home"); }} />;
       default:                  return <HomeScreen user={user} />;
     }
   };
@@ -16639,6 +16656,9 @@ export default function App() {
                     setOrgs(INITIAL_ORGS);
                     setOrgUsers(INITIAL_ORG_USERS);
                     setQuizzesReady(false);
+                    setSessions(INITIAL_SESSIONS);
+                    setBattleCards(INITIAL_BATTLE_CARDS);
+                    setBcCategories(INITIAL_BC_CATEGORIES);
                   }
                   setScreen("home");
                 }}
@@ -16673,11 +16693,15 @@ export default function App() {
           {isAdminType && (
             <span style={{ fontSize: 12, fontWeight: 700, color: C.green }}>Admin</span>
           )}
-          <div style={{
-            width: 30, height: 30, borderRadius: "50%", background: user.color,
-            display: "flex", alignItems: "center", justifyContent: "center",
-            fontSize: 12, fontWeight: 800, color: "#fff",
-          }}>{user.initials}</div>
+          <div
+            onClick={() => navigate("settings")}
+            title="Settings & sign out"
+            style={{
+              width: 30, height: 30, borderRadius: "50%", background: user.color,
+              display: "flex", alignItems: "center", justifyContent: "center",
+              fontSize: 12, fontWeight: 800, color: "#fff", cursor: "pointer",
+              flexShrink: 0,
+            }}>{user.initials}</div>
         </div>
       )}
 
