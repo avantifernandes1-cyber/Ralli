@@ -2,18 +2,18 @@ import React, { useState, useEffect, useRef } from "react";
 
 // ── BRAND TOKENS ───────────────────────────────────────────────
 const C = {
-  pageBg:      "#F7F8FA",
-  white:       "#FFFFFF",
-  orange:      "#FDBF24",
-  orangeLight: "#FFF3C7",
-  orangeDeep:  "#CC9800",
-  dark:        "#0B1220",
-  darkAlt:     "#1F2937",
-  text:        "#0B1220",
-  textSub:     "#334155",
-  textMuted:   "#64748B",
-  border:      "rgba(11,18,32,0.10)",
-  borderLight: "rgba(11,18,32,0.06)",
+  pageBg:      "#f3f1ec",  // cream — page surface
+  white:       "#fbfaf7",  // off-white — card surface
+  orange:      "#f6a70f",  // amber — primary accent
+  orangeLight: "#fce3ab",  // amber tint
+  orangeDeep:  "#c8820a",  // deep amber — for text on light bg
+  dark:        "#12181f",  // ink — primary text / dark surface
+  darkAlt:     "#1a2330",
+  text:        "#12181f",  // ink
+  textSub:     "#8a6a4f",  // umber — secondary text
+  textMuted:   "#a08870",  // muted umber
+  border:      "rgba(18,24,31,0.10)",
+  borderLight: "rgba(18,24,31,0.06)",
   radius:      12,
 };
 
@@ -84,117 +84,345 @@ const NAV_LINKS = [
 ];
 
 function Nav({ currentPage, navigate }) {
-  const [scrolled, setScrolled] = useState(false);
-  const [mobileOpen, setMobileOpen] = useState(false);
+  const [scrolled,    setScrolled]   = useState(false);
+  const [mobileOpen,  setMobileOpen] = useState(false);
+  const [isMobile,    setIsMobile]   = useState(() => window.innerWidth < 768);
 
+  // Scroll effect
   useEffect(() => {
     const fn = () => setScrolled(window.scrollY > 12);
     window.addEventListener("scroll", fn, { passive: true });
     return () => window.removeEventListener("scroll", fn);
   }, []);
 
-  // Close mobile menu on page change
+  // Viewport resize — switch modes and close menu when going desktop
+  useEffect(() => {
+    const fn = () => {
+      const mobile = window.innerWidth < 768;
+      setIsMobile(mobile);
+      if (!mobile) setMobileOpen(false);
+    };
+    window.addEventListener("resize", fn, { passive: true });
+    return () => window.removeEventListener("resize", fn);
+  }, []);
+
+  // Close on page change
   useEffect(() => { setMobileOpen(false); }, [currentPage]);
 
+  // Lock body scroll while menu is open
+  useEffect(() => {
+    document.body.style.overflow = mobileOpen ? "hidden" : "";
+    return () => { document.body.style.overflow = ""; };
+  }, [mobileOpen]);
+
   const handleNav = (id) => {
+    setMobileOpen(false);
     navigate(id);
     window.scrollTo({ top: 0, behavior: "smooth" });
   };
 
+  const navBg = (scrolled || mobileOpen)
+    ? "rgba(255,255,255,0.98)"
+    : "rgba(255,255,255,0.85)";
+  const navBorder = (scrolled || mobileOpen)
+    ? C.border
+    : "rgba(11,18,32,0.05)";
+
   return (
-    <nav style={{
-      position:       "fixed",
-      top:            0,
-      left:           0,
-      right:          0,
-      zIndex:         100,
-      height:         60,
-      display:        "flex",
-      alignItems:     "center",
-      padding:        "0 32px",
-      background:     scrolled ? "rgba(255,255,255,0.96)" : "rgba(255,255,255,0.85)",
-      backdropFilter: "blur(12px)",
-      borderBottom:   `1px solid ${scrolled ? C.border : "rgba(11,18,32,0.05)"}`,
-      transition:     "border-color 0.25s",
-    }}>
-      <div style={{
-        maxWidth:       1120,
-        margin:         "0 auto",
-        width:          "100%",
+    <>
+      {/* ── Fixed nav bar ─────────────────────────────────────── */}
+      <nav style={{
+        position:       "fixed",
+        top:            0,
+        left:           0,
+        right:          0,
+        zIndex:         200,
+        height:         60,
         display:        "flex",
         alignItems:     "center",
-        justifyContent: "space-between",
+        padding:        "0 32px",
+        background:     navBg,
+        backdropFilter: "blur(12px)",
+        borderBottom:   `1px solid ${navBorder}`,
+        transition:     "border-color 0.25s, background 0.25s",
       }}>
-        {/* Logo */}
-        <button
-          onClick={() => handleNav("home")}
-          style={{ display: "flex", alignItems: "center", gap: 10, background: "none", border: "none", cursor: "pointer", padding: 0 }}
-        >
-          {/* Icon mark: orange rounded square + white 4-lobe hub */}
-          <svg width="32" height="32" viewBox="0 0 32 32" fill="none" xmlns="http://www.w3.org/2000/svg">
-            <rect width="32" height="32" rx="7.5" fill="#FDBF24"/>
-            {/* 4 white lobes arranged in a cross */}
-            <circle cx="16" cy="9.5"  r="5.8" fill="white"/>
-            <circle cx="22.5" cy="16" r="5.8" fill="white"/>
-            <circle cx="16" cy="22.5" r="5.8" fill="white"/>
-            <circle cx="9.5"  cy="16" r="5.8" fill="white"/>
-            {/* Center cutout — orange pentagon to match brand */}
-            <circle cx="16" cy="16" r="4.2" fill="#FDBF24"/>
-          </svg>
-          {/* Wordmark */}
-          <div style={{ display: "flex", alignItems: "baseline", gap: 0 }}>
-            <span style={{ fontSize: 17, fontWeight: 900, color: C.dark, letterSpacing: "-0.01em", fontFamily: "inherit" }}>ralli</span>
-            {/* Decorative asterisk from brand */}
-            <span style={{ fontSize: 9, fontWeight: 900, color: C.orange, marginLeft: 1, lineHeight: 1, position: "relative", top: -6 }}>✦</span>
-          </div>
-        </button>
+        <div style={{
+          maxWidth:       1120,
+          margin:         "0 auto",
+          width:          "100%",
+          display:        "flex",
+          alignItems:     "center",
+          justifyContent: "space-between",
+        }}>
+          {/* Logo */}
+          <button
+            onClick={() => handleNav("home")}
+            style={{ display: "flex", alignItems: "center", gap: 10, background: "none", border: "none", cursor: "pointer", padding: 0, flexShrink: 0 }}
+          >
+            <svg width="32" height="32" viewBox="0 0 32 32" fill="none" xmlns="http://www.w3.org/2000/svg">
+              <rect width="32" height="32" rx="7.5" fill="#FDBF24"/>
+              <circle cx="16" cy="9.5"  r="5.8" fill="white"/>
+              <circle cx="22.5" cy="16" r="5.8" fill="white"/>
+              <circle cx="16" cy="22.5" r="5.8" fill="white"/>
+              <circle cx="9.5"  cy="16" r="5.8" fill="white"/>
+              <circle cx="16" cy="16"  r="4.2" fill="#FDBF24"/>
+            </svg>
+            <div style={{ display: "flex", alignItems: "baseline" }}>
+              <span style={{ fontSize: 17, fontWeight: 700, color: C.dark, letterSpacing: "-0.01em", fontFamily: "'Unbounded', sans-serif" }}>ralli</span>
+              <span style={{ fontSize: 9, fontWeight: 900, color: C.orange, marginLeft: 1, lineHeight: 1, position: "relative", top: -6 }}>✦</span>
+            </div>
+          </button>
 
-        {/* Desktop links */}
-        <div style={{ display: "flex", alignItems: "center", gap: 4 }}>
-          {NAV_LINKS.map(l => (
+          {/* Desktop links — hidden below 768px */}
+          {!isMobile && (
+            <div style={{ display: "flex", alignItems: "center", gap: 4 }}>
+              {NAV_LINKS.map(l => (
+                <button
+                  key={l.id}
+                  onClick={() => handleNav(l.id)}
+                  style={{
+                    fontSize:     14,
+                    fontWeight:   currentPage === l.id ? 700 : 500,
+                    color:        currentPage === l.id ? C.text : C.textSub,
+                    background:   currentPage === l.id ? C.orangeLight : "none",
+                    border:       "none",
+                    borderRadius: 7,
+                    padding:      "6px 14px",
+                    cursor:       "pointer",
+                    transition:   "background 0.15s, color 0.15s",
+                  }}
+                  onMouseEnter={e => { if (currentPage !== l.id) { e.currentTarget.style.background = C.pageBg; e.currentTarget.style.color = C.text; } }}
+                  onMouseLeave={e => { if (currentPage !== l.id) { e.currentTarget.style.background = "none"; e.currentTarget.style.color = C.textSub; } }}
+                >
+                  {l.label}
+                </button>
+              ))}
+            </div>
+          )}
+
+          {/* Desktop right — log in + book a demo */}
+          {!isMobile && (
+            <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
+              <a
+                href="/login"
+                style={{
+                  fontSize:       14,
+                  fontWeight:     500,
+                  color:          C.textSub,
+                  textDecoration: "none",
+                  padding:        "7px 12px",
+                  transition:     "color 0.15s",
+                }}
+                onMouseEnter={e => e.currentTarget.style.color = C.text}
+                onMouseLeave={e => e.currentTarget.style.color = C.textSub}
+              >
+                log in
+              </a>
+              <button
+                onClick={() => handleNav("contact")}
+                style={{
+                  fontSize:     14,
+                  fontWeight:   700,
+                  color:        C.dark,
+                  background:   C.orange,
+                  border:       "none",
+                  borderRadius: 8,
+                  padding:      "8px 18px",
+                  cursor:       "pointer",
+                  transition:   "opacity 0.15s",
+                }}
+                onMouseEnter={e => e.currentTarget.style.opacity = "0.85"}
+                onMouseLeave={e => e.currentTarget.style.opacity = "1"}
+              >
+                book a demo
+              </button>
+            </div>
+          )}
+
+          {/* Hamburger button — visible below 768px */}
+          {isMobile && (
             <button
-              key={l.id}
-              onClick={() => handleNav(l.id)}
+              onClick={() => setMobileOpen(o => !o)}
+              aria-label={mobileOpen ? "Close navigation menu" : "Open navigation menu"}
+              aria-expanded={mobileOpen}
+              aria-controls="ralli-mobile-nav"
               style={{
-                fontSize:   14,
-                fontWeight: currentPage === l.id ? 700 : 500,
-                color:      currentPage === l.id ? C.text : C.textSub,
-                background: currentPage === l.id ? C.orangeLight : "none",
-                border:     "none",
-                borderRadius: 7,
-                padding:    "6px 14px",
-                cursor:     "pointer",
-                transition: "background 0.15s, color 0.15s",
+                display:         "flex",
+                flexDirection:   "column",
+                justifyContent:  "center",
+                alignItems:      "center",
+                gap:             5,
+                width:           44,
+                height:          44,
+                background:      "none",
+                border:          "none",
+                cursor:          "pointer",
+                padding:         0,
+                borderRadius:    8,
+                flexShrink:      0,
               }}
-              onMouseEnter={e => { if (currentPage !== l.id) { e.currentTarget.style.background = C.pageBg; e.currentTarget.style.color = C.text; } }}
-              onMouseLeave={e => { if (currentPage !== l.id) { e.currentTarget.style.background = "none"; e.currentTarget.style.color = C.textSub; } }}
             >
-              {l.label}
+              {/* Bar 1 — rotates to top of X */}
+              <span style={{
+                display:      "block",
+                width:        22,
+                height:       2,
+                background:   C.dark,
+                borderRadius: 2,
+                transition:   "transform 0.22s ease",
+                transform:    mobileOpen ? "translateY(7px) rotate(45deg)" : "none",
+              }}/>
+              {/* Bar 2 — fades out */}
+              <span style={{
+                display:      "block",
+                width:        22,
+                height:       2,
+                background:   C.dark,
+                borderRadius: 2,
+                transition:   "opacity 0.22s ease",
+                opacity:      mobileOpen ? 0 : 1,
+              }}/>
+              {/* Bar 3 — rotates to bottom of X */}
+              <span style={{
+                display:      "block",
+                width:        22,
+                height:       2,
+                background:   C.dark,
+                borderRadius: 2,
+                transition:   "transform 0.22s ease",
+                transform:    mobileOpen ? "translateY(-7px) rotate(-45deg)" : "none",
+              }}/>
             </button>
-          ))}
+          )}
         </div>
+      </nav>
 
-        {/* Login */}
-        <a
-          href="/login"
-          style={{
-            fontSize:       14,
-            fontWeight:     600,
-            color:          C.text,
-            textDecoration: "none",
-            padding:        "7px 18px",
-            borderRadius:   8,
-            border:         `1.5px solid ${C.border}`,
-            background:     C.white,
-            transition:     "border-color 0.15s, box-shadow 0.15s",
-          }}
-          onMouseEnter={e => { e.currentTarget.style.borderColor = C.orange; e.currentTarget.style.boxShadow = "0 0 0 3px rgba(253,191,36,0.15)"; }}
-          onMouseLeave={e => { e.currentTarget.style.borderColor = C.border; e.currentTarget.style.boxShadow = "none"; }}
-        >
-          Login
-        </a>
-      </div>
-    </nav>
+      {/* ── Mobile menu (backdrop + panel) ────────────────────── */}
+      {isMobile && (
+        <>
+          {/* Backdrop — tap to close */}
+          <div
+            role="presentation"
+            onClick={() => setMobileOpen(false)}
+            style={{
+              position:       "fixed",
+              inset:          0,
+              zIndex:         150,
+              background:     "rgba(11,18,32,0.45)",
+              backdropFilter: "blur(2px)",
+              opacity:        mobileOpen ? 1 : 0,
+              pointerEvents:  mobileOpen ? "auto" : "none",
+              transition:     "opacity 0.22s ease",
+            }}
+          />
+
+          {/* Panel */}
+          <div
+            id="ralli-mobile-nav"
+            role="dialog"
+            aria-label="Navigation menu"
+            aria-modal="true"
+            style={{
+              position:     "fixed",
+              top:          60,
+              left:         0,
+              right:        0,
+              zIndex:       190,
+              background:   C.white,
+              borderBottom: `1px solid ${C.border}`,
+              boxShadow:    "0 20px 48px rgba(11,18,32,0.14)",
+              padding:      "12px 20px 24px",
+              transform:    mobileOpen ? "translateY(0)" : "translateY(-10px)",
+              opacity:      mobileOpen ? 1 : 0,
+              visibility:   mobileOpen ? "visible" : "hidden",
+              transition:   mobileOpen
+                ? "transform 0.22s ease, opacity 0.22s ease, visibility 0s 0s"
+                : "transform 0.22s ease, opacity 0.22s ease, visibility 0s 0.22s",
+            }}
+          >
+            {/* Page links */}
+            <div style={{ display: "flex", flexDirection: "column", gap: 2, marginBottom: 14 }}>
+              {NAV_LINKS.map(l => (
+                <button
+                  key={l.id}
+                  onClick={() => handleNav(l.id)}
+                  tabIndex={mobileOpen ? 0 : -1}
+                  style={{
+                    display:       "flex",
+                    alignItems:    "center",
+                    width:         "100%",
+                    fontSize:      16,
+                    fontWeight:    currentPage === l.id ? 700 : 500,
+                    color:         currentPage === l.id ? C.text : C.textSub,
+                    background:    currentPage === l.id ? C.orangeLight : "none",
+                    border:        "none",
+                    borderRadius:  9,
+                    padding:       "12px 16px",
+                    cursor:        "pointer",
+                    textAlign:     "left",
+                    minHeight:     48,
+                    transition:    "background 0.12s",
+                  }}
+                >
+                  {l.label}
+                </button>
+              ))}
+            </div>
+
+            {/* Divider */}
+            <div style={{ height: 1, background: C.border, marginBottom: 14 }} />
+
+            {/* CTA row */}
+            <div style={{ display: "flex", flexDirection: "column", gap: 10 }}>
+              <button
+                onClick={() => handleNav("contact")}
+                tabIndex={mobileOpen ? 0 : -1}
+                style={{
+                  display:         "flex",
+                  alignItems:      "center",
+                  justifyContent:  "center",
+                  width:           "100%",
+                  fontSize:        15,
+                  fontWeight:      700,
+                  color:           C.dark,
+                  background:      C.orange,
+                  border:          "none",
+                  borderRadius:    10,
+                  padding:         "14px 0",
+                  cursor:          "pointer",
+                  minHeight:       48,
+                  boxShadow:       "0 4px 14px rgba(253,191,36,0.35)",
+                }}
+              >
+                Book a Demo
+              </button>
+              <a
+                href="/login"
+                tabIndex={mobileOpen ? 0 : -1}
+                style={{
+                  display:         "flex",
+                  alignItems:      "center",
+                  justifyContent:  "center",
+                  width:           "100%",
+                  fontSize:        15,
+                  fontWeight:      500,
+                  color:           C.textSub,
+                  textDecoration:  "none",
+                  background:      "transparent",
+                  border:          `1.5px solid ${C.border}`,
+                  borderRadius:    10,
+                  padding:         "13px 0",
+                  minHeight:       48,
+                  boxSizing:       "border-box",
+                }}
+              >
+                log in
+              </a>
+            </div>
+          </div>
+        </>
+      )}
+    </>
   );
 }
 
@@ -207,49 +435,49 @@ function PageWrapper({ children }) {
 function CTABanner({ navigate }) {
   const [ref, visible] = useInView();
   return (
-    <section style={{ ...S.section, background: C.dark }}>
+    <section style={{ ...S.section, background: C.pageBg }}>
       <div ref={ref} style={{ ...S.container, textAlign: "center" }}>
         <h2 style={{
           ...S.fadeUp(visible),
-          fontSize:      clamp(30, 48),
-          fontWeight:    900,
-          color:         C.white,
+          fontSize:      clamp(28, 44),
+          fontWeight:    800,
+          color:         C.text,
           lineHeight:    1.1,
           letterSpacing: "-0.03em",
-          marginBottom:  18,
+          textTransform: "lowercase",
+          maxWidth:      560,
+          margin:        "0 auto 16px",
         }}>
-          Stop measuring completion.{" "}
-          <span style={{ color: C.orange }}>Start measuring readiness.</span>
+          guarantee comprehension, boost sales efficiency
         </h2>
-        <p style={{ ...S.fadeUp(visible, 0.08), fontSize: 17, color: "rgba(255,255,255,0.5)", lineHeight: 1.65, maxWidth: 420, margin: "0 auto 36px" }}>
-          See how ralli gives your team a readiness score — not just a completion report.
+        <p style={{ ...S.fadeUp(visible, 0.07), fontSize: 16, color: C.textSub, lineHeight: 1.65, maxWidth: 380, margin: "0 auto 32px" }}>
+          stop guessing if your team is ready. deploy smart evaluation profiles and track real confidence indicators.
         </p>
-        <div style={{ ...S.fadeUp(visible, 0.14), display: "flex", gap: 12, justifyContent: "center", flexWrap: "wrap" }}>
+        <div style={{ ...S.fadeUp(visible, 0.13), display: "flex", gap: 12, justifyContent: "center", flexWrap: "wrap" }}>
           <button
             onClick={() => { navigate("contact"); window.scrollTo({ top: 0 }); }}
             style={{
-              fontSize: 15, fontWeight: 700, color: C.dark,
-              background: C.orange, border: "none", borderRadius: 10,
-              padding: "13px 28px", cursor: "pointer",
-              boxShadow: "0 4px 18px rgba(253,191,36,0.38)",
-              transition: "transform 0.15s, box-shadow 0.15s",
+              fontSize: 14, fontWeight: 700, color: C.dark,
+              background: C.orange, border: "none", borderRadius: 9,
+              padding: "12px 26px", cursor: "pointer", transition: "opacity 0.15s",
             }}
-            onMouseEnter={e => { e.currentTarget.style.transform = "translateY(-1px)"; e.currentTarget.style.boxShadow = "0 6px 24px rgba(253,191,36,0.48)"; }}
-            onMouseLeave={e => { e.currentTarget.style.transform = "translateY(0)"; e.currentTarget.style.boxShadow = "0 4px 18px rgba(253,191,36,0.38)"; }}
+            onMouseEnter={e => e.currentTarget.style.opacity = "0.85"}
+            onMouseLeave={e => e.currentTarget.style.opacity = "1"}
           >
-            Book a Demo
+            get started free
           </button>
-          <a href="/login" style={{
-            fontSize: 15, fontWeight: 600, color: "rgba(255,255,255,0.7)",
-            background: "rgba(255,255,255,0.07)", border: "1.5px solid rgba(255,255,255,0.12)",
-            borderRadius: 10, padding: "13px 28px", textDecoration: "none",
-            transition: "background 0.15s",
-          }}
-            onMouseEnter={e => e.currentTarget.style.background = "rgba(255,255,255,0.12)"}
-            onMouseLeave={e => e.currentTarget.style.background = "rgba(255,255,255,0.07)"}
+          <button
+            onClick={() => { navigate("contact"); window.scrollTo({ top: 0 }); }}
+            style={{
+              fontSize: 14, fontWeight: 600, color: C.text,
+              background: "transparent", border: `1.5px solid ${C.border}`,
+              borderRadius: 9, padding: "12px 26px", cursor: "pointer", transition: "opacity 0.15s",
+            }}
+            onMouseEnter={e => e.currentTarget.style.opacity = "0.65"}
+            onMouseLeave={e => e.currentTarget.style.opacity = "1"}
           >
-            Login →
-          </a>
+            talk to sales
+          </button>
         </div>
       </div>
     </section>
@@ -261,73 +489,73 @@ function Hero({ navigate }) {
   const [ref, visible] = useInView(0.05);
   return (
     <section style={{
-      ...S.section,
-      padding:    "140px 24px 96px",
-      background: "linear-gradient(180deg,#FFFDF5 0%,#F7F8FA 100%)",
-      textAlign:  "center",
-      position:   "relative",
-      overflow:   "hidden",
+      padding:  "140px 24px 100px",
+      background: "linear-gradient(105deg, #fbfaf7 0%, #fbfaf7 30%, #fce3ab 70%, #f6a70f 100%)",
+      textAlign: "center",
+      position:  "relative",
+      overflow:  "hidden",
     }}>
-      <div style={{
-        position:        "absolute", inset: 0,
-        backgroundImage: "linear-gradient(rgba(253,191,36,0.06) 1px,transparent 1px),linear-gradient(90deg,rgba(253,191,36,0.06) 1px,transparent 1px)",
-        backgroundSize:  "48px 48px",
-        pointerEvents:   "none",
-      }} />
-      <div ref={ref} style={{ ...S.container, position: "relative" }}>
-        <div style={{ display: "flex", justifyContent: "center", marginBottom: 28 }}>
-          <span style={{ ...S.sectionLabel, ...S.fadeUp(visible) }}>Operational Readiness Platform</span>
+      <div ref={ref} style={{ maxWidth: 760, margin: "0 auto", position: "relative" }}>
+        {/* Badge */}
+        <div style={{ ...S.fadeUp(visible), display: "flex", justifyContent: "center", marginBottom: 32 }}>
+          <div style={{
+            display:      "inline-flex",
+            alignItems:   "center",
+            gap:          8,
+            background:   C.orange,
+            borderRadius: 100,
+            padding:      "5px 14px 5px 6px",
+            fontSize:     12,
+            fontWeight:   600,
+            color:        C.dark,
+          }}>
+            <span style={{ background: C.dark, color: C.orange, borderRadius: 100, padding: "2px 8px", fontSize: 10, fontWeight: 800 }}>new</span>
+            ralli is now in early access — schedule a demo
+            <svg width="13" height="13" viewBox="0 0 13 13" fill="none"><path d="M2.5 6.5h8M7.5 3.5l3 3-3 3" stroke={C.dark} strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round"/></svg>
+          </div>
         </div>
+        {/* Headline */}
         <h1 style={{
           ...S.fadeUp(visible, 0.07),
-          fontSize:      clamp(40, 72),
-          fontWeight:    900,
-          color:         C.text,
-          lineHeight:    1.08,
-          letterSpacing: "-0.03em",
-          maxWidth:      800,
+          fontSize:      clamp(44, 72),
+          fontWeight:    800,
+          color:         C.dark,
+          lineHeight:    1.0,
+          letterSpacing: "-0.04em",
+          maxWidth:      700,
           margin:        "0 auto 22px",
+          textTransform: "lowercase",
         }}>
-          Completion does not equal{" "}
-          <span style={{
-            background:           "linear-gradient(135deg,#FDBF24 0%,#CC9800 100%)",
-            WebkitBackgroundClip: "text",
-            WebkitTextFillColor:  "transparent",
-            backgroundClip:       "text",
-          }}>
-            Comprehension
-          </span>
+          comprehension instead of completion
         </h1>
-        <p style={{ ...S.fadeUp(visible, 0.13), fontSize: clamp(16, 20), color: C.textSub, lineHeight: 1.65, maxWidth: 500, margin: "0 auto 40px" }}>
-          Most organizations measure completion.{" "}
-          <strong style={{ color: C.text, fontWeight: 600 }}>ralli measures readiness.</strong>
+        <p style={{ ...S.fadeUp(visible, 0.12), fontSize: clamp(15, 18), color: C.textSub, lineHeight: 1.65, maxWidth: 460, margin: "0 auto 36px" }}>
+          measuring readiness by defining comprehension instead of tracking completion checkboxes
         </p>
-        <div style={{ ...S.fadeUp(visible, 0.19), display: "flex", gap: 12, justifyContent: "center", flexWrap: "wrap", marginBottom: 64 }}>
+        <div style={{ ...S.fadeUp(visible, 0.17), display: "flex", gap: 12, justifyContent: "center", flexWrap: "wrap" }}>
           <button
             onClick={() => { navigate("contact"); window.scrollTo({ top: 0 }); }}
             style={{
-              fontSize: 15, fontWeight: 700, color: C.dark,
-              background: C.orange, border: "none", borderRadius: 10,
-              padding: "13px 28px", cursor: "pointer",
-              boxShadow: "0 4px 16px rgba(253,191,36,0.35)",
-              transition: "transform 0.15s, box-shadow 0.15s",
+              fontSize: 14, fontWeight: 700, color: C.white,
+              background: C.dark, border: "none", borderRadius: 9,
+              padding: "12px 26px", cursor: "pointer", transition: "opacity 0.15s",
             }}
-            onMouseEnter={e => { e.currentTarget.style.transform = "translateY(-1px)"; e.currentTarget.style.boxShadow = "0 6px 24px rgba(253,191,36,0.45)"; }}
-            onMouseLeave={e => { e.currentTarget.style.transform = "translateY(0)"; e.currentTarget.style.boxShadow = "0 4px 16px rgba(253,191,36,0.35)"; }}
+            onMouseEnter={e => e.currentTarget.style.opacity = "0.8"}
+            onMouseLeave={e => e.currentTarget.style.opacity = "1"}
           >
-            Book a Demo
+            get started free
           </button>
-          <a href="/login" style={{
-            fontSize: 15, fontWeight: 600, color: C.text,
-            background: C.white, border: `1.5px solid ${C.border}`,
-            borderRadius: 10, padding: "13px 28px", textDecoration: "none",
-            transition: "border-color 0.15s",
-          }}
-            onMouseEnter={e => e.currentTarget.style.borderColor = C.orange}
-            onMouseLeave={e => e.currentTarget.style.borderColor = C.border}
+          <button
+            onClick={() => { navigate("contact"); window.scrollTo({ top: 0 }); }}
+            style={{
+              fontSize: 14, fontWeight: 600, color: C.dark,
+              background: "transparent", border: `1.5px solid rgba(18,24,31,0.25)`,
+              borderRadius: 9, padding: "12px 26px", cursor: "pointer", transition: "opacity 0.15s",
+            }}
+            onMouseEnter={e => e.currentTarget.style.opacity = "0.65"}
+            onMouseLeave={e => e.currentTarget.style.opacity = "1"}
           >
-            Login →
-          </a>
+            talk to sales
+          </button>
         </div>
       </div>
     </section>
@@ -413,72 +641,97 @@ function HeroDashboard() {
   );
 }
 
-function Problem() {
+// ── "onboarding is just day one" ──────────────────────────────
+function FeaturesGrid() {
   const [ref, visible] = useInView();
-  const stats = [
-    { value: "87%", label: "of reps who complete training still fail live calls" },
-    { value: "3×",  label: "longer ramp time when readiness isn't measured" },
-    { value: "1 in 3", label: "reps are unready to close — managers don't know which ones" },
+  const features = [
+    {
+      icon: <svg width="22" height="22" viewBox="0 0 22 22" fill="none"><rect x="2" y="2" width="18" height="18" rx="5" fill={C.orangeLight}/><path d="M7 11h8M7 7h8M7 15h5" stroke={C.orangeDeep} strokeWidth="1.8" strokeLinecap="round"/></svg>,
+      title: "continuous calibration",
+      desc:  "automated quizzes sync micro-lessons with every product update, keeping representatives precisely aligned.",
+    },
+    {
+      icon: <svg width="22" height="22" viewBox="0 0 22 22" fill="none"><rect x="2" y="2" width="18" height="18" rx="5" fill={C.orangeLight}/><circle cx="11" cy="11" r="4" stroke={C.orangeDeep} strokeWidth="1.8"/><path d="M11 7V5M11 17v-2M7 11H5M17 11h-2" stroke={C.orangeDeep} strokeWidth="1.8" strokeLinecap="round"/></svg>,
+      title: "knowledge persistence",
+      desc:  "smart repetition targets forgotten concepts over time, cementing comprehension across every market shift.",
+    },
+    {
+      icon: <svg width="22" height="22" viewBox="0 0 22 22" fill="none"><rect x="2" y="2" width="18" height="18" rx="5" fill={C.orangeLight}/><path d="M6 15l4-4 3 3 4-5" stroke={C.orangeDeep} strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round"/></svg>,
+      title: "real-time readiness",
+      desc:  "always know who is ready to pitch. track individual progress over a dynamic learning arc.",
+    },
   ];
   return (
-    <section style={{ ...S.section, background: C.dark }}>
+    <section style={{ ...S.section, background: C.white }}>
       <div ref={ref} style={{ ...S.container }}>
-        <div style={{ textAlign: "center", marginBottom: 56 }}>
-          <div style={{ display: "flex", justifyContent: "center", marginBottom: 20 }}>
-            <span style={{ ...S.sectionLabel, background: "rgba(253,191,36,0.12)", borderColor: "rgba(253,191,36,0.25)", color: C.orange }}>The Problem</span>
-          </div>
-          <h2 style={{ ...S.h2, ...S.fadeUp(visible), color: C.white, maxWidth: 600, margin: "0 auto 16px" }}>
-            Training completion is not a signal. It never was.
+        <div style={{ textAlign: "center", marginBottom: 48 }}>
+          <span style={S.sectionLabel}>ongoing mastery</span>
+          <h2 style={{ ...S.h2, ...S.fadeUp(visible), textTransform: "lowercase", margin: "12px auto 14px", maxWidth: 440 }}>
+            onboarding is just day one
           </h2>
-          <p style={{ ...S.fadeUp(visible, 0.07), fontSize: 17, color: "rgba(255,255,255,0.5)", lineHeight: 1.65, maxWidth: 460, margin: "0 auto" }}>
-            Checking a box doesn't mean your team is ready to perform. Most orgs only discover that problem when quota is missed.
+          <p style={{ ...S.fadeUp(visible, 0.07), fontSize: 16, color: C.textSub, lineHeight: 1.65, maxWidth: 480, margin: "0 auto" }}>
+            enablement should not expire after week two. ralli provides continuous, micro-sized knowledge loops to guarantee readiness through every market shift.
           </p>
         </div>
-        <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit,minmax(240px,1fr))", gap: 18 }}>
-          {stats.map((s,i) => (
-            <div key={i} style={{ ...S.fadeUp(visible, 0.1+i*0.07), background: "rgba(255,255,255,0.04)", border: "1px solid rgba(255,255,255,0.08)", borderRadius: 16, padding: "32px 24px", textAlign: "center" }}>
-              <div style={{ fontSize: 42, fontWeight: 900, color: C.orange, lineHeight: 1, marginBottom: 10, letterSpacing: "-0.03em" }}>{s.value}</div>
-              <div style={{ fontSize: 14, color: "rgba(255,255,255,0.5)", lineHeight: 1.5 }}>{s.label}</div>
+        <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit,minmax(260px,1fr))", gap: 16 }}>
+          {features.map((f, i) => (
+            <div key={i} style={{
+              ...S.fadeUp(visible, 0.1 + i * 0.07),
+              background:   C.white,
+              border:       `1px solid ${C.border}`,
+              borderRadius: 14,
+              padding:      "26px 22px",
+              boxShadow:    "0 2px 10px rgba(18,24,31,0.04)",
+            }}>
+              <div style={{ marginBottom: 14 }}>{f.icon}</div>
+              <div style={{ fontSize: 14, fontWeight: 700, color: C.dark, marginBottom: 8 }}>{f.title}</div>
+              <p style={{ fontSize: 13, color: C.textSub, lineHeight: 1.65, margin: 0 }}>{f.desc}</p>
             </div>
           ))}
-        </div>
-        <div style={{ ...S.fadeUp(visible, 0.33), marginTop: 52, textAlign: "center" }}>
-          <blockquote style={{ fontSize: clamp(17,22), fontWeight: 700, color: C.white, lineHeight: 1.4, fontStyle: "italic", maxWidth: 620, margin: "0 auto" }}>
-            "Completion does not equal competence. Attendance does not equal readiness. You cannot manage what you cannot measure."
-          </blockquote>
         </div>
       </div>
     </section>
   );
 }
 
-function HowItWorks() {
+// ── "curated paths for fast comprehension" ────────────────────
+function LearningPaths() {
   const [ref, visible] = useInView();
-  const steps = [
-    { icon: "📖", label: "Learn",    desc: "Structured courses and lessons built for retention, not just completion." },
-    { icon: "✏️", label: "Practice", desc: "Quizzes and scenario drills that expose gaps before they hit real calls." },
-    { icon: "⚡", label: "Compete",  desc: "Live games that make training stick through healthy team competition." },
-    { icon: "📊", label: "Measure",  desc: "Readiness scores, knowledge heatmaps, and coaching signals — not just completion rates." },
-    { icon: "🎯", label: "Improve",  desc: "Battle cards and targeted coaching close gaps at the moment of need." },
+  const paths = [
+    { title: "enterprise playbook",  lessons: 12, progress: 90 },
+    { title: "handling competitors", lessons: 8,  progress: 45 },
+    { title: "pricing & roi models", lessons: 6,  progress: 30 },
   ];
   return (
-    <section style={{ ...S.section, background: C.white }}>
+    <section style={{ ...S.section, background: C.pageBg }}>
       <div ref={ref} style={{ ...S.container }}>
-        <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 80, alignItems: "center" }}>
-          <div>
-            <span style={S.sectionLabel}>How ralli works</span>
-            <h2 style={{ ...S.h2, ...S.fadeUp(visible) }}>A continuous readiness workflow — not a one-time training event.</h2>
-            <p style={{ ...S.bodyLarge, ...S.fadeUp(visible, 0.07) }}>
-              ralli connects learning, practice, competition, and analytics into a single loop. Every rep builds knowledge. Every manager sees who's ready.
+        <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit,minmax(280px,1fr))", gap: 64, alignItems: "center" }}>
+          <div style={S.fadeUp(visible, 0.04)}>
+            <span style={S.sectionLabel}>structured learning paths</span>
+            <h2 style={{ ...S.h2, textTransform: "lowercase", margin: "14px 0 16px" }}>
+              curated paths for fast comprehension
+            </h2>
+            <p style={{ ...S.bodyLarge }}>
+              organize critical pitch information into bite-size lessons. representatives progress through guided paths designed for cognitive retention.
             </p>
           </div>
-          <div style={{ display: "flex", flexDirection: "column", gap: 4 }}>
-            {steps.map((s,i) => (
-              <div key={i} style={{ ...S.fadeUp(visible, 0.06+i*0.06), display: "flex", alignItems: "flex-start", gap: 14, padding: "14px 18px", borderRadius: C.radius, background: i%2===0?C.pageBg:"transparent", border: `1px solid ${i%2===0?C.border:"transparent"}` }}>
-                <div style={{ width:38,height:38,borderRadius:9,background:C.orangeLight,display:"flex",alignItems:"center",justifyContent:"center",fontSize:17,flexShrink:0 }}>{s.icon}</div>
-                <div>
-                  <div style={{ fontSize:13,fontWeight:700,color:C.text,marginBottom:2 }}>{String(i+1).padStart(2,"0")}  {s.label}</div>
-                  <div style={{ fontSize:13,color:C.textSub,lineHeight:1.55 }}>{s.desc}</div>
+          <div style={{ display: "flex", flexDirection: "column", gap: 10 }}>
+            {paths.map((p, i) => (
+              <div key={i} style={{
+                ...S.fadeUp(visible, 0.1 + i * 0.08),
+                background:   C.white,
+                borderRadius: 12,
+                border:       `1px solid ${C.border}`,
+                padding:      "18px 20px",
+                boxShadow:    "0 2px 8px rgba(18,24,31,0.04)",
+              }}>
+                <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 8 }}>
+                  <div style={{ fontSize: 14, fontWeight: 700, color: C.dark }}>{p.title}</div>
+                  <div style={{ fontSize: 11, fontWeight: 600, color: C.textMuted }}>{p.progress}% done</div>
+                </div>
+                <div style={{ fontSize: 11, color: C.textMuted, marginBottom: 10 }}>{p.lessons} lessons · 0 of {p.lessons} to do</div>
+                <div style={{ height: 4, background: C.borderLight, borderRadius: 3 }}>
+                  <div style={{ height: "100%", width: `${p.progress}%`, background: C.orange, borderRadius: 3 }} />
                 </div>
               </div>
             ))}
@@ -489,33 +742,215 @@ function HowItWorks() {
   );
 }
 
-function SocialProof() {
+// ── "evaluation beyond clicking checkboxes" ───────────────────
+function EvaluationSection() {
   const [ref, visible] = useInView();
-  const quotes = [
-    { quote: "We replaced three separate tools with ralli and finally have a clear picture of which reps are ready to carry quota.", author: "VP of Sales", company: "Series B SaaS Company" },
-    { quote: "Our ramp time dropped significantly once we stopped measuring completion and started measuring comprehension.", author: "Director of Revenue Enablement", company: "Enterprise Software" },
-    { quote: "The readiness score is the first metric our CRO asks about in QBRs. It's become the single source of truth.", author: "Head of Sales Ops", company: "Growth-Stage Tech" },
+  return (
+    <section ref={ref} style={{ width: "100%", display: "flex", flexWrap: "wrap" }}>
+      {/* Left — ink panel with quiz */}
+      <div style={{ flex: "1 1 320px", background: C.dark, padding: "72px 48px", display: "flex", flexDirection: "column", justifyContent: "center" }}>
+        <div style={{ display: "flex", gap: 8, marginBottom: 24, flexWrap: "wrap" }}>
+          <span style={{ ...S.sectionLabel, background: "rgba(246,167,15,0.15)", borderColor: "rgba(246,167,15,0.3)", color: C.orange }}>real-time evaluation</span>
+          <span style={{ ...S.sectionLabel, background: "rgba(246,167,15,0.15)", borderColor: "rgba(246,167,15,0.3)", color: C.orange }}>enterprise diagnostics</span>
+        </div>
+        <div style={{ ...S.fadeUp(visible), background: "rgba(251,250,247,0.05)", border: "1px solid rgba(251,250,247,0.1)", borderRadius: 14, padding: 22, maxWidth: 440 }}>
+          <div style={{ fontSize: 11, fontWeight: 700, color: "rgba(251,250,247,0.35)", textTransform: "uppercase", letterSpacing: "0.08em", marginBottom: 14 }}>scenario evaluation</div>
+          <div style={{ fontSize: 14, fontWeight: 600, color: C.white, marginBottom: 20, lineHeight: 1.5 }}>
+            how should you respond when an enterprise lead asks about our off-grid data deployment options?
+          </div>
+          {[
+            { letter: "a", text: "explain our default cloud backup SLA architecture." },
+            { letter: "b", text: "pivot to security, highlighting our zero-latency offline protocol.", active: true },
+            { letter: "c", text: "defer to engineering for a custom architecture plan." },
+          ].map((opt) => (
+            <div key={opt.letter} style={{
+              display:      "flex",
+              alignItems:   "flex-start",
+              gap:          10,
+              padding:      "10px 12px",
+              borderRadius: 8,
+              background:   opt.active ? C.orange : "transparent",
+              border:       `1px solid ${opt.active ? C.orange : "rgba(251,250,247,0.1)"}`,
+              marginBottom: 6,
+            }}>
+              <span style={{ fontSize: 11, fontWeight: 800, color: opt.active ? C.dark : "rgba(251,250,247,0.35)", minWidth: 14 }}>{opt.letter}</span>
+              <span style={{ fontSize: 12, color: opt.active ? C.dark : "rgba(251,250,247,0.55)", lineHeight: 1.5 }}>{opt.text}</span>
+            </div>
+          ))}
+        </div>
+      </div>
+      {/* Right — cream panel with text */}
+      <div style={{ flex: "1 1 320px", background: C.pageBg, padding: "72px 48px", display: "flex", flexDirection: "column", justifyContent: "center" }}>
+        <span style={{ ...S.sectionLabel, alignSelf: "flex-start", marginBottom: 20 }}>comprehensive diagnostics</span>
+        <h2 style={{ ...S.h2, ...S.fadeUp(visible, 0.08), textTransform: "lowercase", marginBottom: 16, maxWidth: 360 }}>
+          evaluation beyond clicking checkboxes
+        </h2>
+        <p style={{ fontSize: 16, color: C.textSub, lineHeight: 1.7, maxWidth: 360 }}>
+          completion tracking is a false signal. ralli maps deep memory via active scenario testing, diagnosing comprehension bottlenecks before they impact sales calls.
+        </p>
+      </div>
+    </section>
+  );
+}
+
+// ── "live games build comprehension" ─────────────────────────
+function GamesSection({ navigate }) {
+  const [ref, visible] = useInView();
+  const teams = [
+    { rank: 1, name: "Enterprise Outbound", pts: "2,400 pts" },
+    { rank: 2, name: "Mid-Market Growth",   pts: "2,100 pts" },
+    { rank: 3, name: "APAC Accounts",       pts: "1,800 pts" },
+  ];
+  return (
+    <section style={{ ...S.section, background: C.white }}>
+      <div ref={ref} style={{ ...S.container }}>
+        <div style={{ textAlign: "center", marginBottom: 48 }}>
+          <span style={S.sectionLabel}>gamified learning</span>
+          <h2 style={{ ...S.h2, ...S.fadeUp(visible), textTransform: "lowercase", margin: "12px auto 14px", maxWidth: 500 }}>
+            live games build comprehension
+          </h2>
+          <p style={{ ...S.fadeUp(visible, 0.07), fontSize: 16, color: C.textSub, lineHeight: 1.65, maxWidth: 440, margin: "0 auto" }}>
+            turn alignment reviews into competitive team games. teams study and validate knowledge blocks in collaborative live tournaments.
+          </p>
+        </div>
+        <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit,minmax(280px,1fr))", gap: 52, alignItems: "center" }}>
+          {/* Leaderboard card */}
+          <div style={{ ...S.fadeUp(visible, 0.1), background: C.white, border: `1px solid ${C.border}`, borderRadius: 16, padding: "22px 22px 18px", boxShadow: "0 4px 18px rgba(18,24,31,0.07)" }}>
+            <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 16 }}>
+              <div style={{ fontSize: 13, fontWeight: 800, color: C.dark }}>live ralli leaderboard</div>
+              <div style={{ fontSize: 10, fontWeight: 800, color: "#16A34A", background: "#D1FAE5", borderRadius: 100, padding: "3px 9px" }}>LIVE</div>
+            </div>
+            {teams.map((t, i) => (
+              <div key={i} style={{ display: "flex", alignItems: "center", gap: 12, padding: "11px 0", borderBottom: i < teams.length - 1 ? `1px solid ${C.borderLight}` : "none" }}>
+                <span style={{ fontSize: 11, fontWeight: 800, color: i === 0 ? C.orange : C.textMuted, minWidth: 18 }}>#{t.rank}</span>
+                <div style={{ width: 28, height: 28, borderRadius: "50%", background: `hsl(${i * 80 + 20},60%,62%)`, flexShrink: 0 }} />
+                <div style={{ flex: 1, fontSize: 13, fontWeight: 600, color: C.dark }}>{t.name}</div>
+                <div style={{ fontSize: 12, fontWeight: 800, color: i === 0 ? C.orange : C.textSub }}>{t.pts}</div>
+              </div>
+            ))}
+          </div>
+          {/* Text */}
+          <div style={S.fadeUp(visible, 0.14)}>
+            <h3 style={{ fontSize: 20, fontWeight: 800, color: C.dark, marginBottom: 14, lineHeight: 1.25, textTransform: "lowercase" }}>
+              cohesive collaboration, healthy competition
+            </h3>
+            <p style={{ fontSize: 15, color: C.textSub, lineHeight: 1.7, marginBottom: 22 }}>
+              foster team alignment with custom challenges. host weekly multiplayer events covering objection models, pricing formulas, and product releases.
+            </p>
+            <button
+              onClick={() => { navigate("contact"); window.scrollTo({ top: 0 }); }}
+              style={{
+                fontSize: 13, fontWeight: 700, color: C.white,
+                background: C.dark, border: "none", borderRadius: 8,
+                padding: "10px 20px", cursor: "pointer", transition: "opacity 0.15s",
+              }}
+              onMouseEnter={e => e.currentTarget.style.opacity = "0.8"}
+              onMouseLeave={e => e.currentTarget.style.opacity = "1"}
+            >
+              see live games
+            </button>
+          </div>
+        </div>
+      </div>
+    </section>
+  );
+}
+
+// ── "diagnose compliance before pitching" ─────────────────────
+function InsightsSection() {
+  const [ref, visible] = useInView();
+  return (
+    <section style={{ ...S.section, background: C.pageBg }}>
+      <div ref={ref} style={{ ...S.container }}>
+        <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit,minmax(280px,1fr))", gap: 64, alignItems: "center" }}>
+          <div style={S.fadeUp(visible, 0.04)}>
+            <span style={S.sectionLabel}>activate insights</span>
+            <h2 style={{ ...S.h2, textTransform: "lowercase", margin: "14px 0 16px" }}>
+              diagnose compliance before pitching
+            </h2>
+            <p style={{ ...S.bodyLarge }}>
+              track precise memory trajectories across every segment. ralli automatically surfaces forgotten concepts and reveals systemic training blind spots.
+            </p>
+          </div>
+          <div style={{ ...S.fadeUp(visible, 0.1), background: C.dark, borderRadius: 16, padding: 24 }}>
+            <div style={{ fontSize: 13, fontWeight: 600, color: "rgba(251,250,247,0.45)", marginBottom: 18 }}>comprehension blind spots</div>
+            {[
+              { title: "Off-Grid Security Protocol", sub: "12 reps · 8 at risk",  badge: "−42% drop", red: true },
+              { title: "Premium Tier ROI Models",    sub: "9 reps · 4 at risk",   badge: "higher win rate", red: false },
+            ].map((item, i) => (
+              <div key={i} style={{
+                background:   "rgba(251,250,247,0.05)",
+                border:       "1px solid rgba(251,250,247,0.08)",
+                borderRadius: 10,
+                padding:      "16px 16px",
+                marginBottom: i === 0 ? 10 : 0,
+              }}>
+                <div style={{ display: "flex", justifyContent: "space-between", alignItems: "flex-start" }}>
+                  <div>
+                    <div style={{ fontSize: 13, fontWeight: 700, color: C.white, marginBottom: 4 }}>{item.title}</div>
+                    <div style={{ fontSize: 11, color: "rgba(251,250,247,0.35)" }}>{item.sub}</div>
+                  </div>
+                  <span style={{
+                    fontSize: 10, fontWeight: 700,
+                    color:        item.red ? "#f87171" : "#4ade80",
+                    background:   item.red ? "rgba(239,68,68,0.12)" : "rgba(74,222,128,0.12)",
+                    borderRadius: 100, padding: "3px 9px", whiteSpace: "nowrap", marginLeft: 8,
+                  }}>{item.badge}</span>
+                </div>
+              </div>
+            ))}
+          </div>
+        </div>
+      </div>
+    </section>
+  );
+}
+
+// ── "drill down into readiness profiles" ──────────────────────
+function ProfilesSection() {
+  const [ref, visible] = useInView();
+  const reps = [
+    { name: "sarah chen",     role: "Enterprise Outbound", score: 94, status: "ready",   color: C.orange },
+    { name: "marcus vance",   role: "Mid-Market Growth",   score: 100, status: "ready",  color: "#a78bfa" },
+    { name: "jemima chadrix", role: "APAC Accounts",       score: 71, status: "on track", color: "#34d399" },
   ];
   return (
     <section style={{ ...S.section, background: C.pageBg }}>
       <div ref={ref} style={{ ...S.container }}>
-        <div style={{ textAlign: "center", marginBottom: 52 }}>
-          <div style={{ display: "flex", justifyContent: "center", marginBottom: 20 }}>
-            <span style={S.sectionLabel}>What teams are saying</span>
-          </div>
-          <h2 style={{ ...S.h2, ...S.fadeUp(visible), maxWidth: 500, margin: "0 auto" }}>
-            The teams who measure readiness outperform the ones who don't.
+        <div style={{ textAlign: "center", marginBottom: 48 }}>
+          <span style={S.sectionLabel}>streamline onboarding</span>
+          <h2 style={{ ...S.h2, ...S.fadeUp(visible), textTransform: "lowercase", margin: "12px auto 14px", maxWidth: 520 }}>
+            drill down into readiness profiles
           </h2>
+          <p style={{ ...S.fadeUp(visible, 0.07), fontSize: 16, color: C.textSub, lineHeight: 1.65, maxWidth: 440, margin: "0 auto" }}>
+            identify precisely who is ready to deploy and who needs immediate knowledge calibration. target coaching where it impacts revenue.
+          </p>
         </div>
-        <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit,minmax(280px,1fr))", gap: 18 }}>
-          {quotes.map((q,i) => (
-            <div key={i} style={{ ...S.fadeUp(visible, 0.07+i*0.07), background: C.white, borderRadius: 16, border: `1px solid ${C.border}`, padding: 26, boxShadow: "0 4px 16px rgba(11,18,32,0.05)" }}>
-              <div style={{ display: "flex", gap: 2, marginBottom: 14 }}>
-                {Array(5).fill(0).map((_,si) => <svg key={si} width="13" height="13" viewBox="0 0 14 14" fill={C.orange}><path d="M7 1L8.8 5.3L13.5 5.8L10 9L11.1 13.5L7 11.1L2.9 13.5L4 9L0.5 5.8L5.2 5.3L7 1Z"/></svg>)}
+        <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit,minmax(220px,1fr))", gap: 16 }}>
+          {reps.map((r, i) => (
+            <div key={i} style={{
+              ...S.fadeUp(visible, 0.1 + i * 0.07),
+              background:   C.white,
+              borderRadius: 16,
+              border:       `1px solid ${C.border}`,
+              padding:      "28px 22px",
+              textAlign:    "center",
+              boxShadow:    "0 2px 10px rgba(18,24,31,0.04)",
+            }}>
+              <div style={{ width: 60, height: 60, borderRadius: "50%", background: r.color, margin: "0 auto 14px", display: "flex", alignItems: "center", justifyContent: "center", fontSize: 20, fontWeight: 800, color: C.dark }}>
+                {r.name.split(" ").map(n => n[0].toUpperCase()).join("")}
               </div>
-              <p style={{ fontSize: 14, color: C.textSub, lineHeight: 1.65, marginBottom: 18, fontStyle: "italic" }}>"{q.quote}"</p>
-              <div style={{ fontSize: 13, fontWeight: 700, color: C.text }}>{q.author}</div>
-              <div style={{ fontSize: 12, color: C.textMuted }}>{q.company}</div>
+              <div style={{ fontSize: 14, fontWeight: 700, color: C.dark, marginBottom: 3 }}>{r.name}</div>
+              <div style={{ fontSize: 12, color: C.textMuted, marginBottom: 18 }}>{r.role}</div>
+              <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 8 }}>
+                <span style={{ fontSize: 11, color: C.textMuted }}>readiness index</span>
+                <span style={{ fontSize: 12, fontWeight: 800, color: r.score >= 90 ? "#16a34a" : r.score >= 70 ? C.orangeDeep : "#dc2626" }}>
+                  {r.score}% · {r.status}
+                </span>
+              </div>
+              <div style={{ height: 4, background: C.borderLight, borderRadius: 3 }}>
+                <div style={{ height: "100%", width: `${r.score}%`, background: r.score >= 90 ? "#22c55e" : r.score >= 70 ? C.orange : "#ef4444", borderRadius: 3 }} />
+              </div>
             </div>
           ))}
         </div>
@@ -524,18 +959,19 @@ function SocialProof() {
   );
 }
 
-function DashboardShowcase() {
-  const [ref, visible] = useInView(0.1);
+// ── Platform showcase (preserves HeroDashboard visual) ────────
+function PlatformShowcase() {
+  const [ref, visible] = useInView(0.08);
   return (
-    <section style={{ ...S.section, background: C.pageBg, padding: "72px 24px" }}>
+    <section style={{ ...S.section, background: C.white, padding: "72px 24px" }}>
       <div ref={ref} style={{ ...S.container }}>
         <div style={{ textAlign: "center", marginBottom: 40 }}>
-          <span style={S.sectionLabel}>Platform</span>
-          <h2 style={{ ...S.h2, ...S.fadeUp(visible), maxWidth: 520, margin: "12px auto 14px" }}>
-            One view. Every rep. Full readiness picture.
+          <span style={S.sectionLabel}>the platform</span>
+          <h2 style={{ ...S.h2, ...S.fadeUp(visible), textTransform: "lowercase", maxWidth: 480, margin: "12px auto 14px" }}>
+            one view. every rep. full readiness picture.
           </h2>
           <p style={{ ...S.bodyLarge, ...S.fadeUp(visible, 0.07), textAlign: "center", margin: "0 auto" }}>
-            Readiness scores, knowledge gaps, and coaching signals — all in one place.
+            readiness scores, knowledge gaps, and coaching signals — all in one place.
           </p>
         </div>
         <div style={S.fadeUp(visible, 0.13)}>
@@ -546,14 +982,50 @@ function DashboardShowcase() {
   );
 }
 
+// ── Testimonial ───────────────────────────────────────────────
+function TestimonialSection() {
+  const [ref, visible] = useInView();
+  return (
+    <section style={{ ...S.section, background: C.pageBg }}>
+      <div ref={ref} style={{ ...S.container, textAlign: "center", maxWidth: 760 }}>
+        <span style={S.sectionLabel}>a word of readiness</span>
+        <blockquote style={{
+          ...S.fadeUp(visible, 0.07),
+          fontSize:      clamp(18, 28),
+          fontWeight:    700,
+          color:         C.dark,
+          lineHeight:    1.4,
+          letterSpacing: "-0.02em",
+          margin:        "22px auto 28px",
+          fontStyle:     "normal",
+          maxWidth:      680,
+        }}>
+          "we stopped tracking completion because completion meant nothing. with ralli, we finally have an exact diagnostic on what our team actually comprehends before they get on the phone."
+        </blockquote>
+        <div style={{ ...S.fadeUp(visible, 0.13), display: "flex", alignItems: "center", justifyContent: "center", gap: 12 }}>
+          <div style={{ width: 38, height: 38, borderRadius: "50%", background: C.orange, display: "flex", alignItems: "center", justifyContent: "center", fontSize: 13, fontWeight: 800, color: C.dark }}>DH</div>
+          <div style={{ textAlign: "left" }}>
+            <div style={{ fontSize: 14, fontWeight: 700, color: C.dark }}>diana hunter</div>
+            <div style={{ fontSize: 12, color: C.textSub }}>vp sales, enterprise software</div>
+          </div>
+        </div>
+      </div>
+    </section>
+  );
+}
+
 function HomePage({ navigate }) {
   return (
     <PageWrapper>
       <Hero navigate={navigate} />
-      <Problem />
-      <HowItWorks />
-      <DashboardShowcase />
-      <SocialProof />
+      <FeaturesGrid />
+      <LearningPaths />
+      <EvaluationSection />
+      <GamesSection navigate={navigate} />
+      <InsightsSection />
+      <ProfilesSection />
+      <PlatformShowcase />
+      <TestimonialSection />
       <CTABanner navigate={navigate} />
     </PageWrapper>
   );
@@ -1222,6 +1694,212 @@ function ContactPage() {
   );
 }
 
+// ── LEGAL PAGES ────────────────────────────────────────────────
+function LegalSection({ title, children }) {
+  return (
+    <div style={{ marginBottom: 40 }}>
+      <h2 style={{ fontSize: 18, fontWeight: 800, color: C.text, marginBottom: 14, paddingBottom: 10, borderBottom: `1px solid ${C.border}` }}>
+        {title}
+      </h2>
+      {children}
+    </div>
+  );
+}
+
+function LegalP({ children }) {
+  return (
+    <p style={{ fontSize: 15, color: C.textSub, lineHeight: 1.75, marginBottom: 12 }}>
+      {children}
+    </p>
+  );
+}
+
+function PrivacyPage({ navigate }) {
+  return (
+    <PageWrapper>
+      <section style={{ ...S.section, padding: "80px 24px 48px", background: "linear-gradient(180deg,#FFFDF5 0%,#F7F8FA 100%)", textAlign: "center" }}>
+        <div style={{ ...S.container }}>
+          <span style={S.sectionLabel}>Legal</span>
+          <h1 style={{ fontSize: clamp(30, 48), fontWeight: 900, color: C.text, lineHeight: 1.1, letterSpacing: "-0.02em", maxWidth: 560, margin: "12px auto 14px" }}>
+            Privacy Policy
+          </h1>
+          <p style={{ fontSize: 15, color: C.textMuted, maxWidth: 400, margin: "0 auto" }}>
+            Last updated: July 2026
+          </p>
+        </div>
+      </section>
+
+      <section style={{ ...S.section, padding: "56px 24px 96px", background: C.pageBg }}>
+        <div style={{ ...S.container, maxWidth: 740 }}>
+          <LegalP>
+            ralli ("we," "our," or "us") is committed to protecting the privacy of the individuals who use our platform. This Privacy Policy describes how we collect, use, and share information when you visit runralli.com or use the ralli platform.
+          </LegalP>
+
+          <LegalSection title="1. Information We Collect">
+            <LegalP>
+              <strong>Account information.</strong> When you sign up for ralli, we collect your name, email address, company name, and role. Organization administrators may also provide team member information when setting up accounts.
+            </LegalP>
+            <LegalP>
+              <strong>Usage data.</strong> We collect information about how you interact with the platform — courses completed, quiz scores, game participation, and readiness scores. This data is used to generate the analytics and readiness insights that are core to the product.
+            </LegalP>
+            <LegalP>
+              <strong>Contact form submissions.</strong> If you contact us through the website, we collect the name, email, company, role, and message you provide.
+            </LegalP>
+            <LegalP>
+              <strong>Technical data.</strong> We collect standard server logs, IP addresses, browser type, and device information for security and performance monitoring.
+            </LegalP>
+          </LegalSection>
+
+          <LegalSection title="2. How We Use Your Information">
+            <LegalP>We use collected information to provide and improve the ralli platform, authenticate users, generate readiness analytics, send product and account communications, respond to support and sales inquiries, and comply with legal obligations.</LegalP>
+            <LegalP>We do not sell your personal information to third parties.</LegalP>
+          </LegalSection>
+
+          <LegalSection title="3. Data Sharing">
+            <LegalP>
+              <strong>Within your organization.</strong> Readiness scores and progress data are visible to managers and administrators within your organization as configured by your team's settings.
+            </LegalP>
+            <LegalP>
+              <strong>Service providers.</strong> We share data with third-party service providers who support our operations — including Supabase (database and authentication), Resend (email delivery), and Vercel (hosting). These providers are contractually required to protect your data and use it only to perform services on our behalf.
+            </LegalP>
+            <LegalP>
+              <strong>Legal requirements.</strong> We may disclose information if required by law or to protect the rights, safety, or property of ralli or others.
+            </LegalP>
+          </LegalSection>
+
+          <LegalSection title="4. Data Retention">
+            <LegalP>We retain account and usage data for as long as your organization maintains an active account with ralli. Upon account cancellation, data is deleted within 90 days unless retention is required by law.</LegalP>
+          </LegalSection>
+
+          <LegalSection title="5. Security">
+            <LegalP>We use industry-standard security practices including encryption in transit (TLS), row-level security on all database records, and access controls that enforce organizational data isolation. No security system is perfect; we cannot guarantee the absolute security of your information.</LegalP>
+          </LegalSection>
+
+          <LegalSection title="6. Cookies">
+            <LegalP>We use session cookies for authentication and local storage for user preferences. We do not use third-party advertising cookies. Analytics, if implemented, use privacy-respecting tools that do not track users across sites.</LegalP>
+          </LegalSection>
+
+          <LegalSection title="7. Your Rights">
+            <LegalP>Depending on your location, you may have rights to access, correct, delete, or export your personal data. To make a request, contact us at <a href="mailto:avanti@runralli.com" style={{ color: C.orangeDeep, textDecoration: "none" }}>avanti@runralli.com</a>. We will respond within 30 days.</LegalP>
+          </LegalSection>
+
+          <LegalSection title="8. Children">
+            <LegalP>ralli is intended for business use by adults. We do not knowingly collect personal information from individuals under 16 years of age.</LegalP>
+          </LegalSection>
+
+          <LegalSection title="9. Changes to This Policy">
+            <LegalP>We may update this Privacy Policy from time to time. We will notify account holders of material changes via email. Continued use of the platform after changes take effect constitutes acceptance of the updated policy.</LegalP>
+          </LegalSection>
+
+          <LegalSection title="10. Contact">
+            <LegalP>
+              Questions about this Privacy Policy? Email us at{" "}
+              <a href="mailto:avanti@runralli.com" style={{ color: C.orangeDeep, textDecoration: "none" }}>avanti@runralli.com</a>.
+            </LegalP>
+          </LegalSection>
+
+          <div style={{ paddingTop: 16, borderTop: `1px solid ${C.border}` }}>
+            <button
+              onClick={() => { navigate("home"); window.scrollTo({ top: 0 }); }}
+              style={{ fontSize: 14, fontWeight: 600, color: C.orangeDeep, background: "none", border: "none", cursor: "pointer", padding: 0 }}
+            >
+              ← Back to ralli
+            </button>
+          </div>
+        </div>
+      </section>
+    </PageWrapper>
+  );
+}
+
+function TermsPage({ navigate }) {
+  return (
+    <PageWrapper>
+      <section style={{ ...S.section, padding: "80px 24px 48px", background: "linear-gradient(180deg,#FFFDF5 0%,#F7F8FA 100%)", textAlign: "center" }}>
+        <div style={{ ...S.container }}>
+          <span style={S.sectionLabel}>Legal</span>
+          <h1 style={{ fontSize: clamp(30, 48), fontWeight: 900, color: C.text, lineHeight: 1.1, letterSpacing: "-0.02em", maxWidth: 560, margin: "12px auto 14px" }}>
+            Terms of Service
+          </h1>
+          <p style={{ fontSize: 15, color: C.textMuted, maxWidth: 400, margin: "0 auto" }}>
+            Last updated: July 2026
+          </p>
+        </div>
+      </section>
+
+      <section style={{ ...S.section, padding: "56px 24px 96px", background: C.pageBg }}>
+        <div style={{ ...S.container, maxWidth: 740 }}>
+          <LegalP>
+            By accessing or using the ralli platform at runralli.com, you agree to these Terms of Service. If you are using ralli on behalf of an organization, you represent that you have the authority to bind that organization to these terms.
+          </LegalP>
+
+          <LegalSection title="1. The Service">
+            <LegalP>ralli is a sales readiness platform that provides learning management, gamification, quizzes, battle cards, and performance analytics for sales teams. We may update, modify, or discontinue features at any time with reasonable notice.</LegalP>
+          </LegalSection>
+
+          <LegalSection title="2. Accounts">
+            <LegalP>You are responsible for maintaining the security of your account credentials. You must notify us immediately of any unauthorized access at <a href="mailto:avanti@runralli.com" style={{ color: C.orangeDeep, textDecoration: "none" }}>avanti@runralli.com</a>.</LegalP>
+            <LegalP>Each organization using ralli is a separate tenant. You may not access data belonging to another organization. You may not create accounts on behalf of individuals without their knowledge.</LegalP>
+          </LegalSection>
+
+          <LegalSection title="3. Acceptable Use">
+            <LegalP>You agree not to: use the platform for unlawful purposes; upload content that is defamatory, harassing, or violates third-party rights; attempt to reverse-engineer or circumvent any security measures; use automated tools to scrape or extract data; or interfere with the platform's availability for other users.</LegalP>
+          </LegalSection>
+
+          <LegalSection title="4. Your Content">
+            <LegalP>You retain ownership of the training content, courses, quizzes, and battle cards you create within ralli. By uploading content, you grant ralli a limited license to store and display that content to authorized users within your organization.</LegalP>
+            <LegalP>You are responsible for ensuring your content does not infringe any third-party intellectual property rights or violate applicable law.</LegalP>
+          </LegalSection>
+
+          <LegalSection title="5. ralli's Intellectual Property">
+            <LegalP>The ralli platform, including its software, design, trademarks, and methodology, is owned by ralli and protected by intellectual property law. These Terms do not grant you any rights to our intellectual property beyond the right to use the platform as permitted herein.</LegalP>
+          </LegalSection>
+
+          <LegalSection title="6. Payment and Subscription">
+            <LegalP>Subscription pricing, billing terms, and payment methods are set out in your order agreement or the plan selected at sign-up. All fees are non-refundable except as required by law or explicitly stated in your agreement. We reserve the right to suspend access for non-payment after reasonable notice.</LegalP>
+          </LegalSection>
+
+          <LegalSection title="7. Disclaimer of Warranties">
+            <LegalP>ralli is provided "as is" without warranty of any kind, express or implied. We do not warrant that the platform will be error-free, uninterrupted, or that any specific business outcomes will result from use of the platform.</LegalP>
+          </LegalSection>
+
+          <LegalSection title="8. Limitation of Liability">
+            <LegalP>To the fullest extent permitted by law, ralli shall not be liable for any indirect, incidental, special, consequential, or punitive damages arising out of your use of the platform. Our total liability for any claim arising under these Terms shall not exceed the amounts you paid us in the 12 months preceding the claim.</LegalP>
+          </LegalSection>
+
+          <LegalSection title="9. Termination">
+            <LegalP>Either party may terminate the agreement with 30 days' written notice. We may terminate immediately for material breach of these Terms. Upon termination, your access to the platform ceases and your data will be deleted within 90 days.</LegalP>
+          </LegalSection>
+
+          <LegalSection title="10. Governing Law">
+            <LegalP>These Terms are governed by the laws of the State of Delaware, United States, without regard to its conflict of law provisions. Any disputes shall be resolved exclusively in the state or federal courts located in Delaware.</LegalP>
+          </LegalSection>
+
+          <LegalSection title="11. Changes to These Terms">
+            <LegalP>We may update these Terms from time to time. We will provide at least 14 days' notice of material changes via email. Continued use of the platform after the effective date of changes constitutes acceptance.</LegalP>
+          </LegalSection>
+
+          <LegalSection title="12. Contact">
+            <LegalP>
+              Questions about these Terms? Email us at{" "}
+              <a href="mailto:avanti@runralli.com" style={{ color: C.orangeDeep, textDecoration: "none" }}>avanti@runralli.com</a>.
+            </LegalP>
+          </LegalSection>
+
+          <div style={{ paddingTop: 16, borderTop: `1px solid ${C.border}` }}>
+            <button
+              onClick={() => { navigate("home"); window.scrollTo({ top: 0 }); }}
+              style={{ fontSize: 14, fontWeight: 600, color: C.orangeDeep, background: "none", border: "none", cursor: "pointer", padding: 0 }}
+            >
+              ← Back to ralli
+            </button>
+          </div>
+        </div>
+      </section>
+    </PageWrapper>
+  );
+}
+
 // ── FOOTER ─────────────────────────────────────────────────────
 function Footer({ navigate }) {
   const handleNav = (id) => { navigate(id); window.scrollTo({ top: 0 }); };
@@ -1241,7 +1919,7 @@ function Footer({ navigate }) {
                 <circle cx="16" cy="16"  r="4.2" fill="#FDBF24"/>
               </svg>
               <div style={{ display: "flex", alignItems: "baseline" }}>
-                <span style={{ fontSize:15,fontWeight:900,color:"rgba(255,255,255,0.85)" }}>ralli</span>
+                <span style={{ fontSize:15,fontWeight:700,color:"rgba(251,250,247,0.85)",fontFamily:"'Unbounded', sans-serif" }}>ralli</span>
                 <span style={{ fontSize:8,fontWeight:900,color:C.orange,marginLeft:1,position:"relative",top:-5 }}>✦</span>
               </div>
             </div>
@@ -1250,7 +1928,7 @@ function Footer({ navigate }) {
             </p>
           </div>
           {/* Links */}
-          <div style={{ display: "flex", gap: 32 }}>
+          <div style={{ display: "flex", gap: 32, flexWrap: "wrap" }}>
             <div>
               <div style={{ fontSize:11,fontWeight:700,color:"rgba(255,255,255,0.3)",textTransform:"uppercase",letterSpacing:"0.09em",marginBottom:12 }}>Product</div>
               <div style={{ display:"flex",flexDirection:"column",gap:8 }}>
@@ -1275,10 +1953,34 @@ function Footer({ navigate }) {
                 ))}
               </div>
             </div>
+            <div>
+              <div style={{ fontSize:11,fontWeight:700,color:"rgba(255,255,255,0.3)",textTransform:"uppercase",letterSpacing:"0.09em",marginBottom:12 }}>Legal</div>
+              <div style={{ display:"flex",flexDirection:"column",gap:8 }}>
+                {[{id:"privacy",label:"Privacy Policy"},{id:"terms",label:"Terms of Service"}].map(l => (
+                  <button key={l.id} onClick={() => handleNav(l.id)} style={{ fontSize:13,color:"rgba(255,255,255,0.5)",background:"none",border:"none",cursor:"pointer",padding:0,textAlign:"left",transition:"color 0.15s" }}
+                    onMouseEnter={e=>e.currentTarget.style.color="rgba(255,255,255,0.85)"}
+                    onMouseLeave={e=>e.currentTarget.style.color="rgba(255,255,255,0.5)"}>
+                    {l.label}
+                  </button>
+                ))}
+              </div>
+            </div>
           </div>
         </div>
         <div style={{ borderTop:"1px solid rgba(255,255,255,0.06)",paddingTop:24,display:"flex",justifyContent:"space-between",alignItems:"center",flexWrap:"wrap",gap:12 }}>
-          <div style={{ fontSize:12,color:"rgba(255,255,255,0.25)" }}>© {new Date().getFullYear()} ralli. All rights reserved.</div>
+          <div style={{ display:"flex",gap:20,alignItems:"center",flexWrap:"wrap" }}>
+            <div style={{ fontSize:12,color:"rgba(255,255,255,0.25)" }}>© {new Date().getFullYear()} ralli. All rights reserved.</div>
+            <button onClick={() => handleNav("privacy")} style={{ fontSize:12,color:"rgba(255,255,255,0.3)",background:"none",border:"none",cursor:"pointer",padding:0,transition:"color 0.15s" }}
+              onMouseEnter={e=>e.currentTarget.style.color="rgba(255,255,255,0.65)"}
+              onMouseLeave={e=>e.currentTarget.style.color="rgba(255,255,255,0.3)"}>
+              Privacy
+            </button>
+            <button onClick={() => handleNav("terms")} style={{ fontSize:12,color:"rgba(255,255,255,0.3)",background:"none",border:"none",cursor:"pointer",padding:0,transition:"color 0.15s" }}
+              onMouseEnter={e=>e.currentTarget.style.color="rgba(255,255,255,0.65)"}
+              onMouseLeave={e=>e.currentTarget.style.color="rgba(255,255,255,0.3)"}>
+              Terms
+            </button>
+          </div>
           <a href="/login" style={{ fontSize:12,color:"rgba(255,255,255,0.35)",textDecoration:"none",transition:"color 0.15s" }}
             onMouseEnter={e=>e.currentTarget.style.color="rgba(255,255,255,0.65)"}
             onMouseLeave={e=>e.currentTarget.style.color="rgba(255,255,255,0.35)"}>
@@ -1291,19 +1993,53 @@ function Footer({ navigate }) {
 }
 
 // ── ROOT ───────────────────────────────────────────────────────
-export default function MarketingPage() {
-  const [currentPage, setCurrentPage] = useState("home");
+const PAGE_TITLES = {
+  home:     "ralli — Operational Readiness Platform",
+  solution: "Solution — ralli",
+  team:     "Meet the Team — ralli",
+  contact:  "Contact — ralli",
+  privacy:  "Privacy Policy — ralli",
+  terms:    "Terms of Service — ralli",
+};
 
-  // Handle browser back/forward
-  useEffect(() => {
+const VALID_PAGES = new Set([
+  ...NAV_LINKS.map(l => l.id),
+  "privacy",
+  "terms",
+]);
+
+export default function MarketingPage() {
+  // Determine starting page from URL:
+  //   /privacy  → "privacy"
+  //   /terms    → "terms"
+  //   /#section → that section
+  //   /         → "home"
+  const getInitialPage = () => {
+    const p = window.location.pathname;
+    if (p === "/privacy") return "privacy";
+    if (p === "/terms")   return "terms";
     const hash = window.location.hash.replace("#", "");
-    const valid = NAV_LINKS.map(l => l.id);
-    if (valid.includes(hash)) setCurrentPage(hash);
-  }, []);
+    if (VALID_PAGES.has(hash)) return hash;
+    return "home";
+  };
+
+  const [currentPage, setCurrentPage] = useState(getInitialPage);
+
+  // Update document.title on every page change
+  useEffect(() => {
+    document.title = PAGE_TITLES[currentPage] ?? PAGE_TITLES.home;
+  }, [currentPage]);
 
   const navigate = (page) => {
     setCurrentPage(page);
-    window.history.pushState(null, "", `#${page}`);
+    // Legal pages get real paths; SPA sections keep hash; home → /
+    if (page === "privacy" || page === "terms") {
+      window.history.pushState(null, "", `/${page}`);
+    } else if (page === "home") {
+      window.history.pushState(null, "", "/");
+    } else {
+      window.history.pushState(null, "", `/#${page}`);
+    }
   };
 
   const renderPage = () => {
@@ -1311,12 +2047,14 @@ export default function MarketingPage() {
       case "solution": return <SolutionPage navigate={navigate} />;
       case "team":     return <TeamPage navigate={navigate} />;
       case "contact":  return <ContactPage />;
+      case "privacy":  return <PrivacyPage navigate={navigate} />;
+      case "terms":    return <TermsPage navigate={navigate} />;
       default:         return <HomePage navigate={navigate} />;
     }
   };
 
   return (
-    <div style={{ fontFamily: "'Inter',-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif", background: C.pageBg }}>
+    <div style={{ fontFamily: "'Outfit',-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif", background: C.pageBg }}>
       <Nav currentPage={currentPage} navigate={navigate} />
       {renderPage()}
       <Footer navigate={navigate} />
