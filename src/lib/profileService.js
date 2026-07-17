@@ -196,5 +196,8 @@ export function buildUserObject(row) {
 
     // Flag: real Supabase Auth user (vs demo seed user)
     _isReal:  true,
+
+    // Assignment visibility — ISO string or null; used to badge new assignments
+    lastSeenAssignmentsAt: row.last_seen_assignments_at ?? null,
   };
 }

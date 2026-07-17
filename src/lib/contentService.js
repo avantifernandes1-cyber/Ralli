@@ -209,12 +209,56 @@ export async function deleteCourse(courseId) {
 // QUIZZES
 // ─────────────────────────────────────────────────────────────────────────────
 
-/** Normalise a DB row → app quiz shape */
+/**
+ * Coerce one answer option to a plain string.
+ * Handles: string, null/undefined (→ ""), object with any of the known
+ * text-carrier keys (text, label, answer, option, value), anything else (String()).
+ * Uses || not ?? so empty-string values fall through to the next candidate.
+ */
+function normalizeOption(opt) {
+  if (typeof opt === "string") return opt.trim();
+  if (opt === null || opt === undefined) return "";
+  if (typeof opt === "object") {
+    return String(
+      opt.text || opt.label || opt.answer || opt.option || opt.value || ""
+    ).trim();
+  }
+  return String(opt).trim();
+}
+
+/**
+ * Normalise one question to the canonical shape.
+ * • text / q  → both set to the same non-empty string (uses || so "" falls through)
+ * • options   → selected from the first non-empty source across options / answers /
+ *               choices, then every element coerced to a plain string.
+ *
+ * Critically: Array.isArray([]) === true, so an empty options array must NOT be
+ * preferred over a populated answers/choices array.  We use length > 0 to guard.
+ * Scoring (correct index) is preserved unchanged.
+ */
+function normalizeQuestion(q) {
+  const canonical = q.text || q.q || "";
+  const result = { ...q, q: canonical, text: canonical };
+
+  // Pick the first source that is actually a non-empty array.
+  const rawOptions =
+    (Array.isArray(q.options)  && q.options.length  > 0 && q.options)  ||
+    (Array.isArray(q.answers)  && q.answers.length  > 0 && q.answers)  ||
+    (Array.isArray(q.choices)  && q.choices.length  > 0 && q.choices)  ||
+    [];
+
+  result.options = rawOptions.map(normalizeOption);
+  return result;
+}
+
+/** Normalise a DB row → app quiz shape.
+ *  Uses || not ?? because ?? does not fall through on "" (empty string).
+ *  A prior normalisation pass may have written text:"" to the DB; || handles that correctly. */
 function dbToQuiz(row) {
   return {
     id:         row.id,
     name:       row.name,
-    questions:  (row.questions ?? []).map(q => ({ ...q, text: q.text ?? q.q ?? "" })),
+    questions:  (row.questions ?? []).map(normalizeQuestion),
     status:     row.status ?? "active",
     favorite:   row.is_favorite ?? false,
     tags:       row.tags ?? [],
@@ -222,12 +266,16 @@ function dbToQuiz(row) {
   };
 }
 
-/** Normalise an app quiz → DB payload */
+/** Normalise an app quiz → DB payload.
+ *  Writes both `q` and `text` to the canonical text value so the DB is
+ *  always consistent regardless of which field the builder or seed data wrote.
+ *  Also coerces all options to plain strings so the DB never stores
+ *  null/object elements that would render as blank buttons. */
 function quizToDb(quiz, tenantId, userId) {
   return {
     tenant_id:   tenantId,
     name:        quiz.name,
-    questions:   quiz.questions ?? [],
+    questions:   (quiz.questions ?? []).map(normalizeQuestion),
     status:      quiz.status ?? "active",
     is_favorite: quiz.favorite ?? quiz.is_favorite ?? false,
     tags:        quiz.tags ?? [],
@@ -841,5 +889,27 @@ export async function updateUserProfile(userId, prefs = {}) {
     .from("profiles")
     .update(update)
     .eq("id", userId);
+  return { error };
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// ASSIGNMENT VISIBILITY
+// ─────────────────────────────────────────────────────────────────────────────
+
+/**
+ * Mark the current time as when the user last viewed their HomeScreen assignments.
+ * Called on HomeScreen mount for real users.
+ * Enables "NEW" badge logic: any assignment assigned after this timestamp is new on next login.
+ *
+ * @param {string} userId
+ * @returns {Promise<{ error: Object|null }>}
+ */
+export async function updateLastSeenAssignmentsAt(userId) {
+  if (!userId) return { error: null };
+  const { error } = await supabase
+    .from("profiles")
+    .update({ last_seen_assignments_at: new Date().toISOString() })
+    .eq("id", userId);
+  if (error) console.error("[contentService] updateLastSeenAssignmentsAt failed:", error);
   return { error };
 }
