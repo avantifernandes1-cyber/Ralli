@@ -871,7 +871,7 @@ function HomeScreen({ user, onNav, quizAssignments = [], onResumeLesson, onStart
                       </div>
                       <div style={{ textAlign: "right" }}>
                         <div style={{ fontSize: 14, fontWeight: 700, color: C.text }}>{p.score.toLocaleString()}</div>
-                        {p.change !== 0 ? <div style={{ fontSize: 11, fontWeight: 600, color: p.change > 0 ? C.green : C.red }}>{p.change > 0 ? `+${p.change}` : p.change}</div> : <div style={{ fontSize: 11, color: C.textMuted }}>—</div>}
+                        {(p.change ?? 0) !== 0 ? <div style={{ fontSize: 11, fontWeight: 600, color: p.change > 0 ? C.green : C.red }}>{p.change > 0 ? `+${p.change}` : p.change}</div> : <div style={{ fontSize: 11, color: C.textMuted }}>—</div>}
                       </div>
                     </div>
                   ))}
@@ -7036,7 +7036,7 @@ function LearnScreen({ role, user, orgUsers = [], orgs = [], onNav, onAwardXp, p
       {confirmArchive && (
         <div style={{ position: "fixed", inset: 0, background: "rgba(0,0,0,0.5)", display: "flex", alignItems: "center", justifyContent: "center", zIndex: 1001 }}
           onClick={e => { if (e.target === e.currentTarget) setConfirmArchive(null); }}>
-          <div style={{ background: C.white, borderRadius: 16, padding: 32, width: 400, boxShadow: "0 24px 64px rgba(0,0,0,0.25)" }}>
+          <div style={{ background: C.white, borderRadius: 16, padding: 32, width: "min(400px, calc(100vw - 32px))", boxShadow: "0 24px 64px rgba(0,0,0,0.25)" }}>
             <div style={{ fontSize: 32, marginBottom: 12, textAlign: "center" }}>⚠️</div>
             <h3 style={{ margin: "0 0 8px", fontSize: 17, fontWeight: 800, color: C.text, textAlign: "center" }}>Archive {confirmArchive.type === "course" ? "Course" : "Lesson"}?</h3>
             <p style={{ margin: "0 0 24px", fontSize: 13, color: C.textSub, textAlign: "center", lineHeight: 1.6 }}>
@@ -11791,7 +11791,7 @@ function OrganizationsScreen({ orgs, onInviteOrg, onSelectOrg, onRefresh, onDeac
         <div style={{ position: "fixed", inset: 0, background: "rgba(0,0,0,0.5)", display: "flex", alignItems: "center", justifyContent: "center", zIndex: 1001 }}
           onClick={e => { if (e.target === e.currentTarget) setConfirmDelete(null); }}
         >
-          <div style={{ background: C.white, borderRadius: 16, padding: 32, width: 400, boxShadow: "0 24px 64px rgba(0,0,0,0.25)" }}>
+          <div style={{ background: C.white, borderRadius: 16, padding: 32, width: "min(400px, calc(100vw - 32px))", boxShadow: "0 24px 64px rgba(0,0,0,0.25)" }}>
             <div style={{ fontSize: 32, marginBottom: 12, textAlign: "center" }}>⚠️</div>
             <h3 style={{ margin: "0 0 8px", fontSize: 17, fontWeight: 800, color: C.text, textAlign: "center" }}>Delete {confirmDelete.name}?</h3>
             <p style={{ margin: "0 0 24px", fontSize: 13, color: C.textSub, textAlign: "center", lineHeight: 1.6 }}>
@@ -11817,7 +11817,7 @@ function OrganizationsScreen({ orgs, onInviteOrg, onSelectOrg, onRefresh, onDeac
         <div style={{ position: "fixed", inset: 0, background: "rgba(0,0,0,0.5)", display: "flex", alignItems: "center", justifyContent: "center", zIndex: 1001 }}
           onClick={e => { if (e.target === e.currentTarget) setConfirmCancel(null); }}
         >
-          <div style={{ background: C.white, borderRadius: 16, padding: 32, width: 400, boxShadow: "0 24px 64px rgba(0,0,0,0.25)" }}>
+          <div style={{ background: C.white, borderRadius: 16, padding: 32, width: "min(400px, calc(100vw - 32px))", boxShadow: "0 24px 64px rgba(0,0,0,0.25)" }}>
             <div style={{ fontSize: 32, marginBottom: 12, textAlign: "center" }}>⛔</div>
             <h3 style={{ margin: "0 0 8px", fontSize: 17, fontWeight: 800, color: C.text, textAlign: "center" }}>Cancel {confirmCancel.name}?</h3>
             <p style={{ margin: "0 0 24px", fontSize: 13, color: C.textSub, textAlign: "center", lineHeight: 1.6 }}>
@@ -13053,7 +13053,7 @@ function OrgDetailScreen({ org, orgUsers, onBack, onAddUser, onDeactivateOrg, on
       {confirmRemove && (
         <div style={{ position: "fixed", inset: 0, background: "rgba(0,0,0,0.5)", display: "flex", alignItems: "center", justifyContent: "center", zIndex: 1001 }}
           onClick={e => { if (e.target === e.currentTarget) setConfirmRemove(null); }}>
-          <div style={{ background: C.white, borderRadius: 16, padding: 32, width: 400, boxShadow: "0 24px 64px rgba(0,0,0,0.25)" }}>
+          <div style={{ background: C.white, borderRadius: 16, padding: 32, width: "min(400px, calc(100vw - 32px))", boxShadow: "0 24px 64px rgba(0,0,0,0.25)" }}>
             <div style={{ fontSize: 32, marginBottom: 12, textAlign: "center" }}>⚠️</div>
             <h3 style={{ margin: "0 0 8px", fontSize: 17, fontWeight: 800, color: C.text, textAlign: "center" }}>Remove {confirmRemove.name}?</h3>
             <p style={{ margin: "0 0 24px", fontSize: 13, color: C.textSub, textAlign: "center", lineHeight: 1.6 }}>
@@ -13073,7 +13073,7 @@ function OrgDetailScreen({ org, orgUsers, onBack, onAddUser, onDeactivateOrg, on
       {confirmDelete && (
         <div style={{ position: "fixed", inset: 0, background: "rgba(0,0,0,0.5)", display: "flex", alignItems: "center", justifyContent: "center", zIndex: 1001 }}
           onClick={e => { if (e.target === e.currentTarget) setConfirmDelete(false); }}>
-          <div style={{ background: C.white, borderRadius: 16, padding: 32, width: 400, boxShadow: "0 24px 64px rgba(0,0,0,0.25)" }}>
+          <div style={{ background: C.white, borderRadius: 16, padding: 32, width: "min(400px, calc(100vw - 32px))", boxShadow: "0 24px 64px rgba(0,0,0,0.25)" }}>
             <div style={{ fontSize: 32, marginBottom: 12, textAlign: "center" }}>⚠️</div>
             <h3 style={{ margin: "0 0 8px", fontSize: 17, fontWeight: 800, color: C.text, textAlign: "center" }}>Delete {localOrg.name}?</h3>
             <p style={{ margin: "0 0 24px", fontSize: 13, color: C.textSub, textAlign: "center", lineHeight: 1.6 }}>
@@ -13093,7 +13093,7 @@ function OrgDetailScreen({ org, orgUsers, onBack, onAddUser, onDeactivateOrg, on
       {confirmCancel && (
         <div style={{ position: "fixed", inset: 0, background: "rgba(0,0,0,0.5)", display: "flex", alignItems: "center", justifyContent: "center", zIndex: 1001 }}
           onClick={e => { if (e.target === e.currentTarget) setConfirmCancel(false); }}>
-          <div style={{ background: C.white, borderRadius: 16, padding: 32, width: 400, boxShadow: "0 24px 64px rgba(0,0,0,0.25)" }}>
+          <div style={{ background: C.white, borderRadius: 16, padding: 32, width: "min(400px, calc(100vw - 32px))", boxShadow: "0 24px 64px rgba(0,0,0,0.25)" }}>
             <div style={{ fontSize: 32, marginBottom: 12, textAlign: "center" }}>⛔</div>
             <h3 style={{ margin: "0 0 8px", fontSize: 17, fontWeight: 800, color: C.text, textAlign: "center" }}>Cancel {localOrg.name}?</h3>
             <p style={{ margin: "0 0 24px", fontSize: 13, color: C.textSub, textAlign: "center", lineHeight: 1.6 }}>
@@ -13718,7 +13718,7 @@ function TeamScreen({ orgId, orgName, orgUsers, onAddUser, onMemberInvited }) {
       {confirmDeleteTeam && (
         <div style={{ position: "fixed", inset: 0, background: "rgba(0,0,0,0.5)", display: "flex", alignItems: "center", justifyContent: "center", zIndex: 1001 }}
           onClick={e => { if (e.target === e.currentTarget) setConfirmDeleteTeam(null); }}>
-          <div style={{ background: C.white, borderRadius: 16, padding: 32, width: 400, boxShadow: "0 24px 64px rgba(0,0,0,0.25)" }}>
+          <div style={{ background: C.white, borderRadius: 16, padding: 32, width: "min(400px, calc(100vw - 32px))", boxShadow: "0 24px 64px rgba(0,0,0,0.25)" }}>
             <div style={{ fontSize: 32, marginBottom: 12, textAlign: "center" }}>⚠️</div>
             <h3 style={{ margin: "0 0 8px", fontSize: 17, fontWeight: 800, color: C.text, textAlign: "center" }}>Delete {confirmDeleteTeam.name}?</h3>
             <p style={{ margin: "0 0 24px", fontSize: 13, color: C.textSub, textAlign: "center", lineHeight: 1.6 }}>This will remove the team. Members will remain in the org but lose their team assignment. This cannot be undone.</p>
