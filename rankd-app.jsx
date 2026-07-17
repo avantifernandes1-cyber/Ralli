@@ -619,7 +619,54 @@ function HomeScreen({ user, onNav, quizAssignments = [], onResumeLesson, onStart
   const recommendedQuiz = !isReal ? (outstanding.find(q => !q.attempts?.length) ?? null) : null;
 
   if (user.role === "admin") {
-    // Admin home — unchanged
+    // Compute real values from already-loaded props — no additional queries.
+    const repUsers       = isReal
+      ? orgUsers.filter(u => !["ralli_admin", "superadmin", "orgAdmin"].includes(u.role))
+      : null;
+    const teamSize       = isReal ? (homeLoading ? null : repUsers.length) : 18;
+    const totalAssign    = isReal ? (homeLoading ? null : homeAssignments.length) : 12;
+
+    const adminStats = [
+      {
+        iconBg: C.blue,
+        label: "Team Size",
+        value: teamSize != null ? String(teamSize) : "—",
+        sub: "",
+        note: !isReal ? "3 inactive this week"
+            : homeLoading ? "Loading…"
+            : teamSize === 0 ? "No members yet"
+            : `${teamSize} member${teamSize !== 1 ? "s" : ""}`,
+        noteColor: !isReal ? C.red : C.textSub,
+      },
+      {
+        iconBg: C.orange,
+        label: "Avg. Team Score",
+        value: isReal ? "—" : "86",
+        sub: isReal ? "" : "/100",
+        note: isReal ? "See Insights for details" : "+2 pts this week",
+        noteColor: isReal ? C.textSub : C.green,
+      },
+      {
+        iconBg: C.green,
+        label: "Live Sessions",
+        value: isReal ? "—" : "2",
+        sub: isReal ? "" : " active",
+        note: isReal ? "Launch from Games tab" : "1 pending launch",
+        noteColor: C.textSub,
+      },
+      {
+        iconBg: C.purple,
+        label: "Total Assignments",
+        value: totalAssign != null ? String(totalAssign) : "—",
+        sub: "",
+        note: !isReal ? "Across 3 modules"
+            : homeLoading ? "Loading…"
+            : totalAssign === 0 ? "None created yet"
+            : `${totalAssign} active module${totalAssign !== 1 ? "s" : ""}`,
+        noteColor: C.textSub,
+      },
+    ];
+
     return (
       <div style={{ display: "flex", flexDirection: "column", gap: 20 }}>
         <div>
@@ -627,14 +674,8 @@ function HomeScreen({ user, onNav, quizAssignments = [], onResumeLesson, onStart
           <div style={{ fontSize: 12, color: C.textSub, marginTop: 4 }}>{todayLabel} · <span style={{ color: C.green, fontWeight: 600 }}>Admin dashboard</span></div>
         </div>
         <div style={{ display: "grid", gridTemplateColumns: mobile ? "repeat(2, 1fr)" : "repeat(4, 1fr)", gap: 14 }}>
-          {[
-            { icon: "", iconBg: C.blue,   label: "Active Reps",          value: "18",  sub: "",      note: "3 inactive this week",  noteColor: C.red },
-            { icon: "", iconBg: C.orange, label: "Avg. Team Score",       value: "86",  sub: "/100",  note: "+2 pts this week",      noteColor: C.green },
-            { icon: "", iconBg: C.green,  label: "Live Sessions",         value: "2",   sub: " active", note: "1 pending launch",    noteColor: C.textSub },
-            { icon: "", iconBg: C.purple, label: "Pending Assignments",   value: "12",  sub: " total", note: "Across 3 modules",     noteColor: C.textSub },
-          ].map((s, i) => (
+          {adminStats.map((s, i) => (
             <Card key={i}>
-              {s.icon && <div style={{ width: 40, height: 40, borderRadius: 10, background: s.iconBg + "20", border: `1px solid ${s.iconBg}30`, display: "flex", alignItems: "center", justifyContent: "center", fontSize: 18, marginBottom: 14 }}>{s.icon}</div>}
               <div style={{ fontSize: 28, fontWeight: 800, color: C.text, lineHeight: 1 }}>{s.value}<span style={{ fontSize: 16, fontWeight: 500, color: C.textSub }}>{s.sub}</span></div>
               <div style={{ fontSize: 12, color: C.textSub, marginTop: 4 }}>{s.label}</div>
               <div style={{ fontSize: 12, fontWeight: 600, color: s.noteColor, marginTop: 6 }}>{s.note}</div>
@@ -669,7 +710,7 @@ function HomeScreen({ user, onNav, quizAssignments = [], onResumeLesson, onStart
         {[
           {
             iconBg: C.orange, label: "Readiness Score", value: user.score != null ? String(user.score) : "—", sub: user.score != null ? "/100" : "",
-            note: user.score != null ? "+4 pts this week" : "No data yet", noteColor: C.green,
+            note: user.score != null ? (isReal ? "Last 30 days of activity" : "+4 pts this week") : "No data yet", noteColor: user.score != null ? C.green : C.textSub,
             tooltip: "Your Readiness Score reflects quiz accuracy, lesson completion, and game performance over the past 30 days. Scores range from 0–100 and update within 24 hours of activity.",
           },
           {
