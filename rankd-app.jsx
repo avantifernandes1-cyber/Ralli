@@ -4219,9 +4219,23 @@ function RankdScreen({ onNav, onJoin, sessions, onLaunch, onViewResults, onRelau
 // ── RANKD NAME ENTRY SCREEN ──────────────────────────────────
 
 function RankdNameEntryScreen({ onNav, pin, sessionName, onConfirm, defaultName, defaultAvatar = null }) {
-  const [name, setName]   = useState(defaultName ?? "");
-  const [emoji, setEmoji] = useState(defaultAvatar); // null = no avatar selected (optional)
-  const ACCENT            = [C.orange, C.green, "#0EA5E9", "#8B5CF6", "#F43F5E", "#F59E0B"];
+  const [name, setName]       = useState(defaultName ?? "");
+  const [emoji, setEmoji]     = useState(defaultAvatar); // null = no avatar selected (optional)
+  const [joining, setJoining] = useState(false);
+  const [joinError, setJoinError] = useState(null);
+  const ACCENT                = [C.orange, C.green, "#0EA5E9", "#8B5CF6", "#F43F5E", "#F59E0B"];
+
+  const handleConfirm = async () => {
+    if (!name.trim() || joining) return;
+    setJoining(true);
+    setJoinError(null);
+    const err = await onConfirm(name.trim(), emoji);
+    if (err) {
+      setJoinError(err);
+      setJoining(false);
+    }
+    // On success onConfirm navigates away — no need to reset joining state.
+  };
 
   return (
     <div style={{
@@ -4282,7 +4296,7 @@ function RankdNameEntryScreen({ onNav, pin, sessionName, onConfirm, defaultName,
           <input
             type="text" maxLength={24} value={name} autoFocus
             onChange={e => setName(e.target.value)}
-            onKeyDown={e => e.key === "Enter" && name.trim() && onConfirm(name.trim(), emoji)}
+            onKeyDown={e => e.key === "Enter" && handleConfirm()}
             placeholder="Your name or nickname…"
             style={{
               width: "100%", textAlign: "center", fontSize: 18, fontWeight: 700, boxSizing: "border-box",
@@ -4295,15 +4309,20 @@ function RankdNameEntryScreen({ onNav, pin, sessionName, onConfirm, defaultName,
           <p style={{ margin: "0 0 20px", fontSize: 10, color: C.textMuted }}>
             {defaultName ? `Your name — feel free to add a nickname` : "This is how you'll appear to others"}
           </p>
-          <button onClick={() => name.trim() && onConfirm(name.trim(), emoji)} style={{
+          <button onClick={handleConfirm} disabled={!name.trim() || joining} style={{
             width: "100%", padding: 14, borderRadius: 16, border: "none",
             fontSize: 14, fontWeight: 900,
-            background: name.trim() ? C.orange : C.muted,
-            color: name.trim() ? "#fff" : C.textMuted,
-            cursor: name.trim() ? "pointer" : "not-allowed",
+            background: name.trim() && !joining ? C.orange : C.muted,
+            color: name.trim() && !joining ? "#fff" : C.textMuted,
+            cursor: name.trim() && !joining ? "pointer" : "not-allowed",
           }}>
-            {name.trim() ? `Enter as ${name}${emoji ? " " + emoji : ""} →` : "Type your name to continue"}
+            {joining ? "Joining…" : name.trim() ? `Enter as ${name}${emoji ? " " + emoji : ""} →` : "Type your name to continue"}
           </button>
+          {joinError && (
+            <p style={{ margin: "10px 0 0", fontSize: 12, color: C.red, fontWeight: 600, textAlign: "center" }}>
+              {joinError}
+            </p>
+          )}
         </div>
 
         <button onClick={() => onNav("rankd")} style={{
@@ -9611,14 +9630,17 @@ function BattleCardsAdminScreen({ categories, cards, onSaveCategory, onDeleteCat
     tags: [], updatedAt: new Date().toISOString().slice(0,10), content: [],
   });
   const [draft, setDraft] = useState(blankCard);
+  const [cardSaving, setCardSaving] = useState(false);
   const setF = (field) => (e) => setDraft(d => ({ ...d, [field]: e.target.value }));
 
   const openNewCard  = () => { setDraft(blankCard()); setEditingCard("new"); setView("editCard"); };
   const openEditCard = (card) => { setDraft({ ...card }); setEditingCard(card.id); setView("editCard"); };
-  const saveCard = () => {
-    if (!draft.title.trim()) return;
-    onSaveCard({ ...draft, title: draft.title.trim(), updatedAt: new Date().toISOString().slice(0,10) });
-    setView(activeCatId ? "category" : "home");
+  const saveCard = async () => {
+    if (!draft.title.trim() || cardSaving) return;
+    setCardSaving(true);
+    const ok = await onSaveCard({ ...draft, title: draft.title.trim(), updatedAt: new Date().toISOString().slice(0,10) });
+    setCardSaving(false);
+    if (ok) setView(activeCatId ? "category" : "home");
   };
   const cancelEditCard = () => setView(activeCardId ? "detail" : activeCatId ? "category" : "home");
 
@@ -9729,8 +9751,8 @@ function BattleCardsAdminScreen({ categories, cards, onSaveCategory, onDeleteCat
           </div>
           <div style={{ display:"flex", gap:10 }}>
             <button onClick={cancelEditCard} style={{ padding:"10px 18px", borderRadius:10, border:`1px solid ${C.border}`, background:C.cardBg, fontSize:13, fontWeight:700, cursor:"pointer", color:C.text }}>Cancel</button>
-            <button onClick={saveCard} disabled={!draft.title.trim()} style={{ padding:"10px 20px", borderRadius:10, border:"none", background:draft.title.trim()?C.orange:C.muted, color:draft.title.trim()?"#fff":C.textMuted, fontSize:13, fontWeight:700, cursor:draft.title.trim()?"pointer":"not-allowed" }}>
-              {isNew ? "Create Card" : "Save Changes"}
+            <button onClick={saveCard} disabled={!draft.title.trim() || cardSaving} style={{ padding:"10px 20px", borderRadius:10, border:"none", background:draft.title.trim()&&!cardSaving?C.orange:C.muted, color:draft.title.trim()&&!cardSaving?"#fff":C.textMuted, fontSize:13, fontWeight:700, cursor:draft.title.trim()&&!cardSaving?"pointer":"not-allowed" }}>
+              {cardSaving ? "Saving…" : isNew ? "Create Card" : "Save Changes"}
             </button>
           </div>
         </div>
@@ -11862,6 +11884,7 @@ function OrgSetupScreen({ user, onComplete }) {
   const [emailInput, setEmailInput]   = useState("");
   const [invites, setInvites]         = useState([]); // [{ email, inviteUrl, status }]
   const [saving, setSaving]           = useState(false);
+  const [saveError, setSaveError]     = useState(null);
   const [inviteError, setInviteError] = useState(null);
 
   const PRESET_COLORS = [C.orange, "#3B82F6", "#8B5CF6", "#10B981", "#F43F5E", "#F59E0B"];
@@ -11876,30 +11899,51 @@ function OrgSetupScreen({ user, onComplete }) {
 
   const handleSaveBranding = async () => {
     setSaving(true);
+    setSaveError(null);
     try {
       if (user.orgId) {
-        await supabase.from("tenants").update({ name: orgName.trim() || user.orgName }).eq("id", user.orgId);
-        await supabase.from("tenant_settings").update({ branding: { primaryColor: brandColor } }).eq("tenant_id", user.orgId);
+        const { error: nameErr } = await supabase
+          .from("tenants")
+          .update({ name: orgName.trim() || user.orgName })
+          .eq("id", user.orgId);
+        if (nameErr) throw nameErr;
+
+        const { error: brandErr } = await supabase
+          .from("tenant_settings")
+          .update({ branding: { primaryColor: brandColor } })
+          .eq("tenant_id", user.orgId);
+        if (brandErr) throw brandErr;
       }
+      setStep(2);
     } catch (err) {
       console.error("[OrgSetup] branding save failed:", err);
+      const msg = err?.message ?? "Failed to save branding. Please try again.";
+      setSaveError(msg);
+      toast.error(msg);
     } finally {
       setSaving(false);
-      setStep(2);
     }
   };
 
   const handleSaveFeatures = async () => {
     setSaving(true);
+    setSaveError(null);
     try {
       if (user.orgId) {
-        await supabase.from("tenant_settings").update({ features }).eq("tenant_id", user.orgId);
+        const { error: featErr } = await supabase
+          .from("tenant_settings")
+          .update({ features })
+          .eq("tenant_id", user.orgId);
+        if (featErr) throw featErr;
       }
+      setStep(3);
     } catch (err) {
       console.error("[OrgSetup] features save failed:", err);
+      const msg = err?.message ?? "Failed to save features. Please try again.";
+      setSaveError(msg);
+      toast.error(msg);
     } finally {
       setSaving(false);
-      setStep(3);
     }
   };
 
@@ -12037,6 +12081,11 @@ function OrgSetupScreen({ user, onComplete }) {
             >
               {saving ? "Saving…" : "Continue →"}
             </button>
+            {saveError && (
+              <div style={{ marginTop: 10, fontSize: 12, color: C.red ?? "#EF4444", textAlign: "center" }}>
+                {saveError}
+              </div>
+            )}
           </div>
         )}
 
@@ -12082,7 +12131,7 @@ function OrgSetupScreen({ user, onComplete }) {
 
             <div style={{ display: "flex", gap: 10 }}>
               <button
-                onClick={() => setStep(1)}
+                onClick={() => { setStep(1); setSaveError(null); }}
                 style={{ flex: 1, padding: "12px", borderRadius: 10, border: `1px solid ${C.border}`, background: C.white, color: C.text, fontSize: 13, fontWeight: 700, cursor: "pointer" }}
               >
                 ← Back
@@ -12095,6 +12144,11 @@ function OrgSetupScreen({ user, onComplete }) {
                 {saving ? "Saving…" : "Continue →"}
               </button>
             </div>
+            {saveError && (
+              <div style={{ marginTop: 10, fontSize: 12, color: C.red ?? "#EF4444", textAlign: "center" }}>
+                {saveError}
+              </div>
+            )}
           </div>
         )}
 
@@ -15937,12 +15991,16 @@ export default function App() {
     const tid = currentOrg?.id ?? user?.orgId ?? null;
     if (user?._isReal && tid) {
       const { data, error } = await dbSaveBattleCard(tid, card, user.id);
-      if (error) { console.error("[ralli] saveBattleCard failed:", error); toast.error("Failed to save battle card. Please try again."); return; }
+      if (error) { console.error("[ralli] saveBattleCard failed:", error); toast.error("Failed to save battle card. Please try again."); return false; }
       if (data) {
         setBattleCards(prev => prev.find(c => c.id === data.id) ? prev.map(c => c.id === data.id ? data : c) : [...prev, data]);
         toast.success("Battle card saved.");
-        return;
+        return true;
       }
+      // !error && !data — silent RLS block or schema mismatch
+      console.error("[ralli] saveBattleCard: no data returned (possible RLS block or missing row)");
+      toast.error("Failed to save battle card. Please try again.");
+      return false;
     }
     // Demo fallback
     setBattleCards(prev => {
@@ -15951,6 +16009,7 @@ export default function App() {
       return next;
     });
     toast.success("Battle card saved.");
+    return true;
   };
   const handleDeleteBattleCard = async (id) => {
     const tid = currentOrg?.id ?? user?.orgId ?? null;
@@ -16178,8 +16237,10 @@ export default function App() {
     return null; // success
   };
 
-  // User: confirmed name → persist participant to Supabase → go to lobby
-  const handleEnterName = (name, emoji) => {
+  // User: confirmed name → persist participant to Supabase → go to lobby.
+  // Returns null on success or an error string on failure.
+  // Navigation to rankd-lobby only happens after the DB write succeeds (or is skipped for demo).
+  const handleEnterName = async (name, emoji) => {
     setLobbyPlayerName(name);
     // Always compute the same emoji used in DB/presence so My card matches manager view.
     const pidx       = Math.abs(playerId.charCodeAt(0) + (playerId.charCodeAt(1) || 0)) % PLAYER_EMOJIS.length;
@@ -16194,28 +16255,36 @@ export default function App() {
     ));
 
     // Persist participant to Supabase so manager sees them cross-device.
-    // Fire-and-forget — lobby navigation doesn't wait for DB write.
     const joiningSession = sessions.find(s => s.code === lobbyPin);
     const sessionDbId    = joiningSession?.dbId ?? null;
     console.log("[ralli:game] handleEnterName — name:", name, "lobbyPin:", lobbyPin, "sessionDbId:", sessionDbId, "currentUser:", currentUser?.id, "tenantId:", currentUser?.orgId);
+
     if (sessionDbId && currentUser) {
       const pColor = PLAYER_COLORS[pidx % PLAYER_COLORS.length];
-      const pEmoji = finalEmoji;
-      joinGameSession(sessionDbId, {
-        playerId: currentUser.id ?? playerId,
-        name,
-        emoji:    pEmoji,
-        color:    pColor,
-        tenantId: currentUser.orgId ?? null,
-      }).then(({ data: jData, error: jErr }) => {
-        if (jErr) console.error("[ralli:game] joinGameSession FAILED — RLS or schema issue:", jErr);
-        else console.log("[ralli:game] joinGameSession OK — participantId:", jData?.id, "sessionId:", sessionDbId);
-      }).catch(e => console.error("[ralli:game] joinGameSession exception:", e));
+      try {
+        const { data: jData, error: jErr } = await joinGameSession(sessionDbId, {
+          playerId: currentUser.id ?? playerId,
+          name,
+          emoji:    finalEmoji,
+          color:    pColor,
+          tenantId: currentUser.orgId ?? null,
+        });
+        if (jErr) {
+          console.error("[ralli:game] joinGameSession FAILED — RLS or schema issue:", jErr);
+          return jErr.message ?? "Failed to join the game. Please try again.";
+        }
+        console.log("[ralli:game] joinGameSession OK — participantId:", jData?.id, "sessionId:", sessionDbId);
+      } catch (e) {
+        console.error("[ralli:game] joinGameSession exception:", e);
+        return e?.message ?? "Couldn't connect to the game. Check your connection and try again.";
+      }
     } else {
-      console.warn("[ralli:game] handleEnterName: skipping joinGameSession —", !sessionDbId ? "sessionDbId is null (session not found in DB)" : "currentUser is null");
+      // Demo mode or no DB session — skip write, proceed directly.
+      console.warn("[ralli:game] handleEnterName: skipping joinGameSession —", !sessionDbId ? "sessionDbId is null (demo or session not found in DB)" : "currentUser is null (anonymous)");
     }
 
     setScreen("rankd-lobby");
+    return null;
   };
 
   // Admin: open a session.
