@@ -930,26 +930,55 @@ function ContactPage() {
   const [form, setForm] = useState({ name: "", email: "", company: "", role: "", message: "", type: "demo" });
   const [submitted, setSubmitted] = useState(false);
   const [errors, setErrors] = useState({});
+  const [loading, setLoading] = useState(false);
+  const [apiError, setApiError] = useState(null);
 
   const validate = () => {
     const e = {};
     if (!form.name.trim())    e.name    = "Required";
     if (!form.email.trim())   e.email   = "Required";
-    if (!/\S+@\S+\.\S+/.test(form.email)) e.email = "Enter a valid email";
+    else if (!/\S+@\S+\.\S+/.test(form.email)) e.email = "Enter a valid email";
     if (!form.message.trim()) e.message = "Required";
     return e;
   };
 
-  const handleSubmit = (evt) => {
+  const handleSubmit = async (evt) => {
     evt.preventDefault();
+    if (loading) return;                          // block duplicate clicks
     const e = validate();
     if (Object.keys(e).length) { setErrors(e); return; }
-    setSubmitted(true);
+    setApiError(null);
+    setLoading(true);
+    try {
+      const res = await fetch("/api/contact", {
+        method:  "POST",
+        headers: { "Content-Type": "application/json" },
+        body:    JSON.stringify({
+          type:    form.type,
+          name:    form.name,
+          email:   form.email,
+          company: form.company,
+          role:    form.role,
+          message: form.message,
+        }),
+      });
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok) {
+        setApiError(data?.error ?? "Something went wrong. Please try again.");
+        return;
+      }
+      setSubmitted(true);
+    } catch (_) {
+      setApiError("Could not reach the server. Check your connection and try again.");
+    } finally {
+      setLoading(false);
+    }
   };
 
   const set = (k, v) => {
     setForm(f => ({ ...f, [k]: v }));
     if (errors[k]) setErrors(e => { const ne = { ...e }; delete ne[k]; return ne; });
+    if (apiError)  setApiError(null);
   };
 
   const inputStyle = (key) => ({
@@ -1112,25 +1141,56 @@ function ContactPage() {
                   {errors.message && <div style={{ fontSize: 11, color: "#EF4444", marginTop: 4 }}>{errors.message}</div>}
                 </div>
 
+                {/* API-level error banner */}
+                {apiError && (
+                  <div style={{
+                    marginBottom: 16,
+                    padding:      "11px 14px",
+                    borderRadius: 8,
+                    background:   "#FEF2F2",
+                    border:       "1px solid #FECACA",
+                    fontSize:     13,
+                    color:        "#DC2626",
+                    lineHeight:   1.5,
+                  }}>
+                    {apiError}
+                  </div>
+                )}
+
                 <button
                   type="submit"
+                  disabled={loading}
                   style={{
                     width:        "100%",
                     fontSize:     15,
                     fontWeight:   700,
                     color:        C.dark,
-                    background:   C.orange,
+                    background:   loading ? "#FDE68A" : C.orange,
                     border:       "none",
                     borderRadius: 10,
                     padding:      "13px 0",
-                    cursor:       "pointer",
-                    boxShadow:    "0 4px 16px rgba(253,191,36,0.35)",
-                    transition:   "transform 0.15s, box-shadow 0.15s",
+                    cursor:       loading ? "not-allowed" : "pointer",
+                    boxShadow:    loading ? "none" : "0 4px 16px rgba(253,191,36,0.35)",
+                    transition:   "transform 0.15s, box-shadow 0.15s, background 0.15s",
+                    display:      "flex",
+                    alignItems:   "center",
+                    justifyContent: "center",
+                    gap:          8,
                   }}
-                  onMouseEnter={e => { e.currentTarget.style.transform = "translateY(-1px)"; e.currentTarget.style.boxShadow = "0 6px 22px rgba(253,191,36,0.45)"; }}
-                  onMouseLeave={e => { e.currentTarget.style.transform = "translateY(0)"; e.currentTarget.style.boxShadow = "0 4px 16px rgba(253,191,36,0.35)"; }}
+                  onMouseEnter={e => { if (!loading) { e.currentTarget.style.transform = "translateY(-1px)"; e.currentTarget.style.boxShadow = "0 6px 22px rgba(253,191,36,0.45)"; } }}
+                  onMouseLeave={e => { if (!loading) { e.currentTarget.style.transform = "translateY(0)"; e.currentTarget.style.boxShadow = "0 4px 16px rgba(253,191,36,0.35)"; } }}
                 >
-                  {form.type === "demo" ? "Request Demo" : form.type === "join" ? "Send Application" : "Send Message"}
+                  {loading && (
+                    <svg width="16" height="16" viewBox="0 0 16 16" fill="none" style={{ animation: "spin 0.8s linear infinite" }}>
+                      <style>{`@keyframes spin { to { transform: rotate(360deg); } }`}</style>
+                      <circle cx="8" cy="8" r="6" stroke={C.dark} strokeOpacity="0.25" strokeWidth="2.5"/>
+                      <path d="M8 2a6 6 0 0 1 6 6" stroke={C.dark} strokeWidth="2.5" strokeLinecap="round"/>
+                    </svg>
+                  )}
+                  {loading
+                    ? "Sending…"
+                    : form.type === "demo" ? "Request Demo" : form.type === "join" ? "Send Application" : "Send Message"
+                  }
                 </button>
               </form>
             </div>
@@ -1138,7 +1198,7 @@ function ContactPage() {
             {/* Sidebar info */}
             <div style={{ display: "flex", flexDirection: "column", gap: 16 }}>
               {[
-                { icon: "📧", label: "Email",    value: "hello@ralli.io" },
+                { icon: "📧", label: "Email",    value: "avanti@runralli.com" },
                 { icon: "⚡", label: "Response", value: "Within 1 business day" },
               ].map((item, i) => (
                 <div key={i} style={{ background: C.white, borderRadius: 14, border: `1px solid ${C.border}`, padding: "18px 20px" }}>
