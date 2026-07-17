@@ -176,7 +176,6 @@ function useGameChannel(pin, role) {
     channel.subscribe((status) => {
       // Once subscribed, flush any track that was queued before the WebSocket was ready.
       if (status === 'SUBSCRIBED' && pendingTrackRef.current) {
-        console.log("[ralli:channel] SUBSCRIBED — flushing pending track:", pendingTrackRef.current);
         channel.track(pendingTrackRef.current);
         pendingTrackRef.current = null;
       }
@@ -213,7 +212,6 @@ function useGameChannel(pin, role) {
       };
       pendingTrackRef.current = trackData;
       // Also attempt immediately — succeeds if already SUBSCRIBED, is a no-op otherwise.
-      console.log("[ralli:channel] GM.PLAYER_JOIN — attempting track:", trackData);
       ch.track(trackData);
       return;
     }
@@ -954,12 +952,18 @@ const INITIAL_SESSIONS = [
   { code: "291847", name: "Competitor Positioning Quiz", questionCount: 12, status: "ended",   playerCount: 9,  demoMode: true,  players: [] },
 ];
 
+// Helper: produce a display date N days before today so demo dates stay current.
+const _demoDate = (daysAgo) => {
+  const d = new Date(Date.now() - daysAgo * 86_400_000);
+  return d.toLocaleDateString("en-US", { month: "short", day: "numeric", year: "numeric" });
+};
+
 // Production hook: replace with /api/game-history/:userId
 const USER_GAME_HISTORY = [
   {
     id: "gh1",
     sessionName: "Q1 Pipeline Knowledge Blitz",
-    date: "Jun 18, 2025",
+    date: _demoDate(7),
     rank: 2, totalPlayers: 14,
     scorePercent: 92, scoreRaw: 9200,
     accuracy: 80, avgResponseMs: 8400,
@@ -979,7 +983,7 @@ const USER_GAME_HISTORY = [
   {
     id: "gh2",
     sessionName: "Objection Handling Showdown",
-    date: "Jun 12, 2025",
+    date: _demoDate(13),
     rank: 1, totalPlayers: 11,
     scorePercent: 100, scoreRaw: 10000,
     accuracy: 100, avgResponseMs: 6100,
@@ -997,7 +1001,7 @@ const USER_GAME_HISTORY = [
   {
     id: "gh3",
     sessionName: "Discovery Call Drills",
-    date: "Jun 5, 2025",
+    date: _demoDate(20),
     rank: 4, totalPlayers: 16,
     scorePercent: 76, scoreRaw: 7600,
     accuracy: 63, avgResponseMs: 12800,
@@ -1015,7 +1019,7 @@ const USER_GAME_HISTORY = [
   {
     id: "gh4",
     sessionName: "MEDDIC Fundamentals Quiz",
-    date: "May 30, 2025",
+    date: _demoDate(26),
     rank: 1, totalPlayers: 9,
     scorePercent: 100, scoreRaw: 10000,
     accuracy: 100, avgResponseMs: 5700,
@@ -1880,7 +1884,6 @@ function KahootPlayerView({ onNav, playerName, playerId, pin, sessionDbId, broad
     // Game start: host broadcast — show countdown before first question
     if (chMsg.type === GM.GAME_START) { setCdNum(3); setPhase("countdown"); }
     if (chMsg.type === GM.SHOW_QUESTION) {
-      console.log("[ralli:player] SHOW_QUESTION received — type:", chMsg.question?.type, "options:", chMsg.question?.options, "timeLimit:", chMsg.timeLimit);
       const timeLimit = chMsg.timeLimit ?? chMsg.question?.timeLimit ?? 20;
       const elapsed = chMsg.questionStartedAt ? Math.floor((Date.now() - chMsg.questionStartedAt) / 1000) : 0;
       setQuestion(chMsg.question); setTimeLeft(Math.max(1, timeLimit - elapsed));
@@ -4404,18 +4407,11 @@ function RankdLobbyScreen({ onNav, pin, playerName, playerEmoji, sessionName, ro
     status: p.status ?? "active",
   });
 
-  // ── Debug: log lobby mount state ──────────────────────────────────────────
-  useEffect(() => {
-    console.log("[ralli:lobby] mount — role:", role, "pin:", pin, "sessionDbId:", sessionDbId, "isDemoMode:", isDemoMode, "session:", session ? `found demoMode=${session.demoMode}` : "NOT FOUND in sessions[]");
-  }, []); // eslint-disable-line react-hooks/exhaustive-deps
-
   // ── Admin: load initial participants from DB ────────────────────────────────
   useEffect(() => {
     if (role !== "admin" || !sessionDbId || isDemoMode) return;
-    console.log("[ralli:lobby] loading initial participants from DB for sessionDbId:", sessionDbId);
     getLobbyParticipants(sessionDbId).then(({ data, error }) => {
       if (error) console.error("[ralli:lobby] getLobbyParticipants FAILED:", error);
-      else console.log("[ralli:lobby] getLobbyParticipants OK —", data?.length ?? 0, "participants");
       if (data) setDbPlayers(data.map(normParticipant));
     });
   }, [sessionDbId, isDemoMode]); // eslint-disable-line react-hooks/exhaustive-deps
@@ -4424,9 +4420,7 @@ function RankdLobbyScreen({ onNav, pin, playerName, playerEmoji, sessionName, ro
   // Fires immediately when a player calls joinGameSession(), cross-device.
   useEffect(() => {
     if (role !== "admin" || !sessionDbId || isDemoMode) return;
-    console.log("[ralli:lobby] subscribing to realtime participants for sessionDbId:", sessionDbId);
     const channel = subscribeToLobbyParticipants(sessionDbId, (row) => {
-      console.log("[ralli:lobby] realtime INSERT received — player:", row.player_id, row.name);
       setDbPlayers(prev => {
         if (prev.some(p => p.id === row.player_id)) return prev; // already present
         return [...prev, normParticipant(row)];
@@ -15741,10 +15735,8 @@ export default function App() {
     const tenantId = currentUser.orgId;
 
     const refresh = () => {
-      console.log("[ralli:game] refreshing active sessions — tenantId:", tenantId);
       getActiveSessions(tenantId).then(({ data, error }) => {
         if (error) console.error("[ralli:game] getActiveSessions error:", error);
-        else console.log("[ralli:game] getActiveSessions OK —", data?.length ?? 0, "sessions (waiting:", data?.filter(s => s.status === "waiting").length ?? 0, ")");
         if (data) setSessions(data);
       });
     };
@@ -16229,7 +16221,6 @@ export default function App() {
   const handleCreateSession = async (session) => {
     // Persist to Supabase first — enables cross-device joins by PIN
     const tenantId = currentOrg?.id ?? user?.orgId ?? null;
-    console.log("[ralli:game] handleCreateSession — PIN:", session.code, "tenantId:", tenantId, "hostId:", user?.id, "demoMode:", session.demoMode ?? false);
     const { data, error } = await createGameSession({
       pin:           session.code,
       name:          session.name,
@@ -16241,8 +16232,6 @@ export default function App() {
     });
     if (error) {
       console.error("[ralli:game] createGameSession FAILED — RLS or network issue:", error);
-    } else {
-      console.log("[ralli:game] createGameSession OK — dbId:", data?.id, "PIN:", session.code);
     }
     // Keep local state (screens still read from sessions array)
     const newSession = { ...session, dbId: data?.id };
@@ -16262,12 +16251,9 @@ export default function App() {
     let sessionName = sessionNameHint ?? session?.name ?? "Live Game";
     let quizId      = session?.quizId;
 
-    console.log("[ralli:game] handleEnterPin — PIN:", pin, "localSession:", session ? `found (dbId=${session.dbId})` : "not found", "userTenantId:", currentUser?.orgId);
-
     if (!session) {
       // Player is on a different device — fetch session metadata from Supabase
       const { data: remote, error: pinErr } = await findSessionByPin(pin);
-      console.log("[ralli:game] findSessionByPin result — remote:", remote ? `id=${remote.id} tenantId=${remote.tenant_id} status=${remote.status}` : "null", "error:", pinErr);
       if (remote) {
         // Cross-tenant protection: real users can only join their own org's sessions
         if (currentUser?._isReal && remote.tenant_id && remote.tenant_id !== currentUser.orgId) {
@@ -16295,7 +16281,6 @@ export default function App() {
         setSessions(prev => [...prev, fetched]);
         sessionName = remote.name;
         quizId      = remote.quiz_id;
-        console.log("[ralli:game] fetched session added to local state — dbId:", remote.id);
       } else if (pinErr) {
         console.error("[ralli:game] findSessionByPin FAILED — likely RLS blocking authenticated read:", pinErr);
         return "Couldn't verify that PIN. Check your connection and try again.";
@@ -16338,7 +16323,6 @@ export default function App() {
     // Persist participant to Supabase so manager sees them cross-device.
     const joiningSession = sessions.find(s => s.code === lobbyPin);
     const sessionDbId    = joiningSession?.dbId ?? null;
-    console.log("[ralli:game] handleEnterName — name:", name, "lobbyPin:", lobbyPin, "sessionDbId:", sessionDbId, "currentUser:", currentUser?.id, "tenantId:", currentUser?.orgId);
 
     if (sessionDbId && currentUser) {
       const pColor = PLAYER_COLORS[pidx % PLAYER_COLORS.length];
@@ -16354,7 +16338,6 @@ export default function App() {
           console.error("[ralli:game] joinGameSession FAILED — RLS or schema issue:", jErr);
           return jErr.message ?? "Failed to join the game. Please try again.";
         }
-        console.log("[ralli:game] joinGameSession OK — participantId:", jData?.id, "sessionId:", sessionDbId);
       } catch (e) {
         console.error("[ralli:game] joinGameSession exception:", e);
         return e?.message ?? "Couldn't connect to the game. Check your connection and try again.";
@@ -16717,7 +16700,7 @@ export default function App() {
                   fontSize: 20, fontWeight: 900, letterSpacing: "-0.03em", color: C.text,
                   fontFamily: "system-ui, -apple-system, sans-serif",
                 }}>
-                  {currentOrg?.name ?? "momence"}
+                  {currentOrg?.name ?? "Your Team"}
                 </span>
               </div>
             ) : isSuperAdmin ? (
