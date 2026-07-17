@@ -5832,6 +5832,7 @@ function LearnScreen({ role, user, orgUsers = [], orgs = [], onNav, onAwardXp, p
   const [archivedCourses,   setArchivedCourses]   = useState([]);
   const [archivedLessons,   setArchivedLessons]   = useState([]);
   const [confirmArchive,    setConfirmArchive]    = useState(null); // { type: "course"|"lesson", id, title }
+  const [archiveInFlight,  setArchiveInFlight]  = useState(new Set()); // IDs currently being archived/restored
   const [tenantCompletions, setTenantCompletions] = useState([]); // manager/admin only
   const [selectedAssignmentId, setSelectedAssignmentId] = useState(null); // manager click-through
   const [assignTimeframe,  setAssignTimeframe]  = useState("all"); // "all" | "week" | "month" | "custom"
@@ -5985,45 +5986,69 @@ function LearnScreen({ role, user, orgUsers = [], orgs = [], onNav, onAwardXp, p
   const handleArchiveCourse = async (courseId) => {
     const course = courses.find(c => c.id === courseId);
     if (!course) return;
+    if (!isReal) {
+      setCourses(prev => prev.filter(c => c.id !== courseId));
+      setArchivedCourses(prev => [{ ...course, status: "archived" }, ...prev]);
+      return;
+    }
+    if (archiveInFlight.has(courseId)) return;
+    setArchiveInFlight(prev => new Set([...prev, courseId]));
+    const { error } = await archiveCourseService(courseId);
+    setArchiveInFlight(prev => { const s = new Set(prev); s.delete(courseId); return s; });
+    if (error) { console.error("[ralli] archiveCourse failed:", error); toast.error("Failed to archive course. Please try again."); return; }
     setCourses(prev => prev.filter(c => c.id !== courseId));
     setArchivedCourses(prev => [{ ...course, status: "archived" }, ...prev]);
-    if (isReal) {
-      const { error } = await archiveCourseService(courseId);
-      if (error) console.error("[ralli] archiveCourse failed:", error);
-    }
   };
 
   const handleArchiveLesson = async (lessonId) => {
     const lesson = lessons.find(l => l.id === lessonId);
     if (!lesson) return;
+    if (!isReal) {
+      setLessons(prev => prev.filter(l => l.id !== lessonId));
+      setArchivedLessons(prev => [{ ...lesson, status: "archived" }, ...prev]);
+      return;
+    }
+    if (archiveInFlight.has(lessonId)) return;
+    setArchiveInFlight(prev => new Set([...prev, lessonId]));
+    const { error } = await archiveLessonService(lessonId);
+    setArchiveInFlight(prev => { const s = new Set(prev); s.delete(lessonId); return s; });
+    if (error) { console.error("[ralli] archiveLesson failed:", error); toast.error("Failed to archive lesson. Please try again."); return; }
     setLessons(prev => prev.filter(l => l.id !== lessonId));
     setArchivedLessons(prev => [{ ...lesson, status: "archived" }, ...prev]);
-    if (isReal) {
-      const { error } = await archiveLessonService(lessonId);
-      if (error) console.error("[ralli] archiveLesson failed:", error);
-    }
   };
 
   const handleRestoreCourse = async (courseId) => {
     const course = archivedCourses.find(c => c.id === courseId);
     if (!course) return;
+    if (!isReal) {
+      setArchivedCourses(prev => prev.filter(c => c.id !== courseId));
+      setCourses(prev => [{ ...course, status: "active" }, ...prev]);
+      return;
+    }
+    if (archiveInFlight.has(courseId)) return;
+    setArchiveInFlight(prev => new Set([...prev, courseId]));
+    const { error } = await restoreCourseService(courseId);
+    setArchiveInFlight(prev => { const s = new Set(prev); s.delete(courseId); return s; });
+    if (error) { console.error("[ralli] restoreCourse failed:", error); toast.error("Failed to restore course. Please try again."); return; }
     setArchivedCourses(prev => prev.filter(c => c.id !== courseId));
     setCourses(prev => [{ ...course, status: "active" }, ...prev]);
-    if (isReal) {
-      const { error } = await restoreCourseService(courseId);
-      if (error) console.error("[ralli] restoreCourse failed:", error);
-    }
   };
 
   const handleRestoreLesson = async (lessonId) => {
     const lesson = archivedLessons.find(l => l.id === lessonId);
     if (!lesson) return;
+    if (!isReal) {
+      setArchivedLessons(prev => prev.filter(l => l.id !== lessonId));
+      setLessons(prev => [{ ...lesson, status: "active" }, ...prev]);
+      return;
+    }
+    if (archiveInFlight.has(lessonId)) return;
+    setArchiveInFlight(prev => new Set([...prev, lessonId]));
+    const { error } = await restoreLessonService(lessonId);
+    setArchiveInFlight(prev => { const s = new Set(prev); s.delete(lessonId); return s; });
+    if (error) { console.error("[ralli] restoreLesson failed:", error); toast.error("Failed to restore lesson. Please try again."); return; }
     setArchivedLessons(prev => prev.filter(l => l.id !== lessonId));
     setLessons(prev => [{ ...lesson, status: "active" }, ...prev]);
-    if (isReal) {
-      const { error } = await restoreLessonService(lessonId);
-      if (error) console.error("[ralli] restoreLesson failed:", error);
-    }
   };
 
   // ── USER VIEW ─────────────────────────────────────────────
@@ -6947,7 +6972,7 @@ function LearnScreen({ role, user, orgUsers = [], orgs = [], onNav, onAwardXp, p
                       <div style={{ fontSize: 13, fontWeight: 700, color: C.text }}>{c.title}</div>
                       <div style={{ fontSize: 11, color: C.textSub }}>Course · {c.lessonIds?.length ?? 0} lessons</div>
                     </div>
-                    <button onClick={() => handleRestoreCourse(c.id)} style={{ padding: "6px 14px", borderRadius: 8, border: `1px solid ${C.border}`, background: C.white, color: C.textSub, fontSize: 12, fontWeight: 700, cursor: "pointer", flexShrink: 0 }}>Restore</button>
+                    <button onClick={() => handleRestoreCourse(c.id)} disabled={archiveInFlight.has(c.id)} style={{ padding: "6px 14px", borderRadius: 8, border: `1px solid ${C.border}`, background: C.white, color: archiveInFlight.has(c.id) ? C.textMuted : C.textSub, fontSize: 12, fontWeight: 700, cursor: archiveInFlight.has(c.id) ? "not-allowed" : "pointer", flexShrink: 0 }}>{archiveInFlight.has(c.id) ? "Restoring…" : "Restore"}</button>
                   </Card>
                 ))}
               </div>
@@ -6963,7 +6988,7 @@ function LearnScreen({ role, user, orgUsers = [], orgs = [], onNav, onAwardXp, p
                       <div style={{ fontSize: 13, fontWeight: 700, color: C.text }}>{l.title}</div>
                       <div style={{ fontSize: 11, color: C.textSub }}>{(l.type ?? "").toUpperCase()} · {l.duration}</div>
                     </div>
-                    <button onClick={() => handleRestoreLesson(l.id)} style={{ padding: "6px 14px", borderRadius: 8, border: `1px solid ${C.border}`, background: C.white, color: C.textSub, fontSize: 12, fontWeight: 700, cursor: "pointer", flexShrink: 0 }}>Restore</button>
+                    <button onClick={() => handleRestoreLesson(l.id)} disabled={archiveInFlight.has(l.id)} style={{ padding: "6px 14px", borderRadius: 8, border: `1px solid ${C.border}`, background: C.white, color: archiveInFlight.has(l.id) ? C.textMuted : C.textSub, fontSize: 12, fontWeight: 700, cursor: archiveInFlight.has(l.id) ? "not-allowed" : "pointer", flexShrink: 0 }}>{archiveInFlight.has(l.id) ? "Restoring…" : "Restore"}</button>
                   </Card>
                 ))}
               </div>
