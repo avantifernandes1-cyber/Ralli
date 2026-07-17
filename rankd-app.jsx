@@ -30,6 +30,7 @@ import {
   updateParticipantHeartbeat,
   getPlayerGameHistory,
   getSessionPlayers,
+  getSessionRestoreData,
 } from "./src/lib/gameService.js";
 import {
   getTenantCourses,
@@ -59,6 +60,7 @@ import {
   saveBattleCard   as dbSaveBattleCard,
   deleteBattleCard as dbDeleteBattleCard,
   updateUserProfile as dbUpdateUserProfile,
+  updateLastSeenAssignmentsAt,
 } from "./src/lib/contentService.js";
 import { getProfile, createMissingProfile, getTenantProfiles } from "./src/lib/profileService.js";
 import { sendInviteEmail } from "./src/lib/emailService.js";
@@ -502,7 +504,8 @@ function InfoTooltip({ text }) {
   );
 }
 
-function HomeScreen({ user, onNav, quizAssignments = [], onResumeLesson, onStartQuiz, onStartCourse, orgUsers = [], isReal = false, tenantId = null, quizzes = [] }) {
+function HomeScreen({ user, onNav, quizAssignments = [], onResumeLesson, onStartQuiz, onStartCourse, orgUsers = [], isReal = false, tenantId = null, quizzes = [], lastSeenAt = null, onNewAssignments = null }) {
+  const mobile = useMobile();
   const firstName = user.name.split(" ")[0];
   const hour = new Date().getHours();
   const greeting = hour < 12 ? "Good morning" : hour < 17 ? "Good afternoon" : "Good evening";
@@ -539,11 +542,31 @@ function HomeScreen({ user, onNav, quizAssignments = [], onResumeLesson, onStart
     ]).then(([{ data: c }, { data: l }, { data: a }, { data: done }]) => {
       if (c) setHomeCourses(c);
       if (l) setHomeLessons(l);
-      if (a) setHomeAssignments(a);
+      if (a) {
+        setHomeAssignments(a);
+        // Mark as seen only after assignments successfully load.
+        // If the fetch fails (a === null), we do NOT update last_seen_assignments_at
+        // so the user still sees "NEW" badges on the next visit / login.
+        updateLastSeenAssignmentsAt(user.id);
+      }
       if (done) setHomeCompleted(done);
       setHomeLoading(false);
     });
   }, [isReal, tenantId, user?.id]); // eslint-disable-line react-hooks/exhaustive-deps
+
+  // Report new-assignment count to App so the "Learn" nav badge stays in sync.
+  // "new" = assigned after lastSeenAt (only meaningful when lastSeenAt is set).
+  useEffect(() => {
+    if (!isReal || !onNewAssignments || !lastSeenAt) { onNewAssignments?.(0); return; }
+    const userTeamId = orgUsers.find(u => u.id === user?.id)?.teamId ?? null;
+    const mine = homeAssignments.filter(a =>
+      (a.assignedTo?.type === "group"      && a.assignedTo?.orgId === user?.orgId) ||
+      (a.assignedTo?.type === "individual" && a.assignedTo?.userId === user?.id)   ||
+      (a.assignedTo?.type === "team"       && userTeamId && userTeamId === a.assignedTo?.teamId)
+    );
+    const newCount = mine.filter(a => a.assignedAtRaw && a.assignedAtRaw > lastSeenAt).length;
+    onNewAssignments(newCount);
+  }, [homeAssignments, lastSeenAt]); // eslint-disable-line react-hooks/exhaustive-deps
 
   // ── Unified assignment enrichment ─────────────────────────
   // For real users: build enriched list from Supabase data.
@@ -574,7 +597,8 @@ function HomeScreen({ user, onNav, quizAssignments = [], onResumeLesson, onStart
           pct = isComplete ? 100 : 0;
         }
         const dueStatus = (a.dueAt && a.dueAt !== "Open") ? getDueStatus(a.dueAt) : null;
-        return { ...a, content, contentKind: isCourse ? "course" : isLesson ? "lesson" : "quiz", pct, isComplete, dueStatus };
+        const isNew = !!lastSeenAt && !!a.assignedAtRaw && a.assignedAtRaw > lastSeenAt;
+        return { ...a, content, contentKind: isCourse ? "course" : isLesson ? "lesson" : "quiz", pct, isComplete, dueStatus, isNew };
       }).filter(Boolean);
     }
     // Demo: wrap quizAssignments (outstanding only shown, completed = has passed attempt)
@@ -602,7 +626,7 @@ function HomeScreen({ user, onNav, quizAssignments = [], onResumeLesson, onStart
           <h1 style={{ fontSize: 26, fontWeight: 800, color: C.text, margin: 0 }}>{greeting}, {firstName}</h1>
           <div style={{ fontSize: 12, color: C.textSub, marginTop: 4 }}>{todayLabel} · <span style={{ color: C.green, fontWeight: 600 }}>Admin dashboard</span></div>
         </div>
-        <div style={{ display: "grid", gridTemplateColumns: "repeat(4, 1fr)", gap: 14 }}>
+        <div style={{ display: "grid", gridTemplateColumns: mobile ? "repeat(2, 1fr)" : "repeat(4, 1fr)", gap: 14 }}>
           {[
             { icon: "", iconBg: C.blue,   label: "Active Reps",          value: "18",  sub: "",      note: "3 inactive this week",  noteColor: C.red },
             { icon: "", iconBg: C.orange, label: "Avg. Team Score",       value: "86",  sub: "/100",  note: "+2 pts this week",      noteColor: C.green },
@@ -634,29 +658,29 @@ function HomeScreen({ user, onNav, quizAssignments = [], onResumeLesson, onStart
         <h1 style={{ fontSize: 26, fontWeight: 800, color: C.text, margin: 0 }}>{greeting}, {firstName}</h1>
         <div style={{ fontSize: 12, color: C.textSub, marginTop: 4 }}>
           {todayLabel} ·{" "}
-          <button onClick={() => setShowTasksPanel(true)} style={{ background: "none", border: "none", padding: 0, cursor: "pointer", color: C.orange, fontWeight: 600, fontSize: 12 }}>
-            {pendingCount} task{pendingCount !== 1 ? "s" : ""} remaining
+          <button onClick={() => setShowTasksPanel(true)} style={{ background: "none", border: "none", padding: 0, cursor: "pointer", color: pendingCount === 0 ? C.green : C.orange, fontWeight: 600, fontSize: 12 }}>
+            {pendingCount === 0 ? "All caught up" : `${pendingCount} task${pendingCount !== 1 ? "s" : ""} remaining`}
           </button>
         </div>
       </div>
 
       {/* Stat Cards */}
-      <div style={{ display: "grid", gridTemplateColumns: "repeat(4, 1fr)", gap: 14 }}>
+      <div style={{ display: "grid", gridTemplateColumns: mobile ? "repeat(2, 1fr)" : "repeat(4, 1fr)", gap: 14 }}>
         {[
           {
-            iconBg: C.orange, label: "Knowledge Score", value: user.score != null ? String(user.score) : "—", sub: user.score != null ? "/100" : "",
+            iconBg: C.orange, label: "Readiness Score", value: user.score != null ? String(user.score) : "—", sub: user.score != null ? "/100" : "",
             note: user.score != null ? "+4 pts this week" : "No data yet", noteColor: C.green,
-            tooltip: "Your Knowledge Score reflects quiz accuracy, lesson completion, and game performance over the past 30 days. Scores range from 0–100 and update within 24 hours of activity.",
+            tooltip: "Your Readiness Score reflects quiz accuracy, lesson completion, and game performance over the past 30 days. Scores range from 0–100 and update within 24 hours of activity.",
           },
           {
-            iconBg: C.green, label: "Team Rank", value: user.rank != null ? `#${user.rank}` : "—", sub: user.rank != null ? " of 18" : "",
+            iconBg: C.green, label: "Team Rank", value: user.rank != null ? `#${user.rank}` : "—", sub: user.rank != null ? ` of ${orgUsers.length > 0 ? orgUsers.length : "—"}` : "",
             note: user.rank == null ? "No data yet" : user.rank <= 3 ? "↑ Top performer" : user.rank <= 5 ? "↑ Up 1 spot" : "Keep pushing",
             noteColor: user.rank <= 3 ? C.green : C.textSub,
           },
           {
             iconBg: C.blue, label: "Weekly Change", value: user.weeklyChange ? user.weeklyChange.replace("%", "") : "—", sub: user.weeklyChange ? "%" : "",
             note: "vs last week", noteColor: C.textSub,
-            tooltip: `Compares your Knowledge Score this week (${todayLabel} back 7 days) to the prior 7-day period. Positive = improvement. Scores consider quiz results, lesson completions, and game performance.`,
+            tooltip: `Compares your Readiness Score this week (${todayLabel} back 7 days) to the prior 7-day period. Positive = improvement. Scores consider quiz results, lesson completions, and game performance.`,
           },
           {
             iconBg: C.purple, label: "Assigned Training", value: String(pendingCount), sub: " pending",
@@ -683,7 +707,7 @@ function HomeScreen({ user, onNav, quizAssignments = [], onResumeLesson, onStart
       </div>
 
       {/* In Progress + Leaderboard */}
-      <div style={{ display: "grid", gridTemplateColumns: "1fr 320px", gap: 16 }}>
+      <div style={{ display: "grid", gridTemplateColumns: mobile ? "1fr" : "1fr 320px", gap: 16 }}>
         <div style={{ display: "flex", flexDirection: "column", gap: 14 }}>
 
           {/* In Progress / Upcoming — all pending assignments */}
@@ -709,13 +733,14 @@ function HomeScreen({ user, onNav, quizAssignments = [], onResumeLesson, onStart
               else if (contentKind === "course") onStartCourse?.(content.id);
               else onResumeLesson?.(content.id);
             };
-            const actionLabel = pct > 0 ? "Resume →" : "Begin →";
+            const actionLabel = pct > 0 ? "Resume →" : "Start →";
             return (
               <Card key={item.id}>
                 <div style={{ display: "flex", alignItems: "center", gap: 6, marginBottom: 12 }}>
                   <div style={{ width: 8, height: 8, borderRadius: 2, background: typeColor }} />
                   <span style={{ fontSize: 11, fontWeight: 700, color: typeColor, letterSpacing: "0.06em" }}>{typeLabel}</span>
                   {item.required && <span style={{ fontSize: 10, fontWeight: 700, padding: "2px 6px", borderRadius: 4, background: C.redBg, color: C.red }}>REQUIRED</span>}
+                  {item.isNew && <span style={{ fontSize: 10, fontWeight: 700, padding: "2px 6px", borderRadius: 4, background: "#DBEAFE", color: "#2563EB" }}>NEW</span>}
                   {dueStatus && (
                     <span style={{ fontSize: 10, fontWeight: 700, padding: "2px 7px", borderRadius: 4, background: dueStatus.color + "18", color: dueStatus.color, marginLeft: "auto" }}>
                       {dueStatus.label}
@@ -867,7 +892,7 @@ function HomeScreen({ user, onNav, quizAssignments = [], onResumeLesson, onStart
                       </div>
                     )}
                     <button onClick={handleAction} style={{ padding: "7px 14px", borderRadius: 7, border: "none", cursor: "pointer", background: typeColor, color: "#fff", fontSize: 12, fontWeight: 700 }}>
-                      {pct > 0 ? "Resume →" : "Begin →"}
+                      {pct > 0 ? "Resume →" : "Start →"}
                     </button>
                   </div>
                 );
@@ -1090,6 +1115,7 @@ const Q_TYPE_ICONS  = { mc: "", tf: "", type: "", open: "", slider: "", pin: "",
 const PURPLE = "#8B5CF6";
 
 function KahootHostView({ onNav, sessionName, pin, sessionDbId, tenantId, questions, broadcast, chAnswers, chPlayers, onGameEnd, setChAnswers }) {
+  const mobile       = useMobile();
   const [phase,      setPhase]      = useState("countdown");
   const [qIdx,       setQIdx]       = useState(0);
   const [cdNum,      setCdNum]      = useState(3);
@@ -1101,6 +1127,127 @@ function KahootHostView({ onNav, sessionName, pin, sessionDbId, tenantId, questi
   const [questionHistory, setQuestionHistory] = useState([]);
   // DB-backed participant count for countdown — presence may lag behind actual joins
   const [dbParticipantCount, setDbParticipantCount] = useState(chPlayers.length);
+
+  // ── Session restoration ───────────────────────────────────────────────────────
+  // "loading" while fetching DB state, "done" when ready, "error" if fetch fails.
+  // Demo mode (no sessionDbId) initialises as "done" and skips all restoration.
+  const [restoreState, setRestoreState] = useState(sessionDbId ? "loading" : "done");
+  const [restoreError, setRestoreError] = useState(null);
+  const [retryCount,   setRetryCount]   = useState(0);
+
+  useEffect(() => {
+    if (!sessionDbId) return; // demo mode — nothing to restore
+    let cancelled = false;
+    setRestoreState("loading");
+    setRestoreError(null);
+
+    (async () => {
+      try {
+        // 1. Parallel fetch: session state + per-question answer history
+        const { session, answers } = await getSessionRestoreData(sessionDbId);
+        if (cancelled) return;
+
+        if (session.error) throw new Error(session.error.message ?? "Failed to load session");
+        if (!session.data) throw new Error("Session not found");
+
+        const sess = session.data;
+
+        // 2. phase==="waiting" → new game has not progressed past lobby; start normally
+        if (sess.phase === "waiting") {
+          if (!cancelled) setRestoreState("done");
+          return;
+        }
+
+        // 3. Restore question index, paused flag, and phase
+        const restoredQIdx = sess.current_question_index ?? 0;
+        setQIdx(restoredQIdx);
+        setPaused(sess.paused ?? false);
+
+        const safePhase = (sess.phase === "ended") ? "reveal" : (sess.phase ?? "countdown");
+        if (safePhase === "countdown") setCdNum(3);
+        if (safePhase === "question") {
+          const rq = questions[restoredQIdx];
+          if (rq?.timeLimit) setTimeLeft(rq.timeLimit);
+        }
+        // Set phase after other state so countdown/question effects don't fire prematurely
+        setPhase(safePhase);
+
+        // 4. Reconstruct cumulative scores from saved game_answers
+        if (answers.data?.length) {
+          // Deduplicate: for each (player_id, question_idx) keep the highest-points row
+          const best = new Map();
+          for (const row of answers.data) {
+            const key = `${row.player_id}:${row.question_idx}`;
+            const existing = best.get(key);
+            if (!existing || (row.points ?? 0) > (existing.points ?? 0)) best.set(key, row);
+          }
+
+          // Sum deduplicated points per player
+          const totals = new Map(); // player_id → { name, score }
+          for (const row of best.values()) {
+            const cur = totals.get(row.player_id);
+            if (cur) cur.score += row.points ?? 0;
+            else totals.set(row.player_id, { name: row.player_name, score: row.points ?? 0 });
+          }
+
+          // Fetch all participants (no status filter) for emoji/color
+          const { data: participants } = await supabase
+            .from("game_session_participants")
+            .select("player_id, name, emoji, color")
+            .eq("session_id", sessionDbId)
+            .order("joined_at", { ascending: true });
+          if (cancelled) return;
+
+          // Build merged score rows, starting from full participant list (preserves 0-score players)
+          const seen = new Set();
+          const scoreRows = (participants ?? []).map((p, i) => {
+            seen.add(p.player_id);
+            const t = totals.get(p.player_id);
+            const eidx = i % PLAYER_EMOJIS.length;
+            return {
+              id:         p.player_id,
+              name:       p.name,
+              emoji:      p.emoji ?? PLAYER_EMOJIS[eidx],
+              color:      p.color ?? PLAYER_COLORS[eidx % PLAYER_COLORS.length],
+              score:      t?.score ?? 0,
+              delta:      0,
+              wasCorrect: false,
+            };
+          });
+
+          // Also include any players with answers who are absent from participant list
+          let extra = scoreRows.length;
+          for (const [pid, t] of totals.entries()) {
+            if (seen.has(pid)) continue;
+            const eidx = extra % PLAYER_EMOJIS.length;
+            scoreRows.push({
+              id:         pid,
+              name:       t.name,
+              emoji:      PLAYER_EMOJIS[eidx],
+              color:      PLAYER_COLORS[eidx % PLAYER_COLORS.length],
+              score:      t.score,
+              delta:      0,
+              wasCorrect: false,
+            });
+            extra++;
+          }
+
+          scoreRows.sort((a, b) => b.score - a.score);
+          if (!cancelled) setScores(scoreRows);
+        }
+
+        if (!cancelled) setRestoreState("done");
+      } catch (err) {
+        if (!cancelled) {
+          console.error("[ralli:host] restore failed:", err);
+          setRestoreError(err.message ?? "Failed to restore session state");
+          setRestoreState("error");
+        }
+      }
+    })();
+
+    return () => { cancelled = true; };
+  }, [sessionDbId, retryCount]); // eslint-disable-line react-hooks/exhaustive-deps
 
   useEffect(() => {
     if (!sessionDbId) return;
@@ -1130,10 +1277,12 @@ function KahootHostView({ onNav, sessionName, pin, sessionDbId, tenantId, questi
   const timerColor    = timerPct > 50 ? C.green : timerPct > 25 ? C.orange : C.red;
 
   useEffect(() => {
+    if (restoreState !== "done") return; // don't reset restored scores during restoration
     if (phase === "countdown" && (qIdx === 0 || scores.length === 0)) setScores(chPlayers.map(p => ({ ...p, score: 0 })));
-  }, [chPlayers.length]);
+  }, [chPlayers.length, restoreState]); // eslint-disable-line react-hooks/exhaustive-deps
 
   useEffect(() => {
+    if (restoreState !== "done") return; // block until restoration finishes
     if (phase !== "countdown") return;
     if (cdNum <= 0) {
       setPhase("question"); setTimeLeft(q.timeLimit);
@@ -1143,19 +1292,21 @@ function KahootHostView({ onNav, sessionName, pin, sessionDbId, tenantId, questi
     }
     const t = setTimeout(() => setCdNum(n => n - 1), 1000);
     return () => clearTimeout(t);
-  }, [phase, cdNum]);
+  }, [phase, cdNum, restoreState]); // eslint-disable-line react-hooks/exhaustive-deps
 
   useEffect(() => {
+    if (restoreState !== "done") return; // block until restoration finishes
     if (phase !== "question" || paused) return;
     if (timeLeft <= 0) { doReveal(); return; }
     const t = setTimeout(() => setTimeLeft(n => n - 1), 1000);
     return () => clearTimeout(t);
-  }, [phase, timeLeft, paused]);
+  }, [phase, timeLeft, paused, restoreState]); // eslint-disable-line react-hooks/exhaustive-deps
 
   useEffect(() => {
+    if (restoreState !== "done") return; // block until restoration finishes
     if (phase !== "question" || answeredCount < playerCount || answeredCount === 0) return;
     doReveal();
-  }, [answeredCount, phase]);
+  }, [answeredCount, phase, restoreState]); // eslint-disable-line react-hooks/exhaustive-deps
 
   const doReveal = () => {
     if (q.type === "open") {
@@ -1320,7 +1471,45 @@ function KahootHostView({ onNav, sessionName, pin, sessionDbId, tenantId, questi
   const openResponses = Object.entries(chAnswers).map(([pid, ans], i) => ({ id: i, playerId: pid, text: ans.text, name: ans.name }));
   const rankBadges = ["1st","2nd","3rd","4th","5th"];
 
+  // ── Loading / error states during session restoration ─────────────────────────
+  if (restoreState === "loading") {
+    return (
+      <div style={{ minHeight: "100%", display: "flex", alignItems: "center", justifyContent: "center", background: C.cream }}>
+        <div style={{ textAlign: "center", padding: 40 }}>
+          <style>{`@keyframes rhs{to{transform:rotate(360deg)}}`}</style>
+          <div style={{ width: 36, height: 36, borderRadius: "50%", border: `3px solid ${C.border}`, borderTopColor: C.orange, animation: "rhs 0.7s linear infinite", margin: "0 auto 20px" }} />
+          <p style={{ margin: 0, fontSize: 15, fontWeight: 700, color: C.text }}>Restoring session…</p>
+          <p style={{ margin: "6px 0 0", fontSize: 13, color: C.textMuted }}>{sessionName}</p>
+        </div>
+      </div>
+    );
+  }
 
+  if (restoreState === "error") {
+    return (
+      <div style={{ minHeight: "100%", display: "flex", alignItems: "center", justifyContent: "center", background: C.cream }}>
+        <div style={{ textAlign: "center", padding: 40, maxWidth: 380 }}>
+          <div style={{ fontSize: 36, marginBottom: 16 }}>⚠️</div>
+          <p style={{ margin: "0 0 8px", fontSize: 15, fontWeight: 700, color: C.text }}>Could not restore session</p>
+          <p style={{ margin: "0 0 24px", fontSize: 13, color: C.textMuted }}>{restoreError ?? "Failed to load game state from the server."}</p>
+          <div style={{ display: "flex", gap: 10, justifyContent: "center" }}>
+            <button
+              onClick={() => setRetryCount(c => c + 1)}
+              style={{ padding: "10px 24px", borderRadius: 12, border: "none", background: C.orange, color: "#fff", fontWeight: 700, fontSize: 14, cursor: "pointer" }}
+            >
+              Retry
+            </button>
+            <button
+              onClick={() => onNav("rankd")}
+              style={{ padding: "10px 24px", borderRadius: 12, border: `1.5px solid ${C.border}`, background: "#fff", color: C.text, fontWeight: 700, fontSize: 14, cursor: "pointer" }}
+            >
+              Back to Games
+            </button>
+          </div>
+        </div>
+      </div>
+    );
+  }
 
   if (phase === "open-review") {
     return (
@@ -1511,9 +1700,9 @@ function KahootHostView({ onNav, sessionName, pin, sessionDbId, tenantId, questi
       </div>
 
       {/* Question */}
-      <div style={{ padding: "24px 40px 16px", flexShrink: 0 }}>
+      <div style={{ padding: mobile ? "16px 16px 12px" : "24px 40px 16px", flexShrink: 0 }}>
         <p style={{ margin: "0 0 6px", fontSize: 11, fontWeight: 700, letterSpacing: "0.1em", color: C.textMuted, textTransform: "uppercase" }}>{Q_TYPE_LABELS[q.type] ?? "Question"}</p>
-        <h2 style={{ margin: 0, fontSize: 24, fontWeight: 900, color: C.text, lineHeight: 1.3 }}>{q.q}</h2>
+        <h2 style={{ margin: 0, fontSize: mobile ? 18 : 24, fontWeight: 900, color: C.text, lineHeight: 1.3 }}>{q.q}</h2>
       </div>
 
       {/* Answer options — type question shows accepted-answer panel, not a grid */}
@@ -1618,6 +1807,7 @@ function KahootHostView({ onNav, sessionName, pin, sessionDbId, tenantId, questi
 
 // ── REAL GAME PLAYER VIEW ────────────────────────────────────
 function KahootPlayerView({ onNav, playerName, playerId, pin, sessionDbId, broadcast, chMsg }) {
+  const mobile          = useMobile();
   const [phase,         setPhase]         = useState("waiting");
   const [cdNum,         setCdNum]         = useState(3);
   const [question,      setQuestion]      = useState(null);
@@ -1828,7 +2018,7 @@ function KahootPlayerView({ onNav, playerName, playerId, pin, sessionDbId, broad
       ? String.fromCharCode(65 + selectedIdx)
       : "✎";
     return (
-      <div style={{ minHeight: "100%", background: C.cream, display: "flex", flexDirection: "column", alignItems: "center", justifyContent: "center", gap: 20, padding: 32 }}>
+      <div style={{ minHeight: "100%", background: C.cream, display: "flex", flexDirection: "column", alignItems: "center", justifyContent: "center", gap: 20, padding: mobile ? 16 : 32 }}>
         {hasAnswer ? (
           <>
             <div style={{ padding: "16px 24px", borderRadius: 16, background: C.cardBg, border: `1.5px solid ${showResult ? (isCorrect ? "#BBF7D0" : isCorrect === false ? "#FECACA" : C.creamBorder) : C.creamBorder}`, textAlign: "center", maxWidth: 360, width: "100%" }}>
@@ -2367,7 +2557,7 @@ function RankdGameScreen({ onNav, sessionName, role, playerName, questions = GAM
               >{openGrades.__showNames ? "Hide Names" : "Show Names"}</button>
             )}
           </div>
-          <p style={{ margin: 0, fontSize: mobile ? 16 : 20, fontWeight: 800, color: C.text }}>{q.text ?? q.q}</p>
+          <p style={{ margin: 0, fontSize: mobile ? 16 : 20, fontWeight: 800, color: C.text }}>{q.text || q.q}</p>
           <p style={{ margin: "4px 0 0", fontSize: 12, color: C.textMuted }}>
             {openResponses.length} response{openResponses.length !== 1 ? "s" : ""} collected · anonymous to players
           </p>
@@ -3362,7 +3552,7 @@ function SessionDetailView({ session, onBack }) {
               <div key={q.id} style={{ display: "flex", alignItems: "center", gap: 12, padding: "11px 18px", borderBottom: i < qs.length - 1 ? `1px solid ${C.border}` : "none" }}>
                 <span style={{ fontSize: 11, fontWeight: 700, color: C.textMuted, width: 20, flexShrink: 0 }}>Q{i + 1}</span>
                 <div style={{ flex: 1, minWidth: 0 }}>
-                  <div style={{ fontSize: 12, fontWeight: 600, color: C.text, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{q.text ?? q.q}</div>
+                  <div style={{ fontSize: 12, fontWeight: 600, color: C.text, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{q.text || q.q}</div>
                   <div style={{ fontSize: 10, color: C.textSub, marginTop: 1 }}>{q.topic}</div>
                 </div>
                 <span style={{ fontSize: 11, color: C.textSub, flexShrink: 0 }}>{(q.responseMs / 1000).toFixed(1)}s</span>
@@ -3394,7 +3584,7 @@ function SessionDetailView({ session, onBack }) {
                       <span style={{ fontSize: 10, fontWeight: 700, padding: "1px 6px", borderRadius: 4, background: typeColor + "15", color: typeColor }}>{typeLabel}</span>
                       <span style={{ fontSize: 10, fontWeight: 700, padding: "1px 6px", borderRadius: 4, background: C.muted, color: C.textSub }}>{q.topic}</span>
                     </div>
-                    <p style={{ margin: 0, fontSize: 13, fontWeight: 700, color: C.text, lineHeight: 1.4 }}>{q.text ?? q.q}</p>
+                    <p style={{ margin: 0, fontSize: 13, fontWeight: 700, color: C.text, lineHeight: 1.4 }}>{q.text || q.q}</p>
                   </div>
                   <div style={{ textAlign: "right", flexShrink: 0 }}>
                     <div style={{ fontSize: 11, fontWeight: 700, color: q.isCorrect ? C.green : C.red }}>{q.isCorrect ? "Correct" : "Incorrect"}</div>
@@ -3841,19 +4031,32 @@ function RankdJoinPanel({ onJoin, sessions, currentUser }) {
 // ── RANKD ADMIN PANEL ────────────────────────────────────────
 
 function RankdAdminPanel({ onNav, sessions, onLaunch, onViewResults, onRelaunch }) {
-  const [tab, setTab] = useState("new");
+  const [tab, setTab] = useState("active");
 
+  // All statuses that can appear from the DB or local state
   const statusColors = {
     waiting:   { bg: C.limeBg,       text: "#059669",  label: "Waiting"   },
     live:      { bg: C.orangeLight,   text: C.orange,   label: "Live"      },
     started:   { bg: C.orangeLight,   text: C.orange,   label: "Live"      },
+    active:    { bg: C.orangeLight,   text: C.orange,   label: "Live"      },
+    paused:    { bg: "#FEF3C7",       text: "#D97706",  label: "Paused"    },
     ended:     { bg: C.muted,         text: C.textSub,  label: "Ended"     },
     completed: { bg: C.muted,         text: C.textSub,  label: "Completed" },
+    canceled:  { bg: C.muted,         text: C.textSub,  label: "Canceled"  },
+    archived:  { bg: C.muted,         text: C.textSub,  label: "Archived"  },
   };
 
   const TERMINAL_STATUSES = new Set(["ended", "completed", "canceled", "archived"]);
   const activeSessions = sessions.filter(s => !TERMINAL_STATUSES.has(s.status));
   const pastSessions   = sessions.filter(s =>  TERMINAL_STATUSES.has(s.status));
+
+  // Determine the correct CTA label based on session status
+  const getSessionActionLabel = (status) => {
+    if (status === "waiting")                                      return "Open Lobby";
+    if (status === "live" || status === "started" ||
+        status === "active" || status === "paused")                return "Resume";
+    return "Open";
+  };
 
   const SessionRow = ({ s }) => {
     const sc  = statusColors[s.status] ?? { bg: C.muted, text: C.textSub, label: s.status ?? "Unknown" };
@@ -3882,7 +4085,7 @@ function RankdAdminPanel({ onNav, sessions, onLaunch, onViewResults, onRelaunch 
               <button onClick={() => onRelaunch(s)} style={{ display: "flex", alignItems: "center", gap: 6, padding: "8px 16px", borderRadius: 10, fontSize: 12, fontWeight: 700, cursor: "pointer", background: C.dark, color: "#fff", border: "none" }}>▶ Re-launch</button>
             </>
           ) : (
-            <button onClick={() => onLaunch(s)} style={{ display: "flex", alignItems: "center", gap: 6, padding: "8px 16px", borderRadius: 10, fontSize: 12, fontWeight: 700, cursor: "pointer", background: C.green, color: "#fff", border: "none" }}>▶ {s.status === "live" || s.status === "started" ? "Resume" : "Launch"}</button>
+            <button onClick={() => onLaunch(s)} style={{ display: "flex", alignItems: "center", gap: 6, padding: "8px 16px", borderRadius: 10, fontSize: 12, fontWeight: 700, cursor: "pointer", background: C.green, color: "#fff", border: "none" }}>▶ {getSessionActionLabel(s.status)}</button>
           )}
         </div>
       </div>
@@ -3891,32 +4094,31 @@ function RankdAdminPanel({ onNav, sessions, onLaunch, onViewResults, onRelaunch 
 
   return (
     <div style={{ padding: 32, maxWidth: 900 }}>
-      {/* Tabs */}
-      <div style={{ display: "flex", gap: 4, marginBottom: 24, background: C.muted, borderRadius: 10, padding: 4, width: "fit-content" }}>
-        {[
-          { id: "new",  label: "Start New Game" },
-          { id: "past", label: "Past Sessions"  },
-        ].map(t => (
-          <button key={t.id} onClick={() => setTab(t.id)} style={{
-            padding: "8px 18px", borderRadius: 8, border: "none", cursor: "pointer",
-            fontSize: 13, fontWeight: 700,
-            background: tab === t.id ? C.white : "transparent",
-            color:      tab === t.id ? C.text  : C.textSub,
-            boxShadow:  tab === t.id ? "0 1px 4px rgba(0,0,0,0.08)" : "none",
-            transition: "all 0.12s",
-          }}>{t.label}</button>
-        ))}
+      {/* Header row — tabs left, New Game button right */}
+      <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", marginBottom: 24 }}>
+        <div style={{ display: "flex", gap: 4, background: C.muted, borderRadius: 10, padding: 4 }}>
+          {[
+            { id: "active", label: "Active"        },
+            { id: "past",   label: "Past Sessions" },
+          ].map(t => (
+            <button key={t.id} onClick={() => setTab(t.id)} style={{
+              padding: "8px 18px", borderRadius: 8, border: "none", cursor: "pointer",
+              fontSize: 13, fontWeight: 700,
+              background: tab === t.id ? C.white : "transparent",
+              color:      tab === t.id ? C.text  : C.textSub,
+              boxShadow:  tab === t.id ? "0 1px 4px rgba(0,0,0,0.08)" : "none",
+              transition: "all 0.12s",
+            }}>{t.label}</button>
+          ))}
+        </div>
+        <button onClick={() => onNav("rankd-new")} style={{ display: "flex", alignItems: "center", gap: 8, padding: "10px 20px", borderRadius: 12, border: "none", cursor: "pointer", fontSize: 13, fontWeight: 700, color: "#fff", background: C.orange }}>+ New Game</button>
       </div>
 
-      {/* Start New Game tab */}
-      {tab === "new" && (
+      {/* Active tab */}
+      {tab === "active" && (
         <>
-          <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", marginBottom: 20 }}>
-            <div>
-              <h2 style={{ margin: 0, fontSize: 15, fontWeight: 700, color: C.text }}>Active Sessions</h2>
-              <p style={{ margin: "2px 0 0", fontSize: 11, color: C.textSub }}>{activeSessions.length} session{activeSessions.length !== 1 ? "s" : ""}</p>
-            </div>
-            <button onClick={() => onNav("rankd-new")} style={{ display: "flex", alignItems: "center", gap: 8, padding: "10px 20px", borderRadius: 12, border: "none", cursor: "pointer", fontSize: 13, fontWeight: 700, color: "#fff", background: C.orange }}>+ New Game</button>
+          <div style={{ marginBottom: 16 }}>
+            <p style={{ margin: 0, fontSize: 11, color: C.textSub }}>{activeSessions.length} active session{activeSessions.length !== 1 ? "s" : ""}</p>
           </div>
           {activeSessions.length === 0 ? (
             <div style={{ textAlign: "center", padding: "48px 24px", background: C.pageBg, borderRadius: 14, border: `1px solid ${C.border}` }}>
@@ -3936,9 +4138,8 @@ function RankdAdminPanel({ onNav, sessions, onLaunch, onViewResults, onRelaunch 
       {/* Past Sessions tab */}
       {tab === "past" && (
         <>
-          <div style={{ marginBottom: 20 }}>
-            <h2 style={{ margin: 0, fontSize: 15, fontWeight: 700, color: C.text }}>Past Sessions</h2>
-            <p style={{ margin: "2px 0 0", fontSize: 11, color: C.textSub }}>{pastSessions.length} completed session{pastSessions.length !== 1 ? "s" : ""}</p>
+          <div style={{ marginBottom: 16 }}>
+            <p style={{ margin: 0, fontSize: 11, color: C.textSub }}>{pastSessions.length} completed session{pastSessions.length !== 1 ? "s" : ""}</p>
           </div>
           {pastSessions.length === 0 ? (
             <div style={{ textAlign: "center", padding: "48px 24px", background: C.pageBg, borderRadius: 14, border: `1px solid ${C.border}` }}>
@@ -4480,6 +4681,7 @@ function RankdLobbyScreen({ onNav, pin, playerName, playerEmoji, sessionName, ro
 // ── RANKD RESULTS SCREEN ─────────────────────────────────────
 
 function RankdResultsScreen({ onNav, sessionCode, sessions, gameData }) {
+  const mobile    = useMobile();
   const session   = sessions.find(s => s.code === sessionCode);
   const [tab, setTab] = useState("summary");
   const [dbScores, setDbScores] = useState(null);
@@ -4608,7 +4810,7 @@ function RankdResultsScreen({ onNav, sessionCode, sessions, gameData }) {
         {tab === "summary" && (
           <div style={{ display: "flex", flexDirection: "column", gap: 20 }}>
             {/* Overview stats */}
-            <div style={{ display: "grid", gridTemplateColumns: "repeat(4, 1fr)", gap: 14 }}>
+            <div style={{ display: "grid", gridTemplateColumns: mobile ? "repeat(2, 1fr)" : "repeat(4, 1fr)", gap: 14 }}>
               {[
                 { label: "Total Players",       value: totalPlayers > 0 ? String(totalPlayers) : "—",  icon: "", color: C.blue },
                 { label: "Avg Accuracy",        value: avgAccuracy != null ? `${avgAccuracy}%` : "—", icon: "", color: "#059669" },
@@ -4679,7 +4881,7 @@ function RankdResultsScreen({ onNav, sessionCode, sessions, gameData }) {
         )}
 
         {tab === "leaderboard" && (
-          <div style={{ display: "grid", gridTemplateColumns: "7fr 5fr", gap: 24 }}>
+          <div style={{ display: "grid", gridTemplateColumns: mobile ? "1fr" : "7fr 5fr", gap: 24 }}>
             {/* Left: stats + podium + table */}
             <div>
               <div style={{ display: "grid", gridTemplateColumns: "repeat(3, 1fr)", gap: 12, marginBottom: 24 }}>
@@ -5058,6 +5260,7 @@ function NewSessionScreen({ onNav, quizzes, onCreateSession }) {
 // ── QUIZ BUILDER SCREEN ──────────────────────────────────────
 
 function QuizBuilderScreen({ onNav, onSave, initialQuiz }) {
+  const mobile  = useMobile();
   const makeBlank = (type = "mc") => {
     const base = { id: `q_${Date.now()}_${Math.random().toString(36).slice(2)}`, q: "", type, timeLimit: 20 };
     switch (type) {
@@ -5092,9 +5295,12 @@ function QuizBuilderScreen({ onNav, onSave, initialQuiz }) {
   };
 
   const isQComplete = (q) => {
-    if (!q.q?.trim()) return false;
+    // After dbToQuiz normalization both q.text and q.q are set. Check either so the
+    // builder works with quizzes loaded from DB (which have text) and with freshly
+    // created questions (which have q).
+    if (!((q.text || q.q) ?? "").trim()) return false;
     switch (q.type) {
-      case "mc":     return q.options?.length >= 2 && q.options.every(o => o.trim());
+      case "mc":     return q.options?.length >= 2 && q.options.every(o => typeof o === "string" && o.trim());
       case "tf":     return true;
       case "type":   return q.acceptedAnswers?.some(a => a.trim());
       case "open":   return true;
@@ -5366,10 +5572,10 @@ function QuizBuilderScreen({ onNav, onSave, initialQuiz }) {
       </div>
 
       {/* Two-panel */}
-      <div style={{ flex:1, display:"grid", gridTemplateColumns:"240px 1fr", gap:20, minHeight:0 }}>
+      <div style={{ flex:1, display:"grid", gridTemplateColumns: mobile ? "1fr" : "240px 1fr", gridTemplateRows: mobile ? "auto 1fr" : undefined, gap:20, minHeight:0 }}>
 
         {/* Left: question list */}
-        <div style={{ background:C.white, borderRadius:16, border:`1px solid ${C.border}`, display:"flex", flexDirection:"column", overflow:"hidden" }}>
+        <div style={{ background:C.white, borderRadius:16, border:`1px solid ${C.border}`, display:"flex", flexDirection:"column", overflow:"hidden", maxHeight: mobile ? 220 : undefined }}>
           <div style={{ padding:"12px 14px", borderBottom:`1px solid ${C.border}`, display:"flex", alignItems:"center", justifyContent:"space-between", flexShrink:0 }}>
             <span style={{ fontSize:12, fontWeight:700, color:C.textSub }}>{qs.length} Question{qs.length!==1?"s":""}</span>
             <button onClick={addQ} style={{ padding:"4px 10px", borderRadius:8, border:"none", cursor:"pointer", fontSize:12, fontWeight:700, background:C.orange, color:"#fff" }}>+ Add</button>
@@ -5600,9 +5806,11 @@ function LearnScreen({ role, user, orgUsers = [], orgs = [], onNav, onAwardXp, p
     } catch { return new Set(); }
   });
   const [userTab,    setUserTab]    = useState("assigned");
+  const [learnFilter, setLearnFilter] = useState("due"); // "due" | "complete" | "all"
   const [search,     setSearch]     = useState("");
   const [archivedCourses,   setArchivedCourses]   = useState([]);
   const [archivedLessons,   setArchivedLessons]   = useState([]);
+  const [confirmArchive,    setConfirmArchive]    = useState(null); // { type: "course"|"lesson", id, title }
   const [tenantCompletions, setTenantCompletions] = useState([]); // manager/admin only
   const [selectedAssignmentId, setSelectedAssignmentId] = useState(null); // manager click-through
   const [assignTimeframe,  setAssignTimeframe]  = useState("all"); // "all" | "week" | "month" | "custom"
@@ -5668,30 +5876,38 @@ function LearnScreen({ role, user, orgUsers = [], orgs = [], onNav, onAwardXp, p
         )
       );
       if (tid) {
-        awardLessonPoints(tid, uid, id, { dueAt: lessonAssignment?.dueAt })
-          .catch(e => console.error("[ralli] awardLessonPoints failed:", e));
-        triggerReadinessUpdate(tid, uid);
-      }
-
-      // Detect course completion — check if any course containing this lesson is now fully done
-      if (tid) {
+        // Snapshot the completed-lesson set before any state update resolves,
+        // so the course-completion check below uses a stable value.
         const updatedCompleted = new Set([...completedLessons, id]);
-        courses.forEach(course => {
-          if (!course.lessonIds?.includes(id)) return;
-          const wasComplete = course.lessonIds.every(lid => completedLessons.has(lid));
-          if (wasComplete) return; // already completed before this lesson
-          const nowComplete = course.lessonIds.every(lid => updatedCompleted.has(lid));
-          if (!nowComplete) return;
-          const courseAssignment = assignments.find(a =>
-            a.contentType === "course" && a.contentId === course.id && (
-              (a.assignedTo.type === "group"      && a.assignedTo.orgId === user?.orgId) ||
-              (a.assignedTo.type === "individual" && a.assignedTo.userId === uid)        ||
-              (a.assignedTo.type === "team"       && userTeamId && a.assignedTo.teamId === userTeamId)
-            )
-          );
-          awardCoursePoints(tid, uid, course.id, { dueAt: courseAssignment?.dueAt })
-            .catch(e => console.error("[ralli] awardCoursePoints failed:", e));
-        });
+
+        awardLessonPoints(tid, uid, id, { dueAt: lessonAssignment?.dueAt })
+          .then(() => {
+            // Lesson XP is now committed — safe to recalculate readiness.
+            triggerReadinessUpdate(tid, uid);
+
+            // Detect course completion: any course containing this lesson that
+            // wasn't already complete before this lesson is now fully done.
+            courses.forEach(course => {
+              if (!course.lessonIds?.includes(id)) return;
+              const wasComplete = course.lessonIds.every(lid => completedLessons.has(lid));
+              if (wasComplete) return;
+              const nowComplete = course.lessonIds.every(lid => updatedCompleted.has(lid));
+              if (!nowComplete) return;
+              const courseAssignment = assignments.find(a =>
+                a.contentType === "course" && a.contentId === course.id && (
+                  (a.assignedTo.type === "group"      && a.assignedTo.orgId === user?.orgId) ||
+                  (a.assignedTo.type === "individual" && a.assignedTo.userId === uid)        ||
+                  (a.assignedTo.type === "team"       && userTeamId && a.assignedTo.teamId === userTeamId)
+                )
+              );
+              // Award course XP, then trigger a second readiness update so the
+              // final score includes both lesson and course XP.
+              awardCoursePoints(tid, uid, course.id, { dueAt: courseAssignment?.dueAt })
+                .then(() => triggerReadinessUpdate(tid, uid))
+                .catch(e => console.error("[ralli] awardCoursePoints failed:", e));
+            });
+          })
+          .catch(e => console.error("[ralli] awardLessonPoints failed:", e));
       }
     }
   };
@@ -5947,131 +6163,223 @@ function LearnScreen({ role, user, orgUsers = [], orgs = [], onNav, onAwardXp, p
         </div>
 
         {/* ASSIGNED TAB */}
-        {userTab === "assigned" && (
-          <div style={{ display: "flex", flexDirection: "column", gap: 14 }}>
-            {myAssignments.length === 0 && (
-              <div style={{ padding: 60, textAlign: "center", background: C.white, borderRadius: 12, border: `1px solid ${C.border}` }}>
-                <p style={{ margin: 0, fontSize: 15, fontWeight: 700, color: C.text }}>No assignments yet</p>
-                <p style={{ margin: "6px 0 0", fontSize: 13, color: C.textSub }}>Your manager will assign courses and lessons here</p>
-              </div>
-            )}
-            {myAssignments.map(a => {
-              const isCourse = a.contentType === "course";
-              const content  = isCourse ? courses.find(c => c.id === a.contentId) : lessons.find(l => l.id === a.contentId);
-              if (!content) return null;
-              const courseLessons = isCourse ? content.lessonIds.map(id => lessons.find(l => l.id === id)).filter(Boolean) : [];
-              const doneCount = isCourse ? courseLessons.filter(l => completedLessons.has(l.id)).length : 0;
-              const pct = isCourse ? Math.round((doneCount / Math.max(courseLessons.length, 1)) * 100) : (completedLessons.has(content.id) ? 100 : 0);
-              const isComplete = pct === 100;
-              const totalXp = isCourse ? courseLessons.reduce((s, l) => s + (l.xp || 0), 0) : (content.xp || 0);
-              const bonusXp  = isCourse ? Math.round(totalXp * 0.2) : 0;
-              const estMin   = isCourse ? courseLessons.reduce((s, l) => s + (parseInt(l.duration) || 0), 0) : (parseInt(content.duration) || 0);
-              const typeColor = isCourse ? content.color : LESSON_TYPE_COLORS[content.type];
-              return (
-                <Card key={a.id}>
-                  <div style={{ display: "flex", alignItems: "flex-start", gap: 16 }}>
-                    <div style={{
-                      width: 52, height: 52, borderRadius: 12, flexShrink: 0,
-                      background: typeColor + "20", border: `1px solid ${typeColor}30`,
-                      display: "flex", alignItems: "center", justifyContent: "center", fontSize: 24,
-                      opacity: isComplete ? 0.55 : 1,
-                    }}>
-                      {isCourse ? content.emoji : LESSON_TYPE_ICONS[content.type]}
+        {userTab === "assigned" && (() => {
+          // ── Deduplicate by contentType:contentId ──────────────────────────────
+          // The same content can be assigned to a user via multiple paths
+          // (individual + group + team). Count and display it only once.
+          const seenKeys = new Set();
+          const dedupedAssignments = myAssignments.filter(a => {
+            const key = `${a.contentType}:${a.contentId}`;
+            if (seenKeys.has(key)) return false;
+            seenKeys.add(key);
+            return true;
+          });
+
+          // ── Enrich each assignment with completion + availability ──────────────
+          const todayMsForFilter = new Date().setHours(0, 0, 0, 0);
+          const enrichedAssigned = dedupedAssignments.map(a => {
+            const isCourse = a.contentType === "course";
+            const content  = isCourse ? courses.find(c => c.id === a.contentId) : lessons.find(l => l.id === a.contentId);
+            if (!content) return null;
+            const courseLessons = isCourse ? content.lessonIds.map(id => lessons.find(l => l.id === id)).filter(Boolean) : [];
+            const doneCount = isCourse ? courseLessons.filter(l => completedLessons.has(l.id)).length : 0;
+            const pct = isCourse
+              ? Math.round((doneCount / Math.max(courseLessons.length, 1)) * 100)
+              : (completedLessons.has(content.id) ? 100 : 0);
+            const isComplete = pct === 100;
+            // Availability: does the user have at least one lesson they can act on now?
+            // Locked-only courses are excluded from Due but still shown in All.
+            let isAvailable = true;
+            if (isCourse && !isComplete) {
+              const assignedDate = a.assignedAtRaw ? new Date(a.assignedAtRaw)
+                : a.assignedAt ? new Date(a.assignedAt) : null;
+              const lessonSched = content.lessonSchedule ?? {};
+              const isLockedForFilter = (lessonId) => {
+                const days = lessonSched[lessonId]?.available_after_days ?? 0;
+                if (!assignedDate || days === 0) return false;
+                const base = new Date(assignedDate); base.setHours(0, 0, 0, 0);
+                return todayMsForFilter < base.getTime() + days * 86400000;
+              };
+              isAvailable = courseLessons.some(l => !completedLessons.has(l.id) && !isLockedForFilter(l.id));
+            }
+            return { a, content, isCourse, courseLessons, doneCount, pct, isComplete, isAvailable };
+          }).filter(Boolean);
+
+          const dueItems      = enrichedAssigned.filter(e => !e.isComplete && e.isAvailable);
+          const completeItems = enrichedAssigned.filter(e => e.isComplete);
+          // Locked: assigned, not complete, but no lessons are available yet (schedule lock)
+          const lockedItems   = enrichedAssigned.filter(e => !e.isComplete && !e.isAvailable);
+          const filterItems   = learnFilter === "due" ? dueItems : learnFilter === "complete" ? completeItems : enrichedAssigned;
+
+          const AssignedCard = ({ a, content, isCourse, courseLessons, doneCount, pct, isComplete }) => {
+            const totalXp   = isCourse ? courseLessons.reduce((s, l) => s + (l.xp || 0), 0) : (content.xp || 0);
+            const bonusXp   = isCourse ? Math.round(totalXp * 0.2) : 0;
+            const estMin    = isCourse ? courseLessons.reduce((s, l) => s + (parseInt(l.duration) || 0), 0) : (parseInt(content.duration) || 0);
+            const typeColor = isCourse ? content.color : LESSON_TYPE_COLORS[content.type];
+            return (
+              <Card key={a.id}>
+                <div style={{ display: "flex", alignItems: "flex-start", gap: 16 }}>
+                  <div style={{
+                    width: 52, height: 52, borderRadius: 12, flexShrink: 0,
+                    background: typeColor + "20", border: `1px solid ${typeColor}30`,
+                    display: "flex", alignItems: "center", justifyContent: "center", fontSize: 24,
+                    opacity: isComplete ? 0.55 : 1,
+                  }}>
+                    {isCourse ? content.emoji : LESSON_TYPE_ICONS[content.type]}
+                  </div>
+                  <div style={{ flex: 1, minWidth: 0 }}>
+                    <div style={{ display: "flex", alignItems: "center", gap: 6, marginBottom: 2, flexWrap: "wrap" }}>
+                      <span style={{ fontSize: 11, fontWeight: 700, color: typeColor, letterSpacing: "0.06em" }}>
+                        {isCourse ? `COURSE · ${courseLessons.length} LESSONS` : `LESSON · ${content.type.toUpperCase()}`}
+                      </span>
+                      {a.required && <span style={{ fontSize: 10, fontWeight: 700, padding: "1px 6px", borderRadius: 4, background: C.redBg, color: C.red }}>REQUIRED</span>}
+                      {isComplete && <span style={{ fontSize: 10, fontWeight: 700, padding: "1px 6px", borderRadius: 4, background: C.greenBg, color: C.green }}>COMPLETE</span>}
                     </div>
-                    <div style={{ flex: 1, minWidth: 0 }}>
-                      <div style={{ display: "flex", alignItems: "center", gap: 6, marginBottom: 2, flexWrap: "wrap" }}>
-                        <span style={{ fontSize: 11, fontWeight: 700, color: typeColor, letterSpacing: "0.06em" }}>
-                          {isCourse ? `COURSE · ${courseLessons.length} LESSONS` : `LESSON · ${content.type.toUpperCase()}`}
-                        </span>
-                        {a.required && <span style={{ fontSize: 10, fontWeight: 700, padding: "1px 6px", borderRadius: 4, background: C.redBg, color: C.red }}>REQUIRED</span>}
-                        {isComplete && <span style={{ fontSize: 10, fontWeight: 700, padding: "1px 6px", borderRadius: 4, background: C.greenBg, color: C.green }}>COMPLETE</span>}
-                      </div>
-                      <div style={{ fontSize: 15, fontWeight: 700, color: C.text, marginBottom: 4, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{content.title}</div>
-                      <div style={{ display: "flex", gap: 12, fontSize: 12, color: C.textSub, flexWrap: "wrap" }}>
-                        <span>⏱ {estMin} min</span>
-                        <span>Due {a.dueAt}</span>
-                        <span style={{ color: C.orange, fontWeight: 700 }}>{totalXp}{bonusXp ? ` +${bonusXp} bonus` : ""} XP</span>
-                      </div>
-                      {pct > 0 && !isComplete && (
-                        <div style={{ marginTop: 8 }}>
-                          <div style={{ display: "flex", justifyContent: "space-between", marginBottom: 4 }}>
-                            <span style={{ fontSize: 11, color: C.textSub }}>{isCourse ? `${doneCount} / ${courseLessons.length} lessons` : "Progress"}</span>
-                            <span style={{ fontSize: 11, fontWeight: 700, color: C.orange }}>{pct}%</span>
-                          </div>
-                          <ProgressBar value={pct} color={C.orange} height={5} />
+                    <div style={{ fontSize: 15, fontWeight: 700, color: C.text, marginBottom: 4, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{content.title}</div>
+                    <div style={{ display: "flex", gap: 12, fontSize: 12, color: C.textSub, flexWrap: "wrap" }}>
+                      <span>⏱ {estMin} min</span>
+                      <span>Due {a.dueAt}</span>
+                      <span style={{ color: C.orange, fontWeight: 700 }}>{totalXp}{bonusXp ? ` +${bonusXp} bonus` : ""} XP</span>
+                    </div>
+                    {pct > 0 && !isComplete && (
+                      <div style={{ marginTop: 8 }}>
+                        <div style={{ display: "flex", justifyContent: "space-between", marginBottom: 4 }}>
+                          <span style={{ fontSize: 11, color: C.textSub }}>{isCourse ? `${doneCount} / ${courseLessons.length} lessons` : "Progress"}</span>
+                          <span style={{ fontSize: 11, fontWeight: 700, color: C.orange }}>{pct}%</span>
                         </div>
-                      )}
-                    </div>
-                    {isCourse ? (
-                      <button
-                        onClick={() => {
-                          if (isComplete) { setActiveCourse(content); }
-                          else {
-                            // Respect per-lesson availability schedule — don't open locked lessons
-                            const assignedDate = a.assignedAtRaw ? new Date(a.assignedAtRaw)
-                              : a.assignedAt ? new Date(a.assignedAt) : null;
-                            const todayMs = new Date().setHours(0, 0, 0, 0);
-                            const lessonSched = content.lessonSchedule ?? {};
-                            const isLockedLesson = (lessonId) => {
-                              const days = lessonSched[lessonId]?.available_after_days ?? 0;
-                              if (!assignedDate || days === 0) return false;
-                              const base = new Date(assignedDate); base.setHours(0, 0, 0, 0);
-                              return todayMs < base.getTime() + days * 86400000;
-                            };
-                            const next = courseLessons.find(l => !completedLessons.has(l.id) && !isLockedLesson(l.id));
-                            if (next) openLesson(next, content);
-                            else setActiveCourse(content); // all next lessons are still locked — show course detail
-                          }
-                        }}
-                        style={{ padding: "9px 18px", borderRadius: 8, border: isComplete ? `1px solid ${C.border}` : "none", cursor: "pointer", background: isComplete ? C.white : pct > 0 ? C.text : C.orange, color: isComplete ? C.textSub : "#fff", fontSize: 12, fontWeight: 700, flexShrink: 0 }}
-                      >
-                        {isComplete ? "Review" : pct > 0 ? "Continue →" : "Start →"}
-                      </button>
-                    ) : !isComplete ? (
-                      <button
-                        onClick={() => openLesson(content)}
-                        style={{ padding: "9px 18px", borderRadius: 8, border: "none", cursor: "pointer", background: pct > 0 ? C.text : C.orange, color: "#fff", fontSize: 12, fontWeight: 700, flexShrink: 0 }}
-                      >
-                        {pct > 0 ? "Resume →" : "Start →"}
-                      </button>
-                    ) : (
-                      <button onClick={() => openLesson(content)} style={{ padding: "9px 18px", borderRadius: 8, border: `1px solid ${C.border}`, cursor: "pointer", background: C.white, color: C.textSub, fontSize: 12, fontWeight: 700, flexShrink: 0 }}>
-                        Review
-                      </button>
+                        <ProgressBar value={pct} color={C.orange} height={5} />
+                      </div>
                     )}
                   </div>
-                </Card>
-              );
-            })}
-
-            {/* Course suggestions */}
-            {(() => {
-              const suggestions = courses.filter(c => !myAssignments.some(a => a.contentType === "course" && a.contentId === c.id)).slice(0, 3);
-              if (!suggestions.length) return null;
-              return (
-                <div style={{ marginTop: 4 }}>
-                  <h3 style={{ margin: "0 0 12px", fontSize: 13, fontWeight: 800, color: C.text }}>Recommended for you</h3>
-                  <div style={{ display: "flex", gap: 12, overflowX: "auto", paddingBottom: 4 }}>
-                    {suggestions.map(c => {
-                      const cls = c.lessonIds.map(id => lessons.find(l => l.id === id)).filter(Boolean);
-                      return (
-                        <Card key={c.id} style={{ minWidth: 200, flexShrink: 0, cursor: "pointer" }} onClick={() => setActiveCourse(c)}>
-                          <div style={{ display: "flex", gap: 10, alignItems: "flex-start" }}>
-                            <span style={{ fontSize: 26 }}>{c.emoji}</span>
-                            <div>
-                              <div style={{ fontSize: 13, fontWeight: 700, color: C.text, marginBottom: 3 }}>{c.title}</div>
-                              <div style={{ fontSize: 11, color: C.textSub }}>{cls.length} lessons · {cls.reduce((s,l) => s+(l.xp||0),0)} XP</div>
-                            </div>
-                          </div>
-                        </Card>
-                      );
-                    })}
-                  </div>
+                  {isCourse ? (
+                    <button
+                      onClick={() => {
+                        if (isComplete) { setActiveCourse(content); }
+                        else {
+                          // Respect per-lesson availability schedule — don't open locked lessons
+                          const assignedDate = a.assignedAtRaw ? new Date(a.assignedAtRaw)
+                            : a.assignedAt ? new Date(a.assignedAt) : null;
+                          const todayMs = new Date().setHours(0, 0, 0, 0);
+                          const lessonSched = content.lessonSchedule ?? {};
+                          const isLockedLesson = (lessonId) => {
+                            const days = lessonSched[lessonId]?.available_after_days ?? 0;
+                            if (!assignedDate || days === 0) return false;
+                            const base = new Date(assignedDate); base.setHours(0, 0, 0, 0);
+                            return todayMs < base.getTime() + days * 86400000;
+                          };
+                          const next = courseLessons.find(l => !completedLessons.has(l.id) && !isLockedLesson(l.id));
+                          if (next) openLesson(next, content);
+                          else setActiveCourse(content); // all next lessons are still locked — show course detail
+                        }
+                      }}
+                      style={{ padding: "9px 18px", borderRadius: 8, border: isComplete ? `1px solid ${C.border}` : "none", cursor: "pointer", background: isComplete ? C.white : pct > 0 ? C.text : C.orange, color: isComplete ? C.textSub : "#fff", fontSize: 12, fontWeight: 700, flexShrink: 0 }}
+                    >
+                      {isComplete ? "Review" : pct > 0 ? "Continue →" : "Start →"}
+                    </button>
+                  ) : !isComplete && content.type === "recording" ? (
+                    <div style={{ padding: "9px 14px", borderRadius: 8, border: `1px solid ${C.border}`, background: C.pageBg, color: C.textMuted, fontSize: 11, fontWeight: 700, textAlign: "center", flexShrink: 0, lineHeight: 1.3 }}>
+                      Coming<br/>soon
+                    </div>
+                  ) : !isComplete ? (
+                    <button
+                      onClick={() => openLesson(content)}
+                      style={{ padding: "9px 18px", borderRadius: 8, border: "none", cursor: "pointer", background: pct > 0 ? C.text : C.orange, color: "#fff", fontSize: 12, fontWeight: 700, flexShrink: 0 }}
+                    >
+                      {pct > 0 ? "Resume →" : "Start →"}
+                    </button>
+                  ) : (
+                    <button onClick={() => openLesson(content)} style={{ padding: "9px 18px", borderRadius: 8, border: `1px solid ${C.border}`, cursor: "pointer", background: C.white, color: C.textSub, fontSize: 12, fontWeight: 700, flexShrink: 0 }}>
+                      Review
+                    </button>
+                  )}
                 </div>
-              );
-            })()}
-          </div>
-        )}
+              </Card>
+            );
+          };
+
+          return (
+            <div style={{ display: "flex", flexDirection: "column", gap: 14 }}>
+              {/* Empty state — no assignments at all */}
+              {dedupedAssignments.length === 0 && (
+                <div style={{ padding: 60, textAlign: "center", background: C.white, borderRadius: 12, border: `1px solid ${C.border}` }}>
+                  <p style={{ margin: 0, fontSize: 15, fontWeight: 700, color: C.text }}>No assignments yet</p>
+                  <p style={{ margin: "6px 0 0", fontSize: 13, color: C.textSub }}>Your manager will assign courses and lessons here</p>
+                </div>
+              )}
+
+              {/* Due / Complete / All pills */}
+              {dedupedAssignments.length > 0 && (
+                <div style={{ display: "flex", gap: 6 }}>
+                  {[
+                    ["due",      `Due (${dueItems.length})`],
+                    ["complete", `Complete (${completeItems.length})`],
+                    ["all",      `All (${enrichedAssigned.length})`],
+                  ].map(([id, label]) => (
+                    <button key={id} onClick={() => setLearnFilter(id)} style={{
+                      padding: "7px 14px", borderRadius: 8,
+                      border: `1px solid ${learnFilter === id ? C.orange : C.border}`,
+                      background: learnFilter === id ? C.orangeLight : C.white,
+                      color: learnFilter === id ? C.orange : C.textSub,
+                      fontSize: 13, fontWeight: 600, cursor: "pointer",
+                    }}>{label}</button>
+                  ))}
+                </div>
+              )}
+
+              {/* Per-tab empty state */}
+              {dedupedAssignments.length > 0 && filterItems.length === 0 && (
+                <div style={{ padding: 48, textAlign: "center", background: C.white, borderRadius: 16, border: `1px solid ${C.border}` }}>
+                  <p style={{ fontSize: 15, fontWeight: 700, color: C.text, margin: "0 0 4px" }}>
+                    {learnFilter === "complete"
+                      ? "Nothing completed yet"
+                      : (learnFilter === "due" && lockedItems.length > 0)
+                        ? "Nothing due right now"
+                        : "All caught up!"}
+                  </p>
+                  <p style={{ fontSize: 13, color: C.textSub, margin: 0 }}>
+                    {learnFilter === "complete"
+                      ? "Complete a lesson or course to see it here."
+                      : (learnFilter === "due" && lockedItems.length > 0)
+                        ? `${lockedItems.length} assignment${lockedItems.length === 1 ? "" : "s"} unlock on a schedule — check the All tab to see what's coming.`
+                        : learnFilter === "all"
+                          ? "No assignments found."
+                          : "No pending work — you're all done!"}
+                  </p>
+                </div>
+              )}
+
+              {/* Assignment cards */}
+              {filterItems.map(e => <AssignedCard key={e.a.id} {...e} />)}
+
+              {/* Course suggestions — only in Due and All tabs */}
+              {(learnFilter === "due" || learnFilter === "all") && (() => {
+                const suggestions = courses.filter(c => !myAssignments.some(a => a.contentType === "course" && a.contentId === c.id)).slice(0, 3);
+                if (!suggestions.length) return null;
+                return (
+                  <div style={{ marginTop: 4 }}>
+                    <h3 style={{ margin: "0 0 12px", fontSize: 13, fontWeight: 800, color: C.text }}>Recommended for you</h3>
+                    <div style={{ display: "flex", gap: 12, overflowX: "auto", paddingBottom: 4 }}>
+                      {suggestions.map(c => {
+                        const cls = c.lessonIds.map(id => lessons.find(l => l.id === id)).filter(Boolean);
+                        return (
+                          <Card key={c.id} style={{ minWidth: 200, flexShrink: 0, cursor: "pointer" }} onClick={() => setActiveCourse(c)}>
+                            <div style={{ display: "flex", gap: 10, alignItems: "flex-start" }}>
+                              <span style={{ fontSize: 26 }}>{c.emoji}</span>
+                              <div>
+                                <div style={{ fontSize: 13, fontWeight: 700, color: C.text, marginBottom: 3 }}>{c.title}</div>
+                                <div style={{ fontSize: 11, color: C.textSub }}>{cls.length} lessons · {cls.reduce((s,l) => s+(l.xp||0),0)} XP</div>
+                              </div>
+                            </div>
+                          </Card>
+                        );
+                      })}
+                    </div>
+                  </div>
+                );
+              })()}
+            </div>
+          );
+        })()}
 
         {/* KNOWLEDGE BASE TAB */}
         {userTab === "browse" && (
@@ -6235,7 +6543,7 @@ function LearnScreen({ role, user, orgUsers = [], orgs = [], onNav, onAwardXp, p
 
       {/* COURSES TAB */}
       {tab === "courses" && (
-        <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fill, minmax(320px, 1fr))", gap: 16 }}>
+        <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fill, minmax(240px, 1fr))", gap: 16 }}>
           {filteredCourses.map(course => {
             const courseLessons = course.lessonIds.map(id => lessons.find(l => l.id === id)).filter(Boolean);
             const totalMin = courseLessons.reduce((sum, l) => sum + (parseInt(l.duration) || 0), 0);
@@ -6265,7 +6573,7 @@ function LearnScreen({ role, user, orgUsers = [], orgs = [], onNav, onAwardXp, p
                   <div style={{ display: "flex", gap: 6, marginTop: "auto", paddingTop: 4 }}>
                     {canEdit && <button onClick={() => setCourseModal(course)} style={{ flex: 1, padding: "6px 0", borderRadius: 8, border: `1px solid ${C.border}`, background: C.white, color: C.textSub, fontSize: 12, fontWeight: 600, cursor: "pointer" }}>Edit</button>}
                     {canAssign && <button onClick={() => setAssignModal({ contentType: "course", contentId: course.id })} style={{ flex: 1, padding: "6px 0", borderRadius: 8, border: "none", background: C.orange, color: "#fff", fontSize: 12, fontWeight: 700, cursor: "pointer" }}>Assign</button>}
-                    {canEdit && <button onClick={() => handleArchiveCourse(course.id)} style={{ flex: 1, padding: "6px 0", borderRadius: 8, border: `1px solid rgba(239,68,68,0.2)`, background: "transparent", color: C.red, fontSize: 12, fontWeight: 600, cursor: "pointer" }}>Archive</button>}
+                    {canEdit && <button onClick={() => setConfirmArchive({ type: "course", id: course.id, title: course.title })} style={{ flex: 1, padding: "6px 0", borderRadius: 8, border: `1px solid rgba(239,68,68,0.2)`, background: "transparent", color: C.red, fontSize: 12, fontWeight: 600, cursor: "pointer" }}>Archive</button>}
                   </div>
                 </div>
               </Card>
@@ -6299,8 +6607,8 @@ function LearnScreen({ role, user, orgUsers = [], orgs = [], onNav, onAwardXp, p
               {/* Actions — bottom aligned */}
               <div style={{ display: "flex", gap: 6 }}>
                 {canEdit && <button onClick={() => setLessonModal(lesson)} style={{ flex: 1, padding: "6px 0", borderRadius: 8, border: `1px solid ${C.border}`, background: C.white, color: C.textSub, fontSize: 11, fontWeight: 600, cursor: "pointer" }}>Edit</button>}
-                {canAssign && <button onClick={() => setAssignModal({ contentType: "lesson", contentId: lesson.id })} style={{ flex: 1, padding: "6px 0", borderRadius: 8, border: "none", background: C.orange, color: "#fff", fontSize: 11, fontWeight: 700, cursor: "pointer" }}>Assign</button>}
-                {canEdit && <button onClick={() => handleArchiveLesson(lesson.id)} style={{ flex: 1, padding: "6px 0", borderRadius: 8, border: `1px solid rgba(239,68,68,0.2)`, background: "transparent", color: C.red, fontSize: 11, fontWeight: 600, cursor: "pointer" }}>Archive</button>}
+                {canAssign && lesson.type !== "recording" && <button onClick={() => setAssignModal({ contentType: "lesson", contentId: lesson.id })} style={{ flex: 1, padding: "6px 0", borderRadius: 8, border: "none", background: C.orange, color: "#fff", fontSize: 11, fontWeight: 700, cursor: "pointer" }}>Assign</button>}
+                {canEdit && <button onClick={() => setConfirmArchive({ type: "lesson", id: lesson.id, title: lesson.title })} style={{ flex: 1, padding: "6px 0", borderRadius: 8, border: `1px solid rgba(239,68,68,0.2)`, background: "transparent", color: C.red, fontSize: 11, fontWeight: 600, cursor: "pointer" }}>Archive</button>}
               </div>
             </Card>
           ))}
@@ -6440,7 +6748,8 @@ function LearnScreen({ role, user, orgUsers = [], orgs = [], onNav, onAwardXp, p
 
         const renderTable = (rows) => (
           <div style={{ borderRadius: 12, overflow: "hidden", border: `1px solid ${C.border}` }}>
-            <div style={{ display: "grid", gridTemplateColumns: "2fr 1.2fr 0.8fr 1fr 0.8fr 80px", gap: 10, padding: "10px 16px", background: C.pageBg, fontSize: 11, fontWeight: 700, color: C.textMuted, letterSpacing: "0.05em" }}>
+            <div style={{ overflowX: "auto", WebkitOverflowScrolling: "touch" }}>
+            <div style={{ minWidth: 620, display: "grid", gridTemplateColumns: "2fr 1.2fr 0.8fr 1fr 0.8fr 80px", gap: 10, padding: "10px 16px", background: C.pageBg, fontSize: 11, fontWeight: 700, color: C.textMuted, letterSpacing: "0.05em" }}>
               <span>CONTENT</span><span>REP</span><span>DUE DATE</span><span>STATUS</span><span>PROGRESS</span><span>DONE</span>
             </div>
             {rows.map(({ a, content, isCourse, isQuiz, u, progress, status, completedAt }, i) => {
@@ -6453,7 +6762,7 @@ function LearnScreen({ role, user, orgUsers = [], orgs = [], onNav, onAwardXp, p
                 ? (() => { try { return new Date(a.dueAt).toLocaleDateString("en-US", { month: "short", day: "numeric" }); } catch { return a.dueAt; } })()
                 : "Open";
               return (
-                <div key={`${a.id}-${u.id}-${i}`} style={{ display: "grid", gridTemplateColumns: "2fr 1.2fr 0.8fr 1fr 0.8fr 80px", gap: 10, padding: "13px 16px", background: C.white, borderTop: `1px solid ${C.border}`, alignItems: "center" }}>
+                <div key={`${a.id}-${u.id}-${i}`} style={{ minWidth: 620, display: "grid", gridTemplateColumns: "2fr 1.2fr 0.8fr 1fr 0.8fr 80px", gap: 10, padding: "13px 16px", background: C.white, borderTop: `1px solid ${C.border}`, alignItems: "center" }}>
                   {/* Content — clickable to drill into this assignment */}
                   <div style={{ display: "flex", alignItems: "center", gap: 10, minWidth: 0 }}>
                     {contentIcon && (
@@ -6496,6 +6805,7 @@ function LearnScreen({ role, user, orgUsers = [], orgs = [], onNav, onAwardXp, p
                 </div>
               );
             })}
+            </div>
           </div>
         );
 
@@ -6625,6 +6935,24 @@ function LearnScreen({ role, user, orgUsers = [], orgs = [], onNav, onAwardXp, p
               </div>
             </div>
           )}
+        </div>
+      )}
+
+      {/* ARCHIVE CONFIRMATION MODAL */}
+      {confirmArchive && (
+        <div style={{ position: "fixed", inset: 0, background: "rgba(0,0,0,0.5)", display: "flex", alignItems: "center", justifyContent: "center", zIndex: 1001 }}
+          onClick={e => { if (e.target === e.currentTarget) setConfirmArchive(null); }}>
+          <div style={{ background: C.white, borderRadius: 16, padding: 32, width: 400, boxShadow: "0 24px 64px rgba(0,0,0,0.25)" }}>
+            <div style={{ fontSize: 32, marginBottom: 12, textAlign: "center" }}>⚠️</div>
+            <h3 style={{ margin: "0 0 8px", fontSize: 17, fontWeight: 800, color: C.text, textAlign: "center" }}>Archive {confirmArchive.type === "course" ? "Course" : "Lesson"}?</h3>
+            <p style={{ margin: "0 0 24px", fontSize: 13, color: C.textSub, textAlign: "center", lineHeight: 1.6 }}>
+              <strong>{confirmArchive.title}</strong> will be archived and learners will lose access. You can restore it from the Archived tab.
+            </p>
+            <div style={{ display: "flex", gap: 10 }}>
+              <button onClick={() => setConfirmArchive(null)} style={{ flex: 1, padding: "11px", borderRadius: 10, border: `1px solid ${C.border}`, background: C.white, color: C.text, fontSize: 13, fontWeight: 700, cursor: "pointer" }}>Cancel</button>
+              <button onClick={() => { if (confirmArchive.type === "course") handleArchiveCourse(confirmArchive.id); else handleArchiveLesson(confirmArchive.id); setConfirmArchive(null); }} style={{ flex: 1, padding: "11px", borderRadius: 10, border: "none", background: "#ef4444", color: "#fff", fontSize: 13, fontWeight: 700, cursor: "pointer" }}>Archive</button>
+            </div>
+          </div>
         </div>
       )}
 
@@ -6924,8 +7252,14 @@ function LessonBlock({ block, cardStyle }) {
             <p style={{ margin: "0 0 20px", fontSize: 13, color: C.textSub, lineHeight: 1.6 }}>{c.criteria}</p>
           </>
         )}
-        <div style={{ padding: "20px", borderRadius: 10, background: C.pageBg, border: `1px dashed ${C.border}`, textAlign: "center" }}>
-          <div style={{ fontSize: 13, color: C.textSub }}>Recording submission coming soon</div>
+        <div style={{ padding: "18px 20px", borderRadius: 10, background: C.orangeLight, border: `1px solid ${C.orange}30`, display: "flex", alignItems: "flex-start", gap: 12 }}>
+          <span style={{ fontSize: 22, flexShrink: 0, lineHeight: 1.4 }}>🎙️</span>
+          <div>
+            <div style={{ fontSize: 14, fontWeight: 700, color: C.text, marginBottom: 4 }}>Practice your delivery</div>
+            <div style={{ fontSize: 13, color: C.textSub, lineHeight: 1.55 }}>
+              Use the prompt above to rehearse. Recording submission will be available in an upcoming update — for now, practice on your own and mark this lesson complete when ready.
+            </div>
+          </div>
         </div>
       </div>
     );
@@ -7010,19 +7344,35 @@ function LessonViewerScreen({ lesson, courseTitle, onBack, completed, onComplete
         <button onClick={onBack} style={{ padding: "10px 20px", borderRadius: 8, border: `1px solid ${C.border}`, background: C.white, color: C.text, fontSize: 13, fontWeight: 600, cursor: "pointer" }}>
           Back
         </button>
-        {!isDone ? (
-          <button onClick={handleComplete} style={{ padding: "10px 24px", borderRadius: 8, border: "none", background: C.orange, color: "#fff", fontSize: 13, fontWeight: 700, cursor: "pointer" }}>
-            Mark Complete · +{lesson.xp} XP
-          </button>
-        ) : nextLesson ? (
-          <button onClick={() => onNextLesson?.(nextLesson)} style={{ padding: "10px 24px", borderRadius: 8, border: "none", background: C.orange, color: "#fff", fontSize: 13, fontWeight: 700, cursor: "pointer" }}>
-            Next: {nextLesson.title.length > 28 ? nextLesson.title.slice(0, 28) + "…" : nextLesson.title} →
-          </button>
-        ) : (
-          <button onClick={onBack} style={{ padding: "10px 24px", borderRadius: 8, border: "none", background: C.green, color: "#fff", fontSize: 13, fontWeight: 700, cursor: "pointer" }}>
-            ✓ Done
-          </button>
-        )}
+        {(() => {
+          const isRecordingLesson = lesson?.type === "recording" || getBlocks(lesson).some(b => b.type === "recording");
+          if (!isDone && isRecordingLesson) {
+            return (
+              <div style={{ padding: "10px 18px", borderRadius: 8, border: `1px solid ${C.border}`, background: C.pageBg, fontSize: 13, color: C.textMuted, fontWeight: 600, textAlign: "center" }}>
+                Recording submission coming soon
+              </div>
+            );
+          }
+          if (!isDone) {
+            return (
+              <button onClick={handleComplete} style={{ padding: "10px 24px", borderRadius: 8, border: "none", background: C.orange, color: "#fff", fontSize: 13, fontWeight: 700, cursor: "pointer" }}>
+                Mark Complete · +{lesson.xp} XP
+              </button>
+            );
+          }
+          if (nextLesson) {
+            return (
+              <button onClick={() => onNextLesson?.(nextLesson)} style={{ padding: "10px 24px", borderRadius: 8, border: "none", background: C.orange, color: "#fff", fontSize: 13, fontWeight: 700, cursor: "pointer" }}>
+                Next: {nextLesson.title.length > 28 ? nextLesson.title.slice(0, 28) + "…" : nextLesson.title} →
+              </button>
+            );
+          }
+          return (
+            <button onClick={onBack} style={{ padding: "10px 24px", borderRadius: 8, border: "none", background: C.green, color: "#fff", fontSize: 13, fontWeight: 700, cursor: "pointer" }}>
+              ✓ Done
+            </button>
+          );
+        })()}
       </div>
     </div>
   );
@@ -7393,13 +7743,25 @@ function BlockEditor({ block, onChange, onRemove, onMoveUp, onMoveDown, isFirst,
       <div style={{ display: "flex", alignItems: "center", gap: 8, marginBottom: 12 }}>
         <div style={{ width: 6, height: 6, borderRadius: 2, background: blockColor, flexShrink: 0 }} />
         <div style={{ display: "flex", gap: 4, flexWrap: "wrap", flex: 1 }}>
-          {BLOCK_TYPES.map(t => (
-            <button key={t} onClick={() => setType(t)} style={{
-              padding: "3px 8px", borderRadius: 6, border: `1.5px solid ${block.type === t ? blockColor : C.border}`,
-              background: block.type === t ? blockColor + "15" : C.white,
-              fontSize: 11, fontWeight: 700, color: block.type === t ? blockColor : C.textSub, cursor: "pointer",
-            }}>{BLOCK_LABELS[t]}</button>
-          ))}
+          {BLOCK_TYPES.map(t => {
+            const isActive = block.type === t;
+            const isSoon   = t === "recording" && !isActive;
+            return (
+              <button key={t} onClick={() => { if (!isSoon) setType(t); }}
+                title={isSoon ? "Recording coming soon" : undefined}
+                style={{
+                  padding: "3px 8px", borderRadius: 6,
+                  border: `1.5px solid ${isActive ? blockColor : C.border}`,
+                  background: isActive ? blockColor + "15" : C.white,
+                  fontSize: 11, fontWeight: 700,
+                  color: isSoon ? C.textMuted : isActive ? blockColor : C.textSub,
+                  cursor: isSoon ? "not-allowed" : "pointer",
+                  opacity: isSoon ? 0.55 : 1,
+                }}>
+                {BLOCK_LABELS[t]}{isSoon ? " ·  soon" : ""}
+              </button>
+            );
+          })}
         </div>
         <div style={{ display: "flex", gap: 4, flexShrink: 0 }}>
           {!isFirst  && <button onClick={onMoveUp}   title="Move up"   style={{ padding: "3px 7px", borderRadius: 6, border: `1px solid ${C.border}`, background: C.white, cursor: "pointer", fontSize: 13, color: C.textSub }}>↑</button>}
@@ -7547,12 +7909,12 @@ function LessonBuilderModal({ lesson, onSave, onClose }) {
   };
 
   const ADD_TYPES = [
-    { type: "text",      label: "+ Text" },
-    { type: "image",     label: "+ Image" },
-    { type: "video",     label: "+ Video" },
-    { type: "flipcard",  label: "+ Flip Card" },
-    { type: "quiz",      label: "+ Quiz" },
-    { type: "recording", label: "+ Recording" },
+    { type: "text",     label: "+ Text" },
+    { type: "image",    label: "+ Image" },
+    { type: "video",    label: "+ Video" },
+    { type: "flipcard", label: "+ Flip Card" },
+    { type: "quiz",     label: "+ Quiz" },
+    // recording omitted — not yet implemented
   ];
 
   return (
@@ -8181,14 +8543,41 @@ function getDueProgress(assignedAtStr, dueAtStr) {
 
 // ── QuizTakingView ────────────────────────────────────────────────────────────
 function QuizTakingView({ quiz, onComplete, onExit }) {
-  const [qIdx,     setQIdx]     = useState(0);
-  const [answers,  setAnswers]  = useState({}); // questionId → selected index
-  const [revealed, setRevealed] = useState(false);
+  const [qIdx,        setQIdx]        = useState(0);
+  const [answers,     setAnswers]     = useState({});
+  const [revealed,    setRevealed]    = useState(false);
+  const [sliderDraft, setSliderDraft] = useState(null);
+  const [textDraft,   setTextDraft]   = useState(""); // type-answer draft
 
   const q        = quiz.questions[qIdx];
   const total    = quiz.questions.length;
   const selected = answers[q.id] ?? null;
   const isLast   = qIdx === total - 1;
+  const isSlider = q.type === "slider";
+  const isType   = q.type === "type";
+
+  // Reset draft state when question changes
+  useEffect(() => {
+    setSliderDraft(null);
+    setTextDraft("");
+  }, [qIdx]); // eslint-disable-line react-hooks/exhaustive-deps
+
+  // Slider helpers
+  const sliderMin = q.min ?? 0;
+  const sliderMax = q.max ?? 10;
+  const sliderVal = sliderDraft !== null ? sliderDraft
+    : (selected !== null ? selected : Math.round((sliderMin + sliderMax) / 2));
+
+  // Correctness per type
+  const sliderCorrect = isSlider && revealed && selected !== null
+    && Math.abs(selected - (q.correct ?? 5)) <= (q.tolerance ?? 1);
+  const typeCorrect = isType && revealed && typeof selected === "string"
+    && (q.acceptedAnswers ?? []).some(a =>
+        a.trim().toLowerCase() === selected.trim().toLowerCase());
+  const isCorrect = isSlider ? sliderCorrect
+    : isType   ? typeCorrect
+    : (revealed && selected === q.correct);
+  const isWrong = revealed && !isCorrect && selected !== null;
 
   const choose = (idx) => {
     if (revealed) return;
@@ -8196,16 +8585,35 @@ function QuizTakingView({ quiz, onComplete, onExit }) {
     setRevealed(true);
   };
 
+  const commitSlider = () => {
+    if (revealed) return;
+    setAnswers(prev => ({ ...prev, [q.id]: sliderVal }));
+    setRevealed(true);
+  };
+
+  const commitType = () => {
+    if (revealed || !textDraft.trim()) return;
+    setAnswers(prev => ({ ...prev, [q.id]: textDraft }));
+    setRevealed(true);
+  };
+
   const next = () => {
     if (isLast) {
-      // compute result
       const answerList = quiz.questions.map(ques => ({
         questionId: ques.id,
-        selected: answers[ques.id] ?? null,
-        correct: ques.correct,
+        selected:   answers[ques.id] ?? null,
+        correct:    ques.correct,
       }));
-      const correct = answerList.filter(a => a.selected === a.correct).length;
-      const score   = Math.round((correct / total) * 100);
+      const correctCount = answerList.filter((a, i) => {
+        const ques = quiz.questions[i];
+        if (ques.type === "slider") return a.selected !== null
+          && Math.abs(a.selected - (ques.correct ?? 5)) <= (ques.tolerance ?? 1);
+        if (ques.type === "type") return typeof a.selected === "string"
+          && (ques.acceptedAnswers ?? []).some(aa =>
+              aa.trim().toLowerCase() === a.selected.trim().toLowerCase());
+        return a.selected === a.correct;
+      }).length;
+      const score   = Math.round((correctCount / total) * 100);
       const attempt = { id: `at${Date.now()}`, date: new Date().toISOString().slice(0,10), score, passed: score >= (quiz.passingScore ?? 90), answers: answerList };
       onComplete(attempt);
     } else {
@@ -8213,9 +8621,6 @@ function QuizTakingView({ quiz, onComplete, onExit }) {
       setRevealed(false);
     }
   };
-
-  const isCorrect = revealed && selected === q.correct;
-  const isWrong   = revealed && selected !== null && selected !== q.correct;
 
   return (
     <div style={{ maxWidth: 640, margin: "0 auto", display: "flex", flexDirection: "column", gap: 20 }}>
@@ -8233,44 +8638,127 @@ function QuizTakingView({ quiz, onComplete, onExit }) {
       {/* Question */}
       <Card>
         <div style={{ fontSize: 11, fontWeight: 700, color: C.textMuted, letterSpacing: "0.08em", textTransform: "uppercase", marginBottom: 12 }}>Question {qIdx + 1}</div>
-        <p style={{ margin: "0 0 20px", fontSize: 16, fontWeight: 700, color: C.text, lineHeight: 1.5 }}>{q.text ?? q.q}</p>
+        <p style={{ margin: "0 0 20px", fontSize: 16, fontWeight: 700, color: C.text, lineHeight: 1.5 }}>{q.text || q.q}</p>
 
-        <div style={{ display: "flex", flexDirection: "column", gap: 10 }}>
-          {q.options.map((opt, i) => {
-            const isSelected = selected === i;
-            const isRight    = revealed && i === q.correct;
-            const isThisWrong = revealed && isSelected && i !== q.correct;
-            let bg = C.cardBg, border = C.creamBorder, color = C.text;
-            if (isRight)      { bg = "#DCFCE7"; border = C.trueGreen; color = "#166534"; }
-            if (isThisWrong)  { bg = "#FEE2E2"; border = "#EF4444";   color = "#991B1B"; }
-            if (!revealed && isSelected) { bg = C.orangeLight; border = C.orange; }
-
-            return (
-              <button key={i} onClick={() => choose(i)} style={{
-                display: "flex", alignItems: "center", gap: 12,
-                padding: "12px 16px", borderRadius: 12,
-                border: `2px solid ${border}`, background: bg,
-                cursor: revealed ? "default" : "pointer", textAlign: "left", width: "100%",
-                transition: "all 0.15s",
+        {isType ? (
+          /* ── Type Answer ── */
+          <div style={{ display: "flex", flexDirection: "column", gap: 12 }}>
+            <input
+              type="text"
+              placeholder="Type your answer…"
+              value={revealed ? (typeof selected === "string" ? selected : "") : textDraft}
+              disabled={revealed}
+              onChange={e => !revealed && setTextDraft(e.target.value)}
+              onKeyDown={e => e.key === "Enter" && !revealed && commitType()}
+              autoFocus
+              style={{
+                width: "100%", boxSizing: "border-box", padding: "14px 16px", borderRadius: 12,
+                border: `2px solid ${revealed ? (isCorrect ? C.trueGreen : "#EF4444") : C.creamBorder}`,
+                background: revealed ? (isCorrect ? "#DCFCE7" : "#FEE2E2") : C.pageBg,
+                color: C.text, fontSize: 15, fontWeight: 600, outline: "none", fontFamily: "inherit",
+              }}
+            />
+            {revealed && (
+              <div style={{ padding: "10px 14px", borderRadius: 10, background: isCorrect ? "#F0FDF4" : "#FFF7ED", border: `1px solid ${isCorrect ? "#86EFAC" : C.creamBorder}`, fontSize: 13 }}>
+                {isCorrect
+                  ? <strong style={{ color: "#166534" }}>Correct!</strong>
+                  : <><strong style={{ color: C.orange }}>Accepted: </strong><span style={{ color: C.textSub }}>{(q.acceptedAnswers ?? []).join(", ")}</span></>
+                }
+                {q.explanation && <p style={{ margin: "6px 0 0", fontSize: 12, color: C.textSub, lineHeight: 1.6 }}>{q.explanation}</p>}
+              </div>
+            )}
+            {!revealed && (
+              <button onClick={commitType} disabled={!textDraft.trim()} style={{
+                padding: "12px 28px", borderRadius: 12, border: "none", alignSelf: "flex-end",
+                background: textDraft.trim() ? C.orange : C.muted,
+                color: textDraft.trim() ? "#fff" : C.textMuted,
+                fontSize: 14, fontWeight: 700, cursor: textDraft.trim() ? "pointer" : "default",
               }}>
-                <div style={{ width: 28, height: 28, borderRadius: "50%", flexShrink: 0, display: "flex", alignItems: "center", justifyContent: "center", fontSize: 12, fontWeight: 800, background: isRight ? C.trueGreen : isThisWrong ? "#EF4444" : (!revealed && isSelected) ? C.orange : C.muted, color: (isRight || isThisWrong || (!revealed && isSelected)) ? "#fff" : C.textMuted }}>
-                  {isRight ? "✓" : isThisWrong ? "✗" : String.fromCharCode(65 + i)}
-                </div>
-                <span style={{ fontSize: 14, fontWeight: 600, color }}>{opt}</span>
+                Check Answer
               </button>
-            );
-          })}
-        </div>
+            )}
+          </div>
+        ) : isSlider ? (
+          /* ── Slider ── */
+          <div style={{ display: "flex", flexDirection: "column", gap: 16 }}>
+            <div style={{ textAlign: "center" }}>
+              <span style={{ fontSize: 36, fontWeight: 900, lineHeight: 1, color: revealed ? (isCorrect ? "#166534" : C.red) : C.orange }}>{sliderVal}</span>
+              <div style={{ fontSize: 12, color: C.textMuted, marginTop: 4 }}>{sliderMin} – {sliderMax}</div>
+            </div>
+            <input type="range" min={sliderMin} max={sliderMax} step={q.step ?? 1} value={sliderVal} disabled={revealed}
+              onChange={e => !revealed && setSliderDraft(Number(e.target.value))}
+              style={{ width: "100%", accentColor: C.orange, cursor: revealed ? "default" : "pointer" }}
+            />
+            <div style={{ display: "flex", justifyContent: "space-between", fontSize: 12, color: C.textMuted }}>
+              <span>{q.minLabel ? `${q.minLabel} (${sliderMin})` : sliderMin}</span>
+              <span>{q.maxLabel ? `${q.maxLabel} (${sliderMax})` : sliderMax}</span>
+            </div>
+            {revealed && (
+              <div style={{ padding: "10px 14px", borderRadius: 10, background: isCorrect ? "#F0FDF4" : "#FFF7ED", border: `1px solid ${isCorrect ? "#86EFAC" : C.creamBorder}`, fontSize: 13, color: C.text }}>
+                <strong style={{ color: isCorrect ? "#166534" : C.orange }}>
+                  {isCorrect ? `Correct! Target: ${q.correct ?? 5} ±${q.tolerance ?? 1}` : `Target was ${q.correct ?? 5} ±${q.tolerance ?? 1}.`}
+                </strong>
+                {!isCorrect && <span style={{ color: C.textSub }}> You answered {selected}.</span>}
+              </div>
+            )}
+            {revealed && q.explanation && (
+              <div style={{ padding: "12px 16px", borderRadius: 10, background: C.pageBg, border: `1px solid ${C.creamBorder}` }}>
+                <p style={{ margin: 0, fontSize: 13, color: C.text, lineHeight: 1.6 }}>{q.explanation}</p>
+              </div>
+            )}
+            {!revealed && (
+              <button onClick={commitSlider} style={{ padding: "12px 28px", borderRadius: 12, border: "none", background: C.orange, color: "#fff", fontSize: 14, fontWeight: 700, cursor: "pointer", alignSelf: "flex-end" }}>
+                Check Answer
+              </button>
+            )}
+          </div>
+        ) : (
+          /* ── MC / TF ── */
+          <div style={{ display: "flex", flexDirection: "column", gap: 10 }}>
+            {(q.options ?? []).map((opt, i) => {
+              const optLabel = typeof opt === "string" ? opt.trim()
+                : opt !== null && typeof opt === "object"
+                  ? String(opt.text || opt.label || opt.answer || opt.option || opt.value || "").trim()
+                : String(opt ?? "").trim();
+              const isBlank     = !optLabel.trim();
+              const isSelected  = selected === i;
+              const isRight     = revealed && i === q.correct;
+              const isThisWrong = revealed && isSelected && i !== q.correct;
+              if (isBlank) console.warn("[ralli] Invalid quiz option", { quizId: quiz.id, questionId: q.id, optionIndex: i, originalOption: opt });
+              let bg = C.cardBg, border = C.creamBorder, color = C.text;
+              if (isRight)                 { bg = "#DCFCE7"; border = C.trueGreen; color = "#166534"; }
+              if (isThisWrong)             { bg = "#FEE2E2"; border = "#EF4444";   color = "#991B1B"; }
+              if (!revealed && isSelected) { bg = C.orangeLight; border = C.orange; }
+              if (isBlank)                 { bg = C.pageBg;  border = C.muted; }
+              return (
+                <button key={i} onClick={() => !isBlank && choose(i)} disabled={isBlank} style={{
+                  display: "flex", alignItems: "center", gap: 12, padding: "12px 16px", borderRadius: 12,
+                  border: `2px solid ${border}`, background: bg,
+                  cursor: revealed || isBlank ? "default" : "pointer", textAlign: "left", width: "100%",
+                  transition: "all 0.15s", opacity: isBlank ? 0.45 : 1,
+                }}>
+                  <div style={{ width: 28, height: 28, borderRadius: "50%", flexShrink: 0, display: "flex", alignItems: "center", justifyContent: "center", fontSize: 12, fontWeight: 800, background: isRight ? C.trueGreen : isThisWrong ? "#EF4444" : (!revealed && isSelected) ? C.orange : C.muted, color: (isRight || isThisWrong || (!revealed && isSelected)) ? "#fff" : C.textMuted }}>
+                    {isRight ? "✓" : isThisWrong ? "✗" : String.fromCharCode(65 + i)}
+                  </div>
+                  {isBlank
+                    ? <span style={{ fontSize: 13, fontWeight: 600, color: C.textMuted, fontStyle: "italic" }}>Answer option missing</span>
+                    : <span style={{ fontSize: 14, fontWeight: 600, color }}>{optLabel}</span>
+                  }
+                </button>
+              );
+            })}
+          </div>
+        )}
 
-        {/* Explanation */}
-        {revealed && q.explanation && (
+        {/* Explanation — MC/TF only (slider and type show feedback inline) */}
+        {revealed && !isSlider && !isType && q.explanation && (
           <div style={{ marginTop: 16, padding: "12px 16px", borderRadius: 10, background: isCorrect ? "#F0FDF4" : "#FFF7ED", border: `1px solid ${isCorrect ? "#86EFAC" : C.creamBorder}` }}>
             <p style={{ margin: 0, fontSize: 13, color: C.text, lineHeight: 1.6 }}><strong style={{ color: isCorrect ? "#166534" : C.orange }}>{isCorrect ? "Correct" : "Not quite"}.</strong> {q.explanation}</p>
           </div>
         )}
       </Card>
 
-      {/* Next / Finish */}
+      {/* Next / Finish — shown after reveal */}
       {revealed && (
         <button onClick={next} style={{ alignSelf: "flex-end", padding: "12px 28px", borderRadius: 12, border: "none", background: C.orange, color: "#fff", fontSize: 14, fontWeight: 700, cursor: "pointer" }}>
           {isLast ? "See Results →" : "Next Question →"}
@@ -8283,7 +8771,16 @@ function QuizTakingView({ quiz, onComplete, onExit }) {
 // ── QuizResultsView ───────────────────────────────────────────────────────────
 function QuizResultsView({ quiz, attempt, onRetake, onBack }) {
   const total   = quiz.questions.length;
-  const correct = attempt.answers.filter(a => a.selected === a.correct).length;
+  // Slider: tolerance. Type: case-insensitive string match. MC/TF: index equality.
+  const correct = attempt.answers.filter((a, i) => {
+    const q = quiz.questions[i];
+    if (q?.type === "slider") return a.selected !== null
+      && Math.abs(a.selected - (q.correct ?? 5)) <= (q.tolerance ?? 1);
+    if (q?.type === "type") return typeof a.selected === "string"
+      && (q.acceptedAnswers ?? []).some(aa =>
+          aa.trim().toLowerCase() === a.selected.trim().toLowerCase());
+    return a.selected === a.correct;
+  }).length;
   const passed  = attempt.passed;
 
   return (
@@ -8297,7 +8794,7 @@ function QuizResultsView({ quiz, attempt, onRetake, onBack }) {
         <div style={{ marginTop: 8, marginBottom: 4, fontSize: 16, fontWeight: 800, color: C.text }}>{quiz.title}</div>
         <div style={{ fontSize: 13, color: C.textSub, marginBottom: 16 }}>{correct} of {total} correct · {attempt.date}</div>
         <div style={{ display: "inline-flex", alignItems: "center", gap: 8, padding: "6px 16px", borderRadius: 99, background: passed ? "#DCFCE7" : "#FEE2E2", border: `1px solid ${passed ? "#86EFAC" : "#FCA5A5"}` }}>
-          <span style={{ fontSize: 13, fontWeight: 800, color: passed ? "#166534" : "#991B1B" }}>{passed ? "Passed" : "Not passed yet"}</span>
+          <span style={{ fontSize: 13, fontWeight: 800, color: passed ? "#166534" : "#991B1B" }}>{passed ? "Passed" : "Retry"}</span>
         </div>
         {!passed && <p style={{ margin: "12px 0 0", fontSize: 12, color: C.textMuted }}>Score 90% or higher to pass. You've got this.</p>}
         <button onClick={onRetake} style={{ marginTop: 20, padding: "10px 24px", borderRadius: 10, border: `1px solid ${C.orange}`, background: C.orangeLight, color: C.orange, fontSize: 13, fontWeight: 700, cursor: "pointer" }}>
@@ -8310,26 +8807,49 @@ function QuizResultsView({ quiz, attempt, onRetake, onBack }) {
         <div style={{ fontSize: 11, fontWeight: 700, color: C.textMuted, letterSpacing: "0.08em", textTransform: "uppercase", marginBottom: 12 }}>Question Review</div>
         <div style={{ display: "flex", flexDirection: "column", gap: 10 }}>
           {quiz.questions.map((q, i) => {
-            const ans     = attempt.answers.find(a => a.questionId === q.id);
-            const wasRight= ans?.selected === q.correct;
+            const ans       = attempt.answers.find(a => a.questionId === q.id);
+            const isSliderQ = q.type === "slider";
+            const isTypeQ   = q.type === "type";
+
+            const wasRight = isSliderQ
+              ? (ans?.selected !== null && ans?.selected !== undefined
+                  && Math.abs(ans.selected - (q.correct ?? 5)) <= (q.tolerance ?? 1))
+              : isTypeQ
+              ? (typeof ans?.selected === "string"
+                  && (q.acceptedAnswers ?? []).some(aa =>
+                      aa.trim().toLowerCase() === ans.selected.trim().toLowerCase()))
+              : ans?.selected === q.correct;
+
+            const answerLabel = isSliderQ
+              ? (ans?.selected != null ? String(ans.selected) : null)
+              : isTypeQ
+              ? (typeof ans?.selected === "string" ? ans.selected : null)
+              : ((q.options ?? [])[ans?.selected] || null);
+
+            const correctLabel = isSliderQ
+              ? `${q.correct ?? 5} ±${q.tolerance ?? 1}`
+              : isTypeQ
+              ? ((q.acceptedAnswers ?? []).join(", ") || null)
+              : ((q.options ?? [])[q.correct] || null);
+
             return (
               <Card key={q.id} style={{ borderLeft: `4px solid ${wasRight ? C.trueGreen : C.red}` }}>
                 <div style={{ display: "flex", alignItems: "flex-start", justifyContent: "space-between", gap: 12, marginBottom: 10 }}>
-                  <p style={{ margin: 0, fontSize: 14, fontWeight: 600, color: C.text, lineHeight: 1.5 }}>{i+1}. {q.text ?? q.q}</p>
+                  <p style={{ margin: 0, fontSize: 14, fontWeight: 600, color: C.text, lineHeight: 1.5 }}>{i+1}. {q.text || q.q}</p>
                   <span style={{ fontSize: 12, fontWeight: 700, color: wasRight ? "#166534" : "#991B1B", flexShrink: 0, padding: "2px 8px", borderRadius: 99, background: wasRight ? "#DCFCE7" : "#FEE2E2" }}>{wasRight ? "Correct" : "Incorrect"}</span>
                 </div>
 
                 {/* User answer */}
                 {ans?.selected !== null && ans?.selected !== undefined && (
                   <div style={{ fontSize: 13, color: wasRight ? "#166534" : "#991B1B", marginBottom: wasRight ? 0 : 4 }}>
-                    <strong>Your answer:</strong> {q.options[ans.selected]}
+                    <strong>Your answer:</strong> {answerLabel || <em style={{ color: C.textMuted }}>—</em>}
                   </div>
                 )}
 
-                {/* Correct answer (only if wrong) */}
-                {!wasRight && (
+                {/* Correct answer (only if wrong and a target exists) */}
+                {!wasRight && correctLabel && (
                   <div style={{ fontSize: 13, color: "#166534", marginBottom: q.explanation ? 8 : 0 }}>
-                    <strong>Correct answer:</strong> {q.options[q.correct]}
+                    <strong>Correct answer:</strong> {correctLabel}
                   </div>
                 )}
 
@@ -8521,16 +9041,30 @@ function QuizzesScreen({ role, onNav, quizzes, onEditQuiz, onDeleteQuiz, onToggl
     const retakeQuiz = (id) => { setActiveId(id); setActiveAttempt(null); setView("taking"); };
     const viewResults= (id, attempt) => { setActiveId(id); setActiveAttempt(attempt); setView("results"); };
 
-    // Deep-link: if navigated here from HomeScreen with a pending quiz, open it on mount.
-    // Check DB-loaded assignments first; fall back to seed for demo accounts.
+    const toast = useToast();
+
+    // Deep-link: open a specific quiz navigated here from HomeScreen.
+    // For real users, assignments arrive async — hold until assignmentsLoaded is true
+    // before resolving so the lookup runs against a populated list.
+    // Demo users have assignmentsLoaded = true from mount (initialized to !isReal).
+    // pendingQuizId is cleared only after a definitive outcome:
+    //   found  → open the quiz, then clear
+    //   loaded + not found → surface an error, then clear
+    // Re-runs when pendingQuizId changes (new deep-link) or assignmentsLoaded flips (data ready).
     useEffect(() => {
-      if (pendingQuizId) {
-        const exists = assignments.find(q => q.id === pendingQuizId)
-                    ?? USER_QUIZ_ASSIGNMENTS_SEED.find(q => q.id === pendingQuizId);
-        if (exists) startQuiz(pendingQuizId);
-        onClearPendingQuiz?.();
+      if (!pendingQuizId) return;
+      if (!assignmentsLoaded) return; // real users: wait for Supabase assignments to resolve
+
+      const found = assignments.find(q => q.id === pendingQuizId)
+                 ?? (!isReal ? USER_QUIZ_ASSIGNMENTS_SEED.find(q => q.id === pendingQuizId) : null);
+
+      if (found) {
+        startQuiz(pendingQuizId);
+      } else {
+        toast.error("That quiz isn't assigned to your account or is no longer available.");
       }
-    }, []); // eslint-disable-line react-hooks/exhaustive-deps
+      onClearPendingQuiz?.(); // clear only after definitive outcome
+    }, [pendingQuizId, assignmentsLoaded]); // eslint-disable-line react-hooks/exhaustive-deps
 
     const onComplete = (attempt) => {
       setAssignments(prev => prev.map(q => q.id === activeId
@@ -8577,9 +9111,7 @@ function QuizzesScreen({ role, onNav, quizzes, onEditQuiz, onDeleteQuiz, onToggl
 
     // ── Loading state for real users ──
     if (!assignmentsLoaded) {
-      return (
-        <div style={{ padding: 60, textAlign: "center", color: C.textMuted, fontSize: 14 }}>Loading quizzes…</div>
-      );
+      return <LoadingState rows={3} message="Loading quizzes…" />;
     }
 
     // ── Empty state for real users with no assignments ──
@@ -8695,7 +9227,7 @@ function QuizzesScreen({ role, onNav, quizzes, onEditQuiz, onDeleteQuiz, onToggl
                           <span style={{ fontSize: 11, fontWeight: 700, padding: "2px 8px", borderRadius: 99, background: "#DCFCE7", color: "#166534", border: "1px solid #86EFAC" }}>Passed</span>
                         )}
                         {hasTried && !isPassed && (
-                          <span style={{ fontSize: 11, fontWeight: 700, padding: "2px 8px", borderRadius: 99, background: "#FEE2E2", color: "#991B1B", border: "1px solid #FCA5A5" }}>Not passed</span>
+                          <span style={{ fontSize: 11, fontWeight: 700, padding: "2px 8px", borderRadius: 99, background: "#FEE2E2", color: "#991B1B", border: "1px solid #FCA5A5" }}>Retry</span>
                         )}
                       </div>
                       {quiz.description && <p style={{ margin: "0 0 6px", fontSize: 12, color: C.textSub }}>{quiz.description}</p>}
@@ -9041,6 +9573,7 @@ const INITIAL_BATTLE_CARDS = [
 
 function BattleCardsAdminScreen({ categories, cards, onSaveCategory, onDeleteCategory, onSaveCard, onDeleteCard }) {
   // view: "home" | "category" | "detail" | "editCard"
+  const mobile         = useMobile();
   const [view,         setView]         = useState("home");
   const [activeCatId,  setActiveCatId]  = useState(null);
   const [activeCardId, setActiveCardId] = useState(null);
@@ -9189,7 +9722,7 @@ function BattleCardsAdminScreen({ categories, cards, onSaveCategory, onDeleteCat
     const isNew = editingCard === "new";
     return (
       <div style={{ maxWidth: 740, display:"flex", flexDirection:"column", gap:0 }}>
-        <div style={{ display:"flex", alignItems:"center", justifyContent:"space-between", marginBottom:24 }}>
+        <div style={{ display:"flex", alignItems:"center", justifyContent:"space-between", flexWrap:"wrap", gap:12, marginBottom:24 }}>
           <div>
             <button onClick={cancelEditCard} style={{ background:"none", border:"none", cursor:"pointer", fontSize:13, fontWeight:600, color:C.textSub, padding:0, display:"flex", alignItems:"center", gap:6, marginBottom:8 }}>← Battle Cards</button>
             <h2 style={{ margin:0, fontSize:20, fontWeight:900, color:C.text }}>{isNew ? "New Battle Card" : `Edit: ${cards.find(c => c.id === editingCard)?.title ?? ""}`}</h2>
@@ -9205,7 +9738,7 @@ function BattleCardsAdminScreen({ categories, cards, onSaveCategory, onDeleteCat
         <div style={{ display:"flex", flexDirection:"column", gap:16 }}>
           <Card>
             <div style={{ fontSize:13, fontWeight:800, color:C.text, marginBottom:16 }}>Basic Info</div>
-            <div style={{ display:"grid", gridTemplateColumns:"1fr 1fr", gap:14, marginBottom:14 }}>
+            <div style={{ display:"grid", gridTemplateColumns: mobile ? "1fr" : "1fr 1fr", gap:14, marginBottom:14 }}>
               <div>{lbl("Title", true)}<input style={inputStyle} value={draft.title} onChange={setF("title")} placeholder="e.g. Salesforce" /></div>
               <div>{lbl("Subtitle / Type")}<input style={inputStyle} value={draft.subtitle} onChange={setF("subtitle")} placeholder="e.g. CRM" /></div>
             </div>
@@ -9341,7 +9874,7 @@ function BattleCardsAdminScreen({ categories, cards, onSaveCategory, onDeleteCat
   return (
     <div style={{ display:"flex", flexDirection:"column", gap:24 }}>
       {/* Header */}
-      <div style={{ display:"flex", alignItems:"flex-start", justifyContent:"space-between", gap:12 }}>
+      <div style={{ display:"flex", alignItems:"flex-start", justifyContent:"space-between", flexWrap:"wrap", gap:12 }}>
         <div>
           <h2 style={{ margin:0, fontSize:22, fontWeight:800, color:C.text }}>Battle Cards</h2>
           <p style={{ margin:"4px 0 0", fontSize:13, color:C.textSub }}>Manage competitive intelligence for your team</p>
@@ -9411,7 +9944,7 @@ function BattleCardsAdminScreen({ categories, cards, onSaveCategory, onDeleteCat
                 <button onClick={openNewCat} style={{ padding:"10px 22px", borderRadius:10, border:"none", background:C.orange, color:"#fff", fontSize:13, fontWeight:700, cursor:"pointer" }}>+ New Category</button>
               </div>
             ) : (
-              <div style={{ display:"grid", gridTemplateColumns:"repeat(2, 1fr)", gap:12 }}>
+              <div style={{ display:"grid", gridTemplateColumns: mobile ? "1fr" : "repeat(2, 1fr)", gap:12 }}>
                 {categories.map(cat => {
                   const count = cards.filter(c => c.categoryId === cat.id).length;
                   return (
@@ -9553,6 +10086,7 @@ function BattleCardDetail({ card, onBack, actions }) {
 
 function BattleCardsScreen({ categories = INITIAL_BC_CATEGORIES, cards = INITIAL_BATTLE_CARDS, isLoading = false, isReal = false }) {
   // view: "home" | "category" | "detail"
+  const mobile       = useMobile();
   const [view,       setView]       = useState("home");
   const [activeCat,  setActiveCat]  = useState(null); // BC_CATEGORIES id
   const [activeCard, setActiveCard] = useState(null); // BATTLE_CARDS id
@@ -9734,7 +10268,7 @@ function BattleCardsScreen({ categories = INITIAL_BC_CATEGORIES, cards = INITIAL
           {/* Categories */}
           <div>
             <p style={{ margin: "0 0 12px", fontSize: 12, fontWeight: 700, color: C.textMuted, letterSpacing: "0.06em", textTransform: "uppercase" }}>Categories</p>
-            <div style={{ display: "grid", gridTemplateColumns: "repeat(2, 1fr)", gap: 12 }}>
+            <div style={{ display: "grid", gridTemplateColumns: mobile ? "1fr" : "repeat(2, 1fr)", gap: 12 }}>
               {categories.map(cat => {
                 const count = cards.filter(c => c.categoryId === cat.id).length;
                 return (
@@ -9965,6 +10499,7 @@ const LEADERSHIP_SEED = {
 // All data shapes mirror the final backend response model.
 // ─────────────────────────────────────────────────────────────
 function LeadershipDashboardScreen({ currentOrg, orgUsers = [], isReal = false }) {
+  const mobile      = useMobile();
   const realMembers = orgUsers.filter(u => u._isReal);
   const hasRealData = !isReal || realMembers.length > 0;
   const [liveData,     setLiveData]     = useState(null);   // null = not yet loaded
@@ -10003,9 +10538,28 @@ function LeadershipDashboardScreen({ currentOrg, orgUsers = [], isReal = false }
         // Company-level aggregate
         const avg = people.length ? Math.round(people.reduce((s, p) => s + p.readinessScore, 0) / people.length) : 0;
         setLiveData({
-          company: { readinessScore: avg, previousScore: avg, targetScore: 90, trend: [] },
+          company: { readinessScore: avg, previousScore: avg, targetScore: 90, trend: [], period: "Current" },
           teams:   [],   // team breakdown requires team assignments — leave empty for now
-          people,
+          // Normalize people to match the shape the UI expects (score, prev, initials).
+          // liveData builds people with readinessScore/previousScore; LEADERSHIP_SEED uses score/prev.
+          people: people.map(p => ({
+            ...p,
+            score:    p.readinessScore,
+            prev:     p.previousScore,
+            initials: (p.name ?? "").split(" ").map(w => w[0] ?? "").join("").slice(0, 2).toUpperCase() || "TM",
+          })),
+          heatmap:   [],                // not yet computed from activity data
+          trends:    {},                // not yet computed from historical scores
+          aiSummary: null,              // not generated for real data path
+          risk: {                       // placeholder — no overdue/cert data in this query
+            overdueAssignments:    0,
+            overdueCertifications: 0,
+            overdueAssignmentReps: [],
+            certExpiringSoon:      [],
+            lowReadinessReps:      [],
+            teamsBelowTarget:      [],
+            coachingGaps:          [],
+          },
         });
         setLoading(false);
       })
@@ -10056,8 +10610,9 @@ function LeadershipDashboardScreen({ currentOrg, orgUsers = [], isReal = false }
   const coachingReps   = data.people.filter(p => p.tag === "coaching").length;
   const topRep         = data.people.find(p => p.tag === "top");
   const mostImproved   = [...data.people].sort((a, b) => delta(b.score, b.prev) - delta(a.score, a.prev))[0];
-  const weakestTopic   = [...data.heatmap].sort((a, b) => a.score - b.score)[0];
-  const strongestTopic = [...data.heatmap].sort((a, b) => b.score - a.score)[0];
+  // Guard: heatmap may be empty for real orgs that haven't accumulated skill data yet.
+  const weakestTopic   = data.heatmap.length > 0 ? [...data.heatmap].sort((a, b) => a.score - b.score)[0] : null;
+  const strongestTopic = data.heatmap.length > 0 ? [...data.heatmap].sort((a, b) => b.score - a.score)[0] : null;
 
   // section header style
   const SH = (title, sub) => (
@@ -10147,7 +10702,7 @@ function LeadershipDashboardScreen({ currentOrg, orgUsers = [], isReal = false }
       </div>
 
       {/* ── SECTION 1 — Company Readiness KPIs ── */}
-      <div style={{ display: "grid", gridTemplateColumns: "repeat(4, 1fr)", gap: 14 }}>
+      <div style={{ display: "grid", gridTemplateColumns: mobile ? "repeat(2, 1fr)" : "repeat(4, 1fr)", gap: 14 }}>
         {[
           {
             label: "Overall Readiness",
@@ -10188,51 +10743,73 @@ function LeadershipDashboardScreen({ currentOrg, orgUsers = [], isReal = false }
       </div>
 
       {/* ── SECTION 2 — Highlights row ── */}
-      <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr 1fr", gap: 14 }}>
-        {/* Top team */}
+      <div style={{ display: "grid", gridTemplateColumns: mobile ? "1fr" : "1fr 1fr 1fr", gap: 14 }}>
+        {/* Top team — guard for empty teams array (real orgs with no team assignments yet) */}
         {(() => {
-          const top = [...data.teams].sort((a, b) => b.readinessScore - a.readinessScore)[0];
-          return (
+          const top = data.teams.length > 0 ? [...data.teams].sort((a, b) => b.readinessScore - a.readinessScore)[0] : null;
+          return top ? (
             <Card style={{ background: `linear-gradient(135deg, ${C.trueGreenBg}, #fff)`, borderColor: C.trueGreen + "44" }}>
               <div style={{ fontSize: 11, fontWeight: 800, color: C.trueGreen, letterSpacing: "0.06em", marginBottom: 6 }}>TOP TEAM</div>
               <div style={{ fontSize: 18, fontWeight: 800, color: C.text }}>{top.name}</div>
               <div style={{ fontSize: 28, fontWeight: 900, color: C.trueGreen, margin: "6px 0" }}>{top.readinessScore}%</div>
               <div style={{ fontSize: 11, color: C.textSub }}>{deltaLabel(delta(top.readinessScore, top.previousScore))} pts vs last period</div>
             </Card>
+          ) : (
+            <Card style={{ borderColor: C.border }}>
+              <div style={{ fontSize: 11, fontWeight: 800, color: C.textMuted, letterSpacing: "0.06em", marginBottom: 6 }}>TOP TEAM</div>
+              <div style={{ fontSize: 13, color: C.textSub }}>No teams configured yet</div>
+            </Card>
           );
         })()}
 
-        {/* Needs attention team */}
+        {/* Needs attention team — guard for empty teams array */}
         {(() => {
-          const bot = [...data.teams].sort((a, b) => a.readinessScore - b.readinessScore)[0];
-          return (
+          const bot = data.teams.length > 0 ? [...data.teams].sort((a, b) => a.readinessScore - b.readinessScore)[0] : null;
+          return bot ? (
             <Card style={{ background: `linear-gradient(135deg, ${C.redBg}, #fff)`, borderColor: C.red + "44" }}>
               <div style={{ fontSize: 11, fontWeight: 800, color: C.red, letterSpacing: "0.06em", marginBottom: 6 }}>NEEDS ATTENTION</div>
               <div style={{ fontSize: 18, fontWeight: 800, color: C.text }}>{bot.name}</div>
               <div style={{ fontSize: 28, fontWeight: 900, color: C.red, margin: "6px 0" }}>{bot.readinessScore}%</div>
               <div style={{ fontSize: 11, color: C.textSub }}>{deltaLabel(delta(bot.readinessScore, bot.previousScore))} pts vs last period</div>
             </Card>
+          ) : (
+            <Card style={{ borderColor: C.border }}>
+              <div style={{ fontSize: 11, fontWeight: 800, color: C.textMuted, letterSpacing: "0.06em", marginBottom: 6 }}>NEEDS ATTENTION</div>
+              <div style={{ fontSize: 13, color: C.textSub }}>No teams configured yet</div>
+            </Card>
           );
         })()}
 
-        {/* Weakest + Most improved topics */}
+        {/* Weakest + Most improved topics — guard for empty heatmap */}
         <Card>
           <div style={{ display: "flex", flexDirection: "column", gap: 14 }}>
             <div>
               <div style={{ fontSize: 11, fontWeight: 800, color: C.red, letterSpacing: "0.06em", marginBottom: 4 }}>WEAKEST SKILL</div>
-              <div style={{ fontSize: 14, fontWeight: 700, color: C.text }}>{weakestTopic.topic}</div>
-              <div style={{ fontSize: 20, fontWeight: 900, color: C.red }}>{weakestTopic.score}%</div>
+              {weakestTopic ? (
+                <>
+                  <div style={{ fontSize: 14, fontWeight: 700, color: C.text }}>{weakestTopic.topic}</div>
+                  <div style={{ fontSize: 20, fontWeight: 900, color: C.red }}>{weakestTopic.score}%</div>
+                </>
+              ) : (
+                <div style={{ fontSize: 13, color: C.textSub }}>No skill data yet</div>
+              )}
             </div>
             <div style={{ height: 1, background: C.border }} />
             <div>
               <div style={{ fontSize: 11, fontWeight: 800, color: C.trueGreen, letterSpacing: "0.06em", marginBottom: 4 }}>MOST IMPROVED SKILL</div>
-              <div style={{ fontSize: 14, fontWeight: 700, color: C.text }}>{strongestTopic.topic}</div>
-              <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
-                <span style={{ fontSize: 20, fontWeight: 900, color: C.trueGreen }}>{strongestTopic.score}%</span>
-                <span style={{ fontSize: 12, color: C.trueGreen, fontWeight: 600 }}>
-                  {deltaLabel(delta(strongestTopic.score, strongestTopic.prev))} pts
-                </span>
-              </div>
+              {strongestTopic ? (
+                <>
+                  <div style={{ fontSize: 14, fontWeight: 700, color: C.text }}>{strongestTopic.topic}</div>
+                  <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
+                    <span style={{ fontSize: 20, fontWeight: 900, color: C.trueGreen }}>{strongestTopic.score}%</span>
+                    <span style={{ fontSize: 12, color: C.trueGreen, fontWeight: 600 }}>
+                      {deltaLabel(delta(strongestTopic.score, strongestTopic.prev))} pts
+                    </span>
+                  </div>
+                </>
+              ) : (
+                <div style={{ fontSize: 13, color: C.textSub }}>No skill data yet</div>
+              )}
             </div>
           </div>
         </Card>
@@ -10285,25 +10862,31 @@ function LeadershipDashboardScreen({ currentOrg, orgUsers = [], isReal = false }
       {/* ── SECTION 4 — Knowledge Heatmap ── */}
       <Card>
         {SH("Knowledge Heatmap", "Readiness by skill area across the company.")}
-        <div style={{ display: "flex", flexDirection: "column", gap: 10 }}>
-          {[...data.heatmap].sort((a, b) => b.score - a.score).map(topic => {
-            const d = delta(topic.score, topic.prev);
-            return (
-              <div key={topic.topic} style={{ display: "flex", alignItems: "center", gap: 14 }}>
-                <div style={{ width: 160, fontSize: 13, fontWeight: 600, color: C.text, flexShrink: 0 }}>
-                  {topic.topic}
-                  {topic.topic === weakestTopic.topic && <span style={{ marginLeft: 6, fontSize: 10, color: C.red, fontWeight: 700 }}>▼ WEAKEST</span>}
-                  {topic.topic === strongestTopic.topic && <span style={{ marginLeft: 6, fontSize: 10, color: C.trueGreen, fontWeight: 700 }}>▲ TOP</span>}
+        {data.heatmap.length > 0 ? (
+          <div style={{ display: "flex", flexDirection: "column", gap: 10 }}>
+            {[...data.heatmap].sort((a, b) => b.score - a.score).map(topic => {
+              const d = delta(topic.score, topic.prev);
+              return (
+                <div key={topic.topic} style={{ display: "flex", alignItems: "center", gap: 14 }}>
+                  <div style={{ width: 160, fontSize: 13, fontWeight: 600, color: C.text, flexShrink: 0 }}>
+                    {topic.topic}
+                    {weakestTopic && topic.topic === weakestTopic.topic && <span style={{ marginLeft: 6, fontSize: 10, color: C.red, fontWeight: 700 }}>▼ WEAKEST</span>}
+                    {strongestTopic && topic.topic === strongestTopic.topic && <span style={{ marginLeft: 6, fontSize: 10, color: C.trueGreen, fontWeight: 700 }}>▲ TOP</span>}
+                  </div>
+                  <div style={{ flex: 1 }}>
+                    <ProgressBar value={topic.score} max={100} color={scoreColor(topic.score)} trackColor={C.border} height={10} />
+                  </div>
+                  <div style={{ width: 40, textAlign: "right", fontSize: 13, fontWeight: 700, color: scoreColor(topic.score) }}>{topic.score}%</div>
+                  <div style={{ width: 44, textAlign: "right", fontSize: 12, fontWeight: 600, color: deltaColor(d) }}>{deltaLabel(d)} pts</div>
                 </div>
-                <div style={{ flex: 1 }}>
-                  <ProgressBar value={topic.score} max={100} color={scoreColor(topic.score)} trackColor={C.border} height={10} />
-                </div>
-                <div style={{ width: 40, textAlign: "right", fontSize: 13, fontWeight: 700, color: scoreColor(topic.score) }}>{topic.score}%</div>
-                <div style={{ width: 44, textAlign: "right", fontSize: 12, fontWeight: 600, color: deltaColor(d) }}>{deltaLabel(d)} pts</div>
-              </div>
-            );
-          })}
-        </div>
+              );
+            })}
+          </div>
+        ) : (
+          <div style={{ padding: "24px 0", textAlign: "center", color: C.textSub, fontSize: 13 }}>
+            Skill data will appear here after reps complete quizzes and assignments.
+          </div>
+        )}
       </Card>
 
       {/* ── SECTION 5 — Readiness Trends ── */}
@@ -10357,32 +10940,34 @@ function LeadershipDashboardScreen({ currentOrg, orgUsers = [], isReal = false }
         </div>
       </Card>
 
-      {/* ── SECTION 6 — AI Summary ── */}
-      <Card style={{ border: `1.5px solid ${C.orange}44`, background: `linear-gradient(135deg, ${C.orangeLight}50, #fff)` }}>
-        {SH("AI Summary", `Generated ${data.aiSummary.generatedAt} · Based on platform activity`)}
-        <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 18 }}>
-          {[
-            { title: "Improvements",         items: data.aiSummary.improvements,    color: C.trueGreen, icon: "↑" },
-            { title: "Declines",              items: data.aiSummary.declines,        color: C.red,       icon: "↓" },
-            { title: "Needs Attention",       items: data.aiSummary.attention,       color: C.orange,    icon: "" },
-            { title: "Recommended Actions",   items: data.aiSummary.recommendations, color: C.blue,      icon: "" },
-          ].map(sec => (
-            <div key={sec.title}>
-              <div style={{ fontSize: 12, fontWeight: 800, color: sec.color, marginBottom: 8, display: "flex", alignItems: "center", gap: 5 }}>
-                <span>{sec.icon}</span>{sec.title.toUpperCase()}
+      {/* ── SECTION 6 — Performance Summary — only rendered when available ── */}
+      {data.aiSummary && (
+        <Card style={{ border: `1.5px solid ${C.orange}44`, background: `linear-gradient(135deg, ${C.orangeLight}50, #fff)` }}>
+          {SH("Performance Summary", `Generated ${data.aiSummary.generatedAt} · Based on platform activity`)}
+          <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 18 }}>
+            {[
+              { title: "Improvements",         items: data.aiSummary.improvements,    color: C.trueGreen, icon: "↑" },
+              { title: "Declines",              items: data.aiSummary.declines,        color: C.red,       icon: "↓" },
+              { title: "Needs Attention",       items: data.aiSummary.attention,       color: C.orange,    icon: "" },
+              { title: "Recommended Actions",   items: data.aiSummary.recommendations, color: C.blue,      icon: "" },
+            ].map(sec => (
+              <div key={sec.title}>
+                <div style={{ fontSize: 12, fontWeight: 800, color: sec.color, marginBottom: 8, display: "flex", alignItems: "center", gap: 5 }}>
+                  <span>{sec.icon}</span>{sec.title.toUpperCase()}
+                </div>
+                <div style={{ display: "flex", flexDirection: "column", gap: 6 }}>
+                  {sec.items.map((item, i) => (
+                    <div key={i} style={{ display: "flex", gap: 8, alignItems: "flex-start" }}>
+                      <div style={{ width: 4, height: 4, borderRadius: "50%", background: sec.color, marginTop: 6, flexShrink: 0 }} />
+                      <div style={{ fontSize: 12, color: C.textSub, lineHeight: 1.5 }}>{item}</div>
+                    </div>
+                  ))}
+                </div>
               </div>
-              <div style={{ display: "flex", flexDirection: "column", gap: 6 }}>
-                {sec.items.map((item, i) => (
-                  <div key={i} style={{ display: "flex", gap: 8, alignItems: "flex-start" }}>
-                    <div style={{ width: 4, height: 4, borderRadius: "50%", background: sec.color, marginTop: 6, flexShrink: 0 }} />
-                    <div style={{ fontSize: 12, color: C.textSub, lineHeight: 1.5 }}>{item}</div>
-                  </div>
-                ))}
-              </div>
-            </div>
-          ))}
-        </div>
-      </Card>
+            ))}
+          </div>
+        </Card>
+      )}
 
       {/* ── SECTION 7 — People Insights ── */}
       <Card>
@@ -10540,6 +11125,7 @@ function LeadershipDashboardScreen({ currentOrg, orgUsers = [], isReal = false }
 // ── PROGRESS SCREEN ─────────────────────────────────────────
 
 function ProgressScreen({ currentUser = null, isReal = false, tenantId = null }) {
+  const mobile = useMobile();
   const DEMO_WEEKS = [
     { week: "W20", xp: 820 }, { week: "W21", xp: 1100 }, { week: "W22", xp: 950 },
     { week: "W23", xp: 1340 }, { week: "W24", xp: 680 },
@@ -10635,7 +11221,7 @@ function ProgressScreen({ currentUser = null, isReal = false, tenantId = null })
     <div style={{ display: "flex", flexDirection: "column", gap: 20 }}>
       <h2 style={{ margin: 0, fontSize: 22, fontWeight: 800, color: C.text }}>My Progress</h2>
 
-      <div style={{ display: "grid", gridTemplateColumns: "repeat(4, 1fr)", gap: 14 }}>
+      <div style={{ display: "grid", gridTemplateColumns: mobile ? "repeat(2, 1fr)" : "repeat(4, 1fr)", gap: 14 }}>
         {[
           { label: "Total XP",       value: stats.xp.toLocaleString(), icon: "", color: C.orange },
           { label: "Lessons Done",   value: stats.lessonsTotal ? `${stats.lessonsDone}/${stats.lessonsTotal}` : `${stats.lessonsDone}`, icon: "", color: C.blue },
@@ -10650,7 +11236,7 @@ function ProgressScreen({ currentUser = null, isReal = false, tenantId = null })
         ))}
       </div>
 
-      <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 16 }}>
+      <div style={{ display: "grid", gridTemplateColumns: mobile ? "1fr" : "1fr 1fr", gap: 16 }}>
         {/* XP Chart */}
         <Card>
           <div style={{ fontSize: 15, fontWeight: 700, color: C.text, marginBottom: 20 }}>Weekly XP</div>
@@ -10718,6 +11304,7 @@ const fullLeaderboard = [
 ];
 
 function LeaderboardScreen({ currentUser, isReal = false, tenantId = null }) {
+  const mobile = useMobile();
   const [rows,    setRows]    = useState([]);
   const [loading, setLoading] = useState(isReal);
 
@@ -10803,64 +11390,68 @@ function LeaderboardScreen({ currentUser, isReal = false, tenantId = null }) {
         </Card>
       )}
 
-      {/* Full table */}
+      {/* Full table — horizontal scroll on mobile */}
       <Card style={{ padding: 0, overflow: "hidden" }}>
-        {/* Header */}
-        <div style={{
-          padding: "10px 20px",
-          borderBottom: `1px solid ${C.border}`,
-          display: "grid",
-          gridTemplateColumns: colGrid,
-          gap: 6,
-          fontSize: 10,
-          fontWeight: 700,
-          color: C.textMuted,
-          letterSpacing: "0.08em",
-          textTransform: "uppercase",
-        }}>
-          {colHeader.map((h, i) => (
-            <div key={h} style={{ textAlign: i >= 2 ? "right" : "left" }}>{h}</div>
-          ))}
-        </div>
-
-        {/* Rows */}
-        {leaderboard.map((p, i) => {
-          const total        = isReal ? p.total        : (p.score ?? 0);
-          const quizPoints   = isReal ? p.quizPoints   : 0;
-          const gamePoints   = isReal ? p.gamePoints   : 0;
-          const learningXp   = isReal ? p.learningXp   : (p.weeklyXp ?? 0);
-          const gamesPlayed  = isReal ? p.gamesPlayed  : 0;
-          const quizzesDone  = isReal ? p.quizzesCompleted : 0;
-          return (
-            <div key={p.userId ?? p.rank} style={{
-              padding: "12px 20px",
+        <div style={{ overflowX: mobile ? "auto" : "visible", WebkitOverflowScrolling: "touch" }}>
+          <div style={{ minWidth: mobile ? 600 : "auto" }}>
+            {/* Header */}
+            <div style={{
+              padding: "10px 20px",
+              borderBottom: `1px solid ${C.border}`,
               display: "grid",
               gridTemplateColumns: colGrid,
               gap: 6,
-              alignItems: "center",
-              background: p.isMe ? C.orangeLight : "transparent",
-              borderBottom: i < leaderboard.length - 1 ? `1px solid ${C.border}` : "none",
-              borderLeft: `3px solid ${p.isMe ? C.orange : "transparent"}`,
+              fontSize: 10,
+              fontWeight: 700,
+              color: C.textMuted,
+              letterSpacing: "0.08em",
+              textTransform: "uppercase",
             }}>
-              <div style={{ fontSize: 14, fontWeight: 700, color: p.rank <= 3 ? C.orange : C.textSub }}>#{p.rank}</div>
-              <div style={{ display: "flex", alignItems: "center", gap: 10, minWidth: 0 }}>
-                <Avatar initials={p.initials} size={34} color={p.color ?? C.orange} />
-                <div style={{ minWidth: 0 }}>
-                  <div style={{ fontSize: 14, fontWeight: p.isMe ? 700 : 500, color: p.isMe ? C.orange : C.text, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
-                    {p.name}{p.isMe ? " (you)" : ""}
-                  </div>
-                  {p.title && <div style={{ fontSize: 12, color: C.textSub }}>{p.title}</div>}
-                </div>
-              </div>
-              <div style={{ textAlign: "right", fontSize: 15, fontWeight: 800, color: C.text }}>{total.toLocaleString()}</div>
-              <div style={{ textAlign: "right", fontSize: 13, fontWeight: 600, color: C.purple ?? "#8B5CF6" }}>{quizPoints.toLocaleString()}</div>
-              <div style={{ textAlign: "right", fontSize: 13, fontWeight: 600, color: C.orange }}>{gamePoints.toLocaleString()}</div>
-              <div style={{ textAlign: "right", fontSize: 13, fontWeight: 600, color: C.green ?? "#22C55E" }}>{learningXp.toLocaleString()}</div>
-              <div style={{ textAlign: "right", fontSize: 13, color: C.textSub }}>{gamesPlayed}</div>
-              <div style={{ textAlign: "right", fontSize: 13, color: C.textSub }}>{quizzesDone}</div>
+              {colHeader.map((h, i) => (
+                <div key={h} style={{ textAlign: i >= 2 ? "right" : "left" }}>{h}</div>
+              ))}
             </div>
-          );
-        })}
+
+            {/* Rows */}
+            {leaderboard.map((p, i) => {
+              const total        = isReal ? p.total        : (p.score ?? 0);
+              const quizPoints   = isReal ? p.quizPoints   : 0;
+              const gamePoints   = isReal ? p.gamePoints   : 0;
+              const learningXp   = isReal ? p.learningXp   : (p.weeklyXp ?? 0);
+              const gamesPlayed  = isReal ? p.gamesPlayed  : 0;
+              const quizzesDone  = isReal ? p.quizzesCompleted : 0;
+              return (
+                <div key={p.userId ?? p.rank} style={{
+                  padding: "12px 20px",
+                  display: "grid",
+                  gridTemplateColumns: colGrid,
+                  gap: 6,
+                  alignItems: "center",
+                  background: p.isMe ? C.orangeLight : "transparent",
+                  borderBottom: i < leaderboard.length - 1 ? `1px solid ${C.border}` : "none",
+                  borderLeft: `3px solid ${p.isMe ? C.orange : "transparent"}`,
+                }}>
+                  <div style={{ fontSize: 14, fontWeight: 700, color: p.rank <= 3 ? C.orange : C.textSub }}>#{p.rank}</div>
+                  <div style={{ display: "flex", alignItems: "center", gap: 10, minWidth: 0 }}>
+                    <Avatar initials={p.initials} size={34} color={p.color ?? C.orange} />
+                    <div style={{ minWidth: 0 }}>
+                      <div style={{ fontSize: 14, fontWeight: p.isMe ? 700 : 500, color: p.isMe ? C.orange : C.text, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
+                        {p.name}{p.isMe ? " (you)" : ""}
+                      </div>
+                      {p.title && <div style={{ fontSize: 12, color: C.textSub }}>{p.title}</div>}
+                    </div>
+                  </div>
+                  <div style={{ textAlign: "right", fontSize: 15, fontWeight: 800, color: C.text }}>{total.toLocaleString()}</div>
+                  <div style={{ textAlign: "right", fontSize: 13, fontWeight: 600, color: C.purple ?? "#8B5CF6" }}>{quizPoints.toLocaleString()}</div>
+                  <div style={{ textAlign: "right", fontSize: 13, fontWeight: 600, color: C.orange }}>{gamePoints.toLocaleString()}</div>
+                  <div style={{ textAlign: "right", fontSize: 13, fontWeight: 600, color: C.green ?? "#22C55E" }}>{learningXp.toLocaleString()}</div>
+                  <div style={{ textAlign: "right", fontSize: 13, color: C.textSub }}>{gamesPlayed}</div>
+                  <div style={{ textAlign: "right", fontSize: 13, color: C.textSub }}>{quizzesDone}</div>
+                </div>
+              );
+            })}
+          </div>
+        </div>
       </Card>
     </div>
   );
@@ -10878,6 +11469,7 @@ function OrganizationsScreen({ orgs, onInviteOrg, onSelectOrg, onRefresh, onDeac
   const [emailError, setEmailError] = useState(null);
   const [provisioning, setProvisioning] = useState(false);
   const [provisionError, setProvisionError] = useState(null);
+  const toast = useToast();
 
   const resetModal = () => {
     setShowInvite(false);
@@ -10938,7 +11530,7 @@ function OrganizationsScreen({ orgs, onInviteOrg, onSelectOrg, onRefresh, onDeac
       if (action === "deactivate") await onDeactivateOrg(org.id);
       if (action === "reactivate") await onReactivateOrg(org.id);
     } catch (err) {
-      alert(err?.message ?? "Action failed");
+      toast.error("Action failed.");
     } finally {
       setActionLoading(null);
     }
@@ -10951,7 +11543,7 @@ function OrganizationsScreen({ orgs, onInviteOrg, onSelectOrg, onRefresh, onDeac
       await onDeleteOrg(confirmDelete.id);
       setConfirmDelete(null);
     } catch (err) {
-      alert(err?.message ?? "Delete failed");
+      toast.error("Failed to delete organization.");
     } finally {
       setActionLoading(null);
     }
@@ -10964,7 +11556,7 @@ function OrganizationsScreen({ orgs, onInviteOrg, onSelectOrg, onRefresh, onDeac
       await onCancelOrg(confirmCancel.id);
       setConfirmCancel(null);
     } catch (err) {
-      alert(err?.message ?? "Cancel failed");
+      toast.error("Failed to cancel organization.");
     } finally {
       setActionLoading(null);
     }
@@ -11242,8 +11834,8 @@ function OrganizationsScreen({ orgs, onInviteOrg, onSelectOrg, onRefresh, onDeac
                       <input type="number" min="1" value={form.seats} onChange={e => setForm(p => ({ ...p, seats: e.target.value }))} style={{ width: "100%", padding: "10px 12px", borderRadius: 8, border: `1.5px solid ${C.border}`, fontSize: 13, color: C.text, background: C.inputBg, outline: "none", boxSizing: "border-box" }} />
                     </div>
                   </div>
-                  <button type="submit" style={{ marginTop: 4, padding: "12px", borderRadius: 8, border: "none", cursor: "pointer", background: C.orange, color: "#fff", fontSize: 14, fontWeight: 700 }}>
-                    Send Invitation →
+                  <button type="submit" disabled={provisioning} style={{ marginTop: 4, padding: "12px", borderRadius: 8, border: "none", cursor: provisioning ? "not-allowed" : "pointer", background: C.orange, color: "#fff", fontSize: 14, fontWeight: 700, opacity: provisioning ? 0.7 : 1 }}>
+                    {provisioning ? "Provisioning…" : "Send Invitation →"}
                   </button>
                 </form>
               </>
@@ -11593,6 +12185,7 @@ function OrgSetupScreen({ user, onComplete }) {
 // ── ORG DETAIL SCREEN (ralli admin only) ─────────────────────────────────────
 // Full lifecycle: view, edit, manage members, manage invitations.
 function OrgDetailScreen({ org, orgUsers, onBack, onAddUser, onDeactivateOrg, onReactivateOrg, onDeleteOrg, onCancelOrg, onUpdateOrg, onUpdateMember, onRemoveMember, onCancelInvite, onResendMemberInvite }) {
+  const mobile = useMobile();
   const [realMembers, setRealMembers]       = useState(null);   // profiles[]
   const [invitations, setInvitations]       = useState(null);   // all tenant_invitations[]
   const [tenantSettings, setTenantSettings] = useState(null);   // tenant_settings row
@@ -11625,6 +12218,10 @@ function OrgDetailScreen({ org, orgUsers, onBack, onAddUser, onDeactivateOrg, on
   const [inviteLoading, setInviteLoading]     = useState(false);
   const [inviteError, setInviteError]         = useState(null);
   const [newInviteUrl, setNewInviteUrl]       = useState(null);
+  const [inviteEmailSent,  setInviteEmailSent]  = useState(null); // true | false | null
+  const [inviteEmailError, setInviteEmailError] = useState(null); // string | null
+
+  const toast = useToast();
 
   // Resend admin invite
   const [resendStatus, setResendStatus] = useState(null);
@@ -11695,7 +12292,7 @@ function OrgDetailScreen({ org, orgUsers, onBack, onAddUser, onDeactivateOrg, on
     try {
       await onDeactivateOrg(localOrg.id);
       setLocalOrg(prev => ({ ...prev, status: "suspended" }));
-    } catch (err) { alert(err?.message ?? "Failed to suspend"); }
+    } catch (err) { toast.error("Failed to suspend organization."); }
     finally { setActionLoading(null); }
   };
 
@@ -11704,7 +12301,7 @@ function OrgDetailScreen({ org, orgUsers, onBack, onAddUser, onDeactivateOrg, on
     try {
       await onReactivateOrg(localOrg.id);
       setLocalOrg(prev => ({ ...prev, status: "active" }));
-    } catch (err) { alert(err?.message ?? "Failed to reactivate"); }
+    } catch (err) { toast.error("Failed to reactivate organization."); }
     finally { setActionLoading(null); }
   };
 
@@ -11714,7 +12311,7 @@ function OrgDetailScreen({ org, orgUsers, onBack, onAddUser, onDeactivateOrg, on
       await onDeleteOrg(localOrg.id);
       onBack();
     } catch (err) {
-      alert(err?.message ?? "Failed to delete");
+      toast.error("Failed to delete organization.");
       setActionLoading(null);
       setConfirmDelete(false);
     }
@@ -11727,7 +12324,7 @@ function OrgDetailScreen({ org, orgUsers, onBack, onAddUser, onDeactivateOrg, on
       setLocalOrg(prev => ({ ...prev, status: "canceled" }));
       setConfirmCancel(false);
     } catch (err) {
-      alert(err?.message ?? "Failed to cancel organization");
+      toast.error("Failed to cancel organization.");
     } finally {
       setActionLoading(null);
     }
@@ -11791,16 +12388,16 @@ function OrgDetailScreen({ org, orgUsers, onBack, onAddUser, onDeactivateOrg, on
     setMemberSaving(true);
     setMemberError(null);
     try {
-      await onUpdateMember(editMember.id, {
+      const updated = await onUpdateMember(editMember.id, {
         name:   editMemberForm.name   || null,
         role:   editMemberForm.role   || null,
         status: editMemberForm.status || null,
       });
       setRealMembers(prev => prev.map(m => m.id === editMember.id ? {
         ...m,
-        name:   editMemberForm.name   || m.name,
-        role:   editMemberForm.role   || m.role,
-        status: editMemberForm.status || m.status,
+        name:   updated?.name   ?? editMemberForm.name   ?? m.name,
+        role:   updated?.role   ?? editMemberForm.role   ?? m.role,
+        status: updated?.status ?? editMemberForm.status ?? m.status,
       } : m));
       setEditMember(null);
     } catch (err) {
@@ -11818,7 +12415,7 @@ function OrgDetailScreen({ org, orgUsers, onBack, onAddUser, onDeactivateOrg, on
       setRealMembers(prev => prev.filter(m => m.id !== confirmRemove.id));
       setConfirmRemove(null);
     } catch (err) {
-      alert(err?.message ?? "Failed to remove member.");
+      toast.error("Failed to remove member.");
     } finally {
       setActionLoading(null);
     }
@@ -11839,9 +12436,17 @@ function OrgDetailScreen({ org, orgUsers, onBack, onAddUser, onDeactivateOrg, on
       if (error) throw error;
       const url = buildInviteUrl(data.token);
       setNewInviteUrl(url);
-      // Fire invite email — non-blocking, invite URL is always the fallback
-      sendInviteEmail({ to: inviteForm.email.trim().toLowerCase(), orgName: localOrg.name, inviteUrl: url, type: "member", role: inviteForm.role })
-        .catch(err => console.warn("[ralli] Member invite email failed:", err.message));
+      setInviteEmailSent(null);
+      setInviteEmailError(null);
+      // Await email — surface delivery status to admin
+      try {
+        await sendInviteEmail({ to: inviteForm.email.trim().toLowerCase(), orgName: localOrg.name, inviteUrl: url, type: "member", role: inviteForm.role });
+        setInviteEmailSent(true);
+      } catch (emailErr) {
+        console.warn("[ralli] Member invite email failed:", emailErr.message);
+        setInviteEmailSent(false);
+        setInviteEmailError(emailErr.message ?? "Email delivery failed.");
+      }
       setInviteForm({ email: "", role: "user" });
       await refreshData(); // reload invitations list
     } catch (err) {
@@ -11858,7 +12463,7 @@ function OrgDetailScreen({ org, orgUsers, onBack, onAddUser, onDeactivateOrg, on
       await onCancelInvite(invId);
       setInvitations(prev => prev.map(i => i.id === invId ? { ...i, status: "canceled" } : i));
     } catch (err) {
-      alert(err?.message ?? "Failed to cancel invite.");
+      toast.error("Failed to cancel invite.");
     } finally {
       setActionLoading(null);
     }
@@ -11870,11 +12475,15 @@ function OrgDetailScreen({ org, orgUsers, onBack, onAddUser, onDeactivateOrg, on
       const data = await onResendMemberInvite(inv.id);
       const freshToken = data?.token ?? inv.token;
       setInvitations(prev => prev.map(i => i.id === inv.id ? { ...i, status: "pending", token: freshToken } : i));
-      // Fire email with refreshed token — non-blocking
-      sendInviteEmail({ to: inv.email, orgName: localOrg.name, inviteUrl: buildInviteUrl(freshToken), type: "member", role: inv.role })
-        .catch(err => console.warn("[ralli] Resend invite email failed:", err.message));
+      try {
+        await sendInviteEmail({ to: inv.email, orgName: localOrg.name, inviteUrl: buildInviteUrl(freshToken), type: "member", role: inv.role });
+        toast.success(`Invitation sent to ${inv.email}.`);
+      } catch (emailErr) {
+        console.warn("[ralli] Resend invite email failed:", emailErr.message);
+        toast.warning("Invitation created, but the email could not be delivered. Copy the link below and send it manually.");
+      }
     } catch (err) {
-      alert(err?.message ?? "Failed to resend invite.");
+      toast.error("Failed to resend invite.");
     } finally {
       setActionLoading(null);
     }
@@ -11991,7 +12600,7 @@ function OrgDetailScreen({ org, orgUsers, onBack, onAddUser, onDeactivateOrg, on
       )}
 
       {/* ── Org summary + Features ───────────────────────────── */}
-      <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 16 }}>
+      <div style={{ display: "grid", gridTemplateColumns: mobile ? "1fr" : "1fr 1fr", gap: 16 }}>
 
         {/* Summary card */}
         <div style={{ background: C.white, borderRadius: 12, border: `1px solid ${C.border}`, padding: "18px 20px" }}>
@@ -12110,8 +12719,12 @@ function OrgDetailScreen({ org, orgUsers, onBack, onAddUser, onDeactivateOrg, on
           <div style={{ padding: "16px 20px", borderBottom: `1px solid ${C.border}`, background: C.pageBg }}>
             {newInviteUrl ? (
               <div>
-                <div style={{ fontSize: 12, fontWeight: 700, color: C.green, marginBottom: 8 }}>✓ Invite created</div>
-                <div style={{ display: "flex", gap: 8, alignItems: "center", marginBottom: 8 }}>
+                {inviteEmailSent === false ? (
+                  <div style={{ fontSize: 12, fontWeight: 700, color: "#92400E", marginBottom: 4 }}>⚠ Invitation created, but the email could not be delivered. Copy the link below and send it manually.</div>
+                ) : (
+                  <div style={{ fontSize: 12, fontWeight: 700, color: C.green, marginBottom: 4 }}>✓ Invitation sent</div>
+                )}
+                <div style={{ display: "flex", gap: 8, alignItems: "center", marginBottom: 8, marginTop: 8 }}>
                   <input readOnly value={newInviteUrl} onClick={e => e.target.select()}
                     style={{ flex: 1, padding: "8px 10px", borderRadius: 8, border: `1px solid ${C.border}`, fontSize: 11, color: C.textSub, background: C.white, outline: "none" }}
                   />
@@ -12120,7 +12733,7 @@ function OrgDetailScreen({ org, orgUsers, onBack, onAddUser, onDeactivateOrg, on
                     Copy
                   </button>
                 </div>
-                <button onClick={() => { setNewInviteUrl(null); setShowInviteForm(false); }}
+                <button onClick={() => { setNewInviteUrl(null); setInviteEmailSent(null); setInviteEmailError(null); setShowInviteForm(false); }}
                   style={{ fontSize: 12, color: C.textSub, background: "none", border: "none", cursor: "pointer", padding: 0 }}>Done</button>
               </div>
             ) : (
@@ -12169,14 +12782,14 @@ function OrgDetailScreen({ org, orgUsers, onBack, onAddUser, onDeactivateOrg, on
           <div style={{ padding: 32, textAlign: "center", color: C.textSub, fontSize: 13 }}>Loading members…</div>
         ) : members.length === 0 ? (
           <div style={{ padding: 40, textAlign: "center", color: C.textSub, fontSize: 13 }}>No active members yet.</div>
-        ) : members.map((m, i) => {
+        ) : <div style={{ overflowX: mobile ? "auto" : "visible", WebkitOverflowScrolling: "touch" }}>{members.map((m, i) => {
           const initials = (m.name || m.email || "?").split(" ").map(w => w[0]).join("").toUpperCase().slice(0, 2);
           const isEditingThis = editMember?.id === m.id;
           return (
             <div key={m.id} style={{ borderBottom: i < members.length - 1 ? `1px solid ${C.border}` : "none" }}>
               {isEditingThis ? (
-                <form onSubmit={handleEditMemberSubmit} style={{ padding: "14px 20px", display: "flex", gap: 10, alignItems: "flex-end", background: C.pageBg }}>
-                  <div style={{ flex: 2 }}>
+                <form onSubmit={handleEditMemberSubmit} style={{ padding: "14px 20px", display: "flex", gap: 10, alignItems: "flex-end", flexWrap: mobile ? "wrap" : "nowrap", background: C.pageBg }}>
+                  <div style={{ flex: 2, flexBasis: mobile ? "100%" : "auto" }}>
                     <label style={{ display: "block", fontSize: 10, fontWeight: 700, color: C.textSub, letterSpacing: "0.06em", marginBottom: 4 }}>NAME</label>
                     <input value={editMemberForm.name} onChange={e => setEditMemberForm(p => ({ ...p, name: e.target.value }))}
                       style={{ width: "100%", padding: "7px 10px", borderRadius: 8, border: `1.5px solid ${C.border}`, fontSize: 13, color: C.text, background: C.white, outline: "none", boxSizing: "border-box" }} />
@@ -12208,7 +12821,7 @@ function OrgDetailScreen({ org, orgUsers, onBack, onAddUser, onDeactivateOrg, on
                   {memberError && <div style={{ fontSize: 11, color: "#ef4444" }}>{memberError}</div>}
                 </form>
               ) : (
-                <div style={{ display: "flex", alignItems: "center", gap: 14, padding: "13px 20px" }}>
+                <div style={{ display: "flex", alignItems: "center", gap: 14, padding: "13px 20px", minWidth: 540 }}>
                   <div style={{ width: 36, height: 36, borderRadius: "50%", background: m.color ?? C.orange, display: "flex", alignItems: "center", justifyContent: "center", fontSize: 12, fontWeight: 800, color: "#fff", flexShrink: 0 }}>{initials}</div>
                   <div style={{ flex: 1, minWidth: 0 }}>
                     <div style={{ fontSize: 13, fontWeight: 700, color: C.text }}>{m.name || "—"}</div>
@@ -12234,7 +12847,7 @@ function OrgDetailScreen({ org, orgUsers, onBack, onAddUser, onDeactivateOrg, on
               )}
             </div>
           );
-        })}
+        })}</div>}
       </div>
 
       {/* Pending member invites */}
@@ -12248,7 +12861,7 @@ function OrgDetailScreen({ org, orgUsers, onBack, onAddUser, onDeactivateOrg, on
             const isCanceling = actionLoading === "cancel_" + inv.id;
             const isResending = actionLoading === "resend_" + inv.id;
             return (
-              <div key={inv.id} style={{ display: "flex", alignItems: "center", gap: 14, padding: "13px 20px", borderBottom: i < memberInvites.length - 1 ? `1px solid ${C.border}` : "none" }}>
+              <div key={inv.id} style={{ display: "flex", alignItems: mobile ? "flex-start" : "center", flexWrap: mobile ? "wrap" : "nowrap", gap: 14, padding: "13px 20px", borderBottom: i < memberInvites.length - 1 ? `1px solid ${C.border}` : "none" }}>
                 <div style={{ flex: 1, minWidth: 0 }}>
                   <div style={{ fontSize: 13, fontWeight: 700, color: C.text }}>{inv.email}</div>
                   <div style={{ fontSize: 11, color: C.textSub }}>
@@ -12397,11 +13010,15 @@ function TeamScreen({ orgId, orgName, orgUsers, onAddUser, onMemberInvited }) {
 
   const members = localMembers !== null ? localMembers : orgUsers.filter(u => u.orgId === orgId);
 
+  const toast = useToast();
+
   // ── Invite modal state ─────────────────────────────────────────────────────
   const [showAdd, setShowAdd]     = useState(false);
   const [form, setForm]           = useState({ email: "", role: "user", teamId: "" });
   const [submitted, setSubmitted] = useState(false);
   const [inviteUrl, setInviteUrl] = useState(null);
+  const [emailSent,  setEmailSent]  = useState(null); // true | false | null
+  const [emailError, setEmailError] = useState(null); // string | null
   const [inviteLoading, setInviteLoading] = useState(false);
   const [inviteError, setInviteError]     = useState(null);
 
@@ -12418,6 +13035,7 @@ function TeamScreen({ orgId, orgName, orgUsers, onAddUser, onMemberInvited }) {
   const [teamError, setTeamError]       = useState(null);
   const [editTeam, setEditTeam]         = useState(null);
   const [editTeamName, setEditTeamName] = useState("");
+  const [confirmDeleteTeam, setConfirmDeleteTeam] = useState(null);
 
   // ── Team detail state ──────────────────────────────────────────────────────
   const [selectedTeam, setSelectedTeam]       = useState(null); // team row object
@@ -12461,7 +13079,7 @@ function TeamScreen({ orgId, orgName, orgUsers, onAddUser, onMemberInvited }) {
       setAllTenantMembers(all ?? []);
       setAddMemberId("");
     } catch (err) {
-      alert(err?.message ?? "Failed to add member to team.");
+      toast.error("Failed to add member to team.");
     } finally { setMemberAssigning(false); }
   };
 
@@ -12473,7 +13091,7 @@ function TeamScreen({ orgId, orgName, orgUsers, onAddUser, onMemberInvited }) {
       const { data: all } = await supabase.from("profiles").select("id, name, email, role, color, team_id").eq("tenant_id", orgId);
       setAllTenantMembers(all ?? []);
     } catch (err) {
-      alert(err?.message ?? "Failed to remove member from team.");
+      toast.error("Failed to remove member from team.");
     } finally { setMemberRemoving(null); }
   };
 
@@ -12505,19 +13123,23 @@ function TeamScreen({ orgId, orgName, orgUsers, onAddUser, onMemberInvited }) {
       // Keep selectedTeam name in sync if we're in detail view
       if (selectedTeam?.id === editTeam.id) setSelectedTeam(t => ({ ...t, name }));
     } catch (err) {
-      alert(err.message ?? "Failed to update team.");
+      toast.error("Failed to update team.");
     } finally { setTeamSaving(false); }
   };
 
-  const handleDeleteTeam = async (team) => {
-    if (!window.confirm(`Delete team "${team.name}"? This cannot be undone.`)) return;
+  const handleDeleteTeam = (team) => { setConfirmDeleteTeam(team); };
+
+  const executeDeleteTeam = async () => {
+    if (!confirmDeleteTeam) return;
+    const team = confirmDeleteTeam;
+    setConfirmDeleteTeam(null);
     try {
       const { error } = await supabase.from("tenant_teams").delete().eq("id", team.id);
       if (error) throw error;
       if (selectedTeam?.id === team.id) setSelectedTeam(null);
       await loadTeams();
     } catch (err) {
-      alert(err.message ?? "Failed to delete team.");
+      toast.error("Failed to delete team.");
     }
   };
 
@@ -12537,7 +13159,8 @@ function TeamScreen({ orgId, orgName, orgUsers, onAddUser, onMemberInvited }) {
 
   const resetModal = () => {
     setShowAdd(false); setSubmitted(false); setInviteUrl(null);
-    setInviteError(null); setForm({ email: "", role: "user", teamId: "" });
+    setInviteError(null); setEmailSent(null); setEmailError(null);
+    setForm({ email: "", role: "user", teamId: "" });
   };
 
   const handleAdd = async (e) => {
@@ -12547,11 +13170,20 @@ function TeamScreen({ orgId, orgName, orgUsers, onAddUser, onMemberInvited }) {
     try {
       const result = await createMemberInvite(form.email.trim(), form.role, form.teamId || null);
       setInviteUrl(result.inviteUrl);
-      setSubmitted(true);
+      setEmailSent(null);
+      setEmailError(null);
       onMemberInvited?.();
       refreshInvitations();
-      sendInviteEmail({ to: form.email.trim(), orgName, inviteUrl: result.inviteUrl, type: "member", role: form.role })
-        .catch(err => console.warn("[ralli] Member invite email failed:", err.message));
+      // Await email — surface delivery status in modal
+      try {
+        await sendInviteEmail({ to: form.email.trim(), orgName, inviteUrl: result.inviteUrl, type: "member", role: form.role });
+        setEmailSent(true);
+      } catch (emailErr) {
+        console.warn("[ralli] Member invite email failed:", emailErr.message);
+        setEmailSent(false);
+        setEmailError(emailErr.message ?? "Email delivery failed.");
+      }
+      setSubmitted(true);
     } catch (err) {
       setInviteError(err?.message ?? "Failed to create invite. Try again.");
     } finally {
@@ -12565,7 +13197,7 @@ function TeamScreen({ orgId, orgName, orgUsers, onAddUser, onMemberInvited }) {
       await supabase.rpc("cancel_member_invite", { p_invitation_id: invId });
       setInvitations(prev => prev.map(i => i.id === invId ? { ...i, status: "canceled" } : i));
     } catch (err) {
-      alert(err?.message ?? "Failed to cancel invite.");
+      toast.error("Failed to cancel invite.");
     } finally {
       setInvActionLoading(null);
     }
@@ -12578,10 +13210,15 @@ function TeamScreen({ orgId, orgName, orgUsers, onAddUser, onMemberInvited }) {
       if (error) throw error;
       const freshToken = data?.token ?? inv.token;
       setInvitations(prev => prev.map(i => i.id === inv.id ? { ...i, status: "pending", token: freshToken } : i));
-      sendInviteEmail({ to: inv.email, orgName, inviteUrl: buildInviteUrl(freshToken), type: "member", role: inv.role })
-        .catch(err => console.warn("[ralli] Resend invite email failed:", err.message));
+      try {
+        await sendInviteEmail({ to: inv.email, orgName, inviteUrl: buildInviteUrl(freshToken), type: "member", role: inv.role });
+        toast.success(`Invitation sent to ${inv.email}.`);
+      } catch (emailErr) {
+        console.warn("[ralli] Resend invite email failed:", emailErr.message);
+        toast.warning("Invitation created, but the email could not be delivered. Copy the link below and send it manually.");
+      }
     } catch (err) {
-      alert(err?.message ?? "Failed to resend invite.");
+      toast.error("Failed to resend invite.");
     } finally {
       setInvActionLoading(null);
     }
@@ -12875,11 +13512,23 @@ function TeamScreen({ orgId, orgName, orgUsers, onAddUser, onMemberInvited }) {
           <div style={{ background: C.white, borderRadius: 16, padding: 32, width: 440, boxShadow: "0 24px 64px rgba(0,0,0,0.25)" }}>
             {submitted ? (
               <div style={{ textAlign: "center", padding: "8px 0 0" }}>
-                <div style={{ fontSize: 40, marginBottom: 12 }}>✅</div>
-                <div style={{ fontSize: 16, fontWeight: 700, color: C.green, marginBottom: 8 }}>Invite link created</div>
-                <p style={{ fontSize: 13, color: C.textSub, margin: "0 0 20px" }}>
-                  Copy and share this link with <strong>{form.email}</strong>. They'll set a password and join {orgName}.
-                </p>
+                {emailSent === false ? (
+                  <>
+                    <div style={{ fontSize: 40, marginBottom: 12 }}>⚠️</div>
+                    <div style={{ fontSize: 16, fontWeight: 700, color: "#92400E", marginBottom: 8 }}>Invitation created, but the email could not be delivered.</div>
+                    <p style={{ fontSize: 13, color: C.textSub, margin: "0 0 20px" }}>
+                      Copy the link below and send it to <strong>{form.email}</strong> manually. They'll set a password and join {orgName}.
+                    </p>
+                  </>
+                ) : (
+                  <>
+                    <div style={{ fontSize: 40, marginBottom: 12 }}>✅</div>
+                    <div style={{ fontSize: 16, fontWeight: 700, color: C.green, marginBottom: 8 }}>Invitation sent</div>
+                    <p style={{ fontSize: 13, color: C.textSub, margin: "0 0 20px" }}>
+                      An email was sent to <strong>{form.email}</strong>. You can also copy and share this link directly.
+                    </p>
+                  </>
+                )}
                 {inviteUrl && (
                   <div style={{ display: "flex", gap: 8, alignItems: "center", marginBottom: 20 }}>
                     <input readOnly value={inviteUrl}
@@ -12932,6 +13581,22 @@ function TeamScreen({ orgId, orgName, orgUsers, onAddUser, onMemberInvited }) {
                 </form>
               </>
             )}
+          </div>
+        </div>
+      )}
+
+      {/* Delete team confirmation modal */}
+      {confirmDeleteTeam && (
+        <div style={{ position: "fixed", inset: 0, background: "rgba(0,0,0,0.5)", display: "flex", alignItems: "center", justifyContent: "center", zIndex: 1001 }}
+          onClick={e => { if (e.target === e.currentTarget) setConfirmDeleteTeam(null); }}>
+          <div style={{ background: C.white, borderRadius: 16, padding: 32, width: 400, boxShadow: "0 24px 64px rgba(0,0,0,0.25)" }}>
+            <div style={{ fontSize: 32, marginBottom: 12, textAlign: "center" }}>⚠️</div>
+            <h3 style={{ margin: "0 0 8px", fontSize: 17, fontWeight: 800, color: C.text, textAlign: "center" }}>Delete {confirmDeleteTeam.name}?</h3>
+            <p style={{ margin: "0 0 24px", fontSize: 13, color: C.textSub, textAlign: "center", lineHeight: 1.6 }}>This will remove the team. Members will remain in the org but lose their team assignment. This cannot be undone.</p>
+            <div style={{ display: "flex", gap: 10 }}>
+              <button onClick={() => setConfirmDeleteTeam(null)} style={{ flex: 1, padding: "11px", borderRadius: 10, border: `1px solid ${C.border}`, background: C.white, color: C.text, fontSize: 13, fontWeight: 700, cursor: "pointer" }}>Cancel</button>
+              <button onClick={executeDeleteTeam} style={{ flex: 1, padding: "11px", borderRadius: 10, border: "none", background: "#ef4444", color: "#fff", fontSize: 13, fontWeight: 700, cursor: "pointer" }}>Yes, delete</button>
+            </div>
           </div>
         </div>
       )}
@@ -13203,7 +13868,149 @@ function InviteScreen({ token, onSuccess }) {
   );
 }
 
+// ── RESET PASSWORD SCREEN ───────────────────────────────────
+// Rendered when a Supabase PASSWORD_RECOVERY link is opened.
+// Calls supabase.auth.updateUser({ password }) then signs the user out so
+// they log in fresh — ensuring the recovery session is fully cleared.
+function ResetPasswordScreen({ onSuccess }) {
+  const [password, setPassword] = useState("");
+  const [confirm,  setConfirm]  = useState("");
+  const [loading,  setLoading]  = useState(false);
+  const [error,    setError]    = useState("");
+  const [done,     setDone]     = useState(false);
+
+  const handleSubmit = async (e) => {
+    e.preventDefault();
+    setError("");
+    if (password.length < 8)    { setError("Password must be at least 8 characters."); return; }
+    if (password !== confirm)    { setError("Passwords don't match."); return; }
+
+    setLoading(true);
+    const { error: updateErr } = await supabase.auth.updateUser({ password });
+    setLoading(false);
+
+    if (updateErr) {
+      const m = updateErr.message?.toLowerCase() ?? "";
+      if (m.includes("same password")) {
+        setError("New password must be different from your current password.");
+      } else if (m.includes("expired") || m.includes("invalid") || m.includes("token")) {
+        setError("This reset link has expired. Please request a new one from the login screen.");
+      } else {
+        setError("Failed to update password. Please try again or request a new reset link.");
+      }
+      return;
+    }
+
+    setDone(true);
+    // Sign out clears the recovery session so the user must log in fresh with the new password.
+    await supabase.auth.signOut();
+    setTimeout(() => onSuccess(), 2500);
+  };
+
+  const inputStyle = {
+    width: "100%", padding: "11px 14px", borderRadius: 8, fontSize: 14,
+    border: `1.5px solid ${error ? C.red : C.border}`,
+    outline: "none", boxSizing: "border-box", color: C.text,
+    background: C.inputBg,
+  };
+
+  return (
+    <div style={{
+      height: "100vh", display: "flex", alignItems: "center", justifyContent: "center",
+      background: C.cream,
+      fontFamily: "'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif",
+      padding: "24px 20px",
+    }}>
+      <div style={{ width: "100%", maxWidth: 400, margin: "0 auto" }}>
+        {/* Logo */}
+        <div style={{ display: "flex", alignItems: "center", gap: 12, marginBottom: 40, justifyContent: "center" }}>
+          <RalliLogo size={44} />
+          <div>
+            <div style={{ fontSize: 26, fontWeight: 900, color: C.text, letterSpacing: "-0.5px" }}>ralli</div>
+            <div style={{ fontSize: 10, fontWeight: 700, color: C.orangeDark, letterSpacing: "0.1em" }}>Focus. Grow. Succeed.</div>
+          </div>
+        </div>
+
+        <div style={{ background: "#fff", borderRadius: 16, padding: 32, boxShadow: "0 24px 64px rgba(0,0,0,0.3)" }}>
+          {done ? (
+            <div style={{ textAlign: "center", padding: "16px 0" }}>
+              <div style={{ fontSize: 36, marginBottom: 16 }}>✅</div>
+              <h2 style={{ margin: "0 0 8px", fontSize: 20, fontWeight: 800, color: C.text }}>Password updated</h2>
+              <p style={{ margin: 0, fontSize: 14, color: C.textSub }}>Signing you out… you can now log in with your new password.</p>
+            </div>
+          ) : (
+            <>
+              <h2 style={{ margin: "0 0 6px", fontSize: 22, fontWeight: 800, color: C.text }}>Set a new password</h2>
+              <p style={{ margin: "0 0 24px", fontSize: 14, color: C.textSub }}>Choose a strong password for your account.</p>
+              <form onSubmit={handleSubmit} style={{ display: "flex", flexDirection: "column", gap: 14 }}>
+                <div>
+                  <label style={{ display: "block", fontSize: 12, fontWeight: 700, color: C.textSub, marginBottom: 6, letterSpacing: "0.04em" }}>NEW PASSWORD</label>
+                  <input
+                    type="password" value={password} autoFocus
+                    onChange={e => { setPassword(e.target.value); setError(""); }}
+                    placeholder="Min. 8 characters"
+                    style={inputStyle}
+                  />
+                </div>
+                <div>
+                  <label style={{ display: "block", fontSize: 12, fontWeight: 700, color: C.textSub, marginBottom: 6, letterSpacing: "0.04em" }}>CONFIRM PASSWORD</label>
+                  <input
+                    type="password" value={confirm}
+                    onChange={e => { setConfirm(e.target.value); setError(""); }}
+                    placeholder="Re-enter your password"
+                    style={inputStyle}
+                  />
+                </div>
+                {error && (
+                  <div style={{ padding: "10px 14px", borderRadius: 8, background: "#FEF2F2", border: "1px solid #FECACA", fontSize: 13, color: C.red }}>
+                    {error}
+                  </div>
+                )}
+                <button
+                  type="submit"
+                  disabled={loading || !password || !confirm}
+                  style={{
+                    width: "100%", padding: "12px", borderRadius: 10, border: "none", marginTop: 4,
+                    background: loading || !password || !confirm ? C.muted : C.orange,
+                    color: loading || !password || !confirm ? C.textMuted : "#fff",
+                    fontSize: 14, fontWeight: 700,
+                    cursor: loading || !password || !confirm ? "not-allowed" : "pointer",
+                    transition: "background 0.15s",
+                  }}
+                >
+                  {loading ? "Updating…" : "Update password"}
+                </button>
+              </form>
+            </>
+          )}
+        </div>
+      </div>
+    </div>
+  );
+}
+
 // ── LOGIN SCREEN ────────────────────────────────────────────
+
+// Maps raw Supabase auth error messages to customer-safe strings.
+// Never expose error codes, table names, or RLS details to users.
+function mapAuthError(message) {
+  if (!message) return "Sign in failed. Please try again.";
+  const m = message.toLowerCase();
+  if (m.includes("invalid login credentials") || m.includes("invalid password") || m.includes("user not found")) {
+    return "Incorrect email or password. Please try again.";
+  }
+  if (m.includes("email not confirmed")) {
+    return "Please confirm your email before signing in. Check your inbox for a verification link.";
+  }
+  if (m.includes("too many requests") || m.includes("rate limit")) {
+    return "Too many sign-in attempts. Please wait a moment and try again.";
+  }
+  if (m.includes("network") || m.includes("fetch") || m.includes("failed to fetch")) {
+    return "Connection error. Check your internet connection and try again.";
+  }
+  return "Sign in failed. Please try again.";
+}
+
 function LoginScreen({ onLogin, users = USERS }) {
   const [email, setEmail] = useState("");
   const [password, setPassword] = useState("");
@@ -13236,10 +14043,8 @@ function LoginScreen({ onLogin, users = USERS }) {
     setError("");
     setLoading(true);
 
-    const emailLower = email.trim().toLowerCase();
-    const isSeedEmail = users.some(u => u.email.toLowerCase() === emailLower);
-
-    // 1. Try real Supabase Auth first
+    // Demo accounts are only accessible via the quick-login cards below — never via this form.
+    // A failed Supabase auth never falls back to seed data regardless of the email.
     const { data, error: authErr } = await supabase.auth.signInWithPassword({
       email: email.trim(),
       password,
@@ -13258,27 +14063,17 @@ function LoginScreen({ onLogin, users = USERS }) {
       try {
         const created = await createMissingProfile(data.user);
         if (created) { onLogin(created); return; }
-      } catch (profileErr) {
-        setError(`Profile error [${profileErr.code ?? "?"}]: ${profileErr.message}`);
+      } catch {
+        setError("We couldn't load your account. Please contact support if this continues.");
         setLoading(false);
         return;
       }
-      setError("Auth succeeded but profile could not be loaded or created.");
+      setError("We couldn't load your account. Please contact support if this continues.");
       setLoading(false);
       return;
     }
 
-    // Auth failed — if this email is in seed data, try seed login
-    if (isSeedEmail) {
-      await new Promise(r => setTimeout(r, 400));
-      const seedUser = users.find(u => u.email.toLowerCase() === emailLower);
-      if (!password) { setError("Password is required."); setLoading(false); return; }
-      onLogin(seedUser);
-      return;
-    }
-
-    // Not a seed email — show the real Supabase error
-    setError(authErr?.message ?? "Sign in failed. Check your email and password.");
+    setError(mapAuthError(authErr?.message));
     setLoading(false);
   };
 
@@ -13539,6 +14334,7 @@ const USERS             = SEED_USERS;        // alias — used by LoginScreen
 //   4. Cache AI result in ai_insights table to avoid redundant calls
 // ─────────────────────────────────────────────────────────────────────────────
 function InsightsScreen({ user, isReal = false, tenantId = null, orgUsers = [], isAdmin = false }) {
+  const mobile     = useMobile();
   const [loading,  setLoading]  = useState(isReal);
   const [perf,     setPerf]     = useState(null);
   const [teamData, setTeamData] = useState(null);
@@ -13641,7 +14437,7 @@ function InsightsScreen({ user, isReal = false, tenantId = null, orgUsers = [], 
 
   if (loading) {
     return (
-      <div style={{ flex: 1, overflow: "auto", padding: "32px 32px 80px", maxWidth: 860, margin: "0 auto", width: "100%" }}>
+      <div style={{ flex: 1, overflow: "auto", padding: mobile ? "16px 16px 80px" : "32px 32px 80px", maxWidth: 860, margin: "0 auto", width: "100%" }}>
         <div style={{ fontSize: 22, fontWeight: 700, color: C.text, marginBottom: 20 }}>Insights</div>
         <LoadingState rows={3} message="Loading your performance data…" />
       </div>
@@ -13650,7 +14446,7 @@ function InsightsScreen({ user, isReal = false, tenantId = null, orgUsers = [], 
 
   if (error) {
     return (
-      <div style={{ flex: 1, overflow: "auto", padding: "32px 32px 80px", maxWidth: 860, margin: "0 auto", width: "100%" }}>
+      <div style={{ flex: 1, overflow: "auto", padding: mobile ? "16px 16px 80px" : "32px 32px 80px", maxWidth: 860, margin: "0 auto", width: "100%" }}>
         <div style={{ fontSize: 22, fontWeight: 700, color: C.text, marginBottom: 20 }}>Insights</div>
         <ErrorState message={error} />
       </div>
@@ -13660,7 +14456,7 @@ function InsightsScreen({ user, isReal = false, tenantId = null, orgUsers = [], 
   // Guard: real user with no org context or data not yet available
   if (isReal && !displayPerf) {
     return (
-      <div style={{ flex: 1, overflow: "auto", padding: "32px 32px 80px", maxWidth: 860, margin: "0 auto", width: "100%" }}>
+      <div style={{ flex: 1, overflow: "auto", padding: mobile ? "16px 16px 80px" : "32px 32px 80px", maxWidth: 860, margin: "0 auto", width: "100%" }}>
         <div style={{ fontSize: 22, fontWeight: 700, color: C.text, marginBottom: 20 }}>Insights</div>
         <EmptyState
           icon="📈"
@@ -13672,7 +14468,7 @@ function InsightsScreen({ user, isReal = false, tenantId = null, orgUsers = [], 
   }
 
   return (
-    <div style={{ flex: 1, overflow: "auto", padding: "32px 32px 80px", maxWidth: 860, margin: "0 auto", width: "100%" }}>
+    <div style={{ flex: 1, overflow: "auto", padding: mobile ? "16px 16px 80px" : "32px 32px 80px", maxWidth: 860, margin: "0 auto", width: "100%" }}>
 
       {/* Header */}
       <div style={{ marginBottom: 32 }}>
@@ -13733,18 +14529,18 @@ function InsightsScreen({ user, isReal = false, tenantId = null, orgUsers = [], 
               </div>
             </div>
 
-            {/* AI Summary */}
+            {/* Performance Summary */}
             <div style={cardStyle}>
-              <div style={sectionHead}>AI Summary</div>
+              <div style={sectionHead}>Performance Summary</div>
               {aiLoading ? (
-                <div style={{ fontSize: 13, color: C.textMuted, fontStyle: "italic" }}>Generating summary...</div>
+                <div style={{ fontSize: 13, color: C.textMuted, fontStyle: "italic" }}>Generating summary…</div>
               ) : aiSummary ? (
                 <div style={{ fontSize: 14, color: C.text, lineHeight: 1.6 }}>{aiSummary}</div>
               ) : (
                 <div style={{ fontSize: 13, color: C.textMuted, fontStyle: "italic" }}>
                   {isReal
-                    ? "AI summary unavailable. Configure OPENAI_API_KEY in Vercel environment variables to enable."
-                    : "AI summaries are based on real activity data. Complete lessons and quizzes to generate your summary."}
+                    ? "Performance summary unavailable. Complete more activity to generate your summary."
+                    : "Performance summaries are based on real activity data. Complete lessons and quizzes to see yours."}
                 </div>
               )}
             </div>
@@ -14423,6 +15219,17 @@ export default function App() {
   const mobile = useMobile();
   const toast  = useToast();
   const [currentUser,      setCurrentUser]      = useState(null);
+  const [lastSeenAt,       setLastSeenAt]       = useState(null);   // ISO string from profiles.last_seen_assignments_at
+  const [newAssignmentCount, setNewAssignmentCount] = useState(0);  // drives "Learn" nav badge
+  // Password-recovery mode — true when the user opened a Supabase recovery link.
+  // Initialized synchronously from the URL so it's set before getSession() resolves,
+  // preventing the recovery session from being treated as a normal login.
+  // recoveryRef gives the getSession() closure a stable reference that doesn't go stale.
+  const recoveryRef = useRef(
+    window.location.hash.includes("type=recovery") ||
+    new URLSearchParams(window.location.search).get("type") === "recovery"
+  );
+  const [recoveryMode, setRecoveryMode] = useState(recoveryRef.current);
   const [screen,           setScreen]           = useState("home");
   const [sessions,         setSessions]         = useState(INITIAL_SESSIONS);
   const [lobbyPin,         setLobbyPin]         = useState(null);
@@ -14437,6 +15244,7 @@ export default function App() {
   const [pendingLessonId,  setPendingLessonId]  = useState(null);
   const [pendingCourseId,  setPendingCourseId]  = useState(null);
   const [pendingQuizId,    setPendingQuizId]    = useState(null);
+  const deletingQuizIdsRef = useRef(new Set()); // tracks IDs with an in-flight DB delete
   const [orgs,             setOrgs]             = useState(INITIAL_ORGS);
   const [orgUsers,         setOrgUsers]         = useState(INITIAL_ORG_USERS);
   const [selectedOrg,      setSelectedOrg]      = useState(null);
@@ -14577,6 +15385,9 @@ export default function App() {
   // Also subscribe to auth state changes so sign-out clears the user globally.
   useEffect(() => {
     supabase.auth.getSession().then(async ({ data: { session } }) => {
+      // If a recovery link was opened, do not log the user in normally.
+      // The PASSWORD_RECOVERY event (below) owns this flow.
+      if (recoveryRef.current) return;
       if (session?.user && !currentUser) {
         let profile = await getProfile(session.user.id);
         if (!profile) profile = await createMissingProfile(session.user);
@@ -14598,6 +15409,8 @@ export default function App() {
           // Async patches (getLeaderboard, getUserStreak) will update with real values.
           const { level: profileLevel, xpNext: profileXpNext } = computeUserMeta(profile.xp ?? 0);
           setCurrentUser({ ...profile, level: profileLevel, xpNext: profileXpNext });
+          // Seed last-seen timestamp for assignment "NEW" badge logic
+          setLastSeenAt(profile.lastSeenAssignmentsAt ?? null);
           if (isRalliAdmin(profile.role)) {
             setScreen("organizations");
             setOrgs([]); // clear seed/mock orgs — ralli admin sees only real Supabase tenants
@@ -14619,8 +15432,20 @@ export default function App() {
     });
 
     const { data: { subscription } } = supabase.auth.onAuthStateChange(async (event) => {
+      if (event === "PASSWORD_RECOVERY") {
+        // User opened a valid recovery link. Lock the UI to the reset form.
+        // Don't log them into the normal app — they must set a new password first.
+        recoveryRef.current = true;
+        setRecoveryMode(true);
+        return;
+      }
       if (event === "SIGNED_OUT") {
         setCurrentUser(null);
+        setLastSeenAt(null);
+        setNewAssignmentCount(0);
+        setPendingLessonId(null);  // clear any in-flight deep-link nav from prior session
+        setPendingCourseId(null);
+        setPendingQuizId(null);
         setOrgs(INITIAL_ORGS);     // restore seed tenants so demo accounts work
         setOrgUsers(INITIAL_ORG_USERS);
         setQuizzesReady(false);    // reset so next real user waits for their quiz load
@@ -14797,6 +15622,19 @@ export default function App() {
   // BroadcastChannel — only active when a game is running
   const isInGame = ["rankd-lobby", "rankd-game"].includes(screen);
   const { chPlayers, chAnswers, setChAnswers, chMsg, broadcast } = useGameChannel(isInGame ? lobbyPin : null, gameRole);
+
+  // Recovery mode takes priority over normal routing — show the reset form regardless
+  // of whether a session exists. This prevents the app from routing past the form if
+  // getSession() resolved before the PASSWORD_RECOVERY event fired.
+  if (recoveryMode) {
+    return (
+      <ResetPasswordScreen onSuccess={() => {
+        recoveryRef.current = false;
+        setRecoveryMode(false);
+        // SIGNED_OUT from signOut() inside ResetPasswordScreen clears the rest of the state
+      }} />
+    );
+  }
 
   if (!currentUser) {
     const handleLogin = (u) => {
@@ -14983,12 +15821,25 @@ export default function App() {
       p_status: fields.status ?? null,
     });
     if (error) { console.error("[ralli] update_member failed:", error); throw error; }
+    // RPC succeeded — sync App-level orgUsers with the canonical values it returned.
+    // Only runs on success; the throw above prevents reaching this on failure.
+    if (data) {
+      setOrgUsers(prev => prev.map(u => u.id === profileId ? {
+        ...u,                          // preserve all fields not touched by this update
+        name:   data.name   ?? u.name,
+        role:   data.role   ?? u.role,
+        status: data.status ?? u.status,
+      } : u));
+    }
     return data;
   };
 
   const handleRemoveMember = async (profileId) => {
     const { error } = await supabase.rpc("remove_member", { p_profile_id: profileId });
     if (error) { console.error("[ralli] remove_member failed:", error); throw error; }
+    // RPC succeeded — remove the user from App-level orgUsers immediately.
+    // Only runs on success; the throw above prevents reaching this on failure.
+    setOrgUsers(prev => prev.filter(u => u.id !== profileId));
   };
 
   const handleCancelInvite = async (invitationId) => {
@@ -15160,16 +16011,32 @@ export default function App() {
     setEditingQuiz(quiz);
   };
 
-  const handleDeleteQuiz = (id) => {
-    setQuizzes(prev => {
-      const updated = prev.filter(q => q.id !== id);
-      if (!user?._isReal) { try { localStorage.setItem("ralli_quizzes", JSON.stringify(updated)); } catch {} }
-      return updated;
-    });
-    toast.success("Quiz deleted.");
-    // Fire-and-forget DB delete for real users (only UUIDs are in the DB)
-    if (user?._isReal && id && !id.startsWith("quiz_") && !id.startsWith("sq_")) {
-      dbDeleteQuiz(id).then(({ error }) => { if (error) { console.error("[ralli] deleteQuiz failed:", error); toast.error("Failed to delete quiz."); } });
+  const handleDeleteQuiz = async (id) => {
+    // Demo / non-UUID path: synchronous localStorage behavior unchanged
+    if (!user?._isReal || !id || id.startsWith("quiz_") || id.startsWith("sq_")) {
+      setQuizzes(prev => {
+        const updated = prev.filter(q => q.id !== id);
+        if (!user?._isReal) { try { localStorage.setItem("ralli_quizzes", JSON.stringify(updated)); } catch {} }
+        return updated;
+      });
+      toast.success("Quiz deleted.");
+      return;
+    }
+    // Real users: pessimistic — DB must confirm before local state update
+    if (deletingQuizIdsRef.current.has(id)) return; // ignore duplicate in-flight request
+    deletingQuizIdsRef.current.add(id);
+    try {
+      const { error } = await dbDeleteQuiz(id);
+      if (error) {
+        console.error("[ralli] deleteQuiz failed:", error);
+        toast.error("Failed to delete quiz. Please try again.");
+        return;
+      }
+      // Only remove from state after DB confirms success
+      setQuizzes(prev => prev.filter(q => q.id !== id));
+      toast.success("Quiz deleted.");
+    } finally {
+      deletingQuizIdsRef.current.delete(id);
     }
   };
 
@@ -15208,13 +16075,13 @@ export default function App() {
   const handleAssignQuiz = async (assignment) => {
     const tenantId = currentOrg?.id ?? null;
     if (user?._isReal && tenantId) {
-      const { data: saved, error } = await dbCreateAssignment(tenantId, assignment, user?.id);
+      const { error } = await dbCreateAssignment(tenantId, assignment, user?.id);
       if (error) { console.error("[ralli] quiz createAssignment failed:", error); toast.error("Failed to assign quiz. Please try again."); return; }
-      const canonical = saved ?? { ...assignment, id: "a" + Date.now(), assignedAt: "Today" };
-      setAssignments(prev => prev.some(a => a.id === canonical.id) ? prev : [...prev, canonical]);
+      // No App-level setAssignments — assignments state lives inside LearnScreen and QuizzesScreen.
+      // Learners receive the assignment on their next visit to Quizzes or Learn (both re-fetch from Supabase on mount).
       toast.success("Quiz assigned.");
     } else {
-      setAssignments(prev => [...prev, { ...assignment, id: "a" + Date.now(), assignedAt: "Today" }]);
+      // Demo mode: no DB write, no local state update needed — toast confirms the action.
       toast.success("Quiz assigned.");
     }
   };
@@ -15351,16 +16218,31 @@ export default function App() {
     setScreen("rankd-lobby");
   };
 
-  // Admin: launch a session — always show lobby first so manager can see
-  // players join and manually click Start Game. RankdLobbyScreen handles
-  // both demo (fake player animation) and real (BroadcastChannel) modes.
+  // Admin: open a session.
+  // Routing is determined by the session's actual status — do not overwrite it.
+  // Status changes happen only in handleGameStart (waiting→started) and handleGameEnd (→completed).
+  //
+  // waiting  → lobby: players join, host clicks Start when ready
+  // started / live / active / paused → game screen directly
+  //   Note: KahootHostView always initialises phase/qIdx/scores from React state (no DB read-back
+  //   on mount). Running scores and question index are NOT restored after a refresh or re-entry.
+  //   The host reconnects to the BroadcastChannel and can continue broadcasting new questions,
+  //   but prior-question scores are lost in memory. Full restoration requires a future migration
+  //   to read game_sessions.phase / current_question_index and re-aggregate game_answers on mount.
+  const LOBBY_STATUSES = new Set(["waiting"]);
   const handleLaunch = (session) => {
     const quiz = quizzes.find(q => q.id === session.quizId);
     setGameQuestions(quiz?.questions ?? GAME_QUESTIONS);
     setLobbyPin(session.code);
     setLobbySessionName(session.name);
-    setSessions(prev => prev.map(s => s.code === session.code ? { ...s, status: "live" } : s));
-    setScreen("rankd-lobby");
+    // Do NOT overwrite session status — preserve the canonical value from Supabase / local state.
+    if (LOBBY_STATUSES.has(session.status)) {
+      setScreen("rankd-lobby");
+    } else {
+      // started / live / active / paused — re-enter the game screen directly.
+      // Skips lobby so the host is not shown "Start Game" on an already-running session.
+      setScreen("rankd-game");
+    }
   };
 
   // Admin: start real game from lobby
@@ -15397,12 +16279,17 @@ export default function App() {
       scores:   data?.scores ?? [],
       tenantId: gameTenantId,
     }).catch(e => console.error("[ralli] endGameSession failed:", e));
-    // Award game points for all real participants
+    // Award game points for all real participants, then trigger readiness for each.
+    // awardGamePointsForSession returns the deduplicated list of authenticated user IDs
+    // it awarded points to. Anonymous players have no player_id and are excluded.
     if (user?._isReal && gameTenantId && lobbyPin) {
       awardGamePointsForSession(gameTenantId, lobbyPin, data?.scores ?? [])
-        .catch(e => console.error("[ralli] awardGamePointsForSession failed:", e));
-      // Trigger readiness update for the host — individual participant updates happen server-side
-      triggerReadinessUpdate(gameTenantId, user.id);
+        .then(participantUserIds => {
+          if (!participantUserIds?.length) return;
+          // Each call is independent fire-and-forget — one failure does not block others.
+          participantUserIds.forEach(uid => triggerReadinessUpdate(gameTenantId, uid));
+        })
+        .catch(e => { console.error("[ralli] awardGamePointsForSession failed:", e); toast.warning("Points could not be recorded for this session. Game results have been saved."); });
     }
   };
 
@@ -15445,7 +16332,7 @@ export default function App() {
       }} />;
       case "home":              return isOrgAdmin
         ? <LeadershipDashboardScreen currentOrg={currentOrg} orgUsers={orgUsers} isReal={!!user?._isReal} />
-        : <HomeScreen user={user} onNav={navigate} quizAssignments={user?._isReal ? [] : USER_QUIZ_ASSIGNMENTS_SEED} onResumeLesson={(id) => { setPendingLessonId(id); navigate("learn"); }} onStartCourse={(id) => { setPendingCourseId(id); navigate("learn"); }} onStartQuiz={(id) => { setPendingQuizId(id); navigate("quizzes"); }} orgUsers={orgUsers} isReal={!!user?._isReal} tenantId={currentOrg?.id ?? null} quizzes={quizzes} />;
+        : <HomeScreen user={user} onNav={navigate} quizAssignments={user?._isReal ? [] : USER_QUIZ_ASSIGNMENTS_SEED} onResumeLesson={(id) => { setPendingLessonId(id); navigate("learn"); }} onStartCourse={(id) => { setPendingCourseId(id); navigate("learn"); }} onStartQuiz={(id) => { setPendingQuizId(id); navigate("quizzes"); }} orgUsers={orgUsers} isReal={!!user?._isReal} tenantId={currentOrg?.id ?? null} quizzes={quizzes} lastSeenAt={lastSeenAt} onNewAssignments={(n) => setNewAssignmentCount(n)} />;
       case "rankd":             return <RankdScreen onNav={navigate} onJoin={handleEnterPin} sessions={sessions} onLaunch={handleLaunch} onViewResults={handleViewResults} onRelaunch={handleRelaunch} role={gameRole} currentUser={currentUser} />;
       case "rankd-new":         return <NewSessionScreen onNav={navigate} quizzes={quizzes} onCreateSession={handleCreateSession} />;
       case "rankd-quiz-builder":return <QuizBuilderScreen onNav={navigate} onSave={handleSaveQuiz} initialQuiz={editingQuiz} onEditQuiz={handleEditQuiz} />;
@@ -15564,12 +16451,20 @@ export default function App() {
                   {item.icon && <span style={{ fontSize: 15, opacity: active ? 1 : 0.6 }}>{item.icon}</span>}
                   <span style={{ flex: 1, display: "flex", alignItems: "center", gap: 6 }}>
                     <span>{isAdminType && item.adminLabel ? item.adminLabel : item.label}</span>
+                    {/* Static badge (LIVE, #3) — hidden on leaderboard for real users */}
                     {item.badge && !(user?._isReal && item.id === "leaderboard") && (
                       <span style={{
                         fontSize: 9, fontWeight: 700, padding: "2px 7px", borderRadius: 99,
                         background: item.badge === "LIVE" ? "#22C55E" : C.orange,
                         color: "#fff", letterSpacing: "0.04em",
                       }}>{item.badge}</span>
+                    )}
+                    {/* Dynamic badge: new-assignment count on Learn nav item (learners only) */}
+                    {!isAdminType && item.id === "learn" && newAssignmentCount > 0 && screen !== "home" && (
+                      <span style={{
+                        fontSize: 9, fontWeight: 700, padding: "2px 7px", borderRadius: 99,
+                        background: C.orange, color: "#fff", letterSpacing: "0.04em",
+                      }}>{newAssignmentCount}</span>
                     )}
                   </span>
                 </button>
@@ -15592,24 +16487,38 @@ export default function App() {
               <div style={{ minWidth: 0, flex: 1 }}>
                 <div style={{ fontSize: 12, fontWeight: 600, color: C.text, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{user.name}</div>
                 <div style={{ fontSize: 10, color: isSuperAdmin ? "#8B5CF6" : isOrgAdmin ? "#059669" : C.textMuted, marginTop: 1 }}>
-                  {isSuperAdmin ? "ralli admin" : isOrgAdmin ? "Manager" : `${user.streak ?? 0}-day streak`}
+                  {isSuperAdmin ? "ralli admin" : isOrgAdmin ? "Admin" : `${user.streak ?? 0}-day streak`}
                 </div>
               </div>
               <button
                 onClick={async () => {
-                  if (user?._isReal) await supabase.auth.signOut();
-                  setCurrentUser(null); setScreen("home");
+                  if (user?._isReal) {
+                    // Real user: signOut() fires the SIGNED_OUT event which handles state cleanup
+                    await supabase.auth.signOut();
+                  } else {
+                    // Seed/demo user: SIGNED_OUT event won't fire — clear all session state manually
+                    setCurrentUser(null);
+                    setLastSeenAt(null);
+                    setNewAssignmentCount(0);
+                    setPendingLessonId(null);
+                    setPendingCourseId(null);
+                    setPendingQuizId(null);
+                    setOrgs(INITIAL_ORGS);
+                    setOrgUsers(INITIAL_ORG_USERS);
+                    setQuizzesReady(false);
+                  }
+                  setScreen("home");
                 }}
                 title="Sign out"
                 style={{
                   background: "transparent", border: `1px solid ${C.border}`, borderRadius: 7,
-                  color: C.textMuted, fontSize: 13, cursor: "pointer",
-                  width: 26, height: 26, display: "flex", alignItems: "center", justifyContent: "center",
-                  flexShrink: 0, transition: "all 0.1s",
+                  color: C.textMuted, fontSize: 11, fontWeight: 600, cursor: "pointer",
+                  padding: "3px 8px", height: 26, display: "flex", alignItems: "center", justifyContent: "center",
+                  flexShrink: 0, transition: "all 0.1s", whiteSpace: "nowrap",
                 }}
                 onMouseEnter={e => { e.currentTarget.style.background = C.white; e.currentTarget.style.color = C.text; }}
                 onMouseLeave={e => { e.currentTarget.style.background = "transparent"; e.currentTarget.style.color = C.textMuted; }}
-              >↩</button>
+              >Sign out</button>
             </div>
           </div>
         </div>
@@ -15722,10 +16631,17 @@ export default function App() {
           height: 60, background: C.sidebar, borderTop: `1px solid ${C.sidebarBorder}`,
           display: "flex", alignItems: "stretch", flexShrink: 0,
         }}>
-          {NAV_ITEMS.filter(item =>
+          {(isSuperAdmin ? [
+            { id: "organizations", label: "Organizations", icon: "" },
+            { id: "rankd",         label: "ralli",         icon: "", badge: "LIVE" },
+            { id: "learn",         label: "Learn",         icon: "" },
+            { id: "quizzes",       label: "Quizzes",       icon: "" },
+            { id: "battlecards",   label: "Battle Cards",  icon: "" },
+            { id: "settings",      label: "Settings",      icon: "" },
+          ] : NAV_ITEMS.filter(item =>
             (!item.featureKey || canAccessTenant(item.featureKey)) &&
             perm("features", item.permKey ?? item.id)
-          ).map(item => {
+          )).map(item => {
             const active = screen === item.id || (screen.startsWith("rankd-") && item.id === "rankd");
             return (
               <button key={item.id} onClick={() => navigate(item.id)} style={{
