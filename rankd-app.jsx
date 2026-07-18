@@ -66,7 +66,7 @@ import { getProfile, createMissingProfile, getTenantProfiles } from "./src/lib/p
 import { sendInviteEmail } from "./src/lib/emailService.js";
 import { provisionTenant, buildInviteUrl, normalizeProvisionedOrg, createMemberInvite } from "./src/lib/provisioningService.js";
 import { awardLessonPoints, awardCoursePoints, awardQuizPoints, awardGamePointsForSession, getLeaderboard, computeUserMeta, getUserStreak } from "./src/lib/scoringService.js";
-import { triggerReadinessUpdate, getTopicHeatmap, getOrgMetrics, getRepTopicScores } from "./src/lib/insightsService.js";
+import { triggerReadinessUpdate, getTopicHeatmap, getOrgMetrics, getRepTopicScores, getUserPerformance, getRecommendations } from "./src/lib/insightsService.js";
 
 // ── MOBILE HOOK ────────────────────────────────────────────
 function useMobile() {
@@ -617,180 +617,303 @@ function HomeScreen({ user, onNav, quizAssignments = [], onResumeLesson, onStart
   const outstanding    = quizAssignments.filter(q => !q.attempts?.some(a => a.passed));
   const recommendedQuiz = !isReal ? (outstanding.find(q => !q.attempts?.length) ?? null) : null;
 
-  if (user.role === "admin") {
-    // Compute real values from already-loaded props — no additional queries.
-    const repUsers       = isReal
-      ? orgUsers.filter(u => !["ralli_admin", "superadmin", "orgAdmin"].includes(u.role))
-      : null;
-    const teamSize       = isReal ? (homeLoading ? null : repUsers.length) : 18;
-    const totalAssign    = isReal ? (homeLoading ? null : homeAssignments.length) : 12;
+  return (
+    <PersonalDashboardScreen
+      user={user}
+      onNav={onNav}
+      isReal={isReal}
+      tenantId={tenantId}
+      orgUsers={orgUsers}
+      enrichedAssignments={enrichedAssignments}
+      pendingAssignments={pendingAssignments}
+      completedAssignments={completedAssignments}
+      overdueAssignments={overdueAssignments}
+      homeLoading={homeLoading}
+      onResumeLesson={onResumeLesson}
+      onStartCourse={onStartCourse}
+      onStartQuiz={onStartQuiz}
+      homeLbRows={homeLbRows}
+      quizzes={quizzes}
+      quizAssignments={quizAssignments}
+    />
+  );
+}
 
-    const adminStats = [
-      {
-        iconBg: C.blue,
-        label: "Team Size",
-        value: teamSize != null ? String(teamSize) : "—",
-        sub: "",
-        note: !isReal ? "3 inactive this week"
-            : homeLoading ? "Loading…"
-            : teamSize === 0 ? "No members yet"
-            : `${teamSize} member${teamSize !== 1 ? "s" : ""}`,
-        noteColor: !isReal ? C.red : C.textSub,
-      },
-      {
-        iconBg: C.orange,
-        label: "Avg. Team Score",
-        value: isReal ? "—" : "86",
-        sub: isReal ? "" : "/100",
-        note: isReal ? "See Insights for details" : "+2 pts this week",
-        noteColor: isReal ? C.textSub : C.green,
-      },
-      {
-        iconBg: C.green,
-        label: "Live Sessions",
-        value: isReal ? "—" : "2",
-        sub: isReal ? "" : " active",
-        note: isReal ? "Launch from Games tab" : "1 pending launch",
-        noteColor: C.textSub,
-      },
-      {
-        iconBg: C.purple,
-        label: "Total Assignments",
-        value: totalAssign != null ? String(totalAssign) : "—",
-        sub: "",
-        note: !isReal ? "Across 3 modules"
-            : homeLoading ? "Loading…"
-            : totalAssign === 0 ? "None created yet"
-            : `${totalAssign} active module${totalAssign !== 1 ? "s" : ""}`,
-        noteColor: C.textSub,
-      },
-    ];
+// ── PersonalDashboardScreen ─────────────────────────────────────────────────
+// Individual contributor home view. Uses the Leadership Dashboard design
+// language, scoped entirely to the current user's own data.
+// Managers/admins are routed to LeadershipDashboardScreen via case "home".
+function PersonalDashboardScreen({
+  user, onNav, isReal, tenantId, orgUsers,
+  enrichedAssignments, pendingAssignments, completedAssignments, overdueAssignments,
+  homeLoading, onResumeLesson, onStartCourse, onStartQuiz, homeLbRows, quizzes,
+  quizAssignments = [],
+}) {
+  const mobile     = useMobile();
+  const firstName  = (user.name ?? "").split(" ")[0];
+  const hour       = new Date().getHours();
+  const greeting   = hour < 12 ? "Good morning" : hour < 17 ? "Good afternoon" : "Good evening";
+  const todayLabel = new Date().toLocaleDateString("en-US", { month: "short", day: "numeric" });
 
+  // ── Fetch personal performance, topic scores, and recent activity ──────────
+  const [perf,           setPerf]           = useState(null);
+  const [recs,           setRecs]           = useState([]);
+  const [topicScores,    setTopicScores]    = useState([]);
+  const [recentActivity, setRecentActivity] = useState([]);
+  const [perfLoading,    setPerfLoading]    = useState(isReal);
+
+  useEffect(() => {
+    if (!isReal || !tenantId || !user?.id) { setPerfLoading(false); return; }
+    Promise.all([
+      getUserPerformance(tenantId, user.id),
+      getRepTopicScores(tenantId, user.id),
+      supabase
+        .from("user_point_events")
+        .select("source_type, points, created_at")
+        .eq("tenant_id", tenantId)
+        .eq("user_id", user.id)
+        .order("created_at", { ascending: false })
+        .limit(8),
+    ]).then(([perfResult, topics, { data: events }]) => {
+      if (perfResult?.data) {
+        setPerf(perfResult.data);
+        setRecs(getRecommendations(perfResult.data));
+      }
+      if (Array.isArray(topics) && topics.length) setTopicScores(topics);
+      if (events) setRecentActivity(events);
+      setPerfLoading(false);
+    }).catch(() => setPerfLoading(false));
+  }, [isReal, tenantId, user?.id]); // eslint-disable-line react-hooks/exhaustive-deps
+
+  // ── Derived values ─────────────────────────────────────────────────────────
+  const readinessScore = isReal ? (perf?.score ?? null)             : (user.score ?? null);
+  const currentStreak  = user.streak ?? 0;
+  const weeklyXp = isReal
+    ? (() => {
+        const since = Date.now() - 7 * 86_400_000;
+        return recentActivity
+          .filter(e => new Date(e.created_at).getTime() > since)
+          .reduce((s, e) => s + (e.points ?? 0), 0);
+      })()
+    : Math.round((user.xp ?? 0) * 0.15);
+  const teamRank     = user.rank ?? null;
+  const totalMembers = orgUsers.length > 0 ? orgUsers.length : null;
+
+  // ── Design helpers — same tokens as LeadershipDashboard ───────────────────
+  const scoreColor = (s) => s >= 85 ? C.trueGreen : s >= 70 ? C.orange : C.red;
+  const scoreBg    = (s) => s >= 85 ? C.trueGreenBg : s >= 70 ? C.orangeLight : C.redBg;
+
+  const ScoreBadge = ({ score, size = 14 }) => score != null ? (
+    <span style={{ fontSize: size, fontWeight: 800, color: scoreColor(score),
+      background: scoreBg(score), padding: "2px 8px", borderRadius: 6 }}>
+      {score}%
+    </span>
+  ) : null;
+
+  const SH = (title, sub) => (
+    <div style={{ marginBottom: 14 }}>
+      <div style={{ fontSize: 15, fontWeight: 800, color: C.text }}>{title}</div>
+      {sub && <div style={{ fontSize: 12, color: C.textSub, marginTop: 2 }}>{sub}</div>}
+    </div>
+  );
+
+  // ── Demo quiz results from quizAssignments (same source as old HomeScreen) ──
+  const demoQuizResults = !isReal
+    ? quizAssignments.slice(0, 4).map(q => ({
+        name:   q.title ?? q.name ?? "Quiz",
+        date:   q.dueAt && q.dueAt !== "Open" ? q.dueAt : "",
+        score:  q.attempts?.[0]?.score ?? null,
+        passed: q.attempts?.some(a => a.passed) ?? false,
+      }))
+    : [];
+
+  const realQuizResults = isReal && perf?.recentQuizAttempts?.length
+    ? perf.recentQuizAttempts.slice(0, 4).map(a => {
+        const q = quizzes?.find(q => q.id === a.quiz_id);
+        return {
+          name:   q?.title ?? "Quiz",
+          date:   new Date(a.created_at).toLocaleDateString("en-US", { month: "short", day: "numeric" }),
+          score:  a.score,
+          passed: a.passed,
+        };
+      })
+    : [];
+
+  // ── Demo topic scores derived from USER_GAME_HISTORY answers ──────────────
+  const demoTopicScores = (() => {
+    if (isReal) return [];
+    const map = {};
+    USER_GAME_HISTORY.forEach(g => {
+      (g.questions ?? []).forEach(q => {
+        if (!map[q.topic]) map[q.topic] = { correct: 0, total: 0 };
+        map[q.topic].total++;
+        if (q.isCorrect) map[q.topic].correct++;
+      });
+    });
+    return Object.entries(map)
+      .map(([topic, { correct, total }]) => ({ topic, avgScore: Math.round((correct / total) * 100) }))
+      .sort((a, b) => b.avgScore - a.avgScore);
+  })();
+
+  const displayTopicScores = isReal ? topicScores : demoTopicScores;
+
+  // ── Demo recommendations ───────────────────────────────────────────────────
+  const demoRecs = !isReal ? [
+    { priority: "high",   type: "quiz",    action: "Retake Pipeline Management quiz",   reason: "You missed 3 questions — a retake adds +6 pts to your readiness score." },
+    { priority: "medium", type: "lesson",  action: "Finish Competitive Positioning",    reason: "Incomplete modules reduce your learning score." },
+    { priority: "low",    type: "game",    action: "Join the next live Ralli session",  reason: "Live game participation accounts for 25% of your readiness." },
+  ] : [];
+
+  const displayRecs        = isReal ? recs : demoRecs;
+  const recColorMap        = { high: C.red, medium: C.orange, low: C.blue };
+  const recTypeIcon        = { quiz: "📝", lesson: "📖", course: "🎓", game: "⚡", engagement: "🔄" };
+
+  // ── Demo recent activity ───────────────────────────────────────────────────
+  const demoActivity = !isReal ? [
+    { source_type: "quiz",   points: 150, created_at: new Date(Date.now() - 2 * 3_600_000).toISOString() },
+    { source_type: "lesson", points: 75,  created_at: new Date(Date.now() - 26 * 3_600_000).toISOString() },
+    { source_type: "game",   points: 200, created_at: new Date(Date.now() - 2 * 86_400_000).toISOString() },
+    { source_type: "lesson", points: 75,  created_at: new Date(Date.now() - 3 * 86_400_000).toISOString() },
+  ] : [];
+
+  const displayActivity = isReal ? recentActivity : demoActivity;
+
+  const activityLabel = (type) =>
+    ({ lesson: "Completed lesson", quiz: "Completed quiz", game: "Played live game", course: "Completed course" })[type] ?? "Activity";
+  const activityBg = (type) =>
+    ({ lesson: "#DBEAFE", quiz: C.purple + "18", game: C.orangeLight, course: C.trueGreenBg })[type] ?? C.pageBg;
+  const activityTime = (iso) => {
+    const diff = Date.now() - new Date(iso).getTime();
+    if (diff < 3_600_000)       return `${Math.round(diff / 60_000)}m ago`;
+    if (diff < 86_400_000)      return `${Math.round(diff / 3_600_000)}h ago`;
+    if (diff < 2 * 86_400_000)  return "Yesterday";
+    return new Date(iso).toLocaleDateString("en-US", { month: "short", day: "numeric" });
+  };
+
+  // ── Loading state ──────────────────────────────────────────────────────────
+  if ((homeLoading || perfLoading) && isReal) {
     return (
       <div style={{ display: "flex", flexDirection: "column", gap: 20 }}>
         <div>
-          <h1 style={{ fontSize: 26, fontWeight: 800, color: C.text, margin: 0 }}>{greeting}, {firstName}</h1>
-          <div style={{ fontSize: 12, color: C.textSub, marginTop: 4 }}>{todayLabel} · <span style={{ color: C.green, fontWeight: 600 }}>Admin dashboard</span></div>
+          <h2 style={{ margin: 0, fontSize: 22, fontWeight: 800, color: C.text }}>My Dashboard</h2>
+          <p style={{ margin: "4px 0 0", fontSize: 13, color: C.textSub }}>Loading your readiness data…</p>
         </div>
-        <div style={{ display: "grid", gridTemplateColumns: mobile ? "repeat(2, 1fr)" : "repeat(4, 1fr)", gap: 14 }}>
-          {adminStats.map((s, i) => (
-            <Card key={i}>
-              <div style={{ fontSize: 28, fontWeight: 800, color: C.text, lineHeight: 1 }}>{s.value}<span style={{ fontSize: 16, fontWeight: 500, color: C.textSub }}>{s.sub}</span></div>
-              <div style={{ fontSize: 12, color: C.textSub, marginTop: 4 }}>{s.label}</div>
-              <div style={{ fontSize: 12, fontWeight: 600, color: s.noteColor, marginTop: 6 }}>{s.note}</div>
-            </Card>
-          ))}
-        </div>
+        <LoadingState rows={5} message="Fetching performance data…" />
       </div>
     );
   }
 
   return (
-    <div style={{ display: "flex", flexDirection: "column", gap: 20 }}>
-      {/* Streak + greeting */}
-      <div>
-        {user.streak && (
-          <div style={{ display: "flex", alignItems: "center", gap: 6, marginBottom: 4 }}>
-            <span style={{ fontSize: 13, fontWeight: 600, color: C.orange }}>{user.streak ?? 0}-day streak</span>
-            <span style={{ fontSize: 13, color: C.textSub }}>Keep it going</span>
-          </div>
-        )}
-        <h1 style={{ fontSize: 26, fontWeight: 800, color: C.text, margin: 0 }}>{greeting}, {firstName}</h1>
-        <div style={{ fontSize: 12, color: C.textSub, marginTop: 4 }}>
-          {todayLabel} ·{" "}
-          <button onClick={() => setShowTasksPanel(true)} style={{ background: "none", border: "none", padding: 0, cursor: "pointer", color: pendingCount === 0 ? C.green : C.orange, fontWeight: 600, fontSize: 12 }}>
-            {pendingCount === 0 ? "All caught up" : `${pendingCount} task${pendingCount !== 1 ? "s" : ""} remaining`}
-          </button>
+    <div style={{ display: "flex", flexDirection: "column", gap: 24 }}>
+
+      {/* ── Header ─────────────────────────────────────────── */}
+      <div style={{ display: "flex", justifyContent: "space-between", alignItems: "flex-end" }}>
+        <div>
+          {currentStreak > 0 && (
+            <div style={{ display: "flex", alignItems: "center", gap: 6, marginBottom: 4 }}>
+              <span style={{ fontSize: 13, fontWeight: 600, color: C.orange }}>{currentStreak}-day streak</span>
+              <span style={{ fontSize: 13, color: C.textSub }}>· Keep it going</span>
+            </div>
+          )}
+          <h2 style={{ margin: 0, fontSize: 22, fontWeight: 800, color: C.text }}>{greeting}, {firstName}</h2>
+          <p style={{ margin: "4px 0 0", fontSize: 13, color: C.textSub }}>
+            {todayLabel} · Personal Readiness
+          </p>
         </div>
+        {readinessScore != null && <ScoreBadge score={readinessScore} size={16} />}
       </div>
 
-      {/* Stat Cards */}
+      {/* ── TOP — 4 KPI cards ──────────────────────────────── */}
       <div style={{ display: "grid", gridTemplateColumns: mobile ? "repeat(2, 1fr)" : "repeat(4, 1fr)", gap: 14 }}>
         {[
           {
-            iconBg: C.orange, label: "Readiness Score", value: user.score != null ? String(user.score) : "—", sub: user.score != null ? "/100" : "",
-            note: user.score != null ? (isReal ? "Last 30 days of activity" : "+4 pts this week") : "No data yet", noteColor: user.score != null ? C.green : C.textSub,
-            tooltip: "Your Readiness Score reflects quiz accuracy, lesson completion, and game performance over the past 30 days. Scores range from 0–100 and update within 24 hours of activity.",
+            label: "Overall Readiness",
+            value: readinessScore != null ? `${readinessScore}%` : "—",
+            sub:   readinessScore != null ? "Last 30 days" : "Complete activities to unlock",
+            color: readinessScore != null ? scoreColor(readinessScore) : C.textMuted,
+            tooltip: "Weighted average of your quiz accuracy, lesson completion, and game performance over the past 30 days.",
           },
           {
-            iconBg: C.green, label: "Team Rank", value: user.rank != null ? `#${user.rank}` : "—", sub: user.rank != null ? ` of ${orgUsers.length > 0 ? orgUsers.length : "—"}` : "",
-            note: user.rank == null ? "No data yet" : user.rank <= 3 ? "↑ Top performer" : user.rank <= 5 ? "↑ Up 1 spot" : "Keep pushing",
-            noteColor: user.rank <= 3 ? C.green : C.textSub,
+            label: "Team Rank",
+            value: teamRank != null ? `#${teamRank}` : "—",
+            sub:   totalMembers ? `of ${totalMembers} members` : "No rankings yet",
+            color: teamRank != null && teamRank <= 3 ? C.trueGreen : C.text,
           },
           {
-            iconBg: C.blue, label: "Weekly Change", value: user.weeklyChange ? user.weeklyChange.replace("%", "") : "—", sub: user.weeklyChange ? "%" : "",
-            note: "vs last week", noteColor: C.textSub,
-            tooltip: `Compares your Readiness Score this week (${todayLabel} back 7 days) to the prior 7-day period. Positive = improvement. Scores consider quiz results, lesson completions, and game performance.`,
+            label: "Weekly XP",
+            value: weeklyXp > 0 ? weeklyXp.toLocaleString() : "—",
+            sub:   weeklyXp > 0 ? "This week" : "No activity this week",
+            color: weeklyXp > 0 ? C.orange : C.textMuted,
           },
           {
-            iconBg: C.purple, label: "Assigned Training", value: String(pendingCount), sub: " pending",
-            note: pendingCount === 0 ? "All caught up!" : overdueAssignments.length > 0 ? `${overdueAssignments.length} overdue` : `${completedAssignments.length} of ${enrichedAssignments.length} complete`,
-            noteColor: pendingCount === 0 ? C.green : overdueAssignments.length > 0 ? C.red : C.textSub,
-            clickable: true,
+            label: "Current Streak",
+            value: currentStreak > 0 ? `${currentStreak}` : "—",
+            sub:   currentStreak > 0 ? `day${currentStreak !== 1 ? "s" : ""} in a row` : "Start an activity",
+            color: currentStreak >= 7 ? C.trueGreen : currentStreak > 0 ? C.orange : C.textMuted,
           },
         ].map((s, i) => (
-          <Card key={i} style={{ cursor: s.clickable ? "pointer" : "default", transition: "box-shadow 0.15s" }}
-            onClick={s.clickable ? () => setShowTasksPanel(true) : undefined}
-            onMouseEnter={s.clickable ? (e => e.currentTarget.style.boxShadow = "0 4px 16px rgba(253,191,36,0.18)") : undefined}
-            onMouseLeave={s.clickable ? (e => e.currentTarget.style.boxShadow = "") : undefined}
-          >
-            <div style={{ fontSize: 28, fontWeight: 800, color: C.text, lineHeight: 1 }}>
-              {s.value}<span style={{ fontSize: 16, fontWeight: 500, color: C.textSub }}>{s.sub}</span>
-            </div>
-            <div style={{ fontSize: 12, color: C.textSub, marginTop: 4, display: "flex", alignItems: "center" }}>
+          <Card key={i}>
+            <div style={{ fontSize: 26, fontWeight: 900, color: s.color }}>{s.value}</div>
+            <div style={{ fontSize: 12, fontWeight: 700, color: C.text, marginTop: 4, display: "flex", alignItems: "center", gap: 4 }}>
               {s.label}
               {s.tooltip && <InfoTooltip text={s.tooltip} />}
             </div>
-            <div style={{ fontSize: 12, fontWeight: 600, color: s.noteColor, marginTop: 6 }}>{s.note}</div>
+            <div style={{ fontSize: 11, color: C.textSub, marginTop: 2 }}>{s.sub}</div>
           </Card>
         ))}
       </div>
 
-      {/* In Progress + Leaderboard */}
-      <div style={{ display: "grid", gridTemplateColumns: mobile ? "1fr" : "1fr 320px", gap: 16 }}>
-        <div style={{ display: "flex", flexDirection: "column", gap: 14 }}>
+      {/* ── MIDDLE — Assigned Learning + Quiz Results + Leaderboard ─────────── */}
+      <div style={{ display: "grid", gridTemplateColumns: mobile ? "1fr" : "1fr 300px", gap: 16 }}>
 
-          {/* In Progress / Upcoming — all pending assignments */}
+        {/* Left — Assigned + In Progress ─────────────── */}
+        <div style={{ display: "flex", flexDirection: "column", gap: 12 }}>
+          {SH("Assigned Learning",
+            pendingAssignments.length > 0
+              ? `${pendingAssignments.length} pending · ${completedAssignments.length} complete`
+              : "All caught up"
+          )}
+
           {homeLoading ? (
             <Card><p style={{ margin: 0, fontSize: 14, color: C.textSub }}>Loading assignments…</p></Card>
           ) : pendingAssignments.length === 0 ? (
             <Card>
-              <div style={{ display: "flex", alignItems: "center", gap: 6, marginBottom: 10 }}>
-                <div style={{ width: 8, height: 8, borderRadius: 2, background: C.green }} />
-                <span style={{ fontSize: 11, fontWeight: 700, color: C.green, letterSpacing: "0.06em" }}>ALL CAUGHT UP</span>
+              <div style={{ display: "flex", alignItems: "center", gap: 6, marginBottom: 8 }}>
+                <div style={{ width: 8, height: 8, borderRadius: 2, background: C.trueGreen }} />
+                <span style={{ fontSize: 11, fontWeight: 700, color: C.trueGreen, letterSpacing: "0.06em" }}>ALL CAUGHT UP</span>
               </div>
-              <p style={{ margin: 0, fontSize: 14, color: C.textSub }}>No outstanding assignments. Check the Learn or Quizzes tabs for more content.</p>
+              <p style={{ margin: 0, fontSize: 14, color: C.textSub }}>
+                No outstanding assignments. Check the Learn or Quizzes tabs for more content.
+              </p>
             </Card>
-          ) : pendingAssignments.map((item) => {
+          ) : pendingAssignments.slice(0, 3).map((item) => {
             const { content, contentKind, pct, dueStatus } = item;
-            const typeColor  = contentKind === "course" ? (content.color ?? C.orange) : contentKind === "quiz" ? C.purple : LESSON_TYPE_COLORS[content.type] ?? C.blue;
-            const typeLabel  = contentKind === "course" ? "COURSE" : contentKind === "quiz" ? "QUIZ" : `LESSON · ${(content.type ?? "").toUpperCase()}`;
-            const timeProgress = (item.assignedAtRaw && item.dueAt && item.dueAt !== "Open")
-              ? getDueProgress(item.assignedAtRaw, item.dueAt) : 0;
-            const barColor   = dueStatus?.label === "Overdue" ? C.red : timeProgress > 80 ? C.red : timeProgress > 50 ? C.orange : C.green;
+            const typeColor = contentKind === "course" ? (content.color ?? C.orange)
+              : contentKind === "quiz" ? C.purple : LESSON_TYPE_COLORS[content.type] ?? C.blue;
+            const typeLabel = contentKind === "course" ? "COURSE" : contentKind === "quiz" ? "QUIZ" : "LESSON";
             const handleAction = () => {
-              if (contentKind === "quiz")   onStartQuiz?.(content.id);
+              if (contentKind === "quiz")        onStartQuiz?.(content.id);
               else if (contentKind === "course") onStartCourse?.(content.id);
-              else onResumeLesson?.(content.id);
+              else                               onResumeLesson?.(content.id);
             };
-            const actionLabel = pct > 0 ? "Resume →" : "Start →";
             return (
               <Card key={item.id}>
-                <div style={{ display: "flex", alignItems: "center", gap: 6, marginBottom: 12 }}>
+                <div style={{ display: "flex", alignItems: "center", gap: 6, marginBottom: 10 }}>
                   <div style={{ width: 8, height: 8, borderRadius: 2, background: typeColor }} />
                   <span style={{ fontSize: 11, fontWeight: 700, color: typeColor, letterSpacing: "0.06em" }}>{typeLabel}</span>
                   {item.required && <span style={{ fontSize: 10, fontWeight: 700, padding: "2px 6px", borderRadius: 4, background: C.redBg, color: C.red }}>REQUIRED</span>}
-                  {item.isNew && <span style={{ fontSize: 10, fontWeight: 700, padding: "2px 6px", borderRadius: 4, background: "#DBEAFE", color: "#2563EB" }}>NEW</span>}
+                  {item.isNew    && <span style={{ fontSize: 10, fontWeight: 700, padding: "2px 6px", borderRadius: 4, background: "#DBEAFE", color: "#2563EB" }}>NEW</span>}
                   {dueStatus && (
-                    <span style={{ fontSize: 10, fontWeight: 700, padding: "2px 7px", borderRadius: 4, background: dueStatus.color + "18", color: dueStatus.color, marginLeft: "auto" }}>
+                    <span style={{ fontSize: 10, fontWeight: 700, padding: "2px 7px", borderRadius: 4,
+                      background: dueStatus.color + "18", color: dueStatus.color, marginLeft: "auto" }}>
                       {dueStatus.label}
                     </span>
                   )}
                 </div>
                 <div style={{ display: "flex", justifyContent: "space-between", alignItems: "flex-start", gap: 12 }}>
                   <div style={{ flex: 1, minWidth: 0 }}>
-                    <div style={{ fontSize: 16, fontWeight: 700, color: C.text }}>{content.title ?? content.name}</div>
-                    <div style={{ display: "flex", gap: 12, marginTop: 5, fontSize: 12, color: C.textSub }}>
+                    <div style={{ fontSize: 15, fontWeight: 700, color: C.text }}>{content.title ?? content.name}</div>
+                    <div style={{ display: "flex", gap: 10, marginTop: 4, fontSize: 12, color: C.textSub }}>
                       {contentKind === "course" && <span>{(content.lessonIds ?? []).length} lessons</span>}
                       {contentKind === "lesson" && content.duration && <span>⏱ {content.duration}</span>}
                       {contentKind === "quiz"   && <span>{(content.questions ?? []).length} questions</span>}
@@ -800,150 +923,237 @@ function HomeScreen({ user, onNav, quizAssignments = [], onResumeLesson, onStart
                   </div>
                   {pct > 0 && (
                     <div style={{ textAlign: "right", flexShrink: 0 }}>
-                      <div style={{ fontSize: 20, fontWeight: 800, color: typeColor }}>{pct}%</div>
+                      <div style={{ fontSize: 18, fontWeight: 800, color: typeColor }}>{pct}%</div>
                       <div style={{ fontSize: 10, color: C.textSub }}>complete</div>
                     </div>
                   )}
                 </div>
-                {(pct > 0 || timeProgress > 0) && (
-                  <div style={{ marginTop: 12, marginBottom: 14 }}>
-                    <ProgressBar value={pct > 0 ? pct : timeProgress} color={pct > 0 ? typeColor : barColor} height={5} />
+                {pct > 0 && (
+                  <div style={{ marginTop: 10, marginBottom: 10 }}>
+                    <ProgressBar value={pct} color={typeColor} height={5} />
                   </div>
                 )}
-                <div style={{ marginTop: pct > 0 || timeProgress > 0 ? 0 : 12 }}>
-                  <button onClick={handleAction} style={{ padding: "9px 18px", borderRadius: 8, border: "none", cursor: "pointer", background: typeColor, color: "#fff", fontSize: 13, fontWeight: 700 }}>
-                    {actionLabel}
+                <div style={{ marginTop: pct > 0 ? 0 : 12 }}>
+                  <button onClick={handleAction}
+                    style={{ padding: "8px 16px", borderRadius: 8, border: "none", cursor: "pointer",
+                      background: typeColor, color: "#fff", fontSize: 13, fontWeight: 700 }}>
+                    {pct > 0 ? "Resume →" : "Start →"}
                   </button>
                 </div>
               </Card>
             );
           })}
 
-          {/* Demo: Recommended quiz for non-real users */}
-          {!isReal && recommendedQuiz && (
-            <Card>
-              <div style={{ display: "flex", alignItems: "center", gap: 6, marginBottom: 12 }}>
-                <div style={{ width: 8, height: 8, borderRadius: 2, background: C.purple }} />
-                <span style={{ fontSize: 11, fontWeight: 700, color: C.purple, letterSpacing: "0.06em" }}>RECOMMENDED QUIZ</span>
-              </div>
-              <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center" }}>
-                <div>
-                  <div style={{ fontSize: 16, fontWeight: 700, color: C.text }}>{recommendedQuiz.title}</div>
-                  <div style={{ display: "flex", gap: 14, marginTop: 6 }}>
-                    <span style={{ fontSize: 12, color: C.textSub }}>{recommendedQuiz.questions?.length ?? 0} questions</span>
-                    <span style={{ fontSize: 12, fontWeight: 600, color: C.orange }}>+{recommendedQuiz.xp} XP</span>
-                  </div>
-                </div>
-                <button onClick={() => onStartQuiz?.(recommendedQuiz.id)} style={{ padding: "8px 16px", borderRadius: 8, border: `1px solid ${C.orangeBorder}`, background: C.orangeLight, color: C.orange, fontSize: 13, fontWeight: 600, cursor: "pointer", flexShrink: 0 }}>
-                  Start Quiz →
-                </button>
-              </div>
-            </Card>
+          {pendingAssignments.length > 3 && (
+            <button
+              onClick={() => onNav?.("learn")}
+              style={{ padding: "10px", borderRadius: 10, border: `1px solid ${C.border}`,
+                background: C.pageBg, color: C.orange, fontSize: 13, fontWeight: 600,
+                cursor: "pointer", textAlign: "center" }}
+            >
+              +{pendingAssignments.length - 3} more — View all in Learn →
+            </button>
           )}
         </div>
 
-        {/* Leaderboard sidebar */}
-        {(() => {
-          // For real users: homeLbRows loaded from user_point_events (single source of truth).
-          // For demo users: use the hardcoded mock data.
-          const lbData = isReal
-            ? homeLbRows.map(r => ({ ...r, score: r.total }))
-            : leaderboardData.map(p => ({ ...p, isMe: p.userId ? p.userId === user?.id : !!p.isMe }));
-          return (
-            <Card style={{ padding: 0, overflow: "hidden" }}>
-              <div style={{ padding: "16px 20px", borderBottom: `1px solid ${C.border}`, display: "flex", justifyContent: "space-between", alignItems: "center" }}>
-                <span style={{ fontSize: 15, fontWeight: 700, color: C.text }}>Leaderboard</span>
-                <span onClick={() => onNav?.("leaderboard")} style={{ fontSize: 12, color: C.orange, fontWeight: 600, cursor: "pointer" }}>Full view</span>
-              </div>
-              {lbData.length === 0 ? (
-                <div style={{ padding: "32px 20px", textAlign: "center" }}>
-                  <div style={{ fontSize: 24, marginBottom: 10 }}>🏆</div>
-                  <div style={{ fontSize: 13, fontWeight: 700, color: C.text, marginBottom: 4 }}>No rankings yet</div>
-                  <div style={{ fontSize: 12, color: C.textSub, lineHeight: 1.6 }}>Rankings appear once your team completes training.</div>
-                </div>
-              ) : (
-                <div>
-                  {lbData.map((p, i) => (
-                    <div key={p.userId ?? p.rank ?? i} style={{ display: "flex", alignItems: "center", gap: 12, padding: "12px 20px", background: p.isMe ? C.orangeLight : "transparent", borderBottom: i < lbData.length - 1 ? `1px solid ${C.border}` : "none" }}>
-                      <div style={{ width: 24, height: 24, borderRadius: "50%", background: p.rank === 1 ? "#F5A623" : p.rank === 2 ? "#A8B2C0" : p.rank === 3 ? "#CD7F32" : C.pageBg, display: "flex", alignItems: "center", justifyContent: "center", fontSize: 11, fontWeight: 800, color: p.rank <= 3 ? "#fff" : C.textSub, flexShrink: 0 }}>{p.rank}</div>
-                      <Avatar initials={p.initials} size={32} color={p.color} />
-                      <div style={{ flex: 1, minWidth: 0 }}>
-                        <div style={{ fontSize: 13, fontWeight: p.isMe ? 700 : 500, color: p.isMe ? C.orange : C.text, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{p.name}</div>
-                      </div>
-                      <div style={{ textAlign: "right" }}>
-                        <div style={{ fontSize: 14, fontWeight: 700, color: C.text }}>{p.score.toLocaleString()}</div>
-                        {(p.change ?? 0) !== 0 ? <div style={{ fontSize: 11, fontWeight: 600, color: p.change > 0 ? C.green : C.red }}>{p.change > 0 ? `+${p.change}` : p.change}</div> : <div style={{ fontSize: 11, color: C.textMuted }}>—</div>}
-                      </div>
-                    </div>
-                  ))}
-                </div>
-              )}
-            </Card>
-          );
-        })()}
-      </div>
+        {/* Right — Recent Quiz Results + Mini Leaderboard ─ */}
+        <div style={{ display: "flex", flexDirection: "column", gap: 16 }}>
 
-      {/* Tasks Panel — overlay modal */}
-      {showTasksPanel && (
-        <div style={{ position: "fixed", inset: 0, zIndex: 900, display: "flex", alignItems: "flex-start", justifyContent: "flex-end" }}
-          onClick={(e) => { if (e.target === e.currentTarget) setShowTasksPanel(false); }}>
-          <div style={{ background: "rgba(0,0,0,0.3)", position: "absolute", inset: 0 }} onClick={() => setShowTasksPanel(false)} />
-          <div style={{ position: "relative", width: 420, height: "100vh", background: C.white, boxShadow: "-4px 0 32px rgba(0,0,0,0.12)", display: "flex", flexDirection: "column", overflowY: "auto", zIndex: 901 }}>
-            <div style={{ padding: "20px 24px 16px", borderBottom: `1px solid ${C.border}`, display: "flex", alignItems: "center", justifyContent: "space-between", position: "sticky", top: 0, background: C.white, zIndex: 1 }}>
-              <div>
-                <div style={{ fontSize: 16, fontWeight: 800, color: C.text }}>Outstanding Assignments</div>
-                <div style={{ fontSize: 12, color: C.textSub, marginTop: 2 }}>{pendingCount} remaining</div>
-              </div>
-              <button onClick={() => setShowTasksPanel(false)} style={{ background: C.muted, border: "none", borderRadius: 8, width: 32, height: 32, fontSize: 16, cursor: "pointer", color: C.textSub, display: "flex", alignItems: "center", justifyContent: "center" }}>✕</button>
-            </div>
-            <div style={{ padding: "16px 24px", display: "flex", flexDirection: "column", gap: 12 }}>
-              {pendingAssignments.length === 0 ? (
-                <div style={{ padding: 40, textAlign: "center", color: C.textSub }}>
-                  <div style={{ fontSize: 15, fontWeight: 700, color: C.text, marginBottom: 4 }}>All caught up!</div>
-                  <div style={{ fontSize: 13 }}>No outstanding assignments.</div>
+          {/* Recent Quizzes */}
+          <div>
+            {SH("Recent Quizzes", "")}
+            <Card style={{ padding: 0, overflow: "hidden" }}>
+              {(isReal ? realQuizResults : demoQuizResults).length === 0 ? (
+                <div style={{ padding: "24px 20px", textAlign: "center" }}>
+                  <div style={{ fontSize: 13, fontWeight: 700, color: C.text, marginBottom: 4 }}>No quizzes yet</div>
+                  <div style={{ fontSize: 12, color: C.textSub, marginBottom: 12 }}>
+                    Your results will appear here after your first attempt.
+                  </div>
+                  <button
+                    onClick={() => onNav?.("quizzes")}
+                    style={{ padding: "7px 14px", borderRadius: 8, border: `1px solid ${C.orangeBorder}`,
+                      background: C.orangeLight, color: C.orange, fontSize: 12, fontWeight: 600, cursor: "pointer" }}
+                  >
+                    Browse Quizzes →
+                  </button>
                 </div>
-              ) : pendingAssignments.map(item => {
-                const { content, contentKind, pct, dueStatus } = item;
-                const typeColor = contentKind === "course" ? (content.color ?? C.orange) : contentKind === "quiz" ? C.purple : LESSON_TYPE_COLORS[content.type] ?? C.blue;
-                const timeProgress = (item.assignedAtRaw && item.dueAt && item.dueAt !== "Open")
-                  ? getDueProgress(item.assignedAtRaw, item.dueAt) : 0;
-                const barColor = dueStatus?.label === "Overdue" ? C.red : timeProgress > 80 ? C.red : timeProgress > 50 ? C.orange : C.green;
-                const handleAction = () => {
-                  setShowTasksPanel(false);
-                  if (contentKind === "quiz")        onStartQuiz?.(content.id);
-                  else if (contentKind === "course") onStartCourse?.(content.id);
-                  else                               onResumeLesson?.(content.id);
-                };
-                return (
-                  <div key={item.id} style={{ background: C.pageBg, borderRadius: 12, padding: "14px 16px", border: `1px solid ${C.border}` }}>
-                    <div style={{ display: "flex", justifyContent: "space-between", alignItems: "flex-start", gap: 8, marginBottom: 8 }}>
-                      <div style={{ flex: 1, minWidth: 0 }}>
-                        <div style={{ fontSize: 11, fontWeight: 700, color: typeColor, letterSpacing: "0.05em", marginBottom: 2 }}>
-                          {contentKind === "course" ? "COURSE" : contentKind === "quiz" ? "QUIZ" : "LESSON"}
-                        </div>
-                        <div style={{ fontSize: 13, fontWeight: 700, color: C.text, marginBottom: 2 }}>{content.title ?? content.name}</div>
-                        {item.dueAt && item.dueAt !== "Open" && <div style={{ fontSize: 11, color: C.textSub }}>Due {item.dueAt}</div>}
-                      </div>
-                      {dueStatus && <span style={{ fontSize: 10, fontWeight: 700, padding: "2px 7px", borderRadius: 4, background: dueStatus.color + "18", color: dueStatus.color, flexShrink: 0 }}>{dueStatus.label}</span>}
+              ) : (isReal ? realQuizResults : demoQuizResults).map((q, i, arr) => (
+                <div
+                  key={i}
+                  style={{ padding: "13px 18px", borderBottom: i < arr.length - 1 ? `1px solid ${C.border}` : "none",
+                    display: "flex", alignItems: "center", justifyContent: "space-between", gap: 12 }}
+                >
+                  <div style={{ flex: 1, minWidth: 0 }}>
+                    <div style={{ fontSize: 13, fontWeight: 600, color: C.text, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{q.name}</div>
+                    <div style={{ fontSize: 11, color: C.textSub, marginTop: 2 }}>
+                      {q.date}{q.rank != null ? ` · Rank #${q.rank}` : ""}
                     </div>
-                    {(pct > 0 || timeProgress > 0) && (
-                      <div style={{ marginBottom: 10 }}>
-                        <ProgressBar value={pct > 0 ? pct : timeProgress} color={pct > 0 ? typeColor : barColor} height={4} />
+                  </div>
+                  <div style={{ textAlign: "right", flexShrink: 0 }}>
+                    <div style={{ fontSize: 14, fontWeight: 800, color: scoreColor(q.score) }}>{q.score}%</div>
+                    {q.passed != null && (
+                      <div style={{ fontSize: 10, fontWeight: 600, color: q.passed ? C.trueGreen : C.red }}>
+                        {q.passed ? "Passed" : "Failed"}
                       </div>
                     )}
-                    <button onClick={handleAction} style={{ padding: "7px 14px", borderRadius: 7, border: "none", cursor: "pointer", background: typeColor, color: "#fff", fontSize: 12, fontWeight: 700 }}>
-                      {pct > 0 ? "Resume →" : "Start →"}
-                    </button>
+                  </div>
+                </div>
+              ))}
+            </Card>
+          </div>
+
+          {/* Mini Leaderboard */}
+          <div>
+            {SH("Team Leaderboard", "")}
+            <Card style={{ padding: 0, overflow: "hidden" }}>
+              {(() => {
+                const lbData = isReal
+                  ? homeLbRows.map(r => ({ ...r, score: r.total }))
+                  : leaderboardData.slice(0, 5).map(p => ({ ...p, isMe: p.userId ? p.userId === user?.id : !!p.isMe }));
+                if (!lbData.length) {
+                  return (
+                    <div style={{ padding: "20px", textAlign: "center", fontSize: 12, color: C.textSub }}>
+                      Rankings appear once your team earns XP.
+                    </div>
+                  );
+                }
+                return (
+                  <>
+                    {lbData.map((p, i) => (
+                      <div
+                        key={p.userId ?? i}
+                        style={{ display: "flex", alignItems: "center", gap: 10, padding: "10px 16px",
+                          background: p.isMe ? C.orangeLight : "transparent",
+                          borderBottom: i < lbData.length - 1 ? `1px solid ${C.border}` : "none" }}
+                      >
+                        <div style={{ width: 20, height: 20, borderRadius: "50%",
+                          background: p.rank === 1 ? "#F5A623" : p.rank === 2 ? "#A8B2C0" : p.rank === 3 ? "#CD7F32" : C.pageBg,
+                          display: "flex", alignItems: "center", justifyContent: "center",
+                          fontSize: 10, fontWeight: 800, color: p.rank <= 3 ? "#fff" : C.textSub, flexShrink: 0 }}>
+                          {p.rank}
+                        </div>
+                        <Avatar initials={p.initials} size={26} color={p.color} />
+                        <div style={{ flex: 1, minWidth: 0, fontSize: 12, fontWeight: p.isMe ? 700 : 500,
+                          color: p.isMe ? C.orange : C.text, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
+                          {p.name}
+                        </div>
+                        <div style={{ fontSize: 12, fontWeight: 700, color: C.text, flexShrink: 0 }}>
+                          {(p.score ?? 0).toLocaleString()}
+                        </div>
+                      </div>
+                    ))}
+                    <div style={{ padding: "10px 16px", borderTop: `1px solid ${C.border}`, textAlign: "center" }}>
+                      <span onClick={() => onNav?.("leaderboard")}
+                        style={{ fontSize: 12, color: C.orange, fontWeight: 600, cursor: "pointer" }}>
+                        Full leaderboard →
+                      </span>
+                    </div>
+                  </>
+                );
+              })()}
+            </Card>
+          </div>
+        </div>
+      </div>
+
+      {/* ── BOTTOM — Topic Heatmap + Recommendations ────────── */}
+      <div style={{ display: "grid", gridTemplateColumns: mobile ? "1fr" : "1fr 1fr", gap: 16 }}>
+
+        {/* Personal Topic Heatmap */}
+        <Card>
+          {SH("Knowledge by Topic", "Based on your quiz attempts")}
+          {displayTopicScores.length === 0 ? (
+            <div style={{ padding: "20px 0", textAlign: "center", color: C.textSub, fontSize: 13 }}>
+              Complete tagged quizzes to see your topic-by-topic breakdown.
+            </div>
+          ) : (
+            <div style={{ display: "flex", flexDirection: "column", gap: 10 }}>
+              {[...displayTopicScores].sort((a, b) => b.avgScore - a.avgScore).map(t => {
+                const s = t.avgScore ?? 0;
+                const barColor = s >= 85 ? C.trueGreen : s >= 65 ? C.orange : C.red;
+                return (
+                  <div key={t.topic}>
+                    <div style={{ display: "flex", justifyContent: "space-between", marginBottom: 5 }}>
+                      <span style={{ fontSize: 12, fontWeight: 600, color: C.text, textTransform: "capitalize" }}>{t.topic}</span>
+                      <span style={{ fontSize: 12, fontWeight: 800, color: barColor }}>{s}%</span>
+                    </div>
+                    <ProgressBar value={s} color={barColor} height={7} />
+                  </div>
+                );
+              })}
+              <div style={{ display: "flex", gap: 12, marginTop: 4 }}>
+                {[{ label: "Strong ≥85", color: C.trueGreen }, { label: "On Track ≥65", color: C.orange }, { label: "At Risk <65", color: C.red }]
+                  .map(({ label, color }) => (
+                    <div key={label} style={{ display: "flex", alignItems: "center", gap: 4 }}>
+                      <div style={{ width: 8, height: 8, borderRadius: 2, background: color }} />
+                      <span style={{ fontSize: 10, color: C.textMuted }}>{label}</span>
+                    </div>
+                  ))}
+              </div>
+            </div>
+          )}
+        </Card>
+
+        {/* Recommended Next Actions */}
+        <Card>
+          {SH("Recommended Next Actions", "Personalized to close your performance gaps")}
+          {displayRecs.length === 0 ? (
+            <div style={{ padding: "20px 0", textAlign: "center", color: C.textSub, fontSize: 13 }}>
+              {isReal ? "No recommendations yet — keep completing activities." : "All caught up!"}
+            </div>
+          ) : (
+            <div style={{ display: "flex", flexDirection: "column", gap: 10 }}>
+              {displayRecs.map((rec, i) => {
+                const color = recColorMap[rec.priority] ?? C.textSub;
+                return (
+                  <div key={i} style={{ display: "flex", gap: 12, padding: "12px 14px",
+                    borderRadius: C.radiusSm, background: color + "0d", border: `1px solid ${color}22` }}>
+                    <div style={{ fontSize: 16, flexShrink: 0, lineHeight: 1.4 }}>
+                      {recTypeIcon[rec.type] ?? "•"}
+                    </div>
+                    <div>
+                      <div style={{ fontSize: 13, fontWeight: 700, color: C.text, marginBottom: 3 }}>{rec.action}</div>
+                      <div style={{ fontSize: 12, color: C.textSub, lineHeight: 1.5 }}>{rec.reason}</div>
+                    </div>
                   </div>
                 );
               })}
             </div>
+          )}
+        </Card>
+      </div>
+
+      {/* ── Recent Activity ─────────────────────────────────── */}
+      <Card>
+        {SH("Recent Activity", "Your latest XP-earning events")}
+        {displayActivity.length === 0 ? (
+          <div style={{ padding: "20px 0", textAlign: "center", color: C.textSub, fontSize: 13 }}>
+            No activity yet. Complete a lesson, quiz, or game to earn XP.
           </div>
-        </div>
-      )}
+        ) : (
+          <div>
+            {displayActivity.map((e, i) => (
+              <div key={i} style={{ display: "flex", alignItems: "center", gap: 12, padding: "12px 0",
+                borderBottom: i < displayActivity.length - 1 ? `1px solid ${C.border}` : "none" }}>
+                <div style={{ width: 34, height: 34, borderRadius: 8, background: activityBg(e.source_type),
+                  display: "flex", alignItems: "center", justifyContent: "center", fontSize: 15, flexShrink: 0 }}>
+                  {recTypeIcon[e.source_type] ?? "⚡"}
+                </div>
+                <div style={{ flex: 1, minWidth: 0 }}>
+                  <div style={{ fontSize: 13, fontWeight: 600, color: C.text }}>{activityLabel(e.source_type)}</div>
+                  <div style={{ fontSize: 11, color: C.textSub }}>{activityTime(e.created_at)}</div>
+                </div>
+                <div style={{ fontSize: 13, fontWeight: 700, color: C.orange, flexShrink: 0 }}>+{e.points} XP</div>
+              </div>
+            ))}
+          </div>
+        )}
+      </Card>
+
     </div>
   );
 }
+
 
 // ── RANKD DATA ───────────────────────────────────────────────
 
@@ -15354,14 +15564,12 @@ function InsightsScreen({ user, isReal = false, tenantId = null, orgUsers = [], 
 // permKey     — gates by admin-controlled role permission (rolePermissions.features)
 //               defaults to item.id when not specified
 const NAV_ITEMS = [
-  { id: "home",        label: "Home",         icon: "", featureKey: "dashboard", permKey: "home" },
-  { id: "rankd",       label: "ralli",        icon: "", badge: "LIVE", featureKey: "games", permKey: "games" },
-  { id: "learn",       label: "Learn",        icon: "", featureKey: "learn",     permKey: "learn" },
-  { id: "quizzes",     label: "Quizzes",      icon: "", featureKey: "learn",     permKey: "quizzes" },
-  { id: "battlecards", label: "Battle Cards", icon: "", featureKey: "learn",     permKey: "battlecards" },
-  { id: "insights",    label: "Insights",     icon: "", featureKey: "progress",  permKey: "progress" },
-  { id: "progress",    label: "Progress",     adminLabel: "Leadership",  icon: "", featureKey: "progress",    permKey: "progress" },
-  { id: "leaderboard", label: "Leaderboard",  icon: "", badge: "#3", featureKey: "leaderboard", permKey: "leaderboard" },
+  { id: "home",        label: "Home",         icon: "", featureKey: "dashboard",   permKey: "home" },
+  { id: "leaderboard", label: "Leaderboard",  icon: "", featureKey: "leaderboard", permKey: "leaderboard" },
+  { id: "rankd",       label: "Ralli",   icon: "", badge: "LIVE", featureKey: "games", permKey: "games" },
+  { id: "learn",       label: "Learn",        icon: "", featureKey: "learn",       permKey: "learn" },
+  { id: "battlecards", label: "Battle Cards", icon: "", featureKey: "learn",       permKey: "battlecards" },
+  { id: "quizzes",     label: "Quizzes",      icon: "", featureKey: "learn",       permKey: "quizzes" },
   { id: "settings",    label: "Settings",     icon: "", permKey: "settings" },
 ];
 
@@ -17005,7 +17213,7 @@ export default function App() {
         }
         setScreen("team");
       }} />;
-      case "home":              return isOrgAdmin
+      case "home":              return isAdminType
         ? <LeadershipDashboardScreen currentOrg={currentOrg} orgUsers={orgUsers} isReal={!!user?._isReal} />
         : <HomeScreen user={user} onNav={navigate} quizAssignments={user?._isReal ? [] : USER_QUIZ_ASSIGNMENTS_SEED} onResumeLesson={(id) => { setPendingLessonId(id); navigate("learn"); }} onStartCourse={(id) => { setPendingCourseId(id); navigate("learn"); }} onStartQuiz={(id) => { setPendingQuizId(id); navigate("quizzes"); }} orgUsers={orgUsers} isReal={!!user?._isReal} tenantId={currentOrg?.id ?? null} quizzes={quizzes} lastSeenAt={lastSeenAt} onNewAssignments={(n) => setNewAssignmentCount(n)} />;
       case "rankd":             return <RankdScreen onNav={navigate} onJoin={handleEnterPin} sessions={sessions} onLaunch={handleLaunch} onViewResults={handleViewResults} onRelaunch={handleRelaunch} role={gameRole} currentUser={currentUser} />;
@@ -17088,7 +17296,7 @@ export default function App() {
               // Super admin gets org management nav
               ...(isSuperAdmin ? [
                 { id: "organizations", label: "Organizations", icon: "" },
-                { id: "rankd",         label: "ralli",   icon: "", badge: "LIVE" },
+                { id: "rankd",         label: "Ralli",   icon: "", badge: "LIVE" },
                 { id: "learn",         label: "Learn",         icon: "" },
                 { id: "quizzes",       label: "Quizzes",       icon: "" },
                 { id: "battlecards",   label: "Battle Cards",  icon: "" },
@@ -17309,7 +17517,7 @@ export default function App() {
         }}>
           {(isSuperAdmin ? [
             { id: "organizations", label: "Organizations", icon: "" },
-            { id: "rankd",         label: "ralli",         icon: "", badge: "LIVE" },
+            { id: "rankd",         label: "Ralli",    icon: "", badge: "LIVE" },
             { id: "learn",         label: "Learn",         icon: "" },
             { id: "quizzes",       label: "Quizzes",       icon: "" },
             { id: "battlecards",   label: "Battle Cards",  icon: "" },
