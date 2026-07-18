@@ -14577,10 +14577,10 @@ function ResetPasswordScreen({ onSuccess }) {
 
   return (
     <div style={{
-      height: "100vh", display: "flex", alignItems: "center", justifyContent: "center",
+      minHeight: "100vh", display: "flex", alignItems: "flex-start", justifyContent: "center",
       background: C.cream,
       fontFamily: "'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif",
-      padding: "24px 20px",
+      padding: "48px 20px 24px",
     }}>
       <div style={{ width: "100%", maxWidth: 400, margin: "0 auto" }}>
         {/* Logo */}
@@ -14749,10 +14749,10 @@ function LoginScreen({ onLogin, users = USERS }) {
 
   return (
     <div style={{
-      height: "100vh", display: "flex", alignItems: "center", justifyContent: "center",
+      minHeight: "100vh", display: "flex", alignItems: "flex-start", justifyContent: "center",
       background: C.cream,
       fontFamily: "'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif",
-      padding: "24px 20px", overflowY: "auto",
+      padding: "48px 20px 24px",
     }}>
       <div style={{ width: "100%", maxWidth: 400, margin: "0 auto" }}>
         {/* Logo */}
