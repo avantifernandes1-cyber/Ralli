@@ -79,7 +79,7 @@ const S = {
 // ── NAV ────────────────────────────────────────────────────────
 const NAV_LINKS = [
   { id: "home",         label: "Home",                   page: "home"     },
-  { id: "features",     label: "Features + How It Works", page: "solution" },
+  { id: "features",     label: "How It Works",             page: "solution" },
   { id: "pricing",      label: "Pricing",                page: "contact"  },
   { id: "team",         label: "Meet the Team",          page: "team"     },
 ];
@@ -1025,8 +1025,8 @@ function HomePage({ navigate }) {
     <PageWrapper>
       <Hero navigate={navigate} />
       <PlatformShowcase />
-      <GamesSection navigate={navigate} />
       <InsightsSection />
+      <GamesSection navigate={navigate} />
       <ProfilesSection />
       <FeaturesGrid />
       <LearningPaths />
