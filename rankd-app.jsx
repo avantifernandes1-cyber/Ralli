@@ -307,18 +307,16 @@ const C = {
 // are all available as named imports above.
 
 // ── RALLI LOGO ─────────────────────────────────────────────
-function RalliLogo({ size = 36 }) {
+// Uses the official exported asset. height prop controls size;
+// width scales automatically to preserve the lockup proportions.
+function RalliLogo({ height = 32 }) {
   return (
-    <svg width={size} height={size} viewBox="0 0 100 100" xmlns="http://www.w3.org/2000/svg" style={{ display: "block", flexShrink: 0 }}>
-      <rect width="100" height="100" rx="22" fill="#FDBF24"/>
-      {/* Four rounded pods at diagonal positions */}
-      <circle cx="34" cy="34" r="22" fill="white"/>
-      <circle cx="66" cy="34" r="22" fill="white"/>
-      <circle cx="34" cy="66" r="22" fill="white"/>
-      <circle cx="66" cy="66" r="22" fill="white"/>
-      {/* Pentagon center cutout — reveals amber background */}
-      <polygon points="50,39 62,47 57,61 43,61 38,47" fill="#FDBF24"/>
-    </svg>
+    <img
+      src="/assets/ralli-logo.png"
+      alt="ralli"
+      draggable={false}
+      style={{ height, width: "auto", display: "block", flexShrink: 0 }}
+    />
   );
 }
 
@@ -14381,13 +14379,8 @@ function InviteScreen({ token, onSuccess }) {
       <div style={{ width: "100%", maxWidth: 420 }}>
 
         {/* Logo */}
-        <div style={{ textAlign: "center", marginBottom: 32 }}>
-          <div style={{
-            width: 52, height: 52, borderRadius: 14, background: C.orange,
-            display: "inline-flex", alignItems: "center", justifyContent: "center",
-            fontSize: 22, fontWeight: 900, color: "#fff", marginBottom: 12,
-          }}>r</div>
-          <div style={{ fontSize: 13, color: C.textSub, fontWeight: 500 }}>ralli</div>
+        <div style={{ display: "flex", justifyContent: "center", marginBottom: 32 }}>
+          <RalliLogo height={36} />
         </div>
 
         <div style={{
@@ -14588,12 +14581,8 @@ function ResetPasswordScreen({ onSuccess }) {
     }}>
       <div style={{ width: "100%", maxWidth: 400, margin: "0 auto" }}>
         {/* Logo */}
-        <div style={{ display: "flex", alignItems: "center", gap: 12, marginBottom: 40, justifyContent: "center" }}>
-          <RalliLogo size={44} />
-          <div>
-            <div style={{ fontSize: 26, fontWeight: 900, color: C.text, letterSpacing: "-0.5px" }}>ralli</div>
-            <div style={{ fontSize: 10, fontWeight: 700, color: C.orangeDark, letterSpacing: "0.1em" }}>Focus. Grow. Succeed.</div>
-          </div>
+        <div style={{ display: "flex", justifyContent: "center", marginBottom: 40 }}>
+          <RalliLogo height={42} />
         </div>
 
         <div style={{ background: "#fff", borderRadius: 16, padding: 32, boxShadow: "0 24px 64px rgba(0,0,0,0.3)" }}>
@@ -14764,12 +14753,8 @@ function LoginScreen({ onLogin, users = USERS }) {
     }}>
       <div style={{ width: "100%", maxWidth: 400, margin: "0 auto" }}>
         {/* Logo */}
-        <div style={{ display: "flex", alignItems: "center", gap: 12, marginBottom: 40, justifyContent: "center" }}>
-          <RalliLogo size={44} />
-          <div>
-            <div style={{ fontSize: 26, fontWeight: 900, color: C.text, letterSpacing: "-0.5px" }}>ralli</div>
-            <div style={{ fontSize: 10, fontWeight: 700, color: C.orangeDark, letterSpacing: "0.1em" }}>Focus. Grow. Succeed.</div>
-          </div>
+        <div style={{ display: "flex", justifyContent: "center", marginBottom: 40 }}>
+          <RalliLogo height={42} />
         </div>
 
         {/* Card */}
@@ -17062,13 +17047,7 @@ export default function App() {
         <div style={{ width: 220, flexShrink: 0, background: C.sidebar, borderRight: `1px solid ${C.sidebarBorder}`, display: "flex", flexDirection: "column" }}>
           {/* Logo */}
           <div style={{ padding: "20px 18px 14px" }}>
-            <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
-              <RalliLogo size={34} />
-              <div>
-                <div style={{ fontSize: 17, fontWeight: 900, color: C.text, letterSpacing: "-0.5px" }}>ralli</div>
-                <div style={{ fontSize: 9, fontWeight: 600, color: C.textMuted, letterSpacing: "0.06em", textTransform: "uppercase" }}>Sales Readiness</div>
-              </div>
-            </div>
+            <RalliLogo height={28} />
             {/* Org badge — shown for org users */}
             {currentOrg && (
               <div style={{ marginTop: 12, padding: "5px 10px", background: C.pageBg, borderRadius: 8, border: `1px solid ${C.border}`, display: "flex", alignItems: "center", gap: 6 }}>
@@ -17221,9 +17200,8 @@ export default function App() {
           height: 52, background: C.sidebar, borderBottom: `1px solid ${C.sidebarBorder}`,
           display: "flex", alignItems: "center", padding: "0 16px", gap: 10, flexShrink: 0,
         }}>
-          <div style={{ display: "flex", alignItems: "center", gap: 8, flex: 1 }}>
-            <RalliLogo size={28} />
-            <span style={{ fontSize: 16, fontWeight: 900, color: C.text }}>ralli</span>
+          <div style={{ display: "flex", alignItems: "center", flex: 1 }}>
+            <RalliLogo height={22} />
           </div>
           {role === "user" && (
             <span style={{ fontSize: 12, fontWeight: 700, color: C.orange }}>{user.xp.toLocaleString()} XP</span>
