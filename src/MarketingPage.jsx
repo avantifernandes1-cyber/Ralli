@@ -78,9 +78,10 @@ const S = {
 
 // ── NAV ────────────────────────────────────────────────────────
 const NAV_LINKS = [
-  { id: "features",    label: "features",    page: "solution" },
-  { id: "how-it-works", label: "how it works", page: "solution" },
-  { id: "pricing",    label: "pricing",      page: "contact"  },
+  { id: "home",         label: "Home",                   page: "home"     },
+  { id: "features",     label: "Features + How It Works", page: "solution" },
+  { id: "pricing",      label: "Pricing",                page: "contact"  },
+  { id: "team",         label: "Meet the Team",          page: "team"     },
 ];
 
 function Nav({ currentPage, navigate }) {
