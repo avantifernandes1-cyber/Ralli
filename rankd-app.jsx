@@ -10505,14 +10505,62 @@ const LEADERSHIP_SEED = {
     },
   ],
 
-  // Knowledge heatmap — topics × dimensions
+  // Knowledge heatmap — topics × reps (repScores keyed to people[].id)
   heatmap: [
-    { topic: "Product Knowledge",     score: 91, prev: 86, trend: "up"   },
-    { topic: "Discovery",             score: 88, prev: 82, trend: "up"   },
-    { topic: "Objection Handling",    score: 80, prev: 78, trend: "up"   },
-    { topic: "Competitive Positioning", score: 64, prev: 70, trend: "down" },
-    { topic: "Pricing",               score: 76, prev: 73, trend: "up"   },
-    { topic: "Negotiation",           score: 69, prev: 68, trend: "flat" },
+    {
+      topic: "Product Knowledge", score: 91, prev: 86, trend: "up", repsBelow: 0, repsTotal: 10,
+      repScores: [
+        { userId: "p1", score: 98 }, { userId: "p2", score: 97 }, { userId: "p3", score: 93 },
+        { userId: "p4", score: 92 }, { userId: "p5", score: 89 }, { userId: "p6", score: 87 },
+        { userId: "p7", score: 85 }, { userId: "p8", score: 90 }, { userId: "p9", score: 82 },
+        { userId: "p10", score: 78 },
+      ],
+    },
+    {
+      topic: "Discovery", score: 88, prev: 82, trend: "up", repsBelow: 0, repsTotal: 10,
+      repScores: [
+        { userId: "p1", score: 96 }, { userId: "p2", score: 92 }, { userId: "p3", score: 90 },
+        { userId: "p4", score: 89 }, { userId: "p5", score: 86 }, { userId: "p6", score: 84 },
+        { userId: "p7", score: 79 }, { userId: "p8", score: 88 }, { userId: "p9", score: 80 },
+        { userId: "p10", score: 76 },
+      ],
+    },
+    {
+      topic: "Objection Handling", score: 80, prev: 78, trend: "up", repsBelow: 1, repsTotal: 10,
+      repScores: [
+        { userId: "p1", score: 92 }, { userId: "p2", score: 88 }, { userId: "p3", score: 85 },
+        { userId: "p4", score: 82 }, { userId: "p5", score: 80 }, { userId: "p6", score: 75 },
+        { userId: "p7", score: 70 }, { userId: "p8", score: 78 }, { userId: "p9", score: 68 },
+        { userId: "p10", score: 62 },
+      ],
+    },
+    {
+      topic: "Competitive Positioning", score: 64, prev: 70, trend: "down", repsBelow: 4, repsTotal: 10,
+      repScores: [
+        { userId: "p1", score: 82 }, { userId: "p2", score: 78 }, { userId: "p3", score: 74 },
+        { userId: "p4", score: 71 }, { userId: "p5", score: 65 }, { userId: "p6", score: 58 },
+        { userId: "p7", score: 54 }, { userId: "p8", score: 62 }, { userId: "p9", score: 49 },
+        { userId: "p10", score: 47 },
+      ],
+    },
+    {
+      topic: "Pricing", score: 76, prev: 73, trend: "up", repsBelow: 2, repsTotal: 10,
+      repScores: [
+        { userId: "p1", score: 90 }, { userId: "p2", score: 85 }, { userId: "p3", score: 82 },
+        { userId: "p4", score: 78 }, { userId: "p5", score: 74 }, { userId: "p6", score: 70 },
+        { userId: "p7", score: 66 }, { userId: "p8", score: 76 }, { userId: "p9", score: 63 },
+        { userId: "p10", score: 56 },
+      ],
+    },
+    {
+      topic: "Negotiation", score: 69, prev: 68, trend: "flat", repsBelow: 3, repsTotal: 10,
+      repScores: [
+        { userId: "p1", score: 88 }, { userId: "p2", score: 80 }, { userId: "p3", score: 76 },
+        { userId: "p4", score: 72 }, { userId: "p5", score: 67 }, { userId: "p6", score: 62 },
+        { userId: "p7", score: 58 }, { userId: "p8", score: 70 }, { userId: "p9", score: 54 },
+        { userId: "p10", score: 43 },
+      ],
+    },
   ],
 
   // Trends — each period has a score for company and each team
@@ -11307,46 +11355,98 @@ function LeadershipDashboardScreen({ currentOrg, orgUsers = [], isReal = false }
         </div>
         {data.heatmap.length > 0 ? (
           <>
-            <div style={{ display: "flex", flexDirection: "column", gap: 10 }}>
-              {[...data.heatmap].sort((a, b) => (b.avgScore ?? b.score ?? 0) - (a.avgScore ?? a.score ?? 0)).map(topic => {
-                const score      = topic.avgScore ?? topic.score ?? 0;
-                const repsBelow  = topic.repsBelow ?? 0;
-                const repsTotal  = topic.repsTotal ?? 0;
-                const isSelected = topicFilter === topic.topic;
-                const d          = topic.prev != null ? delta(score, topic.prev) : null;
-                return (
-                  <div
-                    key={topic.topic}
-                    onClick={() => setTopicFilter(isSelected ? null : topic.topic)}
-                    style={{
-                      display: "flex", alignItems: "center", gap: 14,
-                      padding: "8px 10px", borderRadius: C.radiusSm, cursor: "pointer",
-                      background: isSelected ? C.orangeLight : "transparent",
-                      border: `1px solid ${isSelected ? C.orange + "66" : "transparent"}`,
-                      transition: "background 0.15s",
-                    }}
-                  >
-                    <div style={{ width: 160, flexShrink: 0 }}>
-                      <div style={{ fontSize: 13, fontWeight: 600, color: C.text, textTransform: "capitalize" }}>
-                        {topic.topic}
-                      </div>
-                      {repsTotal > 0 && (
-                        <div style={{ fontSize: 11, color: repsBelow > 0 ? C.red : C.textMuted, marginTop: 2 }}>
-                          {repsBelow > 0 ? `${repsBelow} below threshold` : "All on track"} · {repsTotal} rep{repsTotal !== 1 ? "s" : ""}
+            {/* True topic × rep matrix */}
+            {(() => {
+              const TOPIC_W = 164;
+              const CELL_W  = 54;
+              const CELL_H  = 38;
+              const sortedTopics = [...data.heatmap].sort((a, b) => (b.avgScore ?? b.score ?? 0) - (a.avgScore ?? a.score ?? 0));
+              const cellBg    = (s) => s == null ? C.pageBg      : s >= 85 ? C.trueGreenBg : s >= 65 ? C.orangeLight : C.redBg;
+              const cellClr   = (s) => s == null ? C.textMuted   : s >= 85 ? C.trueGreen   : s >= 65 ? C.orangeDeep  : C.red;
+              const cellBdr   = (s) => s == null ? C.border      : s >= 85 ? "#86EFAC"     : s >= 65 ? C.orangeBorder : "#FECACA";
+              return (
+                <div style={{ overflowX: "auto", WebkitOverflowScrolling: "touch", margin: "0 -2px" }}>
+                  <div style={{ minWidth: TOPIC_W + data.people.length * (CELL_W + 4) }}>
+                    {/* Header row — rep avatars */}
+                    <div style={{ display: "flex", alignItems: "flex-end", gap: 4, marginBottom: 8, paddingLeft: TOPIC_W + 4 }}>
+                      {data.people.map(rep => (
+                        <div
+                          key={rep.id}
+                          title={`${rep.name} · ${rep.title}`}
+                          onClick={() => setSelectedRep(rep)}
+                          style={{ width: CELL_W, flexShrink: 0, display: "flex", flexDirection: "column", alignItems: "center", gap: 3, cursor: "pointer" }}
+                        >
+                          <div style={{
+                            width: 28, height: 28, borderRadius: "50%",
+                            background: rep.color ?? C.orange,
+                            display: "flex", alignItems: "center", justifyContent: "center",
+                            fontSize: 10, fontWeight: 700, color: "#fff",
+                          }}>{rep.initials}</div>
+                          <div style={{ fontSize: 9, fontWeight: 600, color: C.textMuted, whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis", maxWidth: CELL_W - 4, textAlign: "center" }}>
+                            {rep.name.split(" ")[0]}
+                          </div>
                         </div>
-                      )}
+                      ))}
                     </div>
-                    <div style={{ flex: 1 }}>
-                      <ProgressBar value={score} max={100} color={scoreColor(score)} trackColor={C.border} height={10} />
+                    {/* Topic rows */}
+                    {sortedTopics.map(topic => {
+                      const avgScore   = topic.avgScore ?? topic.score ?? 0;
+                      const isSelected = topicFilter === topic.topic;
+                      return (
+                        <div key={topic.topic} style={{ display: "flex", alignItems: "center", gap: 4, marginBottom: 4 }}>
+                          {/* Topic label */}
+                          <div
+                            onClick={() => setTopicFilter(isSelected ? null : topic.topic)}
+                            title="Click to filter People Insights"
+                            style={{
+                              width: TOPIC_W, flexShrink: 0, cursor: "pointer",
+                              padding: "6px 10px", borderRadius: C.radiusSm,
+                              background: isSelected ? C.orangeLight : "transparent",
+                              border: `1px solid ${isSelected ? C.orange + "66" : "transparent"}`,
+                              transition: "background 0.15s",
+                            }}
+                          >
+                            <div style={{ fontSize: 12, fontWeight: 600, color: C.text }}>{topic.topic}</div>
+                            <div style={{ fontSize: 10, color: scoreColor(avgScore), fontWeight: 700, marginTop: 1 }}>{avgScore}% avg</div>
+                          </div>
+                          {/* Score cells */}
+                          {data.people.map(rep => {
+                            const rs    = topic.repScores?.find(r => r.userId === rep.id);
+                            const score = rs?.score ?? null;
+                            return (
+                              <div
+                                key={rep.id}
+                                title={score != null ? `${rep.name}: ${score}%` : `${rep.name}: no data`}
+                                style={{
+                                  width: CELL_W, height: CELL_H, flexShrink: 0,
+                                  display: "flex", alignItems: "center", justifyContent: "center",
+                                  borderRadius: 6,
+                                  background: cellBg(score),
+                                  border: `1px solid ${cellBdr(score)}`,
+                                  fontSize: 12, fontWeight: 700,
+                                  color: cellClr(score),
+                                }}
+                              >
+                                {score != null ? `${score}` : "—"}
+                              </div>
+                            );
+                          })}
+                        </div>
+                      );
+                    })}
+                    {/* Legend */}
+                    <div style={{ display: "flex", gap: 12, marginTop: 10, paddingLeft: TOPIC_W + 4 }}>
+                      {[{ label: "Strong ≥85", bg: C.trueGreenBg, clr: C.trueGreen, bdr: "#86EFAC" }, { label: "On Track ≥65", bg: C.orangeLight, clr: C.orangeDeep, bdr: C.orangeBorder }, { label: "At Risk <65", bg: C.redBg, clr: C.red, bdr: "#FECACA" }, { label: "No data", bg: C.pageBg, clr: C.textMuted, bdr: C.border }].map(({ label, bg, clr, bdr }) => (
+                        <div key={label} style={{ display: "flex", alignItems: "center", gap: 4 }}>
+                          <div style={{ width: 12, height: 12, borderRadius: 3, background: bg, border: `1px solid ${bdr}` }} />
+                          <span style={{ fontSize: 10, color: C.textMuted }}>{label}</span>
+                        </div>
+                      ))}
                     </div>
-                    <div style={{ width: 40, textAlign: "right", fontSize: 13, fontWeight: 700, color: scoreColor(score) }}>{score}%</div>
-                    {d != null && (
-                      <div style={{ width: 44, textAlign: "right", fontSize: 12, fontWeight: 600, color: deltaColor(d) }}>{deltaLabel(d)} pts</div>
-                    )}
                   </div>
-                );
-              })}
-            </div>
+                </div>
+              );
+            })()}
 
             {/* Weak Topic Summary — bottom 3 topics */}
             {(() => {
