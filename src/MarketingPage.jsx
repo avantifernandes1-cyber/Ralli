@@ -428,13 +428,29 @@ function Nav({ currentPage, navigate }) {
 // ── SHARED COMPONENTS ──────────────────────────────────────────
 function PageWrapper({ children }) {
   useEffect(() => { window.scrollTo({ top: 0 }); }, []);
-  return <div style={{ paddingTop: 60 }}>{children}</div>;
+  return (
+    <div style={{
+      paddingTop:      60,
+      minHeight:       "100vh",
+      background: [
+        "radial-gradient(ellipse at 88% 5%, rgba(246,167,15,0.22) 0%, rgba(252,227,171,0.12) 24%, transparent 52%)",
+        "radial-gradient(ellipse at 10% 30%, rgba(252,227,171,0.34) 0%, rgba(246,167,15,0.08) 26%, transparent 55%)",
+        "radial-gradient(ellipse at 75% 55%, rgba(246,167,15,0.10) 0%, rgba(252,227,171,0.16) 22%, transparent 50%)",
+        "radial-gradient(ellipse at 18% 82%, rgba(246,167,15,0.15) 0%, rgba(252,227,171,0.10) 28%, transparent 56%)",
+        "linear-gradient(180deg, #fbfaf7 0%, #ffffff 28%, #fdfaf3 52%, #ffffff 72%, #fbfaf7 100%)",
+      ].join(","),
+      backgroundRepeat: "no-repeat",
+      backgroundSize:   "100% 100%",
+    }}>
+      {children}
+    </div>
+  );
 }
 
 function CTABanner({ navigate }) {
   const [ref, visible] = useInView();
   return (
-    <section style={{ ...S.section, background: "linear-gradient(110deg, #f3f1ec 0%, #f3f1ec 35%, #fce3ab 70%, #f6a70f 100%)" }}>
+    <section style={{ ...S.section, background: "transparent" }}>
       <div ref={ref} style={{ ...S.container, textAlign: "center" }}>
         <h2 style={{
           ...S.fadeUp(visible),
@@ -488,11 +504,11 @@ function Hero({ navigate }) {
   const [ref, visible] = useInView(0.05);
   return (
     <section style={{
-      padding:  "140px 24px 100px",
-      background: "linear-gradient(105deg, #fbfaf7 0%, #fbfaf7 30%, #fce3ab 70%, #f6a70f 100%)",
-      textAlign: "center",
-      position:  "relative",
-      overflow:  "hidden",
+      padding:   "140px 24px 100px",
+      background: "transparent",
+      textAlign:  "center",
+      position:   "relative",
+      overflow:   "hidden",
     }}>
       <div ref={ref} style={{ maxWidth: 760, margin: "0 auto", position: "relative" }}>
         {/* Badge */}
@@ -660,7 +676,7 @@ function FeaturesGrid() {
     },
   ];
   return (
-    <section style={{ ...S.section, background: C.white }}>
+    <section style={{ ...S.section, background: "transparent" }}>
       <div ref={ref} style={{ ...S.container }}>
         <div style={{ textAlign: "center", marginBottom: 48 }}>
           <span style={S.sectionLabel}>ongoing mastery</span>
@@ -701,7 +717,7 @@ function LearningPaths() {
     { title: "pricing & roi models", lessons: 6,  progress: 30 },
   ];
   return (
-    <section style={{ ...S.section, background: C.pageBg }}>
+    <section style={{ ...S.section, background: "transparent" }}>
       <div ref={ref} style={{ ...S.container }}>
         <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit,minmax(280px,1fr))", gap: 64, alignItems: "center" }}>
           <div style={S.fadeUp(visible, 0.04)}>
@@ -778,7 +794,7 @@ function EvaluationSection() {
         </div>
       </div>
       {/* Right — cream panel with text */}
-      <div style={{ flex: "1 1 320px", background: C.pageBg, padding: "72px 48px", display: "flex", flexDirection: "column", justifyContent: "center" }}>
+      <div style={{ flex: "1 1 320px", background: "transparent", padding: "72px 48px", display: "flex", flexDirection: "column", justifyContent: "center" }}>
         <span style={{ ...S.sectionLabel, alignSelf: "flex-start", marginBottom: 20 }}>comprehension diagnostics</span>
         <h2 style={{ ...S.h2, ...S.fadeUp(visible, 0.08), textTransform: "lowercase", marginBottom: 16, maxWidth: 360 }}>
           evaluation beyond clicking checkboxes
@@ -800,7 +816,7 @@ function GamesSection({ navigate }) {
     { rank: 3, name: "APAC Accounts",       pts: "1,800 pts" },
   ];
   return (
-    <section style={{ ...S.section, background: C.white }}>
+    <section style={{ ...S.section, background: "transparent" }}>
       <div ref={ref} style={{ ...S.container }}>
         <div style={{ textAlign: "center", marginBottom: 48 }}>
           <span style={S.sectionLabel}>gamified alignment</span>
@@ -858,7 +874,7 @@ function GamesSection({ navigate }) {
 function InsightsSection() {
   const [ref, visible] = useInView();
   return (
-    <section style={{ ...S.section, background: C.pageBg }}>
+    <section style={{ ...S.section, background: "transparent" }}>
       <div ref={ref} style={{ ...S.container }}>
         <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit,minmax(280px,1fr))", gap: 64, alignItems: "center" }}>
           <div style={S.fadeUp(visible, 0.04)}>
@@ -913,7 +929,7 @@ function ProfilesSection() {
     { name: "jemima chadrix", role: "APAC Accounts",       score: 79, status: "ready",    color: "#34d399" },
   ];
   return (
-    <section style={{ ...S.section, background: C.pageBg }}>
+    <section style={{ ...S.section, background: "transparent" }}>
       <div ref={ref} style={{ ...S.container }}>
         <div style={{ textAlign: "center", marginBottom: 48 }}>
           <span style={S.sectionLabel}>individual rep coaching</span>
@@ -961,7 +977,7 @@ function ProfilesSection() {
 function PlatformShowcase() {
   const [ref, visible] = useInView(0.08);
   return (
-    <section style={{ ...S.section, background: C.white, padding: "72px 24px" }}>
+    <section style={{ ...S.section, background: "transparent", padding: "72px 24px" }}>
       <div ref={ref} style={{ ...S.container }}>
         <div style={{ textAlign: "center", marginBottom: 40 }}>
           <span style={S.sectionLabel}>the platform</span>
@@ -984,7 +1000,7 @@ function PlatformShowcase() {
 function TestimonialSection() {
   const [ref, visible] = useInView();
   return (
-    <section style={{ ...S.section, background: C.pageBg }}>
+    <section style={{ ...S.section, background: "transparent" }}>
       <div ref={ref} style={{ ...S.container, textAlign: "center", maxWidth: 760 }}>
         <span style={S.sectionLabel}>a proof of readiness</span>
         <blockquote style={{
