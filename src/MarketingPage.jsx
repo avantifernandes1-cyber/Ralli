@@ -1031,14 +1031,14 @@ function TestimonialSection() {
 function HomePage({ navigate }) {
   return (
     <PageWrapper>
+      <PlatformShowcase />
       <Hero navigate={navigate} />
-      <FeaturesGrid />
-      <LearningPaths />
-      <EvaluationSection />
       <GamesSection navigate={navigate} />
       <InsightsSection />
       <ProfilesSection />
-      <PlatformShowcase />
+      <FeaturesGrid />
+      <LearningPaths />
+      <EvaluationSection />
       <TestimonialSection />
       <CTABanner navigate={navigate} />
     </PageWrapper>
