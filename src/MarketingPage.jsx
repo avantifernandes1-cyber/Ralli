@@ -157,8 +157,9 @@ function Nav({ currentPage, navigate }) {
           {/* Logo */}
           <button
             onClick={() => handleNav("home")}
-            style={{ display: "flex", alignItems: "center", background: "none", border: "none", cursor: "pointer", padding: 0, flexShrink: 0 }}
+            style={{ display: "flex", alignItems: "center", gap: 12, background: "none", border: "none", cursor: "pointer", padding: 0, flexShrink: 0 }}
           >
+            <img src="/assets/ralli-icon.png" alt="" aria-hidden="true" style={{ height: 20, width: "auto", display: "block" }} />
             <img src="/assets/ralli-logo.png" alt="ralli" style={{ height: 26, display: "block" }} />
           </button>
 
@@ -1913,7 +1914,8 @@ function Footer({ navigate }) {
         <div style={{ display: "grid", gridTemplateColumns: "1fr auto", gap: 32, alignItems: "start", marginBottom: 32 }}>
           {/* Brand */}
           <div>
-            <div style={{ marginBottom: 10 }}>
+            <div style={{ display: "flex", alignItems: "center", gap: 10, marginBottom: 10 }}>
+              <img src="/assets/ralli-icon.png" alt="" aria-hidden="true" style={{ height: 18, width: "auto", display: "block" }} />
               <img src="/assets/ralli-logo-light.png" alt="ralli" style={{ height: 22, display: "block" }} />
             </div>
             <p style={{ fontSize:13,color:"rgba(255,255,255,0.3)",lineHeight:1.55,maxWidth:240 }}>
