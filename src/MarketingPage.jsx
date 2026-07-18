@@ -77,10 +77,9 @@ const S = {
 
 // ── NAV ────────────────────────────────────────────────────────
 const NAV_LINKS = [
-  { id: "home",     label: "Home" },
-  { id: "solution", label: "Solution" },
-  { id: "team",     label: "Meet the Team" },
-  { id: "contact",  label: "Contact" },
+  { id: "features",    label: "features",    page: "solution" },
+  { id: "how-it-works", label: "how it works", page: "solution" },
+  { id: "pricing",    label: "pricing",      page: "contact"  },
 ];
 
 function Nav({ currentPage, navigate }) {
@@ -179,20 +178,20 @@ function Nav({ currentPage, navigate }) {
               {NAV_LINKS.map(l => (
                 <button
                   key={l.id}
-                  onClick={() => handleNav(l.id)}
+                  onClick={() => handleNav(l.page)}
                   style={{
                     fontSize:     14,
-                    fontWeight:   currentPage === l.id ? 700 : 500,
-                    color:        currentPage === l.id ? C.text : C.textSub,
-                    background:   currentPage === l.id ? C.orangeLight : "none",
+                    fontWeight:   currentPage === l.page ? 700 : 500,
+                    color:        currentPage === l.page ? C.text : C.textSub,
+                    background:   currentPage === l.page ? C.orangeLight : "none",
                     border:       "none",
                     borderRadius: 7,
                     padding:      "6px 14px",
                     cursor:       "pointer",
                     transition:   "background 0.15s, color 0.15s",
                   }}
-                  onMouseEnter={e => { if (currentPage !== l.id) { e.currentTarget.style.background = C.pageBg; e.currentTarget.style.color = C.text; } }}
-                  onMouseLeave={e => { if (currentPage !== l.id) { e.currentTarget.style.background = "none"; e.currentTarget.style.color = C.textSub; } }}
+                  onMouseEnter={e => { if (currentPage !== l.page) { e.currentTarget.style.background = C.pageBg; e.currentTarget.style.color = C.text; } }}
+                  onMouseLeave={e => { if (currentPage !== l.page) { e.currentTarget.style.background = "none"; e.currentTarget.style.color = C.textSub; } }}
                 >
                   {l.label}
                 </button>
@@ -345,16 +344,16 @@ function Nav({ currentPage, navigate }) {
               {NAV_LINKS.map(l => (
                 <button
                   key={l.id}
-                  onClick={() => handleNav(l.id)}
+                  onClick={() => handleNav(l.page)}
                   tabIndex={mobileOpen ? 0 : -1}
                   style={{
                     display:       "flex",
                     alignItems:    "center",
                     width:         "100%",
                     fontSize:      16,
-                    fontWeight:    currentPage === l.id ? 700 : 500,
-                    color:         currentPage === l.id ? C.text : C.textSub,
-                    background:    currentPage === l.id ? C.orangeLight : "none",
+                    fontWeight:    currentPage === l.page ? 700 : 500,
+                    color:         currentPage === l.page ? C.text : C.textSub,
+                    background:    currentPage === l.page ? C.orangeLight : "none",
                     border:        "none",
                     borderRadius:  9,
                     padding:       "12px 16px",
@@ -435,7 +434,7 @@ function PageWrapper({ children }) {
 function CTABanner({ navigate }) {
   const [ref, visible] = useInView();
   return (
-    <section style={{ ...S.section, background: C.pageBg }}>
+    <section style={{ ...S.section, background: "linear-gradient(110deg, #f3f1ec 0%, #f3f1ec 35%, #fce3ab 70%, #f6a70f 100%)" }}>
       <div ref={ref} style={{ ...S.container, textAlign: "center" }}>
         <h2 style={{
           ...S.fadeUp(visible),
@@ -509,8 +508,7 @@ function Hero({ navigate }) {
             fontWeight:   600,
             color:        C.dark,
           }}>
-            <span style={{ background: C.dark, color: C.orange, borderRadius: 100, padding: "2px 8px", fontSize: 10, fontWeight: 800 }}>new</span>
-            ralli is now in early access — schedule a demo
+            ralli games are now live · schedule a demo now
             <svg width="13" height="13" viewBox="0 0 13 13" fill="none"><path d="M2.5 6.5h8M7.5 3.5l3 3-3 3" stroke={C.dark} strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round"/></svg>
           </div>
         </div>
@@ -781,7 +779,7 @@ function EvaluationSection() {
       </div>
       {/* Right — cream panel with text */}
       <div style={{ flex: "1 1 320px", background: C.pageBg, padding: "72px 48px", display: "flex", flexDirection: "column", justifyContent: "center" }}>
-        <span style={{ ...S.sectionLabel, alignSelf: "flex-start", marginBottom: 20 }}>comprehensive diagnostics</span>
+        <span style={{ ...S.sectionLabel, alignSelf: "flex-start", marginBottom: 20 }}>comprehension diagnostics</span>
         <h2 style={{ ...S.h2, ...S.fadeUp(visible, 0.08), textTransform: "lowercase", marginBottom: 16, maxWidth: 360 }}>
           evaluation beyond clicking checkboxes
         </h2>
@@ -805,7 +803,7 @@ function GamesSection({ navigate }) {
     <section style={{ ...S.section, background: C.white }}>
       <div ref={ref} style={{ ...S.container }}>
         <div style={{ textAlign: "center", marginBottom: 48 }}>
-          <span style={S.sectionLabel}>gamified learning</span>
+          <span style={S.sectionLabel}>gamified alignment</span>
           <h2 style={{ ...S.h2, ...S.fadeUp(visible), textTransform: "lowercase", margin: "12px auto 14px", maxWidth: 500 }}>
             live games build comprehension
           </h2>
@@ -864,7 +862,7 @@ function InsightsSection() {
       <div ref={ref} style={{ ...S.container }}>
         <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit,minmax(280px,1fr))", gap: 64, alignItems: "center" }}>
           <div style={S.fadeUp(visible, 0.04)}>
-            <span style={S.sectionLabel}>activate insights</span>
+            <span style={S.sectionLabel}>actionable insights</span>
             <h2 style={{ ...S.h2, textTransform: "lowercase", margin: "14px 0 16px" }}>
               diagnose compliance before pitching
             </h2>
@@ -912,13 +910,13 @@ function ProfilesSection() {
   const reps = [
     { name: "sarah chen",     role: "Enterprise Outbound", score: 94, status: "ready",   color: C.orange },
     { name: "marcus vance",   role: "Mid-Market Growth",   score: 100, status: "ready",  color: "#a78bfa" },
-    { name: "jemima chadrix", role: "APAC Accounts",       score: 71, status: "on track", color: "#34d399" },
+    { name: "jemima chadrix", role: "APAC Accounts",       score: 79, status: "ready",    color: "#34d399" },
   ];
   return (
     <section style={{ ...S.section, background: C.pageBg }}>
       <div ref={ref} style={{ ...S.container }}>
         <div style={{ textAlign: "center", marginBottom: 48 }}>
-          <span style={S.sectionLabel}>streamline onboarding</span>
+          <span style={S.sectionLabel}>individual rep coaching</span>
           <h2 style={{ ...S.h2, ...S.fadeUp(visible), textTransform: "lowercase", margin: "12px auto 14px", maxWidth: 520 }}>
             drill down into readiness profiles
           </h2>
@@ -988,7 +986,7 @@ function TestimonialSection() {
   return (
     <section style={{ ...S.section, background: C.pageBg }}>
       <div ref={ref} style={{ ...S.container, textAlign: "center", maxWidth: 760 }}>
-        <span style={S.sectionLabel}>a word of readiness</span>
+        <span style={S.sectionLabel}>a proof of readiness</span>
         <blockquote style={{
           ...S.fadeUp(visible, 0.07),
           fontSize:      clamp(18, 28),
