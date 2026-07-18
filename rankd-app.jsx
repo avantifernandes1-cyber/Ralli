@@ -351,9 +351,9 @@ function ProgressBar({ value, max = 100, color = C.orange, height = 6, trackColo
   );
 }
 
-function Card({ children, style = {}, onClick }) {
+function Card({ children, style = {}, onClick, id }) {
   return (
-    <div onClick={onClick} style={{
+    <div id={id} onClick={onClick} style={{
       background: C.white, borderRadius: 16,
       border: `1px solid ${C.border}`,
       boxShadow: C.shadowSm,
