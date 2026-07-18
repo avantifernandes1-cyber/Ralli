@@ -21,6 +21,7 @@ function clamp(min, max) {
   return `clamp(${min}px, ${(min + max) / 2}px, ${max}px)`;
 }
 
+
 // ── HOOKS ──────────────────────────────────────────────────────
 function useInView(threshold = 0.15) {
   const ref = useRef(null);
@@ -156,20 +157,9 @@ function Nav({ currentPage, navigate }) {
           {/* Logo */}
           <button
             onClick={() => handleNav("home")}
-            style={{ display: "flex", alignItems: "center", gap: 10, background: "none", border: "none", cursor: "pointer", padding: 0, flexShrink: 0 }}
+            style={{ display: "flex", alignItems: "center", background: "none", border: "none", cursor: "pointer", padding: 0, flexShrink: 0 }}
           >
-            <svg width="32" height="32" viewBox="0 0 32 32" fill="none" xmlns="http://www.w3.org/2000/svg">
-              <rect width="32" height="32" rx="7.5" fill="#FDBF24"/>
-              <circle cx="16" cy="9.5"  r="5.8" fill="white"/>
-              <circle cx="22.5" cy="16" r="5.8" fill="white"/>
-              <circle cx="16" cy="22.5" r="5.8" fill="white"/>
-              <circle cx="9.5"  cy="16" r="5.8" fill="white"/>
-              <circle cx="16" cy="16"  r="4.2" fill="#FDBF24"/>
-            </svg>
-            <div style={{ display: "flex", alignItems: "baseline" }}>
-              <span style={{ fontSize: 17, fontWeight: 700, color: C.dark, letterSpacing: "-0.01em", fontFamily: "'Unbounded', sans-serif" }}>ralli</span>
-              <span style={{ fontSize: 9, fontWeight: 900, color: C.orange, marginLeft: 1, lineHeight: 1, position: "relative", top: -6 }}>✦</span>
-            </div>
+            <img src="/assets/ralli-logo.png" alt="ralli" style={{ height: 26, display: "block" }} />
           </button>
 
           {/* Desktop links — hidden below 768px */}
@@ -1031,8 +1021,8 @@ function TestimonialSection() {
 function HomePage({ navigate }) {
   return (
     <PageWrapper>
-      <PlatformShowcase />
       <Hero navigate={navigate} />
+      <PlatformShowcase />
       <GamesSection navigate={navigate} />
       <InsightsSection />
       <ProfilesSection />
@@ -1923,19 +1913,8 @@ function Footer({ navigate }) {
         <div style={{ display: "grid", gridTemplateColumns: "1fr auto", gap: 32, alignItems: "start", marginBottom: 32 }}>
           {/* Brand */}
           <div>
-            <div style={{ display: "flex", alignItems: "center", gap: 9, marginBottom: 10 }}>
-              <svg width="26" height="26" viewBox="0 0 32 32" fill="none" xmlns="http://www.w3.org/2000/svg">
-                <rect width="32" height="32" rx="7.5" fill="#FDBF24"/>
-                <circle cx="16" cy="9.5"  r="5.8" fill="white"/>
-                <circle cx="22.5" cy="16" r="5.8" fill="white"/>
-                <circle cx="16" cy="22.5" r="5.8" fill="white"/>
-                <circle cx="9.5"  cy="16" r="5.8" fill="white"/>
-                <circle cx="16" cy="16"  r="4.2" fill="#FDBF24"/>
-              </svg>
-              <div style={{ display: "flex", alignItems: "baseline" }}>
-                <span style={{ fontSize:15,fontWeight:700,color:"rgba(251,250,247,0.85)",fontFamily:"'Unbounded', sans-serif" }}>ralli</span>
-                <span style={{ fontSize:8,fontWeight:900,color:C.orange,marginLeft:1,position:"relative",top:-5 }}>✦</span>
-              </div>
+            <div style={{ marginBottom: 10 }}>
+              <img src="/assets/ralli-logo-light.png" alt="ralli" style={{ height: 22, display: "block" }} />
             </div>
             <p style={{ fontSize:13,color:"rgba(255,255,255,0.3)",lineHeight:1.55,maxWidth:240 }}>
               The operational readiness platform for sales teams.
