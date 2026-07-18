@@ -66,7 +66,7 @@ import { getProfile, createMissingProfile, getTenantProfiles } from "./src/lib/p
 import { sendInviteEmail } from "./src/lib/emailService.js";
 import { provisionTenant, buildInviteUrl, normalizeProvisionedOrg, createMemberInvite } from "./src/lib/provisioningService.js";
 import { awardLessonPoints, awardCoursePoints, awardQuizPoints, awardGamePointsForSession, getLeaderboard, computeUserMeta, getUserStreak } from "./src/lib/scoringService.js";
-import { triggerReadinessUpdate } from "./src/lib/insightsService.js";
+import { triggerReadinessUpdate, getTopicHeatmap, getOrgMetrics, getRepTopicScores } from "./src/lib/insightsService.js";
 
 // ── MOBILE HOOK ────────────────────────────────────────────
 function useMobile() {
@@ -10591,6 +10591,254 @@ const LEADERSHIP_SEED = {
 };
 
 // ── LeadershipDashboardScreen ─────────────────────────────────
+// ─────────────────────────────────────────────────────────────
+// RepDrillDownModal — per-rep readiness detail for managers
+// ─────────────────────────────────────────────────────────────
+function RepDrillDownModal({ rep, tenantId, onClose }) {
+  const [topicScores,  setTopicScores]  = useState(null);
+  const [quizHistory,  setQuizHistory]  = useState(null);
+  const [quizNames,    setQuizNames]    = useState({});
+  const [assignments,  setAssignments]  = useState(null); // Fix 8
+  const [loading,      setLoading]      = useState(true);
+
+  useEffect(() => {
+    if (!rep || !tenantId) return;
+    setLoading(true);
+    const repId = rep.id ?? rep.user_id;
+
+    Promise.all([
+      getRepTopicScores(tenantId, repId),
+      supabase
+        .from("quiz_attempts")
+        .select("id, quiz_id, score, passed, attempt_num, created_at")
+        .eq("tenant_id", tenantId)
+        .eq("user_id", repId)
+        .order("created_at", { ascending: false })
+        .limit(20),
+      supabase
+        .from("tenant_quizzes")
+        .select("id, name")
+        .eq("tenant_id", tenantId),
+      // Fix 8: fetch assignments + completions for this rep
+      supabase
+        .from("tenant_assignments")
+        .select("id, content_type, content_id, assigned_to, due_at, required")
+        .eq("tenant_id", tenantId),
+      supabase
+        .from("lesson_completions")
+        .select("lesson_id, completed_at")
+        .eq("tenant_id", tenantId)
+        .eq("profile_id", repId),
+      supabase.from("tenant_courses").select("id, name").eq("tenant_id", tenantId),
+      supabase.from("tenant_lessons").select("id, name").eq("tenant_id", tenantId),
+    ]).then(([topics, { data: attempts }, { data: quizzes }, { data: allAssignments }, { data: completions }, { data: courses }, { data: lessons }]) => {
+      setTopicScores(topics ?? []);
+      setQuizHistory(attempts ?? []);
+
+      const names = {};
+      (quizzes ?? []).forEach(q => { names[q.id] = q.name; });
+      setQuizNames(names);
+
+      // Fix 8: filter to individual assignments for this rep
+      const repAssignments = (allAssignments ?? []).filter(a => {
+        const at = a.assigned_to ?? {};
+        return at.type === "individual" && (at.userId === repId || at.user_id === repId);
+      });
+
+      // Build content name maps
+      const courseNames = {};
+      (courses ?? []).forEach(c => { courseNames[c.id] = c.name; });
+      const lessonNames = {};
+      (lessons ?? []).forEach(l => { lessonNames[l.id] = l.name; });
+      const completedLessons = new Set((completions ?? []).map(c => c.lesson_id));
+      const passedQuizzes   = new Set((attempts  ?? []).filter(a => a.passed).map(a => a.quiz_id));
+
+      const enriched = repAssignments.map(a => {
+        const title =
+          a.content_type === "course" ? (courseNames[a.content_id] || "Course") :
+          a.content_type === "lesson" ? (lessonNames[a.content_id] || "Lesson") :
+          a.content_type === "quiz"   ? (names[a.content_id]       || "Quiz")   : "Content";
+        const status =
+          a.content_type === "quiz"   ? (passedQuizzes.has(a.content_id)    ? "Passed"   : "Pending") :
+          a.content_type === "lesson" ? (completedLessons.has(a.content_id) ? "Complete" : "Pending") :
+          "Assigned";
+        return { ...a, title, status };
+      });
+
+      setAssignments(enriched);
+      setLoading(false);
+    }).catch(() => setLoading(false));
+  }, [rep?.id, rep?.user_id, tenantId]);
+
+  if (!rep) return null;
+
+  const name     = rep.name || rep.full_name || rep.initials || "Rep";
+  const score    = rep.score ?? rep.readiness_score ?? 0;
+  const band     = score >= 85 ? { label: "High",     color: C.trueGreen } :
+                   score >= 65 ? { label: "On Track",  color: C.blue      } :
+                                 { label: "At Risk",   color: C.red       };
+
+  // Coaching recommendations based on topic gaps
+  const recs = [];
+  if (topicScores) {
+    const weakTopics = topicScores.filter(t => t.avgScore < 65);
+    if (weakTopics.length) {
+      recs.push(`Focus coaching on: ${weakTopics.slice(0, 3).map(t => t.topic).join(", ")}.`);
+    }
+    if (topicScores.length && topicScores[0]?.avgScore < 50) {
+      recs.push("Consider re-assigning foundational quizzes before next pipeline review.");
+    }
+  }
+  if (score < 65) recs.push("Schedule a 1:1 coaching session this week.");
+  if (!recs.length) recs.push("Rep is performing well — maintain current cadence.");
+
+  return (
+    <div
+      onClick={onClose}
+      style={{
+        position: "fixed", inset: 0, zIndex: 1000,
+        background: "rgba(11,18,32,0.45)", display: "flex",
+        alignItems: "center", justifyContent: "center", padding: 16,
+      }}
+    >
+      <div
+        onClick={e => e.stopPropagation()}
+        style={{
+          background: C.white, borderRadius: C.radius, width: "100%", maxWidth: 620,
+          maxHeight: "90vh", overflowY: "auto",
+          boxShadow: "0 8px 40px rgba(11,18,32,0.18)",
+        }}
+      >
+        {/* Header */}
+        <div style={{ padding: "20px 24px", borderBottom: `1px solid ${C.border}`, display: "flex", alignItems: "center", gap: 14 }}>
+          <Avatar initials={rep.initials || name.slice(0, 2).toUpperCase()} size={44} color={C.white} bg={C.orange} />
+          <div style={{ flex: 1 }}>
+            <div style={{ fontWeight: 700, fontSize: 17, color: C.text }}>{name}</div>
+            <div style={{ fontSize: 13, color: C.textMuted, marginTop: 2 }}>{rep.email || rep.role || "Team Member"}</div>
+          </div>
+          <div style={{ textAlign: "right" }}>
+            <div style={{ fontSize: 26, fontWeight: 800, color: band.color }}>{score}%</div>
+            <div style={{ fontSize: 12, color: C.textMuted, fontWeight: 600 }}>{band.label}</div>
+          </div>
+          <button onClick={onClose} style={{ marginLeft: 8, background: "none", border: "none", cursor: "pointer", fontSize: 20, color: C.textMuted, lineHeight: 1 }}>✕</button>
+        </div>
+
+        {loading ? (
+          <div style={{ padding: 32 }}><LoadingState rows={4} message="Loading rep details…" /></div>
+        ) : (
+          <div style={{ padding: 24, display: "flex", flexDirection: "column", gap: 24 }}>
+
+            {/* Topic Breakdown */}
+            <div>
+              <div style={{ fontWeight: 700, fontSize: 14, color: C.text, marginBottom: 12 }}>Topic Readiness</div>
+              {topicScores?.length ? (
+                <div style={{ display: "flex", flexDirection: "column", gap: 10 }}>
+                  {topicScores.map(t => {
+                    const tColor = t.avgScore >= 85 ? C.trueGreen : t.avgScore >= 65 ? C.blue : C.red;
+                    return (
+                      <div key={t.topic}>
+                        <div style={{ display: "flex", justifyContent: "space-between", marginBottom: 4 }}>
+                          <span style={{ fontSize: 13, color: C.text, textTransform: "capitalize" }}>{t.topic}</span>
+                          <span style={{ fontSize: 13, fontWeight: 700, color: tColor }}>{t.avgScore}%</span>
+                        </div>
+                        <ProgressBar value={t.avgScore} max={100} color={tColor} height={6} />
+                        <div style={{ fontSize: 11, color: C.textMuted, marginTop: 3 }}>{t.attempts} quiz{t.attempts !== 1 ? "zes" : ""} · {t.passed} passed</div>
+                      </div>
+                    );
+                  })}
+                </div>
+              ) : (
+                <div style={{ fontSize: 13, color: C.textMuted }}>No tagged quiz data available yet.</div>
+              )}
+            </div>
+
+            {/* Quiz History */}
+            <div>
+              <div style={{ fontWeight: 700, fontSize: 14, color: C.text, marginBottom: 12 }}>Recent Quiz Activity</div>
+              {quizHistory?.length ? (
+                <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
+                  {quizHistory.slice(0, 8).map(a => (
+                    <div key={a.id} style={{ display: "flex", alignItems: "center", justifyContent: "space-between", padding: "10px 14px", background: C.pageBg, borderRadius: C.radiusSm }}>
+                      <div>
+                        <div style={{ fontSize: 13, fontWeight: 600, color: C.text }}>{quizNames[a.quiz_id] || "Quiz"}</div>
+                        <div style={{ fontSize: 11, color: C.textMuted, marginTop: 2 }}>{new Date(a.created_at).toLocaleDateString()}</div>
+                      </div>
+                      <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
+                        <span style={{ fontSize: 13, fontWeight: 700, color: a.score >= 65 ? C.trueGreen : C.red }}>{a.score}%</span>
+                        <span style={{ fontSize: 11, padding: "2px 8px", borderRadius: 99, background: a.passed ? C.trueGreenBg : C.redBg, color: a.passed ? C.trueGreen : C.red, fontWeight: 600 }}>{a.passed ? "Passed" : "Failed"}</span>
+                      </div>
+                    </div>
+                  ))}
+                </div>
+              ) : (
+                <div style={{ fontSize: 13, color: C.textMuted }}>No quiz attempts recorded yet.</div>
+              )}
+            </div>
+
+            {/* Fix 8: Assigned Learning */}
+            <div>
+              <div style={{ fontWeight: 700, fontSize: 14, color: C.text, marginBottom: 12 }}>Assigned Learning</div>
+              {assignments === null ? (
+                <div style={{ fontSize: 13, color: C.textMuted }}>Loading…</div>
+              ) : assignments.length === 0 ? (
+                <div style={{ fontSize: 13, color: C.textMuted }}>No individual assignments for this rep.</div>
+              ) : (
+                <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
+                  {assignments.map(a => {
+                    const statusColor =
+                      a.status === "Passed"   ? C.trueGreen :
+                      a.status === "Complete" ? C.blue      : C.textMuted;
+                    const typeLabel =
+                      a.content_type === "course" ? "Course" :
+                      a.content_type === "lesson" ? "Lesson" :
+                      a.content_type === "quiz"   ? "Quiz"   : a.content_type;
+                    return (
+                      <div key={a.id} style={{ display: "flex", alignItems: "center", justifyContent: "space-between", padding: "10px 14px", background: C.pageBg, borderRadius: C.radiusSm }}>
+                        <div>
+                          <div style={{ fontSize: 13, fontWeight: 600, color: C.text }}>{a.title}</div>
+                          <div style={{ fontSize: 11, color: C.textMuted, marginTop: 2 }}>
+                            {typeLabel}
+                            {a.due_at && a.due_at !== "Open" ? ` · Due ${new Date(a.due_at).toLocaleDateString()}` : ""}
+                            {a.required ? " · Required" : ""}
+                          </div>
+                        </div>
+                        <span style={{ fontSize: 11, padding: "2px 8px", borderRadius: 99, fontWeight: 600, background: a.status === "Pending" ? C.pageBg : `${statusColor}18`, color: statusColor, border: `1px solid ${statusColor}44` }}>
+                          {a.status}
+                        </span>
+                      </div>
+                    );
+                  })}
+                </div>
+              )}
+            </div>
+
+            {/* Battle Card Engagement — placeholder until BC tracking is built */}
+            <div>
+              <div style={{ fontWeight: 700, fontSize: 14, color: C.text, marginBottom: 8 }}>Battle Card Engagement</div>
+              <div style={{ padding: "12px 14px", background: C.pageBg, borderRadius: C.radiusSm, fontSize: 13, color: C.textMuted }}>
+                Battle card engagement tracking coming soon.
+              </div>
+            </div>
+
+            {/* Coaching Recommendations */}
+            <div>
+              <div style={{ fontWeight: 700, fontSize: 14, color: C.text, marginBottom: 12 }}>Coaching Recommendations</div>
+              <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
+                {recs.map((r, i) => (
+                  <div key={i} style={{ display: "flex", gap: 10, padding: "10px 14px", background: C.orangeLight, borderRadius: C.radiusSm, borderLeft: `3px solid ${C.orange}` }}>
+                    <span style={{ fontSize: 13, color: C.text }}>{r}</span>
+                  </div>
+                ))}
+              </div>
+            </div>
+
+          </div>
+        )}
+      </div>
+    </div>
+  );
+}
+
 // Available to: orgAdmin, superadmin
 // Production hook: replace LEADERSHIP_SEED with API fetch on mount.
 // All data shapes mirror the final backend response model.
@@ -10604,63 +10852,74 @@ function LeadershipDashboardScreen({ currentOrg, orgUsers = [], isReal = false }
   const [trendPeriod,  setTrendPeriod]  = useState("weekly");
   const [peopleFilter, setPeopleFilter] = useState("all"); // all | top | improved | promotion | coaching
   const [teamFilter,   setTeamFilter]   = useState("all"); // all | team id
+  const [selectedRep,  setSelectedRep]  = useState(null);  // rep object for drill-down modal
+  const [orgMetrics,   setOrgMetrics]   = useState(null);  // getOrgMetrics result
+  const [topicFilter,  setTopicFilter]  = useState(null);  // string | null — filter people by weak topic
 
-  // Load real readiness scores from Supabase when available
+  // Load readiness scores + topic heatmap + org metrics from Supabase
   useEffect(() => {
     const tid = currentOrg?.id;
     if (!isReal || !tid) { setLoading(false); return; }
-    supabase
-      .from("readiness_scores")
-      .select("user_id, score, computed_at")
-      .eq("tenant_id", tid)
-      .order("computed_at", { ascending: false })
-      .then(({ data: rows }) => {
-        if (!rows || rows.length === 0) { setLoading(false); return; } // no data yet — show EmptyState
-        // Deduplicate — take the most recent row per user (handles pre-migration multi-row data)
-        const seen = new Set();
-        const unique = rows.filter(r => { if (seen.has(r.user_id)) return false; seen.add(r.user_id); return true; });
-        // Build people array from orgUsers + readiness_scores rows
-        const people = unique.map((r, i) => {
-          const member = orgUsers.find(u => u.id === r.user_id);
-          return {
-            id:            r.user_id,
-            name:          member?.name ?? "Team Member",
-            title:         member?.title ?? member?.role ?? "Rep",
-            readinessScore: r.score ?? 0,
-            previousScore:  r.score ?? 0, // no prior-period data yet
-            trend:         0,
-            color:         ["#6366f1","#f59e0b","#10b981","#ec4899","#3b82f6"][i % 5],
-          };
-        });
-        // Company-level aggregate
-        const avg = people.length ? Math.round(people.reduce((s, p) => s + p.readinessScore, 0) / people.length) : 0;
-        setLiveData({
-          company: { readinessScore: avg, previousScore: avg, targetScore: 90, trend: [], period: "Current" },
-          teams:   [],   // team breakdown requires team assignments — leave empty for now
-          // Normalize people to match the shape the UI expects (score, prev, initials).
-          // liveData builds people with readinessScore/previousScore; LEADERSHIP_SEED uses score/prev.
-          people: people.map(p => ({
-            ...p,
-            score:    p.readinessScore,
-            prev:     p.previousScore,
-            initials: (p.name ?? "").split(" ").map(w => w[0] ?? "").join("").slice(0, 2).toUpperCase() || "TM",
-          })),
-          heatmap:   [],                // not yet computed from activity data
-          trends:    {},                // not yet computed from historical scores
-          aiSummary: null,              // not generated for real data path
-          risk: {                       // placeholder — no overdue/cert data in this query
-            overdueAssignments:    0,
-            overdueCertifications: 0,
-            overdueAssignmentReps: [],
-            certExpiringSoon:      [],
-            lowReadinessReps:      [],
-            teamsBelowTarget:      [],
-            coachingGaps:          [],
-          },
-        });
-        setLoading(false);
-      })
-      .catch(e => { console.error("[ralli] LeadershipDashboard readiness fetch failed:", e); setLoading(false); });
+
+    Promise.all([
+      supabase
+        .from("readiness_scores")
+        .select("user_id, score, computed_at")
+        .eq("tenant_id", tid)
+        .order("computed_at", { ascending: false }),
+      getTopicHeatmap(tid),
+      getOrgMetrics(tid),
+    ]).then(([{ data: rows }, heatmap, metrics]) => {
+      // Org metrics are independent of whether scores exist
+      if (metrics) setOrgMetrics(metrics);
+
+      if (!rows || rows.length === 0) { setLoading(false); return; }
+
+      // Deduplicate — take the most recent row per user (handles pre-migration multi-row data)
+      const seen = new Set();
+      const unique = rows.filter(r => { if (seen.has(r.user_id)) return false; seen.add(r.user_id); return true; });
+
+      // Build people array from orgUsers + readiness_scores rows
+      const people = unique.map((r, i) => {
+        const member = orgUsers.find(u => u.id === r.user_id);
+        return {
+          id:            r.user_id,
+          name:          member?.name ?? "Team Member",
+          title:         member?.title ?? member?.role ?? "Rep",
+          email:         member?.email ?? "",
+          readinessScore: r.score ?? 0,
+          previousScore:  r.score ?? 0,
+          trend:         0,
+          color:         ["#6366f1","#f59e0b","#10b981","#ec4899","#3b82f6"][i % 5],
+        };
+      });
+
+      const avg = people.length ? Math.round(people.reduce((s, p) => s + p.readinessScore, 0) / people.length) : 0;
+
+      setLiveData({
+        company: { readinessScore: avg, previousScore: avg, targetScore: 90, trend: [], period: "Current" },
+        teams:   [],
+        people: people.map(p => ({
+          ...p,
+          score:    p.readinessScore,
+          prev:     p.previousScore,
+          initials: (p.name ?? "").split(" ").map(w => w[0] ?? "").join("").slice(0, 2).toUpperCase() || "TM",
+        })),
+        heatmap:   heatmap ?? [],
+        trends:    {},
+        aiSummary: null,
+        risk: {
+          overdueAssignments:    0,
+          overdueCertifications: 0,
+          overdueAssignmentReps: [],
+          certExpiringSoon:      [],
+          lowReadinessReps:      people.filter(p => p.readinessScore < 65).map(p => p.id),
+          teamsBelowTarget:      [],
+          coachingGaps:          [],
+        },
+      });
+      setLoading(false);
+    }).catch(e => { console.error("[ralli] LeadershipDashboard fetch failed:", e); setLoading(false); });
   }, [isReal, currentOrg?.id]); // eslint-disable-line react-hooks/exhaustive-deps
 
   // Loading / empty guards — real users only. Demo always falls through to LEADERSHIP_SEED.
@@ -10694,22 +10953,46 @@ function LeadershipDashboardScreen({ currentOrg, orgUsers = [], isReal = false }
   const delta      = (curr, prev) => curr - prev;
   const deltaLabel = (d) => d > 0 ? `+${d}` : `${d}`;
   const deltaColor = (d) => d > 0 ? C.trueGreen : d < 0 ? C.red : C.textMuted;
+  // Fix 1: safe accessor handles both real data (avgScore) and seed data (score)
+  const getTopicScore = (t) => Number(t?.avgScore ?? t?.score ?? 0);
 
   const trendPoints = data.trends?.[trendPeriod] ?? [];
   const maxTrendVal = 100;
 
-  // people filtered
-  const filteredPeople = peopleFilter === "all"
-    ? data.people
-    : data.people.filter(p => p.tag === peopleFilter);
+  // Fix 4: topic filter — when active, show below-threshold reps; if none, show all measured reps
+  const topicFilterOnTrack = (() => {
+    if (!topicFilter || !data.heatmap.length) return false;
+    const entry = data.heatmap.find(t => t.topic === topicFilter);
+    if (!entry?.repScores?.length) return false;
+    return entry.repScores.filter(r => r.score < 65).length === 0;
+  })();
+
+  const filteredPeople = (() => {
+    let list = peopleFilter === "all" ? data.people : data.people.filter(p => p.tag === peopleFilter);
+    if (topicFilter && data.heatmap.length > 0) {
+      const topicEntry = data.heatmap.find(t => t.topic === topicFilter);
+      if (topicEntry?.repScores?.length) {
+        const belowIds = new Set(topicEntry.repScores.filter(r => r.score < 65).map(r => r.userId));
+        if (belowIds.size > 0) {
+          // Some reps below threshold — show only them
+          list = list.filter(p => belowIds.has(p.id));
+        } else {
+          // Everyone on track — show all reps who have data for this topic
+          const measuredIds = new Set(topicEntry.repScores.map(r => r.userId));
+          if (measuredIds.size > 0) list = list.filter(p => measuredIds.has(p.id));
+        }
+      }
+    }
+    return list;
+  })();
 
   const promotionReps  = data.people.filter(p => p.tag === "promotion").length;
   const coachingReps   = data.people.filter(p => p.tag === "coaching").length;
   const topRep         = data.people.find(p => p.tag === "top");
   const mostImproved   = [...data.people].sort((a, b) => delta(b.score, b.prev) - delta(a.score, a.prev))[0];
-  // Guard: heatmap may be empty for real orgs that haven't accumulated skill data yet.
-  const weakestTopic   = data.heatmap.length > 0 ? [...data.heatmap].sort((a, b) => a.score - b.score)[0] : null;
-  const strongestTopic = data.heatmap.length > 0 ? [...data.heatmap].sort((a, b) => b.score - a.score)[0] : null;
+  // Fix 1: use getTopicScore() so real data (avgScore) and seed data (score) both work
+  const weakestTopic   = data.heatmap.length > 0 ? [...data.heatmap].sort((a, b) => getTopicScore(a) - getTopicScore(b))[0] : null;
+  const strongestTopic = data.heatmap.length > 0 ? [...data.heatmap].sort((a, b) => getTopicScore(b) - getTopicScore(a))[0] : null;
 
   // section header style
   const SH = (title, sub) => (
@@ -10798,46 +11081,97 @@ function LeadershipDashboardScreen({ currentOrg, orgUsers = [], isReal = false }
         </div>
       </div>
 
-      {/* ── SECTION 1 — Company Readiness KPIs ── */}
-      <div style={{ display: "grid", gridTemplateColumns: mobile ? "repeat(2, 1fr)" : "repeat(4, 1fr)", gap: 14 }}>
-        {[
+      {/* ── SECTION 1 — Organization Metrics ── */}
+      {(() => {
+        const m = orgMetrics;
+        const readiness  = m?.overallReadiness  ?? company.readinessScore;
+        const quizScore  = m?.avgQuizScore      ?? null;
+        const completion = m?.completionPct     ?? null;
+        const below      = m?.belowThreshold    ?? coachingReps;
+        const active     = m?.activeLearners    ?? null;
+        const cards = [
           {
             label: "Overall Readiness",
-            value: `${company.readinessScore}%`,
-            sub: `${deltaLabel(companyDelta)} pts vs last period`,
-            color: scoreColor(company.readinessScore),
-            icon: "",
+            value: `${readiness}%`,
+            sub: m ? `${m.totalMembersScored} members scored` : `${deltaLabel(companyDelta)} pts vs last period`,
+            color: scoreColor(readiness),
           },
           {
-            label: "Target Score",
-            value: `${company.targetScore}%`,
-            sub: toTarget > 0 ? `${toTarget} pts to target` : "Target met",
-            color: toTarget > 0 ? C.orange : C.trueGreen,
-            icon: "",
+            label: "Avg Quiz Score",
+            value: quizScore !== null ? `${quizScore}%` : "—",
+            sub: "Across all quiz attempts",
+            color: quizScore !== null ? scoreColor(quizScore) : C.textMuted,
           },
           {
-            label: "Ready for Promotion",
-            value: `${promotionReps}`,
-            sub: "Reps above 95% readiness",
-            color: C.trueGreen,
-            icon: "",
+            label: "Content Completion",
+            value: completion !== null ? `${completion}%` : "—",
+            sub: "Reps with ≥1 lesson complete",
+            color: completion !== null ? scoreColor(completion) : C.textMuted,
           },
           {
-            label: "Needs Attention",
-            value: `${coachingReps}`,
-            sub: "Reps below 70% readiness",
-            color: C.red,
-            icon: "",
+            label: "Below Threshold",
+            value: `${below}`,
+            sub: "Reps below 65% readiness",
+            color: below > 0 ? C.red : C.trueGreen,
           },
-        ].map((s, i) => (
-          <Card key={i}>
-            {s.icon && <div style={{ fontSize: 22, marginBottom: 6 }}>{s.icon}</div>}
-            <div style={{ fontSize: 26, fontWeight: 900, color: s.color }}>{s.value}</div>
-            <div style={{ fontSize: 12, fontWeight: 700, color: C.text, marginTop: 4 }}>{s.label}</div>
-            <div style={{ fontSize: 11, color: C.textSub, marginTop: 2 }}>{s.sub}</div>
-          </Card>
-        ))}
-      </div>
+          {
+            label: "Active Learners",
+            value: active !== null ? `${active}` : "—",
+            sub: "Engaged in last 30 days",
+            color: C.blue,
+          },
+        ];
+        return (
+          <div style={{ display: "grid", gridTemplateColumns: mobile ? "repeat(2, 1fr)" : "repeat(5, 1fr)", gap: 14 }}>
+            {cards.map((s, i) => (
+              <Card key={i}>
+                <div style={{ fontSize: 26, fontWeight: 900, color: s.color }}>{s.value}</div>
+                <div style={{ fontSize: 12, fontWeight: 700, color: C.text, marginTop: 4 }}>{s.label}</div>
+                <div style={{ fontSize: 11, color: C.textSub, marginTop: 2 }}>{s.sub}</div>
+              </Card>
+            ))}
+          </div>
+        );
+      })()}
+
+      {/* ── Threshold Alert Banner — real orgs only (Fix 5: suppress for demo) ── */}
+      {isReal && (() => {
+        const atRisk = (liveData ?? data).people?.filter(p => (p.score ?? p.readinessScore ?? 0) < 65) ?? [];
+        if (!atRisk.length) return null;
+        return (
+          <div style={{
+            background: C.redBg, border: `1px solid ${C.red}33`,
+            borderRadius: C.radiusMd, padding: "14px 18px",
+            display: "flex", alignItems: "flex-start", gap: 12,
+          }}>
+            <span style={{ fontSize: 18, flexShrink: 0 }}>⚠️</span>
+            <div>
+              <div style={{ fontSize: 13, fontWeight: 700, color: C.red }}>
+                {atRisk.length} rep{atRisk.length !== 1 ? "s" : ""} below readiness threshold (65%)
+              </div>
+              <div style={{ fontSize: 12, color: C.textSub, marginTop: 4 }}>
+                {atRisk.slice(0, 5).map(p => p.name || p.initials).join(", ")}
+                {atRisk.length > 5 ? ` +${atRisk.length - 5} more` : ""}
+                {" — "}
+                <span
+                  onClick={() => {
+                    setPeopleFilter("all");
+                    setTopicFilter(null);
+                    // Fix 6: scroll to People Insights section
+                    setTimeout(() => {
+                      document.getElementById("people-insights-section")
+                        ?.scrollIntoView({ behavior: "smooth", block: "start" });
+                    }, 50);
+                  }}
+                  style={{ color: C.red, cursor: "pointer", textDecoration: "underline", fontWeight: 600 }}
+                >
+                  View in People Insights
+                </span>
+              </div>
+            </div>
+          </div>
+        );
+      })()}
 
       {/* ── SECTION 2 — Highlights row ── */}
       <div style={{ display: "grid", gridTemplateColumns: mobile ? "1fr" : "1fr 1fr 1fr", gap: 14 }}>
@@ -10885,7 +11219,7 @@ function LeadershipDashboardScreen({ currentOrg, orgUsers = [], isReal = false }
               {weakestTopic ? (
                 <>
                   <div style={{ fontSize: 14, fontWeight: 700, color: C.text }}>{weakestTopic.topic}</div>
-                  <div style={{ fontSize: 20, fontWeight: 900, color: C.red }}>{weakestTopic.score}%</div>
+                  <div style={{ fontSize: 20, fontWeight: 900, color: C.red }}>{getTopicScore(weakestTopic)}%</div>
                 </>
               ) : (
                 <div style={{ fontSize: 13, color: C.textSub }}>No skill data yet</div>
@@ -10898,10 +11232,12 @@ function LeadershipDashboardScreen({ currentOrg, orgUsers = [], isReal = false }
                 <>
                   <div style={{ fontSize: 14, fontWeight: 700, color: C.text }}>{strongestTopic.topic}</div>
                   <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
-                    <span style={{ fontSize: 20, fontWeight: 900, color: C.trueGreen }}>{strongestTopic.score}%</span>
-                    <span style={{ fontSize: 12, color: C.trueGreen, fontWeight: 600 }}>
-                      {deltaLabel(delta(strongestTopic.score, strongestTopic.prev))} pts
-                    </span>
+                    <span style={{ fontSize: 20, fontWeight: 900, color: C.trueGreen }}>{getTopicScore(strongestTopic)}%</span>
+                    {strongestTopic.prev != null && (
+                      <span style={{ fontSize: 12, color: C.trueGreen, fontWeight: 600 }}>
+                        {deltaLabel(delta(getTopicScore(strongestTopic), strongestTopic.prev))} pts
+                      </span>
+                    )}
                   </div>
                 </>
               ) : (
@@ -10958,30 +11294,97 @@ function LeadershipDashboardScreen({ currentOrg, orgUsers = [], isReal = false }
 
       {/* ── SECTION 4 — Knowledge Heatmap ── */}
       <Card>
-        {SH("Knowledge Heatmap", "Readiness by skill area across the company.")}
+        <div style={{ display: "flex", justifyContent: "space-between", alignItems: "flex-start", marginBottom: 16 }}>
+          {SH("Knowledge Heatmap", "Readiness by topic across the company. Click a topic to filter reps.")}
+          {topicFilter && (
+            <button
+              onClick={() => setTopicFilter(null)}
+              style={{ fontSize: 12, fontWeight: 600, color: C.orange, background: C.orangeLight, border: `1px solid ${C.orange}44`, borderRadius: 8, padding: "4px 10px", cursor: "pointer" }}
+            >
+              Clear filter: {topicFilter} ✕
+            </button>
+          )}
+        </div>
         {data.heatmap.length > 0 ? (
-          <div style={{ display: "flex", flexDirection: "column", gap: 10 }}>
-            {[...data.heatmap].sort((a, b) => b.score - a.score).map(topic => {
-              const d = delta(topic.score, topic.prev);
+          <>
+            <div style={{ display: "flex", flexDirection: "column", gap: 10 }}>
+              {[...data.heatmap].sort((a, b) => (b.avgScore ?? b.score ?? 0) - (a.avgScore ?? a.score ?? 0)).map(topic => {
+                const score      = topic.avgScore ?? topic.score ?? 0;
+                const repsBelow  = topic.repsBelow ?? 0;
+                const repsTotal  = topic.repsTotal ?? 0;
+                const isSelected = topicFilter === topic.topic;
+                const d          = topic.prev != null ? delta(score, topic.prev) : null;
+                return (
+                  <div
+                    key={topic.topic}
+                    onClick={() => setTopicFilter(isSelected ? null : topic.topic)}
+                    style={{
+                      display: "flex", alignItems: "center", gap: 14,
+                      padding: "8px 10px", borderRadius: C.radiusSm, cursor: "pointer",
+                      background: isSelected ? C.orangeLight : "transparent",
+                      border: `1px solid ${isSelected ? C.orange + "66" : "transparent"}`,
+                      transition: "background 0.15s",
+                    }}
+                  >
+                    <div style={{ width: 160, flexShrink: 0 }}>
+                      <div style={{ fontSize: 13, fontWeight: 600, color: C.text, textTransform: "capitalize" }}>
+                        {topic.topic}
+                      </div>
+                      {repsTotal > 0 && (
+                        <div style={{ fontSize: 11, color: repsBelow > 0 ? C.red : C.textMuted, marginTop: 2 }}>
+                          {repsBelow > 0 ? `${repsBelow} below threshold` : "All on track"} · {repsTotal} rep{repsTotal !== 1 ? "s" : ""}
+                        </div>
+                      )}
+                    </div>
+                    <div style={{ flex: 1 }}>
+                      <ProgressBar value={score} max={100} color={scoreColor(score)} trackColor={C.border} height={10} />
+                    </div>
+                    <div style={{ width: 40, textAlign: "right", fontSize: 13, fontWeight: 700, color: scoreColor(score) }}>{score}%</div>
+                    {d != null && (
+                      <div style={{ width: 44, textAlign: "right", fontSize: 12, fontWeight: 600, color: deltaColor(d) }}>{deltaLabel(d)} pts</div>
+                    )}
+                  </div>
+                );
+              })}
+            </div>
+
+            {/* Weak Topic Summary — bottom 3 topics */}
+            {(() => {
+              const weak = [...data.heatmap]
+                .sort((a, b) => (a.avgScore ?? a.score ?? 0) - (b.avgScore ?? b.score ?? 0))
+                .slice(0, 3)
+                .filter(t => (t.avgScore ?? t.score ?? 0) < 75);
+              if (!weak.length) return null;
               return (
-                <div key={topic.topic} style={{ display: "flex", alignItems: "center", gap: 14 }}>
-                  <div style={{ width: 160, fontSize: 13, fontWeight: 600, color: C.text, flexShrink: 0 }}>
-                    {topic.topic}
-                    {weakestTopic && topic.topic === weakestTopic.topic && <span style={{ marginLeft: 6, fontSize: 10, color: C.red, fontWeight: 700 }}>▼ WEAKEST</span>}
-                    {strongestTopic && topic.topic === strongestTopic.topic && <span style={{ marginLeft: 6, fontSize: 10, color: C.trueGreen, fontWeight: 700 }}>▲ TOP</span>}
+                <div style={{ marginTop: 20, borderTop: `1px solid ${C.border}`, paddingTop: 16 }}>
+                  <div style={{ fontSize: 13, fontWeight: 700, color: C.text, marginBottom: 10 }}>Weak Topics</div>
+                  <div style={{ display: "grid", gridTemplateColumns: `repeat(${Math.min(weak.length, 3)}, 1fr)`, gap: 10 }}>
+                    {weak.map(t => {
+                      const s = t.avgScore ?? t.score ?? 0;
+                      return (
+                        <div
+                          key={t.topic}
+                          onClick={() => setTopicFilter(topicFilter === t.topic ? null : t.topic)}
+                          style={{
+                            padding: "12px 14px", borderRadius: C.radiusSm, cursor: "pointer",
+                            background: s < 65 ? C.redBg : C.orangeLight,
+                            border: `1px solid ${s < 65 ? C.red + "33" : C.orange + "44"}`,
+                          }}
+                        >
+                          <div style={{ fontSize: 12, fontWeight: 700, color: s < 65 ? C.red : C.orangeDeep, textTransform: "capitalize" }}>{t.topic}</div>
+                          <div style={{ fontSize: 20, fontWeight: 900, color: s < 65 ? C.red : C.orange, margin: "4px 0" }}>{s}%</div>
+                          {t.repsBelow > 0 && <div style={{ fontSize: 11, color: C.textMuted }}>{t.repsBelow} rep{t.repsBelow !== 1 ? "s" : ""} need coaching</div>}
+                        </div>
+                      );
+                    })}
                   </div>
-                  <div style={{ flex: 1 }}>
-                    <ProgressBar value={topic.score} max={100} color={scoreColor(topic.score)} trackColor={C.border} height={10} />
-                  </div>
-                  <div style={{ width: 40, textAlign: "right", fontSize: 13, fontWeight: 700, color: scoreColor(topic.score) }}>{topic.score}%</div>
-                  <div style={{ width: 44, textAlign: "right", fontSize: 12, fontWeight: 600, color: deltaColor(d) }}>{deltaLabel(d)} pts</div>
                 </div>
               );
-            })}
-          </div>
+            })()}
+          </>
         ) : (
           <div style={{ padding: "24px 0", textAlign: "center", color: C.textSub, fontSize: 13 }}>
-            Skill data will appear here after reps complete quizzes and assignments.
+            Skill data will appear here after reps complete tagged quizzes.
           </div>
         )}
       </Card>
@@ -11067,9 +11470,26 @@ function LeadershipDashboardScreen({ currentOrg, orgUsers = [], isReal = false }
       )}
 
       {/* ── SECTION 7 — People Insights ── */}
-      <Card>
+      <Card id="people-insights-section">
         <div style={{ display: "flex", justifyContent: "space-between", alignItems: "flex-start", marginBottom: 16 }}>
-          {SH("People Insights", "Individual readiness scores and coaching signals.")}
+          <div>
+            {SH("People Insights", topicFilter ? `Filtered: reps below threshold on "${topicFilter}"` : "Individual readiness scores. Click a rep to view details.")}
+            {topicFilter && (
+              <button
+                onClick={() => setTopicFilter(null)}
+                style={{ fontSize: 11, fontWeight: 600, color: C.orange, background: C.orangeLight, border: `1px solid ${C.orange}44`, borderRadius: 6, padding: "3px 8px", cursor: "pointer", marginTop: -8, display: "inline-block" }}
+              >
+                Clear topic filter ✕
+              </button>
+            )}
+            {/* Fix 4: on-track message when all measured reps are above threshold */}
+            {topicFilterOnTrack && (
+              <div style={{ marginTop: 8, fontSize: 13, color: C.trueGreen, fontWeight: 600, display: "flex", alignItems: "center", gap: 6 }}>
+                <span style={{ fontSize: 15 }}>✓</span>
+                Everyone measured for <strong>"{topicFilter}"</strong> is on track.
+              </div>
+            )}
+          </div>
           <div style={{ display: "flex", gap: 6, flexWrap: "wrap" }}>
             {[
               { id: "all",       label: "All" },
@@ -11111,10 +11531,17 @@ function LeadershipDashboardScreen({ currentOrg, orgUsers = [], isReal = false }
               };
               const tag = tagConfig[p.tag];
               return (
-                <div key={p.id} style={{
-                  display: "flex", alignItems: "center", gap: 12, padding: "12px 16px",
-                  background: C.white, borderTop: i === 0 ? "none" : `1px solid ${C.border}`,
-                }}>
+                <div
+                  key={p.id}
+                  onClick={() => setSelectedRep(p)}
+                  style={{
+                    display: "flex", alignItems: "center", gap: 12, padding: "12px 16px",
+                    background: C.white, borderTop: i === 0 ? "none" : `1px solid ${C.border}`,
+                    cursor: "pointer", transition: "background 0.1s",
+                  }}
+                  onMouseEnter={e => e.currentTarget.style.background = C.pageBg}
+                  onMouseLeave={e => e.currentTarget.style.background = C.white}
+                >
                   <Avatar initials={p.initials} color={p.color} size={36} />
                   <div style={{ flex: 1, minWidth: 0 }}>
                     <div style={{ fontSize: 13, fontWeight: 700, color: C.text }}>{p.name}</div>
@@ -11214,6 +11641,15 @@ function LeadershipDashboardScreen({ currentOrg, orgUsers = [], isReal = false }
           </div>
         </div>
       </Card>
+
+      {/* Rep Drill-Down Modal */}
+      {selectedRep && (
+        <RepDrillDownModal
+          rep={selectedRep}
+          tenantId={currentOrg?.id}
+          onClose={() => setSelectedRep(null)}
+        />
+      )}
 
     </div>
   );

@@ -479,3 +479,283 @@ export function triggerReadinessUpdate(tenantId, userId) {
   computeAndSaveReadinessScore(tenantId, userId)
     .catch(e => console.error("[ralli] triggerReadinessUpdate failed:", e));
 }
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Readiness Analytics v2
+// ─────────────────────────────────────────────────────────────────────────────
+
+/**
+ * Compute topic-level readiness across all reps in a tenant.
+ * Uses quiz_attempts joined with tenant_quizzes.tags (JSONB array).
+ *
+ * Returns an array sorted by avgScore ascending (weakest topics first):
+ *   [{
+ *     topic:       string,
+ *     avgScore:    number,   // 0–100
+ *     repsTotal:   number,
+ *     repsBelow:   number,   // score < 65
+ *     repsAbove:   number,
+ *     repScores:   [{ userId, score, passed }],
+ *   }]
+ *
+ * @param {string} tenantId
+ * @returns {Promise<Array>}
+ */
+export async function getTopicHeatmap(tenantId) {
+  if (!tenantId) return [];
+
+  const [{ data: quizzes, error: qErr }, { data: attempts, error: aErr }] =
+    await Promise.all([
+      supabase
+        .from("tenant_quizzes")
+        .select("id, tags")
+        .eq("tenant_id", tenantId)
+        .eq("status", "active"),
+      supabase
+        .from("quiz_attempts")
+        .select("user_id, quiz_id, score, passed, created_at")
+        .eq("tenant_id", tenantId),
+    ]);
+
+  if (qErr || aErr || !quizzes?.length || !attempts?.length) return [];
+
+  // Build quiz → tags[] map (normalize JSONB which may be string array or null)
+  const quizTags = {};
+  for (const q of quizzes) {
+    const tags = Array.isArray(q.tags)
+      ? q.tags
+      : typeof q.tags === "string"
+      ? JSON.parse(q.tags)
+      : [];
+    // Normalize: trim + lowercase so "Discovery" and "discovery" aggregate together
+    quizTags[q.id] = tags.filter(Boolean).map(t => String(t).trim().toLowerCase());
+  }
+
+  // Keep only the latest attempt per (user, quiz) pair
+  const latestAttempts = {};
+  for (const a of attempts) {
+    const key = `${a.user_id}::${a.quiz_id}`;
+    if (
+      !latestAttempts[key] ||
+      new Date(a.created_at) > new Date(latestAttempts[key].created_at)
+    ) {
+      latestAttempts[key] = a;
+    }
+  }
+
+  // Bucket scores by topic
+  const topicMap = {}; // topic → { scores: [{ userId, score, passed }] }
+  for (const a of Object.values(latestAttempts)) {
+    const tags = quizTags[a.quiz_id] ?? [];
+    if (!tags.length) continue;
+    const score = typeof a.score === "number" ? a.score : parseFloat(a.score) || 0;
+    for (const tag of tags) {
+      if (!topicMap[tag]) topicMap[tag] = { scores: [] };
+      topicMap[tag].scores.push({ userId: a.user_id, score, passed: !!a.passed });
+    }
+  }
+
+  // Aggregate per topic
+  const result = Object.entries(topicMap).map(([topic, { scores }]) => {
+    const avg = scores.reduce((s, r) => s + r.score, 0) / scores.length;
+    const below = scores.filter(r => r.score < 65);
+    return {
+      topic,
+      avgScore:  Math.round(avg),
+      repsTotal: scores.length,
+      repsBelow: below.length,
+      repsAbove: scores.length - below.length,
+      repScores: scores,
+    };
+  });
+
+  // Weakest first
+  return result.sort((a, b) => a.avgScore - b.avgScore);
+}
+
+/**
+ * Compute per-topic quiz scores for a single rep.
+ *
+ * Returns:
+ *   [{ topic, avgScore, attempts, passed }]
+ *   sorted by avgScore ascending.
+ *
+ * @param {string} tenantId
+ * @param {string} userId
+ * @returns {Promise<Array>}
+ */
+export async function getRepTopicScores(tenantId, userId) {
+  if (!tenantId || !userId) return [];
+
+  const [{ data: quizzes, error: qErr }, { data: attempts, error: aErr }] =
+    await Promise.all([
+      supabase
+        .from("tenant_quizzes")
+        .select("id, tags")
+        .eq("tenant_id", tenantId)
+        .eq("status", "active"),
+      supabase
+        .from("quiz_attempts")
+        .select("quiz_id, score, passed, created_at")
+        .eq("tenant_id", tenantId)
+        .eq("user_id", userId),
+    ]);
+
+  if (qErr || aErr || !quizzes?.length || !attempts?.length) return [];
+
+  const quizTags = {};
+  for (const q of quizzes) {
+    const tags = Array.isArray(q.tags)
+      ? q.tags
+      : typeof q.tags === "string"
+      ? JSON.parse(q.tags)
+      : [];
+    // Normalize: trim + lowercase so "Discovery" and "discovery" aggregate together
+    quizTags[q.id] = tags.filter(Boolean).map(t => String(t).trim().toLowerCase());
+  }
+
+  // Latest attempt per quiz
+  const latestByQuiz = {};
+  for (const a of attempts) {
+    if (
+      !latestByQuiz[a.quiz_id] ||
+      new Date(a.created_at) > new Date(latestByQuiz[a.quiz_id].created_at)
+    ) {
+      latestByQuiz[a.quiz_id] = a;
+    }
+  }
+
+  const topicMap = {};
+  for (const a of Object.values(latestByQuiz)) {
+    const tags = quizTags[a.quiz_id] ?? [];
+    const score = typeof a.score === "number" ? a.score : parseFloat(a.score) || 0;
+    for (const tag of tags) {
+      if (!topicMap[tag]) topicMap[tag] = { scores: [], passed: 0 };
+      topicMap[tag].scores.push(score);
+      if (a.passed) topicMap[tag].passed++;
+    }
+  }
+
+  const result = Object.entries(topicMap).map(([topic, { scores, passed }]) => ({
+    topic,
+    avgScore: Math.round(scores.reduce((s, v) => s + v, 0) / scores.length),
+    attempts: scores.length,
+    passed,
+  }));
+
+  return result.sort((a, b) => a.avgScore - b.avgScore);
+}
+
+/**
+ * Compute org-level summary metrics for the Leadership Dashboard KPI cards.
+ *
+ * Returns:
+ *   {
+ *     overallReadiness:   number,   // avg of latest readiness_scores per user
+ *     avgQuizScore:       number,   // avg of all quiz_attempts.score
+ *     completionPct:      number,   // % of scored users with ≥1 lesson_completion
+ *     belowThreshold:     number,   // readiness_scores < 65
+ *     activeLearners:     number,   // distinct users in user_point_events last 30d
+ *     totalMembersScored: number,
+ *   }
+ *
+ * @param {string} tenantId
+ * @returns {Promise<Object>}
+ */
+export async function getOrgMetrics(tenantId) {
+  if (!tenantId) return null;
+
+  const thirtyDaysAgo = new Date(Date.now() - 30 * 24 * 60 * 60 * 1000).toISOString();
+
+  const [
+    { data: scores,      error: sErr  },
+    { data: attempts,    error: aErr  },
+    { data: completions, error: cErr  },
+    { data: events,      error: eErr  },
+    // Fix 7: active member count from profiles (excludes inactive/removed members)
+    { count: activeMemberCount, error: mErr },
+  ] = await Promise.all([
+    supabase
+      .from("readiness_scores")
+      .select("user_id, score, computed_at")
+      .eq("tenant_id", tenantId)
+      .order("computed_at", { ascending: false }),
+    // Fix 2: fetch user_id + quiz_id + created_at so we can deduplicate retakes
+    supabase
+      .from("quiz_attempts")
+      .select("user_id, quiz_id, score, created_at")
+      .eq("tenant_id", tenantId),
+    supabase
+      .from("lesson_completions")
+      .select("profile_id")
+      .eq("tenant_id", tenantId),
+    supabase
+      .from("user_point_events")
+      .select("user_id")
+      .eq("tenant_id", tenantId)
+      .gte("created_at", thirtyDaysAgo),
+    // Fix 7: count active profiles (same filter the orgUsers loader uses)
+    supabase
+      .from("profiles")
+      .select("id", { count: "exact", head: true })
+      .eq("tenant_id", tenantId)
+      .neq("status", "inactive"),
+  ]);
+
+  if (sErr || aErr || cErr || eErr || mErr) {
+    console.error("[ralli] getOrgMetrics error", { sErr, aErr, cErr, eErr, mErr });
+    return null;
+  }
+
+  // Deduplicate: keep latest score per user
+  const latestByUser = {};
+  for (const row of (scores ?? [])) {
+    if (!latestByUser[row.user_id]) latestByUser[row.user_id] = row.score;
+  }
+  const userScores = Object.values(latestByUser);
+  const totalMembersScored = userScores.length;
+
+  const overallReadiness = totalMembersScored
+    ? Math.round(userScores.reduce((s, v) => s + v, 0) / totalMembersScored)
+    : 0;
+
+  const belowThreshold = userScores.filter(s => s < 65).length;
+
+  // Fix 2: deduplicate quiz attempts to latest per user+quiz before averaging
+  const latestAttemptMap = {};
+  for (const a of (attempts ?? [])) {
+    const key = `${a.user_id}::${a.quiz_id}`;
+    if (!latestAttemptMap[key] || new Date(a.created_at) > new Date(latestAttemptMap[key].created_at)) {
+      latestAttemptMap[key] = a;
+    }
+  }
+  const dedupedScores = Object.values(latestAttemptMap).map(a =>
+    typeof a.score === "number" ? a.score : parseFloat(a.score) || 0
+  );
+  const avgQuizScore = dedupedScores.length
+    ? Math.round(dedupedScores.reduce((s, v) => s + v, 0) / dedupedScores.length)
+    : 0;
+
+  // Users who have completed at least one lesson
+  const usersWithCompletions = new Set(
+    (completions ?? []).map(c => c.profile_id)
+  );
+  // Fix 7: use active member count as denominator (not just scored members)
+  const memberDenominator = (activeMemberCount ?? 0) > 0 ? activeMemberCount : totalMembersScored;
+  const completionPct = memberDenominator
+    ? Math.round((usersWithCompletions.size / memberDenominator) * 100)
+    : 0;
+
+  // Distinct active learners in last 30 days
+  const activeLearners = new Set((events ?? []).map(e => e.user_id)).size;
+
+  return {
+    overallReadiness,
+    avgQuizScore,
+    completionPct,
+    belowThreshold,
+    activeLearners,
+    totalMembersScored,
+    totalActiveMembers: activeMemberCount ?? totalMembersScored,
+  };
+}
