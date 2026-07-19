@@ -601,11 +601,15 @@ function HomeScreen({ user, onNav, quizAssignments = [], onResumeLesson, onStart
       }).filter(Boolean);
     }
     // Demo: wrap quizAssignments (outstanding only shown, completed = has passed attempt)
-    return quizAssignments.map(q => {
-      const isComplete = q.attempts?.some(a => a.passed) ?? false;
-      const dueStatus = (q.dueAt && q.dueAt !== "Open") ? getDueStatus(q.dueAt) : null;
-      return { ...q, content: q, contentKind: "quiz", pct: isComplete ? 100 : 0, isComplete, dueStatus, contentType: "quiz", contentId: q.id };
-    });
+    // + append the Continue Learning seed (in-progress course/lesson) — demo-only, unchanged quiz data.
+    return [
+      ...quizAssignments.map(q => {
+        const isComplete = q.attempts?.some(a => a.passed) ?? false;
+        const dueStatus = (q.dueAt && q.dueAt !== "Open") ? getDueStatus(q.dueAt) : null;
+        return { ...q, content: q, contentKind: "quiz", pct: isComplete ? 100 : 0, isComplete, dueStatus, contentType: "quiz", contentId: q.id };
+      }),
+      ...DEMO_CONTINUE_LEARNING_SEED,
+    ];
   })();
 
   const pendingAssignments   = enrichedAssignments.filter(x => !x.isComplete);
@@ -687,6 +691,13 @@ function PersonalDashboardScreen({
 
   // ── Derived values ─────────────────────────────────────────────────────────
   const readinessScore = isReal ? (perf?.score ?? null)             : (user.score ?? null);
+  // Knowledge Score = raw quiz accuracy (distinct from the weighted Overall Readiness score).
+  const knowledgeScore = isReal
+    ? (perf?.quizzesAttempted > 0 ? perf.avgQuizScore : null)
+    : (() => {
+        const scored = quizAssignments.flatMap(q => q.attempts?.map(a => a.score) ?? []).filter(s => s != null);
+        return scored.length ? Math.round(scored.reduce((s, v) => s + v, 0) / scored.length) : null;
+      })();
   const currentStreak  = user.streak ?? 0;
   const weeklyXp = isReal
     ? (() => {
@@ -823,8 +834,8 @@ function PersonalDashboardScreen({
         {readinessScore != null && <ScoreBadge score={readinessScore} size={16} />}
       </div>
 
-      {/* ── TOP — 4 KPI cards ──────────────────────────────── */}
-      <div style={{ display: "grid", gridTemplateColumns: mobile ? "repeat(2, 1fr)" : "repeat(4, 1fr)", gap: 14 }}>
+      {/* ── TOP — 5 KPI cards ──────────────────────────────── */}
+      <div style={{ display: "grid", gridTemplateColumns: mobile ? "repeat(2, 1fr)" : "repeat(5, 1fr)", gap: 14 }}>
         {[
           {
             label: "Overall Readiness",
@@ -832,6 +843,13 @@ function PersonalDashboardScreen({
             sub:   readinessScore != null ? "Last 30 days" : "Complete activities to unlock",
             color: readinessScore != null ? scoreColor(readinessScore) : C.textMuted,
             tooltip: "Weighted average of your quiz accuracy, lesson completion, and game performance over the past 30 days.",
+          },
+          {
+            label: "Knowledge Score",
+            value: knowledgeScore != null ? `${knowledgeScore}%` : "—",
+            sub:   knowledgeScore != null ? "Avg. quiz accuracy" : "Take a quiz to unlock",
+            color: knowledgeScore != null ? scoreColor(knowledgeScore) : C.textMuted,
+            tooltip: "Your average score across all quiz attempts.",
           },
           {
             label: "Team Rank",
@@ -862,6 +880,43 @@ function PersonalDashboardScreen({
           </Card>
         ))}
       </div>
+
+      {/* ── Continue Learning — in-progress assignments, resume where you left off ── */}
+      {(() => {
+        const inProgress = pendingAssignments.filter(x => x.pct > 0);
+        if (!inProgress.length) return null;
+        return (
+          <div>
+            {SH("Continue Learning", "Pick up where you left off")}
+            <div style={{ display: "grid", gridTemplateColumns: mobile ? "1fr" : `repeat(${Math.min(inProgress.length, 3)}, 1fr)`, gap: 14 }}>
+              {inProgress.slice(0, 3).map((item) => {
+                const { content, contentKind, pct } = item;
+                const typeColor = contentKind === "course" ? (content.color ?? C.orange)
+                  : contentKind === "quiz" ? C.purple : LESSON_TYPE_COLORS[content.type] ?? C.blue;
+                const handleAction = () => {
+                  if (contentKind === "quiz")        onStartQuiz?.(content.id);
+                  else if (contentKind === "course") onStartCourse?.(content.id);
+                  else                               onResumeLesson?.(content.id);
+                };
+                return (
+                  <Card key={item.id}>
+                    <div style={{ fontSize: 13, fontWeight: 700, color: C.text, marginBottom: 8 }}>{content.title ?? content.name}</div>
+                    <ProgressBar value={pct} color={typeColor} height={6} />
+                    <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginTop: 10 }}>
+                      <span style={{ fontSize: 11, color: C.textSub }}>{pct}% complete</span>
+                      <button onClick={handleAction}
+                        style={{ padding: "6px 12px", borderRadius: 7, border: "none", cursor: "pointer",
+                          background: typeColor, color: "#fff", fontSize: 12, fontWeight: 700 }}>
+                        Resume →
+                      </button>
+                    </div>
+                  </Card>
+                );
+              })}
+            </div>
+          </div>
+        );
+      })()}
 
       {/* ── MIDDLE — Assigned Learning + Quiz Results + Leaderboard ─────────── */}
       <div style={{ display: "grid", gridTemplateColumns: mobile ? "1fr" : "1fr 300px", gap: 16 }}>
@@ -8812,6 +8867,40 @@ const USER_QUIZ_ASSIGNMENTS_SEED = [
         { questionId: "q3", selected: 1, correct: 1 },
       ]},
     ],
+  },
+];
+
+// ── DEMO ONLY: Continue Learning seed (Personal Dashboard) ─────────────────
+// Gives the demo account one in-progress course and one in-progress lesson so
+// "Continue Learning" has something realistic to resume. Reuses existing demo
+// content (INITIAL_LEARN_COURSES / INITIAL_LEARN_LESSONS) by reference — no
+// new content, no Supabase calls. Real accounts never read this constant.
+const DEMO_CONTINUE_LEARNING_SEED = [
+  {
+    id: "demo-continue-course",
+    contentType: "course",
+    contentId: "lc2",
+    content: INITIAL_LEARN_COURSES.find(c => c.id === "lc2"), // "SDR Core Fundamentals"
+    contentKind: "course",
+    pct: 40,
+    isComplete: false,
+    dueAt: "Open",
+    dueStatus: null,
+    required: false,
+    isNew: false,
+  },
+  {
+    id: "demo-continue-lesson",
+    contentType: "lesson",
+    contentId: "ll6",
+    content: INITIAL_LEARN_LESSONS.find(l => l.id === "ll6"), // "Competitive Positioning vs. Salesforce"
+    contentKind: "lesson",
+    pct: 70,
+    isComplete: false,
+    dueAt: "Open",
+    dueStatus: null,
+    required: false,
+    isNew: false,
   },
 ];
 
