@@ -1582,12 +1582,11 @@ const Q_TYPES = [
   { id: "type",   label: "Type Answer",     icon: "", color: "#059669", desc: "Players type a response" },
   { id: "open",   label: "Open Ended",      icon: "", color: "#8B5CF6", desc: "Free response, manually graded" },
   { id: "slider", label: "Slider Scale",    icon: "", color: "#D97706", desc: "Rate on a numeric scale" },
-  { id: "pin",    label: "Pin Answer",      icon: "", color: "#DC2626", desc: "Click the right spot"   },
   { id: "match",  label: "Matching",        icon: "", color: "#8B5CF6", desc: "Connect pairs together"  },
 ];
 
-const Q_TYPE_LABELS = { mc: "Multiple Choice", tf: "True / False", type: "Type Answer", open: "Open Ended", slider: "Slider", pin: "Pin", match: "Matching" };
-const Q_TYPE_ICONS  = { mc: "", tf: "", type: "", open: "", slider: "", pin: "", match: "" };
+const Q_TYPE_LABELS = { mc: "Multiple Choice", tf: "True / False", type: "Type Answer", open: "Open Ended", slider: "Slider", match: "Matching" };
+const Q_TYPE_ICONS  = { mc: "", tf: "", type: "", open: "", slider: "", match: "" };
 
 // ── REAL GAME HOST VIEW ──────────────────────────────────────
 const PURPLE = "#8B5CF6";
@@ -2737,8 +2736,6 @@ function RankdGameScreen({ onNav, sessionName, role, playerName, questions = GAM
   const [openSubmitted,  setOpenSubmitted]  = useState(false);
   const [sliderValue,    setSliderValue]    = useState(5);
   const [sliderSubmitted,setSliderSubmitted]= useState(false);
-  const [pinPoint,       setPinPoint]       = useState(null);
-  const [pinSubmitted,   setPinSubmitted]   = useState(false);
   const [shuffledRight,  setShuffledRight]  = useState([]);
   // Host controls
   const [paused,         setPaused]         = useState(false);
@@ -2772,7 +2769,6 @@ function RankdGameScreen({ onNav, sessionName, role, playerName, questions = GAM
         setOpenResponses([]); setOpenGrades({}); setOpenSubmitted(false);
         setSliderValue(Math.round(((q.min ?? 0) + (q.max ?? 10)) / 2));
         setSliderSubmitted(false);
-        setPinPoint(null); setPinSubmitted(false);
         setMatchPairs([]); setMatchSelLeft(null);
         if (q.type === "match" && q.pairs?.length) {
           setShuffledRight([...q.pairs].sort(() => Math.random() - 0.5));
@@ -2845,13 +2841,6 @@ function RankdGameScreen({ onNav, sessionName, role, playerName, questions = GAM
           const tol  = q.tolerance ?? 1;
           const ok   = diff <= tol;
           return { wasCorrect: ok, delta: ok ? Math.round(400 + Math.max(0, 1 - diff / tol) * 600) : 0 };
-        }
-        case "pin": {
-          if (!pinSubmitted || !pinPoint || q.correctX === undefined) return { wasCorrect: false, delta: 0 };
-          const dist = Math.sqrt(Math.pow(pinPoint.x - q.correctX, 2) + Math.pow(pinPoint.y - q.correctY, 2));
-          const tol  = q.tolerance ?? 15;
-          const ok   = dist <= tol;
-          return { wasCorrect: ok, delta: ok ? Math.round(400 + Math.max(0, 1 - dist / tol) * 600) : 0 };
         }
         case "match": {
           if (!q.pairs?.length || matchPairs.length === 0) return { wasCorrect: false, delta: 0 };
@@ -3557,75 +3546,6 @@ function RankdGameScreen({ onNav, sessionName, role, playerName, questions = GAM
         </div>
       )}
 
-      {/* ── Pin Answer ── */}
-      {q.type === "pin" && (
-        <div style={{ flex: 1, padding: "16px 40px", display: "flex", flexDirection: "column", alignItems: "center", justifyContent: "center", gap: 14, maxWidth: 680, margin: "0 auto", width: "100%", boxSizing: "border-box" }}>
-          <div
-            onClick={e => {
-              if (pinSubmitted || isReveal || role === "admin") return;
-              const rect = e.currentTarget.getBoundingClientRect();
-              const x = Math.round(((e.clientX - rect.left) / rect.width) * 100);
-              const y = Math.round(((e.clientY - rect.top) / rect.height) * 100);
-              setPinPoint({ x, y });
-            }}
-            style={{
-              position: "relative", width: "100%", height: 220, borderRadius: 16,
-              cursor: (pinSubmitted || isReveal || role === "admin") ? "default" : "crosshair",
-              background: q.imageUrl
-                ? `url(${q.imageUrl}) center/cover no-repeat`
-                : `linear-gradient(135deg, rgba(27,45,82,0.8), rgba(22,40,68,0.9))`,
-              border: "2px solid rgba(255,255,255,0.1)", overflow: "hidden",
-            }}
-          >
-            {/* Grid lines */}
-            {[33,66].map(p => <div key={`v${p}`} style={{ position:"absolute", left:`${p}%`, top:0, bottom:0, width:1, background:"rgba(255,255,255,0.1)" }} />)}
-            {[33,66].map(p => <div key={`h${p}`} style={{ position:"absolute", top:`${p}%`, left:0, right:0, height:1, background:"rgba(255,255,255,0.1)" }} />)}
-
-            {!q.imageUrl && !pinPoint && (
-              <div style={{ position:"absolute", inset:0, display:"flex", flexDirection:"column", alignItems:"center", justifyContent:"center", gap:8 }}>
-                <span style={{ fontSize:32 }}>●</span>
-                <p style={{ margin:0, fontSize:13, color:"rgba(255,255,255,0.4)", fontWeight:600 }}>Click to place your pin</p>
-              </div>
-            )}
-
-            {/* User's pin */}
-            {pinPoint && (
-              <div style={{ position:"absolute", left:`${pinPoint.x}%`, top:`${pinPoint.y}%`, transform:"translate(-50%,-100%)", fontSize:28, pointerEvents:"none" }}>
-                ●
-              </div>
-            )}
-
-            {/* Correct zone on reveal */}
-            {isReveal && q.correctX !== undefined && (
-              <>
-                <div style={{
-                  position:"absolute", left:`${q.correctX}%`, top:`${q.correctY}%`,
-                  transform:"translate(-50%,-50%)",
-                  width: (q.tolerance ?? 15) * 2 + "%",
-                  height: (q.tolerance ?? 15) * 2 * (220/680) + "%",
-                  borderRadius:"50%", background:"rgba(16,185,129,0.25)", border:"2px solid rgba(16,185,129,0.6)",
-                  pointerEvents:"none",
-                }} />
-                <div style={{ position:"absolute", left:`${q.correctX}%`, top:`${q.correctY}%`, transform:"translate(-50%,-100%)", fontSize:28, filter:"hue-rotate(100deg)", pointerEvents:"none" }}>
-                  ●
-                </div>
-              </>
-            )}
-          </div>
-
-          {!pinSubmitted && !isReveal && role === "user" && (
-            <button onClick={() => { if (pinPoint) { setPinSubmitted(true); setLockedAtTime(timeLeft); } }} style={{
-              padding: "10px 32px", borderRadius: 12, border: "none", cursor: pinPoint ? "pointer" : "not-allowed",
-              fontSize: 13, fontWeight: 900, background: pinPoint ? C.orange : "rgba(255,255,255,0.1)",
-              color: pinPoint ? "#fff" : "rgba(255,255,255,0.3)",
-            }}>{pinPoint ? "Confirm Pin →" : "Click the image to place pin"}</button>
-          )}
-          {pinSubmitted && !isReveal && (
-            <p style={{ margin:0, fontSize:13, fontWeight:700, color:C.green }}>✓ Pin placed — waiting for reveal…</p>
-          )}
-        </div>
-      )}
-
       {/* ── Matching ── */}
       {q.type === "match" && (() => {
         const PAIR_COLORS = ["#7C3AED","#0284C7","#059669","#DC2626","#D97706","#EC4899"];
@@ -3716,7 +3636,6 @@ function RankdGameScreen({ onNav, sessionName, role, playerName, questions = GAM
           : q.type === "type" ? !typeSubmitted
           : q.type === "open" ? !openSubmitted
           : q.type === "slider" ? !sliderSubmitted
-          : q.type === "pin" ? !pinSubmitted
           : matchPairs.length === 0;
 
         if (!noAnswer) {
@@ -3733,13 +3652,6 @@ function RankdGameScreen({ onNav, sessionName, role, playerName, questions = GAM
             wasCorrect = diff <= (q.tolerance ?? 1);
             pts = wasCorrect ? Math.round(400 + Math.max(0, 1 - diff / (q.tolerance ?? 1)) * 600) : 0;
             if (!wasCorrect) detail = `Correct: ${q.correct} (±${q.tolerance ?? 1})`;
-          } else if (q.type === "pin") {
-            if (pinPoint && q.correctX !== undefined) {
-              const dist = Math.sqrt(Math.pow(pinPoint.x - q.correctX, 2) + Math.pow(pinPoint.y - q.correctY, 2));
-              wasCorrect = dist <= (q.tolerance ?? 15);
-              pts = wasCorrect ? Math.round(400 + speedPct * 600) : 0;
-            }
-            if (!wasCorrect) detail = "Pin not in the correct zone";
           } else if (q.type === "match") {
             const correct = matchPairs.filter(mp => shuffledRight[mp.rightIdx]?.right === (q.pairs ?? [])[mp.leftIdx]?.right).length;
             wasCorrect = correct === (q.pairs?.length ?? 0);
@@ -3798,7 +3710,6 @@ function RankdGameScreen({ onNav, sessionName, role, playerName, questions = GAM
           : q.type === "type" ? typeSubmitted
           : q.type === "open" ? openSubmitted
           : q.type === "slider" ? sliderSubmitted
-          : q.type === "pin" ? pinSubmitted
           : matchPairs.length >= (q.pairs?.length ?? 999);
         if (!hasAnswered) return null;
         return (
@@ -5756,7 +5667,6 @@ function QuizBuilderScreen({ onNav, onSave, initialQuiz }) {
       case "type":   return { ...base, acceptedAnswers: [""], timeLimit: 30 };
       case "open":   return { ...base, timeLimit: 60 };
       case "slider": return { ...base, min: 0, max: 10, minLabel: "", maxLabel: "", correct: 5, tolerance: 1, timeLimit: 20 };
-      case "pin":    return { ...base, imageUrl: "", correctX: 50, correctY: 50, tolerance: 15, timeLimit: 30 };
       case "match":  return { ...base, pairs: [{left:"",right:""},{left:"",right:""}], timeLimit: 45 };
       default: return base;
     }
@@ -5792,7 +5702,6 @@ function QuizBuilderScreen({ onNav, onSave, initialQuiz }) {
       case "type":   return q.acceptedAnswers?.some(a => a.trim());
       case "open":   return true;
       case "slider": return (q.min ?? 0) < (q.max ?? 10);
-      case "pin":    return true;
       case "match":  return q.pairs?.length >= 2 && q.pairs.every(p => p.left.trim() && p.right.trim());
       default: return false;
     }
@@ -5952,53 +5861,6 @@ function QuizBuilderScreen({ onNav, onSave, initialQuiz }) {
         </div>
       );
 
-      // ── Pin Answer ──
-      case "pin": return (
-        <div style={{ display:"flex", flexDirection:"column", gap:14 }}>
-          <div>
-            <label style={{ fontSize:11, fontWeight:700, color:C.textSub, textTransform:"uppercase", letterSpacing:"0.06em", display:"block", marginBottom:6 }}>Image URL (optional)</label>
-            <input value={activeQ.imageUrl??""} onChange={e => updateQ({imageUrl:e.target.value})} placeholder="https://example.com/image.jpg"
-              style={{ width:"100%", boxSizing:"border-box", padding:"9px 12px", borderRadius:8, border:`1px solid ${C.border}`, background:C.pageBg, color:C.text, fontSize:13, outline:"none", fontFamily:"inherit" }}
-            />
-          </div>
-          <div>
-            <label style={{ fontSize:11, fontWeight:700, color:C.textSub, textTransform:"uppercase", letterSpacing:"0.06em", display:"block", marginBottom:8 }}>Click to set correct answer location</label>
-            <div
-              onClick={e => {
-                const rect = e.currentTarget.getBoundingClientRect();
-                updateQ({ correctX: Math.round(((e.clientX-rect.left)/rect.width)*100), correctY: Math.round(((e.clientY-rect.top)/rect.height)*100) });
-              }}
-              style={{
-                position:"relative", height:180, borderRadius:12, cursor:"crosshair", overflow:"hidden",
-                background: activeQ.imageUrl ? `url(${activeQ.imageUrl}) center/cover no-repeat` : `linear-gradient(135deg,${C.dark}33,${C.dark}66)`,
-                border:`2px dashed ${C.border}`,
-              }}
-            >
-              {[33,66].map(p => <div key={`v${p}`} style={{ position:"absolute",left:`${p}%`,top:0,bottom:0,width:1,background:"rgba(0,0,0,0.1)" }} />)}
-              {[33,66].map(p => <div key={`h${p}`} style={{ position:"absolute",top:`${p}%`,left:0,right:0,height:1,background:"rgba(0,0,0,0.1)" }} />)}
-              {!activeQ.imageUrl && (
-                <div style={{ position:"absolute",inset:0,display:"flex",alignItems:"center",justifyContent:"center",flexDirection:"column",gap:6 }}>
-                  <span style={{ fontSize:22 }}>●</span>
-                  <p style={{ margin:0,fontSize:12,color:C.textMuted }}>Click to set the correct spot</p>
-                </div>
-              )}
-              {activeQ.correctX !== undefined && (
-                <div style={{ position:"absolute",left:`${activeQ.correctX}%`,top:`${activeQ.correctY}%`,transform:"translate(-50%,-100%)",fontSize:22,pointerEvents:"none" }}>●</div>
-              )}
-            </div>
-            {activeQ.correctX !== undefined && (
-              <p style={{ margin:"6px 0 0", fontSize:11, color:"#059669", fontWeight:600 }}>✓ Set at ({activeQ.correctX}%, {activeQ.correctY}%)</p>
-            )}
-          </div>
-          <div style={{ display:"flex", alignItems:"center", gap:10 }}>
-            <label style={{ fontSize:11, fontWeight:700, color:C.textSub, textTransform:"uppercase", letterSpacing:"0.06em", whiteSpace:"nowrap" }}>Tolerance radius (%)</label>
-            <input type="number" min={1} max={50} value={activeQ.tolerance??15} onChange={e => updateQ({tolerance:Number(e.target.value)})}
-              style={{ width:70, padding:"7px 10px", borderRadius:8, border:`1px solid ${C.border}`, background:C.pageBg, color:C.text, fontSize:13, fontWeight:700, outline:"none", fontFamily:"inherit" }}
-            />
-          </div>
-        </div>
-      );
-
       // ── Matching ──
       case "match": return (
         <div>
@@ -6039,7 +5901,19 @@ function QuizBuilderScreen({ onNav, onSave, initialQuiz }) {
         </div>
       );
 
-      default: return null;
+      // Any question type that no longer exists (e.g. a legacy question loaded from
+      // an older quiz) — never crash the builder, just make it unmistakable that the
+      // type is gone and point the admin at what to do next.
+      default: return (
+        <div style={{ padding:16, borderRadius:12, background:C.redBg, border:`1px solid ${C.red}44` }}>
+          <p style={{ margin:0, fontSize:13, fontWeight:700, color:C.red }}>
+            This question type ("{activeQ.type}") is no longer supported.
+          </p>
+          <p style={{ margin:"6px 0 0", fontSize:12, color:C.textSub, lineHeight:1.5 }}>
+            Pick a new question type above to replace it, or remove this question from the quiz. It won't count toward "ready" until then.
+          </p>
+        </div>
+      );
     }
   };
 
@@ -9114,9 +8988,13 @@ function getDueProgress(assignedAtStr, dueAtStr) {
 // One canonical definition of "was this answer correct" per question type, so
 // taking a quiz and reviewing its results can never disagree. `selected` shapes
 // by type: mc/tf → option index, type → string, slider → number,
-// pin → { x, y }, match → [{ leftIdx, rightIdx, rightText }], open → string
+// match → [{ leftIdx, rightIdx, rightText }], open → string
 // (open is free-response/manually-graded; there is no in-app grader in the
 // self-paced quiz flow, so it is never counted against the learner).
+// Note: "pin" was removed as a question type (see legacy-compat note on
+// QuizTakingView/QuizResultsView below) — any question of an unrecognized
+// type falls to the default branch and is safely scored as incorrect
+// rather than crashing.
 function isAnswerCorrect(ques, selected) {
   switch (ques.type) {
     case "slider":
@@ -9126,10 +9004,6 @@ function isAnswerCorrect(ques, selected) {
       return typeof selected === "string"
         && (ques.acceptedAnswers ?? []).some(a =>
             a.trim().toLowerCase() === selected.trim().toLowerCase());
-    case "pin":
-      if (!selected || ques.correctX === undefined) return false;
-      return Math.sqrt(Math.pow(selected.x - ques.correctX, 2) + Math.pow(selected.y - ques.correctY, 2))
-        <= (ques.tolerance ?? 15);
     case "match": {
       const pairs = ques.pairs ?? [];
       if (!pairs.length || !Array.isArray(selected) || selected.length !== pairs.length) return false;
@@ -9139,8 +9013,15 @@ function isAnswerCorrect(ques, selected) {
       // Manually graded — never auto-marked wrong, but an unanswered question
       // still shouldn't count as "correct".
       return typeof selected === "string" && selected.trim().length > 0;
-    default: // mc / tf
+    case "mc":
+    case "tf":
       return selected === ques.correct;
+    default:
+      // Unknown/unsupported question type (e.g. a legacy "pin" question after that
+      // type was removed) — always score as incorrect. Never fall back to comparing
+      // `selected`/`ques.correct` directly, since both can be `undefined` for a type
+      // that no longer defines those fields, which would otherwise read as "correct".
+      return false;
   }
 }
 
@@ -9152,7 +9033,6 @@ function QuizTakingView({ quiz, onComplete, onExit }) {
   const [revealed,      setRevealed]      = useState(false);
   const [sliderDraft,   setSliderDraft]   = useState(null);
   const [textDraft,     setTextDraft]     = useState(""); // type-answer / open-response draft
-  const [pinDraft,      setPinDraft]      = useState(null);   // { x, y } before confirm
   const [shuffledRight, setShuffledRight] = useState([]);     // shuffled q.pairs for the "matches" column
   const [matchPicked,   setMatchPicked]   = useState(null);   // rightIdx "picked up" via click/keyboard, awaiting a drop target
   const [matchDrag,     setMatchDrag]     = useState(null);   // { rightIdx, pointerId, x, y, moved, fromLeftIdx } while a pointer-drag is in flight
@@ -9164,15 +9044,17 @@ function QuizTakingView({ quiz, onComplete, onExit }) {
   const isLast   = qIdx === total - 1;
   const isSlider = q.type === "slider";
   const isType   = q.type === "type";
-  const isPin    = q.type === "pin";
   const isMatch  = q.type === "match";
   const isOpen   = q.type === "open";
+  // Any question whose type isn't one of the above (e.g. a legacy "pin" question
+  // from before that type was removed) falls back to a safe, explicit notice
+  // instead of silently rendering as a broken multiple-choice list.
+  const isKnownType = isSlider || isType || isMatch || isOpen || q.type === "mc" || q.type === "tf";
 
   // Reset draft state when question changes
   useEffect(() => {
     setSliderDraft(null);
     setTextDraft("");
-    setPinDraft(null);
     setMatchPicked(null);
     setMatchDrag(null);
     setMatchOverZone(null);
@@ -9186,9 +9068,6 @@ function QuizTakingView({ quiz, onComplete, onExit }) {
   const sliderMax = q.max ?? 10;
   const sliderVal = sliderDraft !== null ? sliderDraft
     : (selected !== null ? selected : Math.round((sliderMin + sliderMax) / 2));
-
-  // Pin helpers
-  const pinVal = pinDraft ?? selected;
 
   // Match helpers
   const matchPairs   = Array.isArray(selected) ? selected : [];
@@ -9222,12 +9101,6 @@ function QuizTakingView({ quiz, onComplete, onExit }) {
   const commitOpen = () => {
     if (revealed || !textDraft.trim()) return;
     setAnswers(prev => ({ ...prev, [q.id]: textDraft }));
-    setRevealed(true);
-  };
-
-  const commitPin = () => {
-    if (revealed || !pinDraft) return;
-    setAnswers(prev => ({ ...prev, [q.id]: pinDraft }));
     setRevealed(true);
   };
 
@@ -9434,56 +9307,26 @@ function QuizTakingView({ quiz, onComplete, onExit }) {
               </button>
             )}
           </div>
-        ) : isPin ? (
-          /* ── Pin Answer ── */
-          <div style={{ display: "flex", flexDirection: "column", alignItems: "center", gap: 14 }}>
-            <div
-              onClick={e => {
-                if (revealed) return;
-                const rect = e.currentTarget.getBoundingClientRect();
-                const x = Math.round(((e.clientX - rect.left) / rect.width) * 100);
-                const y = Math.round(((e.clientY - rect.top) / rect.height) * 100);
-                setPinDraft({ x, y });
-              }}
-              style={{
-                position: "relative", width: "100%", height: 220, borderRadius: 14,
-                cursor: revealed ? "default" : "crosshair",
-                background: q.imageUrl ? `url(${q.imageUrl}) center/cover no-repeat` : C.pageBg,
-                border: `2px solid ${C.creamBorder}`, overflow: "hidden",
-              }}
-            >
-              {!q.imageUrl && !pinVal && (
-                <div style={{ position: "absolute", inset: 0, display: "flex", flexDirection: "column", alignItems: "center", justifyContent: "center", gap: 8 }}>
-                  <span style={{ fontSize: 28, color: C.textMuted }}>●</span>
-                  <p style={{ margin: 0, fontSize: 13, color: C.textMuted, fontWeight: 600 }}>Click to place your pin</p>
-                </div>
-              )}
-              {pinVal && (
-                <div style={{ position: "absolute", left: `${pinVal.x}%`, top: `${pinVal.y}%`, transform: "translate(-50%,-100%)", fontSize: 26, color: C.orange, pointerEvents: "none" }}>●</div>
-              )}
-              {revealed && q.correctX !== undefined && (
-                <>
-                  <div style={{
-                    position: "absolute", left: `${q.correctX}%`, top: `${q.correctY}%`, transform: "translate(-50%,-50%)",
-                    width: (q.tolerance ?? 15) * 2 + "%", height: (q.tolerance ?? 15) * 2 * (220 / 680) + "%",
-                    borderRadius: "50%", background: "rgba(16,185,129,0.2)", border: "2px solid #86EFAC", pointerEvents: "none",
-                  }} />
-                  <div style={{ position: "absolute", left: `${q.correctX}%`, top: `${q.correctY}%`, transform: "translate(-50%,-100%)", fontSize: 26, color: C.trueGreen, pointerEvents: "none" }}>●</div>
-                </>
-              )}
+        ) : !isKnownType ? (
+          /* ── Legacy/unsupported question type ──
+             Reached only if a quiz contains a question whose type has since been
+             removed from the product (e.g. old "pin" questions). Never falls through
+             to the MC/TF options list — that produced a real bug once already when a
+             type had no explicit branch. Assignment/manager tooling is expected to
+             replace or delete this question; taking it here just can't be scored. */
+          <div style={{ display: "flex", flexDirection: "column", gap: 12 }}>
+            <div style={{ padding: 16, borderRadius: 12, background: "#FFF7ED", border: `1px solid ${C.creamBorder}` }}>
+              <p style={{ margin: 0, fontSize: 14, fontWeight: 700, color: C.text }}>This question type is no longer supported.</p>
+              <p style={{ margin: "6px 0 0", fontSize: 13, color: C.textSub, lineHeight: 1.5 }}>
+                It won't be scored. Ask your manager to update this quiz.
+              </p>
             </div>
-            {revealed && (
-              <div style={{ width: "100%", padding: "10px 14px", borderRadius: 10, background: isCorrect ? "#F0FDF4" : "#FFF7ED", border: `1px solid ${isCorrect ? "#86EFAC" : C.creamBorder}`, fontSize: 13, color: C.text, boxSizing: "border-box" }}>
-                <strong style={{ color: isCorrect ? "#166534" : C.orange }}>{isCorrect ? "Correct!" : "Not quite."}</strong>
-              </div>
-            )}
             {!revealed && (
-              <button onClick={commitPin} disabled={!pinDraft} style={{
+              <button onClick={() => setRevealed(true)} style={{
                 padding: "12px 28px", borderRadius: 12, border: "none", alignSelf: "flex-end",
-                background: pinDraft ? C.orange : C.muted, color: pinDraft ? "#fff" : C.textMuted,
-                fontSize: 14, fontWeight: 700, cursor: pinDraft ? "pointer" : "default",
+                background: C.orange, color: "#fff", fontSize: 14, fontWeight: 700, cursor: "pointer",
               }}>
-                {pinDraft ? "Confirm Pin" : "Click the image to place pin"}
+                Continue
               </button>
             )}
           </div>
@@ -9731,8 +9574,8 @@ function QuizTakingView({ quiz, onComplete, onExit }) {
           </div>
         )}
 
-        {/* Explanation — MC/TF/Pin/Match only (slider, type show feedback inline; open isn't graded) */}
-        {revealed && !isSlider && !isType && !isOpen && q.explanation && (
+        {/* Explanation — MC/TF/Match only (slider, type show feedback inline; open isn't graded; unsupported types show their own notice) */}
+        {revealed && !isSlider && !isType && !isOpen && isKnownType && q.explanation && (
           <div style={{ marginTop: 16, padding: "12px 16px", borderRadius: 10, background: isCorrect ? "#F0FDF4" : "#FFF7ED", border: `1px solid ${isCorrect ? "#86EFAC" : C.creamBorder}` }}>
             <p style={{ margin: 0, fontSize: 13, color: C.text, lineHeight: 1.6 }}><strong style={{ color: isCorrect ? "#166534" : C.orange }}>{isCorrect ? "Correct" : "Not quite"}.</strong> {q.explanation}</p>
           </div>
@@ -9793,9 +9636,11 @@ function QuizResultsView({ quiz, attempt, onRetake, onBack, showRetake = true, s
             const ans       = attempt.answers.find(a => a.questionId === q.id);
             const isSliderQ = q.type === "slider";
             const isTypeQ   = q.type === "type";
-            const isPinQ    = q.type === "pin";
             const isMatchQ  = q.type === "match";
             const isOpenQ   = q.type === "open";
+            // A question whose type no longer exists (e.g. a legacy "pin" question) —
+            // never crash the results view, just show it as unscored.
+            const isKnownQ  = isSliderQ || isTypeQ || isMatchQ || isOpenQ || q.type === "mc" || q.type === "tf";
 
             const wasRight = isAnswerCorrect(q, ans?.selected);
             const hasAnswer = isMatchQ
@@ -9806,31 +9651,32 @@ function QuizResultsView({ quiz, attempt, onRetake, onBack, showRetake = true, s
               ? (ans?.selected != null ? String(ans.selected) : null)
               : isTypeQ
               ? (typeof ans?.selected === "string" ? ans.selected : null)
-              : isPinQ
-              ? (ans?.selected ? `(${ans.selected.x}%, ${ans.selected.y}%)` : null)
               : isOpenQ
               ? (typeof ans?.selected === "string" ? ans.selected : null)
               : isMatchQ
               ? null // rendered as a per-pair breakdown below instead of a single line
+              : !isKnownQ
+              ? null
               : ((q.options ?? [])[ans?.selected] || null);
 
             const correctLabel = isSliderQ
               ? `${q.correct ?? 5} ±${q.tolerance ?? 1}`
               : isTypeQ
               ? ((q.acceptedAnswers ?? []).join(", ") || null)
-              : isPinQ
-              ? (q.correctX !== undefined ? `(${q.correctX}%, ${q.correctY}%) ±${q.tolerance ?? 15}` : null)
               : isOpenQ
               ? null // no "correct" answer to compare against — manually graded
               : isMatchQ
               ? null
+              : !isKnownQ
+              ? null
               : ((q.options ?? [])[q.correct] || null);
 
-            // Neutral (non red/green) treatment for open-ended — it isn't auto-graded.
-            const badgeBg   = isOpenQ ? C.muted   : wasRight ? "#DCFCE7" : "#FEE2E2";
-            const badgeColor= isOpenQ ? C.textSub : wasRight ? "#166534" : "#991B1B";
-            const badgeText = isOpenQ ? (hasAnswer ? "Submitted" : "Skipped") : (wasRight ? "Correct" : "Incorrect");
-            const borderColor = isOpenQ ? C.creamBorder : wasRight ? C.trueGreen : C.red;
+            // Neutral (non red/green) treatment for open-ended (not auto-graded) and
+            // for unsupported legacy types (never scored, never counted against the learner).
+            const badgeBg   = (isOpenQ || !isKnownQ) ? C.muted   : wasRight ? "#DCFCE7" : "#FEE2E2";
+            const badgeColor= (isOpenQ || !isKnownQ) ? C.textSub : wasRight ? "#166534" : "#991B1B";
+            const badgeText = !isKnownQ ? "Unsupported" : isOpenQ ? (hasAnswer ? "Submitted" : "Skipped") : (wasRight ? "Correct" : "Incorrect");
+            const borderColor = (isOpenQ || !isKnownQ) ? C.creamBorder : wasRight ? C.trueGreen : C.red;
 
             return (
               <Card key={q.id} style={{ borderLeft: `4px solid ${borderColor}` }}>
@@ -9862,7 +9708,9 @@ function QuizResultsView({ quiz, attempt, onRetake, onBack, showRetake = true, s
                   </div>
                 )}
                 {!isMatchQ && !hasAnswer && (
-                  <div style={{ fontSize: 13, color: C.textMuted }}><em>No answer submitted.</em></div>
+                  <div style={{ fontSize: 13, color: C.textMuted }}>
+                    <em>{isKnownQ ? "No answer submitted." : "This question type is no longer supported and wasn't scored."}</em>
+                  </div>
                 )}
 
                 {/* Correct answer (only if wrong and a target exists) */}
