@@ -521,6 +521,9 @@ function HomeScreen({ user, onNav, quizAssignments = [], onResumeLesson, onStart
   const [homeLessons,     setHomeLessons]     = useState([]);
   const [homeAssignments, setHomeAssignments] = useState([]);
   const [homeCompleted,   setHomeCompleted]   = useState(new Set());
+  const [homeQuizAttempts,setHomeQuizAttempts]= useState([]); // raw quiz_attempts rows, newest first — single source for both
+                                                                 // "is this assigned quiz done" and the Recent Quizzes list below,
+                                                                 // so they can never disagree with each other.
   const [homeLoading,     setHomeLoading]     = useState(isReal);
 
   // ── Leaderboard sidebar — reads from user_point_events (single source of truth)
@@ -539,7 +542,8 @@ function HomeScreen({ user, onNav, quizAssignments = [], onResumeLesson, onStart
       getTenantLessons(tenantId),
       getTenantAssignments(tenantId),
       getLessonCompletions(user.id),
-    ]).then(([{ data: c }, { data: l }, { data: a }, { data: done }]) => {
+      getUserQuizAttempts(tenantId, user.id), // needed to know which assigned quizzes are already passed
+    ]).then(([{ data: c }, { data: l }, { data: a }, { data: done }, { data: attempts }]) => {
       if (c) setHomeCourses(c);
       if (l) setHomeLessons(l);
       if (a) {
@@ -550,6 +554,7 @@ function HomeScreen({ user, onNav, quizAssignments = [], onResumeLesson, onStart
         updateLastSeenAssignmentsAt(user.id);
       }
       if (done) setHomeCompleted(done);
+      if (attempts) setHomeQuizAttempts(attempts); // already ordered newest-first by getUserQuizAttempts
       setHomeLoading(false);
     });
   }, [isReal, tenantId, user?.id]); // eslint-disable-line react-hooks/exhaustive-deps
@@ -594,6 +599,13 @@ function HomeScreen({ user, onNav, quizAssignments = [], onResumeLesson, onStart
           isComplete = cls.length > 0 && pct === 100;
         } else if (isLesson) {
           isComplete = homeCompleted.has(content.id);
+          pct = isComplete ? 100 : 0;
+        } else {
+          // Quiz — was previously never marked complete here (isComplete stayed at its
+          // initial `false` for every quiz assignment, so passed quizzes never left
+          // Assigned Learning). A quiz only counts as complete once it has a PASSED
+          // attempt — an attempt existing with a failing score must not count.
+          isComplete = homeQuizAttempts.some(at => at.quiz_id === content.id && at.passed);
           pct = isComplete ? 100 : 0;
         }
         const dueStatus = (a.dueAt && a.dueAt !== "Open") ? getDueStatus(a.dueAt) : null;
@@ -642,6 +654,7 @@ function HomeScreen({ user, onNav, quizAssignments = [], onResumeLesson, onStart
       quizAssignments={quizAssignments}
       homeCourses={homeCourses}
       homeLessons={homeLessons}
+      homeQuizAttempts={homeQuizAttempts}
     />
   );
 }
@@ -654,7 +667,7 @@ function PersonalDashboardScreen({
   user, onNav, isReal, tenantId, orgUsers,
   enrichedAssignments, pendingAssignments, completedAssignments, overdueAssignments,
   homeLoading, onResumeLesson, onStartCourse, onStartQuiz, homeLbRows, quizzes,
-  quizAssignments = [], homeCourses = [], homeLessons = [],
+  quizAssignments = [], homeCourses = [], homeLessons = [], homeQuizAttempts = [],
 }) {
   const mobile     = useMobile();
   const firstName  = (user.name ?? "").split(" ")[0];
@@ -667,9 +680,13 @@ function PersonalDashboardScreen({
   const [recs,           setRecs]           = useState([]);
   const [topicScores,    setTopicScores]    = useState([]);
   const [recentActivity, setRecentActivity] = useState([]);
-  const [quizAttemptsFull, setQuizAttemptsFull] = useState([]); // full attempts (incl. answers) for review
+  // Full quiz_attempts rows (incl. answers, for review) — fetched once by the parent
+  // HomeScreen (it also needs them to determine Assigned Learning completion) and
+  // passed down here as `homeQuizAttempts`, so this list and the assignment-completion
+  // check can never fall out of sync with each other.
+  const quizAttemptsFull = homeQuizAttempts;
   const [perfLoading,    setPerfLoading]    = useState(isReal);
-  // Recent Activity → quiz review modal. null when closed.
+  // Recent Activity / Recent Quizzes → quiz review modal. null when closed.
   const [activityReview, setActivityReview] = useState(null); // { quiz, attempt } | null
 
   useEffect(() => {
@@ -677,7 +694,6 @@ function PersonalDashboardScreen({
     Promise.all([
       getUserPerformance(tenantId, user.id),
       getRepTopicScores(tenantId, user.id),
-      getUserQuizAttempts(tenantId, user.id), // reused as-is — same source Quizzes screen uses for review
       supabase
         .from("user_point_events")
         .select("source_type, source_id, points, created_at")
@@ -685,13 +701,12 @@ function PersonalDashboardScreen({
         .eq("user_id", user.id)
         .order("created_at", { ascending: false })
         .limit(8),
-    ]).then(([perfResult, topics, attemptsResult, { data: events }]) => {
+    ]).then(([perfResult, topics, { data: events }]) => {
       if (perfResult?.data) {
         setPerf(perfResult.data);
         setRecs(getRecommendations(perfResult.data));
       }
       if (Array.isArray(topics) && topics.length) setTopicScores(topics);
-      if (attemptsResult?.data) setQuizAttemptsFull(attemptsResult.data);
       if (events) setRecentActivity(events);
       setPerfLoading(false);
     }).catch(() => setPerfLoading(false));
@@ -738,25 +753,52 @@ function PersonalDashboardScreen({
 
   // ── Demo quiz results from quizAssignments (same source as old HomeScreen) ──
   const demoQuizResults = !isReal
-    ? quizAssignments.slice(0, 4).map(q => ({
-        name:   q.title ?? q.name ?? "Quiz",
-        date:   q.dueAt && q.dueAt !== "Open" ? q.dueAt : "",
-        score:  q.attempts?.[0]?.score ?? null,
-        passed: q.attempts?.some(a => a.passed) ?? false,
-      }))
-    : [];
-
-  const realQuizResults = isReal && perf?.recentQuizAttempts?.length
-    ? perf.recentQuizAttempts.slice(0, 4).map(a => {
-        const q = quizzes?.find(q => q.id === a.quiz_id);
+    ? quizAssignments.filter(q => q.attempts?.length).slice(0, 4).map(q => {
+        const attempt = q.attempts[0];
         return {
-          name:   q?.title ?? "Quiz",
-          date:   new Date(a.created_at).toLocaleDateString("en-US", { month: "short", day: "numeric" }),
-          score:  a.score,
-          passed: a.passed,
+          name:        q.title ?? q.name ?? "Quiz",
+          date:        q.dueAt && q.dueAt !== "Open" ? q.dueAt : "",
+          score:       attempt?.score ?? null,
+          passed:      q.attempts?.some(a => a.passed) ?? false,
+          attemptNum:  q.attempts.length > 1 ? q.attempts.length : null,
+          clickable:   !!attempt,
+          quiz: q, attempt,
         };
       })
     : [];
+
+  // Real: built directly from quizAttemptsFull (the same fetch that also drives
+  // Assigned Learning completion above) — already ordered newest-first, and not
+  // limited to a rolling 30-day scoring window like perf.recentQuizAttempts was,
+  // so this always reflects the true latest attempts, not a scoring-derived subset.
+  const realQuizResults = isReal
+    ? quizAttemptsFull.slice(0, 4).map(a => {
+        const q = quizzes?.find(qz => qz.id === a.quiz_id);
+        return {
+          name:        q?.title ?? q?.name ?? "Quiz",
+          date:        a.created_at ? new Date(a.created_at).toLocaleDateString("en-US", { month: "short", day: "numeric" }) : "",
+          score:       a.score,
+          passed:      a.passed,
+          attemptNum:  a.attempt_num ?? null,
+          clickable:   !!q,
+          quiz: q, attempt: a,
+        };
+      })
+    : [];
+
+  // Shared with Recent Activity's click-through — opens the exact same
+  // QuizResultsView-based review modal, so there's one review experience, not two.
+  const openAttemptReview = (quiz, rawAttempt) => {
+    if (!quiz || !rawAttempt) return;
+    const quizForReview = isReal ? { ...quiz, title: quiz.name ?? quiz.title } : quiz;
+    const attempt = isReal ? {
+      score: rawAttempt.score, passed: rawAttempt.passed, answers: rawAttempt.answers ?? [],
+      date: rawAttempt.created_at
+        ? new Date(rawAttempt.created_at).toLocaleDateString("en-US", { month: "short", day: "numeric", year: "numeric" })
+        : "",
+    } : rawAttempt; // demo attempts already have { score, passed, answers, date }
+    setActivityReview({ quiz: quizForReview, attempt });
+  };
 
   // ── Demo topic scores derived from USER_GAME_HISTORY answers ──────────────
   const demoTopicScores = (() => {
@@ -1117,22 +1159,27 @@ function PersonalDashboardScreen({
               ) : (isReal ? realQuizResults : demoQuizResults).map((q, i, arr) => (
                 <div
                   key={i}
+                  onClick={q.clickable ? () => openAttemptReview(q.quiz, q.attempt) : undefined}
                   style={{ padding: "13px 18px", borderBottom: i < arr.length - 1 ? `1px solid ${C.border}` : "none",
-                    display: "flex", alignItems: "center", justifyContent: "space-between", gap: 12 }}
+                    display: "flex", alignItems: "center", justifyContent: "space-between", gap: 12,
+                    cursor: q.clickable ? "pointer" : "default" }}
                 >
                   <div style={{ flex: 1, minWidth: 0 }}>
-                    <div style={{ fontSize: 13, fontWeight: 600, color: C.text, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{q.name}</div>
+                    <div style={{ fontSize: 13, fontWeight: 600, color: q.clickable ? C.orange : C.text, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{q.name}</div>
                     <div style={{ fontSize: 11, color: C.textSub, marginTop: 2 }}>
-                      {q.date}{q.rank != null ? ` · Rank #${q.rank}` : ""}
+                      {q.date}{q.attemptNum ? ` · Attempt ${q.attemptNum}` : ""}{q.rank != null ? ` · Rank #${q.rank}` : ""}
                     </div>
                   </div>
-                  <div style={{ textAlign: "right", flexShrink: 0 }}>
-                    <div style={{ fontSize: 14, fontWeight: 800, color: scoreColor(q.score) }}>{q.score}%</div>
-                    {q.passed != null && (
-                      <div style={{ fontSize: 10, fontWeight: 600, color: q.passed ? C.trueGreen : C.red }}>
-                        {q.passed ? "Passed" : "Failed"}
-                      </div>
-                    )}
+                  <div style={{ display: "flex", alignItems: "center", gap: 8, flexShrink: 0 }}>
+                    <div style={{ textAlign: "right" }}>
+                      <div style={{ fontSize: 14, fontWeight: 800, color: scoreColor(q.score) }}>{q.score}%</div>
+                      {q.passed != null && (
+                        <div style={{ fontSize: 10, fontWeight: 600, color: q.passed ? C.trueGreen : C.red }}>
+                          {q.passed ? "Passed" : "Failed"}
+                        </div>
+                      )}
+                    </div>
+                    {q.clickable && <span style={{ fontSize: 12, color: C.textMuted }}>›</span>}
                   </div>
                 </div>
               ))}
@@ -9099,14 +9146,17 @@ function isAnswerCorrect(ques, selected) {
 
 // ── QuizTakingView ────────────────────────────────────────────────────────────
 function QuizTakingView({ quiz, onComplete, onExit }) {
+  const mobile = useMobile(); // matching is the first two-column layout in this view — needs to stack on narrow screens
   const [qIdx,          setQIdx]          = useState(0);
   const [answers,       setAnswers]       = useState({});
   const [revealed,      setRevealed]      = useState(false);
   const [sliderDraft,   setSliderDraft]   = useState(null);
   const [textDraft,     setTextDraft]     = useState(""); // type-answer / open-response draft
   const [pinDraft,      setPinDraft]      = useState(null);   // { x, y } before confirm
-  const [matchSelLeft,  setMatchSelLeft]  = useState(null);   // index of selected left-side prompt
   const [shuffledRight, setShuffledRight] = useState([]);     // shuffled q.pairs for the "matches" column
+  const [matchPicked,   setMatchPicked]   = useState(null);   // rightIdx "picked up" via click/keyboard, awaiting a drop target
+  const [matchDrag,     setMatchDrag]     = useState(null);   // { rightIdx, pointerId, x, y, moved, fromLeftIdx } while a pointer-drag is in flight
+  const [matchOverZone, setMatchOverZone] = useState(null);   // leftIdx (number) | "pool" | null — drop zone currently hovered during a drag
 
   const q        = quiz.questions[qIdx];
   const total    = quiz.questions.length;
@@ -9123,7 +9173,9 @@ function QuizTakingView({ quiz, onComplete, onExit }) {
     setSliderDraft(null);
     setTextDraft("");
     setPinDraft(null);
-    setMatchSelLeft(null);
+    setMatchPicked(null);
+    setMatchDrag(null);
+    setMatchOverZone(null);
     setShuffledRight(q.type === "match" && q.pairs?.length
       ? [...q.pairs].sort(() => Math.random() - 0.5)
       : []);
@@ -9179,20 +9231,93 @@ function QuizTakingView({ quiz, onComplete, onExit }) {
     setRevealed(true);
   };
 
-  const chooseMatchLeft = (li) => {
-    if (revealed || matchAllDone) return;
-    setMatchSelLeft(li === matchSelLeft ? null : li);
+  // ── Matching: place/unplace/swap — shared by drag-and-drop AND the click/keyboard
+  // fallback below, so both input methods always produce the exact same state shape
+  // ({ leftIdx, rightIdx, rightText }[]) that isAnswerCorrect() and QuizResultsView
+  // already score/display. Placement never auto-reveals — matching now requires an
+  // explicit "Submit Matches" (commitMatch), same pattern as pin/slider.
+  const placeMatchCard = (rightIdx, targetLeftIdx) => {
+    if (revealed) return;
+    setAnswers(prev => {
+      const current    = Array.isArray(prev[q.id]) ? prev[q.id] : [];
+      const sourcePair  = current.find(mp => mp.rightIdx === rightIdx);       // where this card is now (undefined = pool)
+      const targetPair  = current.find(mp => mp.leftIdx === targetLeftIdx);   // what's currently in the target slot (undefined = empty)
+      const next = current.filter(mp => mp.rightIdx !== rightIdx && mp.leftIdx !== targetLeftIdx);
+      next.push({ leftIdx: targetLeftIdx, rightIdx, rightText: shuffledRight[rightIdx]?.right });
+      if (targetPair && sourcePair) {
+        // True swap: the card displaced from the target slot takes the dragged card's old slot.
+        next.push({ leftIdx: sourcePair.leftIdx, rightIdx: targetPair.rightIdx, rightText: shuffledRight[targetPair.rightIdx]?.right });
+      }
+      // If targetPair existed but sourcePair didn't (card came from the pool), the
+      // displaced card simply isn't re-added — it returns to the pool.
+      return { ...prev, [q.id]: next };
+    });
   };
 
-  const chooseMatchRight = (ri) => {
-    if (revealed || matchAllDone || matchSelLeft === null || getPairForRight(ri)) return;
-    const newPairs = [
-      ...matchPairs.filter(mp => mp.leftIdx !== matchSelLeft),
-      { leftIdx: matchSelLeft, rightIdx: ri, rightText: shuffledRight[ri]?.right },
-    ];
-    setAnswers(prev => ({ ...prev, [q.id]: newPairs }));
-    setMatchSelLeft(null);
-    if (newPairs.length >= matchPrompts.length) setRevealed(true);
+  const unplaceMatchCard = (rightIdx) => {
+    if (revealed) return;
+    setAnswers(prev => {
+      const current = Array.isArray(prev[q.id]) ? prev[q.id] : [];
+      return { ...prev, [q.id]: current.filter(mp => mp.rightIdx !== rightIdx) };
+    });
+  };
+
+  const commitMatch = () => {
+    if (revealed || !matchAllDone) return;
+    setRevealed(true);
+  };
+
+  // Click / keyboard fallback (no pointer drag required): click a card to "pick" it
+  // up, then click any drop zone (a prompt row, or the pool) to send it there.
+  // Picking the already-picked card again releases it without moving anything.
+  const handleCardActivate = (rightIdx) => {
+    if (revealed) return;
+    setMatchPicked(prev => (prev === rightIdx ? null : rightIdx));
+  };
+  const handleZoneActivate = (targetLeftIdx /* number | "pool" */) => {
+    if (revealed || matchPicked === null) return;
+    if (targetLeftIdx === "pool") unplaceMatchCard(matchPicked);
+    else placeMatchCard(matchPicked, targetLeftIdx);
+    setMatchPicked(null);
+  };
+
+  // Pointer-based drag (mouse + touch + pen, via the Pointer Events API — native
+  // HTML5 drag-and-drop doesn't fire on touch devices, so this is hand-rolled).
+  const MATCH_DRAG_THRESHOLD = 6; // px of movement before a press counts as a drag, not a click
+  const startMatchDrag = (e, rightIdx) => {
+    if (revealed) return;
+    e.currentTarget.setPointerCapture(e.pointerId);
+    const fromLeftIdx = getPairForRight(rightIdx)?.leftIdx ?? null;
+    setMatchDrag({ rightIdx, pointerId: e.pointerId, x: e.clientX, y: e.clientY, startX: e.clientX, startY: e.clientY, moved: false, fromLeftIdx });
+    setMatchPicked(null); // dragging takes over from any pending click-pick
+  };
+  const moveMatchDrag = (e) => {
+    if (!matchDrag || e.pointerId !== matchDrag.pointerId) return;
+    const dx = e.clientX - matchDrag.startX, dy = e.clientY - matchDrag.startY;
+    const moved = matchDrag.moved || Math.hypot(dx, dy) > MATCH_DRAG_THRESHOLD;
+    setMatchDrag(prev => prev && ({ ...prev, x: e.clientX, y: e.clientY, moved }));
+    if (moved) {
+      const el = document.elementFromPoint(e.clientX, e.clientY);
+      const zoneEl = el?.closest?.("[data-match-zone]");
+      const zone = zoneEl?.getAttribute("data-match-zone") ?? null;
+      setMatchOverZone(zone === "pool" ? "pool" : zone !== null ? Number(zone) : null);
+    }
+  };
+  const endMatchDrag = (e) => {
+    if (!matchDrag || e.pointerId !== matchDrag.pointerId) return;
+    if (matchDrag.moved) {
+      const el = document.elementFromPoint(e.clientX, e.clientY);
+      const zoneEl = el?.closest?.("[data-match-zone]");
+      const zone = zoneEl?.getAttribute("data-match-zone") ?? null;
+      if (zone === "pool") unplaceMatchCard(matchDrag.rightIdx);
+      else if (zone !== null) placeMatchCard(matchDrag.rightIdx, Number(zone));
+      // else: dropped outside any zone — treat as cancelled, card stays where it was
+    } else {
+      // No meaningful movement — this was a click/tap, not a drag.
+      handleCardActivate(matchDrag.rightIdx);
+    }
+    setMatchDrag(null);
+    setMatchOverZone(null);
   };
 
   const next = () => {
@@ -9363,57 +9488,179 @@ function QuizTakingView({ quiz, onComplete, onExit }) {
             )}
           </div>
         ) : isMatch ? (
-          /* ── Matching ── */
-          <div style={{ display: "flex", gap: 14 }}>
-            <div style={{ flex: 1, display: "flex", flexDirection: "column", gap: 8 }}>
-              <p style={{ margin: "0 0 4px", fontSize: 10, fontWeight: 700, color: C.textMuted, textTransform: "uppercase", letterSpacing: "0.08em" }}>Prompts</p>
-              {matchPrompts.map((pair, li) => {
-                const pairInfo  = getPairForLeft(li);
-                const isSelLeft = matchSelLeft === li;
-                const isRevealCorrect = revealed && pairInfo && pairInfo.rightText === pair.right;
-                const isRevealWrong   = revealed && pairInfo && pairInfo.rightText !== pair.right;
-                let border = C.creamBorder, bg = C.cardBg;
-                if (isRevealCorrect)      { border = C.trueGreen; bg = "#DCFCE7"; }
-                else if (isRevealWrong)   { border = "#EF4444";   bg = "#FEE2E2"; }
-                else if (isSelLeft)       { border = C.orange;    bg = C.orangeLight; }
-                else if (pairInfo)        { border = C.orange;    bg = C.orangeLight; }
-                return (
-                  <div key={li} onClick={() => !pairInfo && chooseMatchLeft(li)} style={{
-                    padding: "12px 14px", borderRadius: 12, cursor: pairInfo ? "default" : "pointer",
-                    border: `2px solid ${border}`, background: bg, display: "flex", alignItems: "center", gap: 10,
-                  }}>
-                    <div style={{ width: 24, height: 24, borderRadius: "50%", flexShrink: 0, display: "flex", alignItems: "center", justifyContent: "center", fontSize: 11, fontWeight: 800, background: isRevealCorrect ? C.trueGreen : isRevealWrong ? "#EF4444" : C.muted, color: (isRevealCorrect || isRevealWrong) ? "#fff" : C.textMuted }}>
-                      {isRevealCorrect ? "✓" : isRevealWrong ? "✗" : String.fromCharCode(65 + li)}
+          /* ── Matching (drag-and-drop, with a click/keyboard fallback) ──
+             Left prompts stay fixed. Right answers are draggable cards that start in
+             the "Answers" pool and move into a prompt's drop zone. Cards can be
+             re-dragged (or re-clicked) to a different prompt or back to the pool at
+             any time before Submit — correctness is never revealed until then. */
+          (() => {
+            const unplacedRight = shuffledRight
+              .map((pair, ri) => ({ pair, ri }))
+              .filter(({ ri }) => !getPairForRight(ri));
+
+            const cardStyle = (ri, extra = {}) => {
+              const isPicked  = matchPicked === ri;
+              const isDragged = matchDrag?.rightIdx === ri && matchDrag.moved;
+              return {
+                padding: "10px 12px", borderRadius: 10, display: "flex", alignItems: "center",
+                justifyContent: "space-between", gap: 8, fontSize: 13, fontWeight: 600, color: C.text,
+                background: isPicked ? C.orangeLight : C.cardBg,
+                border: `2px solid ${isPicked ? C.orange : C.creamBorder}`,
+                cursor: revealed ? "default" : "grab",
+                opacity: isDragged ? 0.35 : 1,
+                touchAction: "none", // required so the browser doesn't scroll instead of dragging on touch
+                userSelect: "none",
+                boxShadow: isPicked ? "0 0 0 3px rgba(253,191,36,0.18)" : "none",
+                ...extra,
+              };
+            };
+
+            const Card_ = ({ ri, placedLeftIdx }) => (
+              <div
+                key={ri}
+                role="button"
+                tabIndex={revealed ? -1 : 0}
+                aria-pressed={matchPicked === ri}
+                aria-label={placedLeftIdx != null
+                  ? `${shuffledRight[ri]?.right}, placed. Press Enter to pick up and move.`
+                  : `${shuffledRight[ri]?.right}. Press Enter to pick up, then Enter a prompt to place it.`}
+                onPointerDown={e => startMatchDrag(e, ri)}
+                onPointerMove={moveMatchDrag}
+                onPointerUp={endMatchDrag}
+                onPointerCancel={endMatchDrag}
+                onKeyDown={e => { if (!revealed && (e.key === "Enter" || e.key === " ")) { e.preventDefault(); handleCardActivate(ri); } }}
+                // A placed card sits inside its prompt's drop-zone div, which has its own
+                // onClick (handleZoneActivate). Without stopping propagation, the native
+                // click synthesized after pointerup would bubble to that zone and fire
+                // handleZoneActivate with a stale `matchPicked` closure value — capable of
+                // silently relocating a DIFFERENT already-picked card. The card's own
+                // pick/drag behavior is fully handled by the pointer handlers above.
+                onClick={e => e.stopPropagation()}
+                style={cardStyle(ri)}
+              >
+                <span>{shuffledRight[ri]?.right}</span>
+                {placedLeftIdx != null && !revealed && (
+                  <span
+                    role="button" tabIndex={0} aria-label="Remove from prompt"
+                    onClick={e => { e.stopPropagation(); unplaceMatchCard(ri); }}
+                    onKeyDown={e => { if (e.key === "Enter" || e.key === " ") { e.preventDefault(); e.stopPropagation(); unplaceMatchCard(ri); } }}
+                    style={{ color: C.textMuted, fontSize: 14, lineHeight: 1, cursor: "pointer", flexShrink: 0 }}
+                  >×</span>
+                )}
+              </div>
+            );
+
+            return (
+              <div style={{ display: "flex", flexDirection: "column", gap: 16 }}>
+                <div style={{ display: "flex", flexDirection: mobile ? "column" : "row", gap: 14 }}>
+                  {/* Left — fixed prompts, each with an adjacent drop zone */}
+                  <div style={{ flex: 1, display: "flex", flexDirection: "column", gap: 8 }}>
+                    <p style={{ margin: "0 0 4px", fontSize: 10, fontWeight: 700, color: C.textMuted, textTransform: "uppercase", letterSpacing: "0.08em" }}>Prompts</p>
+                    {matchPrompts.map((pair, li) => {
+                      const pairInfo  = getPairForLeft(li);
+                      const isRevealCorrect = revealed && pairInfo && pairInfo.rightText === pair.right;
+                      const isRevealWrong   = revealed && pairInfo && pairInfo.rightText !== pair.right;
+                      const isOver = matchOverZone === li;
+                      const canDrop = matchPicked !== null || (matchDrag && matchDrag.moved);
+                      let zoneBorder = C.creamBorder, zoneBg = "transparent";
+                      if (isRevealCorrect)    { zoneBorder = C.trueGreen; zoneBg = "#DCFCE7"; }
+                      else if (isRevealWrong) { zoneBorder = "#EF4444";   zoneBg = "#FEE2E2"; }
+                      else if (isOver)        { zoneBorder = C.orange;   zoneBg = C.orangeLight; }
+                      return (
+                        <div key={li} style={{ display: "flex", alignItems: "stretch", gap: 8 }}>
+                          <div style={{
+                            flex: "0 0 auto", minWidth: 96, padding: "10px 12px", borderRadius: 10,
+                            border: `2px solid ${C.creamBorder}`, background: C.pageBg,
+                            display: "flex", alignItems: "center", gap: 8,
+                          }}>
+                            <div style={{ width: 22, height: 22, borderRadius: "50%", flexShrink: 0, display: "flex", alignItems: "center", justifyContent: "center", fontSize: 10, fontWeight: 800, background: isRevealCorrect ? C.trueGreen : isRevealWrong ? "#EF4444" : C.muted, color: (isRevealCorrect || isRevealWrong) ? "#fff" : C.textMuted }}>
+                              {isRevealCorrect ? "✓" : isRevealWrong ? "✗" : String.fromCharCode(65 + li)}
+                            </div>
+                            <span style={{ fontSize: 13, fontWeight: 600, color: C.text }}>{pair.left}</span>
+                          </div>
+                          {/* Drop zone — beside its prompt */}
+                          <div
+                            data-match-zone={li}
+                            role="button" tabIndex={revealed || matchPicked === null ? -1 : 0}
+                            aria-label={pairInfo ? `Drop zone for ${pair.left}, currently holds ${pairInfo.rightText}` : `Empty drop zone for ${pair.left}`}
+                            onClick={() => handleZoneActivate(li)}
+                            onKeyDown={e => { if ((e.key === "Enter" || e.key === " ") && matchPicked !== null) { e.preventDefault(); handleZoneActivate(li); } }}
+                            style={{
+                              flex: 1, minWidth: 0, borderRadius: 10,
+                              border: `2px dashed ${pairInfo ? "transparent" : (isOver ? C.orange : C.creamBorder)}`,
+                              background: !pairInfo && isOver ? C.orangeLight : "transparent",
+                              display: "flex", alignItems: "stretch",
+                              padding: pairInfo ? 0 : "10px 12px",
+                              cursor: (canDrop && !revealed) ? "pointer" : "default",
+                            }}
+                          >
+                            {pairInfo
+                              ? <div style={{ flex: 1 }}><Card_ ri={pairInfo.rightIdx} placedLeftIdx={li} /></div>
+                              : <span style={{ fontSize: 12, color: C.textMuted, fontStyle: "italic", alignSelf: "center" }}>
+                                  {matchPicked !== null ? "Tap to drop here" : "Drop answer here"}
+                                </span>
+                            }
+                          </div>
+                        </div>
+                      );
+                    })}
+                  </div>
+
+                  {/* Right — pool of unplaced draggable answer cards */}
+                  <div style={{ flex: mobile ? "1 1 auto" : "0 0 40%", display: "flex", flexDirection: "column", gap: 8 }}>
+                    <p style={{ margin: "0 0 4px", fontSize: 10, fontWeight: 700, color: C.textMuted, textTransform: "uppercase", letterSpacing: "0.08em" }}>
+                      Answers {unplacedRight.length > 0 ? `(${unplacedRight.length} left)` : ""}
+                    </p>
+                    <div
+                      data-match-zone="pool"
+                      role="button" tabIndex={revealed || matchPicked === null ? -1 : 0}
+                      aria-label="Answer pool — drop here to remove a placed answer"
+                      onClick={() => handleZoneActivate("pool")}
+                      onKeyDown={e => { if ((e.key === "Enter" || e.key === " ") && matchPicked !== null) { e.preventDefault(); handleZoneActivate("pool"); } }}
+                      style={{
+                        flex: 1, display: "flex", flexDirection: "column", gap: 8, minHeight: 60,
+                        borderRadius: 10, padding: 8,
+                        border: `2px dashed ${matchOverZone === "pool" ? C.orange : "transparent"}`,
+                        background: matchOverZone === "pool" ? C.orangeLight : "transparent",
+                      }}
+                    >
+                      {unplacedRight.length === 0 ? (
+                        <p style={{ margin: 0, fontSize: 12, color: C.textMuted, fontStyle: "italic" }}>All answers placed.</p>
+                      ) : unplacedRight.map(({ ri }) => <Card_ key={ri} ri={ri} placedLeftIdx={null} />)}
                     </div>
-                    <span style={{ fontSize: 13, fontWeight: 600, color: C.text }}>{pair.left}</span>
                   </div>
-                );
-              })}
-            </div>
-            <div style={{ flex: 1, display: "flex", flexDirection: "column", gap: 8 }}>
-              <p style={{ margin: "0 0 4px", fontSize: 10, fontWeight: 700, color: C.textMuted, textTransform: "uppercase", letterSpacing: "0.08em" }}>Matches</p>
-              {shuffledRight.map((pair, ri) => {
-                const pairInfo  = getPairForRight(ri);
-                const isRevealCorrect = revealed && pairInfo && pair.right === matchPrompts[pairInfo.leftIdx]?.right;
-                const isRevealWrong   = revealed && pairInfo && pair.right !== matchPrompts[pairInfo.leftIdx]?.right;
-                const canClick = !revealed && !pairInfo && matchSelLeft !== null && !matchAllDone;
-                let border = C.creamBorder, bg = C.cardBg;
-                if (isRevealCorrect)    { border = C.trueGreen; bg = "#DCFCE7"; }
-                else if (isRevealWrong) { border = "#EF4444";   bg = "#FEE2E2"; }
-                else if (pairInfo)      { border = C.orange;    bg = C.orangeLight; }
-                return (
-                  <div key={ri} onClick={() => canClick && chooseMatchRight(ri)} style={{
-                    padding: "12px 14px", borderRadius: 12, cursor: canClick ? "pointer" : "default",
-                    border: `2px solid ${border}`, background: bg, display: "flex", alignItems: "center", justifyContent: "space-between", gap: 10,
+                </div>
+
+                {/* Floating drag ghost — follows the pointer while a real drag is in progress */}
+                {matchDrag && matchDrag.moved && (
+                  <div style={{
+                    position: "fixed", left: matchDrag.x, top: matchDrag.y, transform: "translate(-50%, -50%)",
+                    zIndex: 2000, pointerEvents: "none", width: 180,
                   }}>
-                    <span style={{ fontSize: 13, fontWeight: 600, color: C.text }}>{pair.right}</span>
-                    {isRevealCorrect && <span style={{ color: C.trueGreen, fontSize: 13 }}>✓</span>}
-                    {isRevealWrong   && <span style={{ color: "#EF4444",   fontSize: 13 }}>✗</span>}
+                    <div style={cardStyle(matchDrag.rightIdx, { cursor: "grabbing", boxShadow: "0 8px 20px rgba(11,18,32,0.25)" })}>
+                      <span>{shuffledRight[matchDrag.rightIdx]?.right}</span>
+                    </div>
                   </div>
-                );
-              })}
-            </div>
-          </div>
+                )}
+
+                {!revealed && (
+                  <>
+                    <p style={{ margin: 0, fontSize: 11, color: C.textMuted }}>
+                      Drag an answer beside its prompt, or press Enter on a card to pick it up and Enter on a prompt to place it.
+                    </p>
+                    <button onClick={commitMatch} disabled={!matchAllDone} style={{
+                      padding: "12px 28px", borderRadius: 12, border: "none", alignSelf: "flex-end",
+                      background: matchAllDone ? C.orange : C.muted,
+                      color: matchAllDone ? "#fff" : C.textMuted,
+                      fontSize: 14, fontWeight: 700, cursor: matchAllDone ? "pointer" : "default",
+                    }}>
+                      {matchAllDone ? "Submit Matches" : `Place all ${matchPrompts.length} answers to continue`}
+                    </button>
+                  </>
+                )}
+              </div>
+            );
+          })()
         ) : isOpen ? (
           /* ── Open Ended ── */
           <div style={{ display: "flex", flexDirection: "column", gap: 12 }}>
