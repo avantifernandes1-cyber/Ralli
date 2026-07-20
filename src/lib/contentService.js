@@ -347,7 +347,27 @@ export async function deleteQuiz(quizId) {
 
 
 // ─────────────────────────────────────────────────────────────────────────────
-// ASSIGNMENTS
+// ASSIGNMENTS — unified engine
+//
+// Every assignment row is user-level: assigned_to is always
+// { type: 'individual', userId, userName }. Team/group targets fan out to one
+// row per eligible member at creation time. `source_type`/`source_id`/
+// `source_label` preserve where the assignment came from (an individual pick,
+// a team, an org-wide group, or a future automation) so reporting, auditing,
+// and bulk management stay possible without re-deriving it from assigned_to.
+//
+// Legacy rows created before this engine existed may still have
+// assigned_to.type === 'team' | 'group' (one row covering a whole team/org).
+// Those are left untouched and keep rendering via the dynamic
+// membership-expansion path already in rankd-app.jsx (resolveAssignedUsers).
+// Only new writes go through createAssignments() below.
+//
+// "Active" = assigned, in_progress, or overdue (i.e. not completed). A user
+// with a COMPLETED assignment for this content is eligible to be assigned
+// again; a user with an ACTIVE one is not. Enforced here at the application
+// layer (see 026_assignments_update_rls.sql's note) because "completed" is
+// derived from quiz_attempts / lesson_completions, which Postgres can't
+// reference from a table constraint on tenant_assignments.
 // ─────────────────────────────────────────────────────────────────────────────
 
 /** Normalise a DB row → app assignment shape */
@@ -359,6 +379,12 @@ function dbToAssignment(row) {
     assignedTo:     row.assigned_to ?? {},
     dueAt:          row.due_at ?? "Open",
     required:       row.required ?? false,
+    assignedBy:     row.assigned_by ?? null,
+    source: {
+      type:  row.source_type ?? "individual",
+      id:    row.source_id ?? null,
+      label: row.source_label ?? null,
+    },
     assignedAt:     row.assigned_at
       ? new Date(row.assigned_at).toLocaleDateString("en-US", { month: "short", day: "numeric" })
       : "—",
@@ -381,50 +407,245 @@ export async function getTenantAssignments(tenantId) {
 }
 
 /**
- * Create a new assignment.
- * @param {string} tenantId
- * @param {Object} assignment - { contentType, contentId, assignedTo, dueAt, required }
- * @param {string} [userId]
- * @returns {Promise<{ data: Object|null, error: Object|null }>}
+ * Resolve a target (individual/team/group) into the candidate { userId, userName }
+ * pairs it fans out to. Queried fresh from Supabase so it always reflects
+ * current team/org membership at assign time (or at eligibility-check time).
+ *
+ * Individual targets are never trusted blindly: assignedTo.userId is verified
+ * against `profiles` for this exact tenant_id, and inactive/suspended profiles
+ * are excluded — same as team/group. An invalid target (wrong tenant, doesn't
+ * exist, inactive, or suspended) resolves to an empty candidate list, which
+ * createAssignments() turns into a clear `blocked` result rather than a
+ * silent no-op or a cross-tenant write.
  */
-export async function createAssignment(tenantId, assignment, userId) {
-  const assignedTo = assignment.assignedTo ?? {};
-  const targetType = assignedTo.type;
-  const targetKey  = targetType === "team"       ? "teamId"
-                   : targetType === "individual" ? "userId"
-                   : targetType === "group"      ? "orgId"
-                   : null;
-  const targetId   = targetKey ? assignedTo[targetKey] : null;
+async function resolveTargetCandidates(tenantId, assignedTo) {
+  const targetType = assignedTo?.type;
 
-  // Dedup: if the same content is already assigned to the same target, return the
-  // existing row rather than inserting a duplicate.
-  if (targetId) {
-    const { data: existing } = await supabase
-      .from("tenant_assignments")
-      .select("*")
-      .eq("tenant_id",           tenantId)
-      .eq("content_type",        assignment.contentType)
-      .eq("content_id",          assignment.contentId)
-      .eq("assigned_to->>type",  targetType)
-      .eq(`assigned_to->>${targetKey}`, targetId)
+  if (targetType === "individual") {
+    if (!assignedTo.userId) return [];
+    const { data: profile } = await supabase
+      .from("profiles")
+      .select("id, name, email, status")
+      .eq("id", assignedTo.userId)
+      .eq("tenant_id", tenantId)
       .maybeSingle();
-    if (existing) return { data: dbToAssignment(existing), error: null };
+    if (!profile || profile.status === "inactive" || profile.status === "suspended") return [];
+    return [{ userId: profile.id, userName: assignedTo.userName || profile.name || profile.email?.split("@")[0] || "User" }];
   }
 
-  const { data, error } = await supabase
+  if (targetType === "team") {
+    if (!assignedTo.teamId) return [];
+    const { data } = await supabase
+      .from("profiles")
+      .select("id, name, email")
+      .eq("tenant_id", tenantId)
+      .eq("team_id", assignedTo.teamId)
+      .not("status", "in", "(inactive,suspended)");
+    return (data ?? []).map(p => ({ userId: p.id, userName: p.name ?? p.email?.split("@")[0] ?? "User" }));
+  }
+
+  if (targetType === "group") {
+    const { data } = await supabase
+      .from("profiles")
+      .select("id, name, email, role")
+      .eq("tenant_id", tenantId)
+      .not("status", "in", "(inactive,suspended)")
+      .not("role", "in", "(ralli_admin,orgAdmin)");
+    return (data ?? []).map(p => ({ userId: p.id, userName: p.name ?? p.email?.split("@")[0] ?? "User" }));
+  }
+
+  return [];
+}
+
+/**
+ * Which candidate users have already completed this piece of content.
+ * Completed users remain eligible for reassignment.
+ * @returns {Promise<Set<string>>} profile IDs
+ */
+async function getCompletedUserIds(tenantId, contentType, contentId) {
+  if (contentType === "quiz") {
+    const { data } = await supabase
+      .from("quiz_attempts")
+      .select("user_id")
+      .eq("tenant_id", tenantId)
+      .eq("quiz_id", contentId)
+      .eq("passed", true);
+    return new Set((data ?? []).map(r => r.user_id));
+  }
+
+  if (contentType === "lesson") {
+    const { data } = await supabase
+      .from("lesson_completions")
+      .select("profile_id")
+      .eq("tenant_id", tenantId)
+      .eq("lesson_id", contentId);
+    return new Set((data ?? []).map(r => r.profile_id));
+  }
+
+  if (contentType === "course") {
+    const { data: course } = await supabase
+      .from("tenant_courses")
+      .select("lesson_ids")
+      .eq("id", contentId)
+      .eq("tenant_id", tenantId) // defense in depth — don't rely on RLS alone for tenant scoping
+      .maybeSingle();
+    const lessonIds = course?.lesson_ids ?? [];
+    if (lessonIds.length === 0) return new Set();
+    const { data: completions } = await supabase
+      .from("lesson_completions")
+      .select("profile_id, lesson_id")
+      .eq("tenant_id", tenantId)
+      .in("lesson_id", lessonIds);
+    const doneByUser = new Map();
+    for (const row of completions ?? []) {
+      const set = doneByUser.get(row.profile_id) ?? new Set();
+      set.add(row.lesson_id);
+      doneByUser.set(row.profile_id, set);
+    }
+    const completed = new Set();
+    for (const [userId, doneLessons] of doneByUser) {
+      if (doneLessons.size >= lessonIds.length) completed.add(userId);
+    }
+    return completed;
+  }
+
+  return new Set();
+}
+
+/**
+ * Which candidate users currently hold an ACTIVE assignment (assigned /
+ * in_progress / overdue) for this content. Covers both new-style per-user
+ * rows and legacy team/group aggregate rows, so duplicate prevention is
+ * correct regardless of when the existing assignment was created.
+ *
+ * NOT used by createAssignments() anymore — a read-then-act check here is
+ * inherently racy under concurrent calls (see 034_atomic_assignment_engine.sql).
+ * createAssignments() delegates the check-then-insert to the
+ * create_assignments_atomic() RPC, which does it inside one locked
+ * transaction. This function is kept as a correct, tenant-safe read-only
+ * utility (e.g. for a future "who's currently active on X" report).
+ * @returns {Promise<Map<string, { assignmentId: string, dueAt: string|null, required: boolean }>>}
+ */
+async function getActiveAssignmentsByUser(tenantId, contentType, contentId) {
+  const { data: rows } = await supabase
     .from("tenant_assignments")
-    .insert({
-      tenant_id:    tenantId,
-      content_type: assignment.contentType,
-      content_id:   assignment.contentId,
-      assigned_to:  assignedTo,
-      due_at:       assignment.dueAt && assignment.dueAt !== "Open" ? assignment.dueAt : null,
-      required:     assignment.required ?? false,
-      assigned_by:  userId ?? null,
-    })
-    .select()
-    .single();
-  return { data: data ? dbToAssignment(data) : null, error };
+    .select("id, assigned_to, due_at, required")
+    .eq("tenant_id", tenantId)
+    .eq("content_type", contentType)
+    .eq("content_id", contentId);
+
+  const completed = await getCompletedUserIds(tenantId, contentType, contentId);
+  const activeByUser = new Map();
+
+  for (const row of rows ?? []) {
+    const candidates = await resolveTargetCandidates(tenantId, row.assigned_to);
+    for (const c of candidates) {
+      if (completed.has(c.userId)) continue; // completed — doesn't block reassignment
+      if (!activeByUser.has(c.userId)) {
+        activeByUser.set(c.userId, { assignmentId: row.id, dueAt: row.due_at, required: row.required });
+      }
+    }
+  }
+  return activeByUser;
+}
+
+/**
+ * Unified assignment engine. Fans out team/group targets to one row per
+ * eligible member; skips members who already hold an active assignment for
+ * this content; lets completed members be reassigned. Individual targets
+ * that are invalid (wrong tenant, inactive/suspended, or already actively
+ * assigned) come back as `blocked: true` so the caller can explain why.
+ *
+ * The eligibility check and the inserts happen atomically inside the
+ * create_assignments_atomic() RPC (034_atomic_assignment_engine.sql),
+ * serialized per tenant+content via a transaction-scoped advisory lock — this
+ * function does NOT do its own read-then-insert, so concurrent calls for the
+ * same content can't both see "no active assignment" and both write.
+ *
+ * @param {string} tenantId
+ * @param {{ contentType: 'quiz'|'lesson'|'course', contentId: string, assignedTo: Object, dueAt?: string, required?: boolean }} assignment
+ * @param {string} [assignedByUserId]
+ * @returns {Promise<{
+ *   data: Object[],
+ *   error: Object|null,
+ *   assignedCount: number,
+ *   skippedCount: number,
+ *   skipped: Array<{ userId: string, userName: string, reason: string, dueAt: string|null }>,
+ *   blocked: boolean,
+ * }>}
+ */
+export async function createAssignments(tenantId, assignment, assignedByUserId) {
+  const assignedTo = assignment.assignedTo ?? {};
+  const targetType  = assignedTo.type ?? "individual";
+
+  // Resolves + validates the target (tenant match, inactive/suspended
+  // exclusion for every target type, including individual — see
+  // resolveTargetCandidates()). Safe to do outside the lock: team/group
+  // membership isn't what races here: it's the per-user active-assignment
+  // check, which the RPC below makes atomic.
+  const candidates = await resolveTargetCandidates(tenantId, assignedTo);
+
+  if (candidates.length === 0) {
+    // An individual target that resolved to zero candidates means the
+    // requested user doesn't exist in this tenant, or is inactive/suspended —
+    // that's a blocked error, not a silent no-op. An empty team/group (no
+    // eligible members) is not an error, just nothing to do.
+    if (targetType === "individual") {
+      return {
+        data: [], error: null, assignedCount: 0, skippedCount: 1,
+        skipped: [{ userId: assignedTo.userId ?? null, userName: assignedTo.userName ?? "", reason: "invalid_target", dueAt: null }],
+        blocked: true,
+      };
+    }
+    return { data: [], error: null, assignedCount: 0, skippedCount: 0, skipped: [], blocked: false };
+  }
+
+  const dueAt       = assignment.dueAt && assignment.dueAt !== "Open" ? assignment.dueAt : null;
+  const sourceId    = targetType === "team" ? assignedTo.teamId : targetType === "group" ? assignedTo.orgId : null;
+  const sourceLabel = targetType === "team" ? (assignedTo.teamName ?? null) : null;
+
+  const { data, error } = await supabase.rpc("create_assignments_atomic", {
+    p_tenant_id:    tenantId,
+    p_content_type: assignment.contentType,
+    p_content_id:   assignment.contentId,
+    p_candidates:   candidates,
+    p_due_at:       dueAt,
+    p_required:     assignment.required ?? false,
+    p_assigned_by:  assignedByUserId ?? null,
+    p_source_type:  targetType,
+    p_source_id:    sourceId,
+    p_source_label: sourceLabel,
+  });
+
+  if (error) {
+    // 23505 (unique_violation) shouldn't happen under the advisory lock, but
+    // handle it gracefully rather than surfacing a raw DB error if it ever
+    // does (e.g. a future constraint, or an exact-duplicate retried request).
+    if (error.code === "23505") {
+      return {
+        data: [], error: null, assignedCount: 0, skippedCount: candidates.length,
+        skipped: candidates.map(c => ({ userId: c.userId, userName: c.userName, reason: "already_assigned", dueAt: null })),
+        blocked: targetType === "individual",
+      };
+    }
+    console.error("[contentService] create_assignments_atomic failed:", error);
+    return { data: [], error, assignedCount: 0, skippedCount: 0, skipped: [], blocked: false };
+  }
+
+  const created       = data?.created ?? [];
+  const skipped       = data?.skipped ?? [];
+  const assignedCount = data?.assignedCount ?? created.length;
+  const skippedCount  = data?.skippedCount ?? skipped.length;
+  const blocked       = targetType === "individual" && assignedCount === 0 && skippedCount > 0;
+
+  return {
+    data: created.map(dbToAssignment),
+    error: null,
+    assignedCount,
+    skippedCount,
+    skipped,
+    blocked,
+  };
 }
 
 /**
@@ -640,7 +861,10 @@ export async function getUserQuizAttempts(tenantId, userId) {
 
 /**
  * Fetch all quiz attempts for all users in a tenant.
- * Used by managers/admins for team-level insights.
+ * Used by managers/admins for team-level insights, and by the manager
+ * Quizzes screen to compute assignment status (assigned/in-progress/completed/overdue)
+ * and to power the per-attempt answer drill-down (question, selected answer,
+ * correct answer, correct/incorrect).
  *
  * @param {string} tenantId
  * @returns {Promise<{ data: Array|null, error: Object|null }>}
@@ -648,7 +872,7 @@ export async function getUserQuizAttempts(tenantId, userId) {
 export async function getTenantQuizAttempts(tenantId) {
   const { data, error } = await supabase
     .from("quiz_attempts")
-    .select("id, user_id, quiz_id, score, passed, attempt_num, created_at")
+    .select("id, user_id, quiz_id, score, passed, attempt_num, answers, created_at")
     .eq("tenant_id", tenantId)
     .order("created_at", { ascending: false });
   return { data, error };

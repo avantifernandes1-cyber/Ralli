@@ -43,7 +43,7 @@ import {
   getLessonCompletions,
   markLessonComplete,
   getTenantAssignments,
-  createAssignment as dbCreateAssignment,
+  createAssignments as dbCreateAssignments,
   deleteAssignment as dbDeleteAssignment,
   archiveCourse as archiveCourseService,
   archiveLesson as archiveLessonService,
@@ -53,6 +53,7 @@ import {
   getTenantLessonCompletions,
   saveQuizAttempt,
   getUserQuizAttempts,
+  getTenantQuizAttempts,
   getTenantBcCategories,
   getTenantBattleCards,
   saveBcCategory   as dbSaveBcCategory,
@@ -639,6 +640,8 @@ function HomeScreen({ user, onNav, quizAssignments = [], onResumeLesson, onStart
       homeLbRows={homeLbRows}
       quizzes={quizzes}
       quizAssignments={quizAssignments}
+      homeCourses={homeCourses}
+      homeLessons={homeLessons}
     />
   );
 }
@@ -651,7 +654,7 @@ function PersonalDashboardScreen({
   user, onNav, isReal, tenantId, orgUsers,
   enrichedAssignments, pendingAssignments, completedAssignments, overdueAssignments,
   homeLoading, onResumeLesson, onStartCourse, onStartQuiz, homeLbRows, quizzes,
-  quizAssignments = [],
+  quizAssignments = [], homeCourses = [], homeLessons = [],
 }) {
   const mobile     = useMobile();
   const firstName  = (user.name ?? "").split(" ")[0];
@@ -664,26 +667,31 @@ function PersonalDashboardScreen({
   const [recs,           setRecs]           = useState([]);
   const [topicScores,    setTopicScores]    = useState([]);
   const [recentActivity, setRecentActivity] = useState([]);
+  const [quizAttemptsFull, setQuizAttemptsFull] = useState([]); // full attempts (incl. answers) for review
   const [perfLoading,    setPerfLoading]    = useState(isReal);
+  // Recent Activity → quiz review modal. null when closed.
+  const [activityReview, setActivityReview] = useState(null); // { quiz, attempt } | null
 
   useEffect(() => {
     if (!isReal || !tenantId || !user?.id) { setPerfLoading(false); return; }
     Promise.all([
       getUserPerformance(tenantId, user.id),
       getRepTopicScores(tenantId, user.id),
+      getUserQuizAttempts(tenantId, user.id), // reused as-is — same source Quizzes screen uses for review
       supabase
         .from("user_point_events")
-        .select("source_type, points, created_at")
+        .select("source_type, source_id, points, created_at")
         .eq("tenant_id", tenantId)
         .eq("user_id", user.id)
         .order("created_at", { ascending: false })
         .limit(8),
-    ]).then(([perfResult, topics, { data: events }]) => {
+    ]).then(([perfResult, topics, attemptsResult, { data: events }]) => {
       if (perfResult?.data) {
         setPerf(perfResult.data);
         setRecs(getRecommendations(perfResult.data));
       }
       if (Array.isArray(topics) && topics.length) setTopicScores(topics);
+      if (attemptsResult?.data) setQuizAttemptsFull(attemptsResult.data);
       if (events) setRecentActivity(events);
       setPerfLoading(false);
     }).catch(() => setPerfLoading(false));
@@ -780,17 +788,19 @@ function PersonalDashboardScreen({
   const recTypeIcon        = { quiz: "📝", lesson: "📖", course: "🎓", game: "⚡", engagement: "🔄" };
 
   // ── Demo recent activity ───────────────────────────────────────────────────
+  // Linked to real demo content (existing quiz/lesson/course records — no invented history):
+  //   quiz   → qa5 "Discovery Call Framework" (has a seeded attempt with full answers)
+  //   lesson → ll4 "Handling the 'Not Interested' Objection"
+  //   course → lc1 "Objection Handling Mastery"
   const demoActivity = !isReal ? [
-    { source_type: "quiz",   points: 150, created_at: new Date(Date.now() - 2 * 3_600_000).toISOString() },
-    { source_type: "lesson", points: 75,  created_at: new Date(Date.now() - 26 * 3_600_000).toISOString() },
+    { source_type: "quiz",   source_id: "qa5", points: 150, created_at: new Date(Date.now() - 2 * 3_600_000).toISOString() },
+    { source_type: "lesson", source_id: "ll4", points: 75,  created_at: new Date(Date.now() - 26 * 3_600_000).toISOString() },
     { source_type: "game",   points: 200, created_at: new Date(Date.now() - 2 * 86_400_000).toISOString() },
-    { source_type: "lesson", points: 75,  created_at: new Date(Date.now() - 3 * 86_400_000).toISOString() },
+    { source_type: "course", source_id: "lc1", points: 100, created_at: new Date(Date.now() - 3 * 86_400_000).toISOString() },
   ] : [];
 
   const displayActivity = isReal ? recentActivity : demoActivity;
 
-  const activityLabel = (type) =>
-    ({ lesson: "Completed lesson", quiz: "Completed quiz", game: "Played live game", course: "Completed course" })[type] ?? "Activity";
   const activityBg = (type) =>
     ({ lesson: "#DBEAFE", quiz: C.purple + "18", game: C.orangeLight, course: C.trueGreenBg })[type] ?? C.pageBg;
   const activityTime = (iso) => {
@@ -799,6 +809,78 @@ function PersonalDashboardScreen({
     if (diff < 86_400_000)      return `${Math.round(diff / 3_600_000)}h ago`;
     if (diff < 2 * 86_400_000)  return "Yesterday";
     return new Date(iso).toLocaleDateString("en-US", { month: "short", day: "numeric" });
+  };
+
+  // ── Resolve a Recent Activity row → display title + click target ───────────
+  // Reuses already-fetched content (quizzes / homeCourses / homeLessons for real
+  // accounts; the existing demo content seeds for demo accounts). No new fetches,
+  // no new content records — only a lookup by the event's source_id.
+  const resolveActivityContent = (e) => {
+    const id = e.source_id;
+    // "attempted" distinguishes "this is a lesson/quiz/course whose content we tried to
+    // resolve" (missing → safe fallback note) from types like game/bonus that never had
+    // linkable content to begin with.
+    if (!id) return { kind: e.source_type, title: null, clickable: false, attempted: false };
+    if (e.source_type === "quiz") {
+      const quiz = isReal ? quizzes?.find(q => q.id === id) : quizAssignments.find(q => q.id === id);
+      const title = quiz?.title ?? quiz?.name ?? null;
+      return { kind: "quiz", title, clickable: !!title, quiz, attempted: true };
+    }
+    if (e.source_type === "lesson") {
+      const lesson = isReal ? homeLessons.find(l => l.id === id) : INITIAL_LEARN_LESSONS.find(l => l.id === id);
+      return { kind: "lesson", title: lesson?.title ?? null, clickable: !!lesson, lesson, attempted: true };
+    }
+    if (e.source_type === "course") {
+      const course = isReal ? homeCourses.find(c => c.id === id) : INITIAL_LEARN_COURSES.find(c => c.id === id);
+      return { kind: "course", title: course?.title ?? null, clickable: !!course, course, attempted: true };
+    }
+    return { kind: e.source_type, title: null, clickable: false, attempted: false };
+  };
+
+  const activityLabel = (e) => {
+    const { kind, title } = resolveActivityContent(e);
+    if (title) return `Completed: ${title}`;
+    return ({ lesson: "Completed lesson", quiz: "Completed quiz", game: "Played live game", course: "Completed course" })[kind]
+      ?? "Activity";
+  };
+
+  // Find the specific quiz attempt (with per-question answers) tied to a point event,
+  // so the review modal opens the exact prior attempt rather than just "the latest".
+  const findAttemptForEvent = (e, quiz) => {
+    if (isReal) {
+      const candidates = quizAttemptsFull.filter(a => a.quiz_id === e.source_id);
+      if (!candidates.length) return null;
+      const targetMs = new Date(e.created_at).getTime();
+      const closest = candidates.reduce((best, a) => {
+        const diff = Math.abs(new Date(a.created_at).getTime() - targetMs);
+        return (!best || diff < best.diff) ? { attempt: a, diff } : best;
+      }, null);
+      const raw = closest?.attempt;
+      if (!raw) return null;
+      return {
+        score:   raw.score,
+        passed:  raw.passed,
+        answers: raw.answers ?? [],
+        date:    new Date(raw.created_at).toLocaleDateString("en-US", { month: "short", day: "numeric", year: "numeric" }),
+      };
+    }
+    // Demo: reuse the quiz's own seeded attempt — no invented history.
+    return quiz?.attempts?.[0] ?? null;
+  };
+
+  const handleActivityClick = (e) => {
+    const info = resolveActivityContent(e);
+    if (!info.clickable) return;
+    if (info.kind === "quiz") {
+      const attempt = findAttemptForEvent(e, info.quiz);
+      if (!attempt) return; // no matching attempt on record — safe no-op fallback
+      const quizForReview = isReal ? { ...info.quiz, title: info.quiz.name ?? info.quiz.title } : info.quiz;
+      setActivityReview({ quiz: quizForReview, attempt });
+    } else if (info.kind === "lesson") {
+      onResumeLesson?.(info.lesson.id);
+    } else if (info.kind === "course") {
+      onStartCourse?.(info.course.id);
+    }
   };
 
   // ── Loading state ──────────────────────────────────────────────────────────
@@ -1187,23 +1269,61 @@ function PersonalDashboardScreen({
           </div>
         ) : (
           <div>
-            {displayActivity.map((e, i) => (
-              <div key={i} style={{ display: "flex", alignItems: "center", gap: 12, padding: "12px 0",
-                borderBottom: i < displayActivity.length - 1 ? `1px solid ${C.border}` : "none" }}>
-                <div style={{ width: 34, height: 34, borderRadius: 8, background: activityBg(e.source_type),
-                  display: "flex", alignItems: "center", justifyContent: "center", fontSize: 15, flexShrink: 0 }}>
-                  {recTypeIcon[e.source_type] ?? "⚡"}
+            {displayActivity.map((e, i) => {
+              const info = resolveActivityContent(e);
+              const clickable = info.clickable;
+              return (
+                <div
+                  key={i}
+                  onClick={clickable ? () => handleActivityClick(e) : undefined}
+                  style={{ display: "flex", alignItems: "center", gap: 12, padding: "12px 0",
+                    borderBottom: i < displayActivity.length - 1 ? `1px solid ${C.border}` : "none",
+                    cursor: clickable ? "pointer" : "default",
+                    borderRadius: clickable ? 8 : 0 }}
+                >
+                  <div style={{ width: 34, height: 34, borderRadius: 8, background: activityBg(e.source_type),
+                    display: "flex", alignItems: "center", justifyContent: "center", fontSize: 15, flexShrink: 0 }}>
+                    {recTypeIcon[e.source_type] ?? "⚡"}
+                  </div>
+                  <div style={{ flex: 1, minWidth: 0 }}>
+                    <div style={{ fontSize: 13, fontWeight: 600, color: clickable ? C.orange : C.text, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
+                      {activityLabel(e)}
+                    </div>
+                    <div style={{ fontSize: 11, color: C.textSub }}>
+                      {activityTime(e.created_at)}
+                      {info.attempted && !info.title ? " · content unavailable" : ""}
+                    </div>
+                  </div>
+                  <div style={{ fontSize: 13, fontWeight: 700, color: C.orange, flexShrink: 0 }}>+{e.points} XP</div>
+                  {clickable && <span style={{ fontSize: 12, color: C.textMuted, flexShrink: 0 }}>›</span>}
                 </div>
-                <div style={{ flex: 1, minWidth: 0 }}>
-                  <div style={{ fontSize: 13, fontWeight: 600, color: C.text }}>{activityLabel(e.source_type)}</div>
-                  <div style={{ fontSize: 11, color: C.textSub }}>{activityTime(e.created_at)}</div>
-                </div>
-                <div style={{ fontSize: 13, fontWeight: 700, color: C.orange, flexShrink: 0 }}>+{e.points} XP</div>
-              </div>
-            ))}
+              );
+            })}
           </div>
         )}
       </Card>
+
+      {/* ── Recent Activity: quiz review modal — reuses the existing QuizResultsView ── */}
+      {activityReview && (
+        <div
+          onClick={() => setActivityReview(null)}
+          style={{ position: "fixed", inset: 0, zIndex: 1000, background: "rgba(11,18,32,0.45)",
+            display: "flex", alignItems: "center", justifyContent: "center", padding: 16, overflowY: "auto" }}
+        >
+          <div
+            onClick={e => e.stopPropagation()}
+            style={{ background: C.white, borderRadius: C.radius, width: "100%", maxWidth: 680,
+              maxHeight: "90vh", overflowY: "auto", boxShadow: "0 8px 40px rgba(11,18,32,0.18)", padding: 24 }}
+          >
+            <QuizResultsView
+              quiz={activityReview.quiz}
+              attempt={activityReview.attempt}
+              onRetake={() => { const id = activityReview.quiz.id; setActivityReview(null); onStartQuiz?.(id); }}
+              onBack={() => setActivityReview(null)}
+            />
+          </div>
+        </div>
+      )}
 
     </div>
   );
@@ -7395,12 +7515,20 @@ function LearnScreen({ role, user, orgUsers = [], orgs = [], onNav, onAwardXp, p
           isReal={isReal}
           onAssign={async (assignment) => {
             if (isReal && tenantId) {
-              const { data: saved, error } = await dbCreateAssignment(tenantId, assignment, user?.id);
-              if (error) { console.error("[ralli] createAssignment failed:", error); toast.error("Failed to create assignment. Please try again."); }
-              else { toast.success("Assignment created."); }
-              const canonical = saved ?? { ...assignment, id: "a" + Date.now(), assignedAt: "Today" };
-              // Guard: if createAssignment returned an existing row, don't add it twice to state
-              setAssignments(prev => prev.some(a => a.id === canonical.id) ? prev : [...prev, canonical]);
+              const { data: created, error, blocked, assignedCount, skippedCount, skipped } =
+                await dbCreateAssignments(tenantId, assignment, user?.id);
+              if (error) { console.error("[ralli] createAssignment failed:", error); toast.error("Failed to create assignment. Please try again."); return; }
+              if (blocked) {
+                const who = skipped[0]?.userName || "This user";
+                const due = skipped[0]?.dueAt ? ` (due ${new Date(skipped[0].dueAt).toLocaleDateString("en-US", { month: "short", day: "numeric" })})` : "";
+                toast.error(`${who} already has an active assignment for this content${due}. Wait for it to complete, or remove the existing assignment first.`);
+                return; // keep modal open — manager can adjust and retry
+              }
+              // created is one row per eligible fanned-out user (1 for individual, N for team/group)
+              setAssignments(prev => [...prev, ...created]);
+              toast.success(skippedCount > 0
+                ? `${assignedCount} assigned, ${skippedCount} skipped (already assigned).`
+                : "Assignment created.");
             } else {
               setAssignments(prev => [...prev, { ...assignment, id: "a" + Date.now(), assignedAt: "Today" }]);
               toast.success("Assignment created.");
@@ -8935,13 +9063,50 @@ function getDueProgress(assignedAtStr, dueAtStr) {
   return Math.min(100, Math.max(0, Math.round((elapsed / total) * 100)));
 }
 
+// ── Scoring helpers shared by QuizTakingView + QuizResultsView ─────────────────
+// One canonical definition of "was this answer correct" per question type, so
+// taking a quiz and reviewing its results can never disagree. `selected` shapes
+// by type: mc/tf → option index, type → string, slider → number,
+// pin → { x, y }, match → [{ leftIdx, rightIdx, rightText }], open → string
+// (open is free-response/manually-graded; there is no in-app grader in the
+// self-paced quiz flow, so it is never counted against the learner).
+function isAnswerCorrect(ques, selected) {
+  switch (ques.type) {
+    case "slider":
+      return selected !== null && selected !== undefined
+        && Math.abs(selected - (ques.correct ?? 5)) <= (ques.tolerance ?? 1);
+    case "type":
+      return typeof selected === "string"
+        && (ques.acceptedAnswers ?? []).some(a =>
+            a.trim().toLowerCase() === selected.trim().toLowerCase());
+    case "pin":
+      if (!selected || ques.correctX === undefined) return false;
+      return Math.sqrt(Math.pow(selected.x - ques.correctX, 2) + Math.pow(selected.y - ques.correctY, 2))
+        <= (ques.tolerance ?? 15);
+    case "match": {
+      const pairs = ques.pairs ?? [];
+      if (!pairs.length || !Array.isArray(selected) || selected.length !== pairs.length) return false;
+      return selected.every(mp => pairs[mp.leftIdx]?.right === mp.rightText);
+    }
+    case "open":
+      // Manually graded — never auto-marked wrong, but an unanswered question
+      // still shouldn't count as "correct".
+      return typeof selected === "string" && selected.trim().length > 0;
+    default: // mc / tf
+      return selected === ques.correct;
+  }
+}
+
 // ── QuizTakingView ────────────────────────────────────────────────────────────
 function QuizTakingView({ quiz, onComplete, onExit }) {
-  const [qIdx,        setQIdx]        = useState(0);
-  const [answers,     setAnswers]     = useState({});
-  const [revealed,    setRevealed]    = useState(false);
-  const [sliderDraft, setSliderDraft] = useState(null);
-  const [textDraft,   setTextDraft]   = useState(""); // type-answer draft
+  const [qIdx,          setQIdx]          = useState(0);
+  const [answers,       setAnswers]       = useState({});
+  const [revealed,      setRevealed]      = useState(false);
+  const [sliderDraft,   setSliderDraft]   = useState(null);
+  const [textDraft,     setTextDraft]     = useState(""); // type-answer / open-response draft
+  const [pinDraft,      setPinDraft]      = useState(null);   // { x, y } before confirm
+  const [matchSelLeft,  setMatchSelLeft]  = useState(null);   // index of selected left-side prompt
+  const [shuffledRight, setShuffledRight] = useState([]);     // shuffled q.pairs for the "matches" column
 
   const q        = quiz.questions[qIdx];
   const total    = quiz.questions.length;
@@ -8949,11 +9114,19 @@ function QuizTakingView({ quiz, onComplete, onExit }) {
   const isLast   = qIdx === total - 1;
   const isSlider = q.type === "slider";
   const isType   = q.type === "type";
+  const isPin    = q.type === "pin";
+  const isMatch  = q.type === "match";
+  const isOpen   = q.type === "open";
 
   // Reset draft state when question changes
   useEffect(() => {
     setSliderDraft(null);
     setTextDraft("");
+    setPinDraft(null);
+    setMatchSelLeft(null);
+    setShuffledRight(q.type === "match" && q.pairs?.length
+      ? [...q.pairs].sort(() => Math.random() - 0.5)
+      : []);
   }, [qIdx]); // eslint-disable-line react-hooks/exhaustive-deps
 
   // Slider helpers
@@ -8962,15 +9135,18 @@ function QuizTakingView({ quiz, onComplete, onExit }) {
   const sliderVal = sliderDraft !== null ? sliderDraft
     : (selected !== null ? selected : Math.round((sliderMin + sliderMax) / 2));
 
-  // Correctness per type
-  const sliderCorrect = isSlider && revealed && selected !== null
-    && Math.abs(selected - (q.correct ?? 5)) <= (q.tolerance ?? 1);
-  const typeCorrect = isType && revealed && typeof selected === "string"
-    && (q.acceptedAnswers ?? []).some(a =>
-        a.trim().toLowerCase() === selected.trim().toLowerCase());
-  const isCorrect = isSlider ? sliderCorrect
-    : isType   ? typeCorrect
-    : (revealed && selected === q.correct);
+  // Pin helpers
+  const pinVal = pinDraft ?? selected;
+
+  // Match helpers
+  const matchPairs   = Array.isArray(selected) ? selected : [];
+  const matchPrompts = q.pairs ?? [];
+  const matchAllDone = matchPrompts.length > 0 && matchPairs.length >= matchPrompts.length;
+  const getPairForLeft  = (li) => matchPairs.find(mp => mp.leftIdx === li);
+  const getPairForRight = (ri) => matchPairs.find(mp => mp.rightIdx === ri);
+
+  // Correctness per type — delegates to the same logic used in results/scoring.
+  const isCorrect = revealed && isAnswerCorrect(q, selected);
   const isWrong = revealed && !isCorrect && selected !== null;
 
   const choose = (idx) => {
@@ -8991,6 +9167,34 @@ function QuizTakingView({ quiz, onComplete, onExit }) {
     setRevealed(true);
   };
 
+  const commitOpen = () => {
+    if (revealed || !textDraft.trim()) return;
+    setAnswers(prev => ({ ...prev, [q.id]: textDraft }));
+    setRevealed(true);
+  };
+
+  const commitPin = () => {
+    if (revealed || !pinDraft) return;
+    setAnswers(prev => ({ ...prev, [q.id]: pinDraft }));
+    setRevealed(true);
+  };
+
+  const chooseMatchLeft = (li) => {
+    if (revealed || matchAllDone) return;
+    setMatchSelLeft(li === matchSelLeft ? null : li);
+  };
+
+  const chooseMatchRight = (ri) => {
+    if (revealed || matchAllDone || matchSelLeft === null || getPairForRight(ri)) return;
+    const newPairs = [
+      ...matchPairs.filter(mp => mp.leftIdx !== matchSelLeft),
+      { leftIdx: matchSelLeft, rightIdx: ri, rightText: shuffledRight[ri]?.right },
+    ];
+    setAnswers(prev => ({ ...prev, [q.id]: newPairs }));
+    setMatchSelLeft(null);
+    if (newPairs.length >= matchPrompts.length) setRevealed(true);
+  };
+
   const next = () => {
     if (isLast) {
       const answerList = quiz.questions.map(ques => ({
@@ -8998,16 +9202,15 @@ function QuizTakingView({ quiz, onComplete, onExit }) {
         selected:   answers[ques.id] ?? null,
         correct:    ques.correct,
       }));
-      const correctCount = answerList.filter((a, i) => {
-        const ques = quiz.questions[i];
-        if (ques.type === "slider") return a.selected !== null
-          && Math.abs(a.selected - (ques.correct ?? 5)) <= (ques.tolerance ?? 1);
-        if (ques.type === "type") return typeof a.selected === "string"
-          && (ques.acceptedAnswers ?? []).some(aa =>
-              aa.trim().toLowerCase() === a.selected.trim().toLowerCase());
-        return a.selected === a.correct;
-      }).length;
-      const score   = Math.round((correctCount / total) * 100);
+      // Open-ended questions are manually graded — there is no in-app grader here,
+      // so they're excluded entirely from the automatic score (not counted right,
+      // not counted wrong, not counted toward the denominator). A quiz with 4
+      // graded questions + 1 open-ended response scores out of 4, not 5.
+      const gradedTotal   = quiz.questions.filter(ques => ques.type !== "open").length;
+      const correctCount  = answerList.filter((a, i) =>
+        quiz.questions[i].type !== "open" && isAnswerCorrect(quiz.questions[i], a.selected)
+      ).length;
+      const score   = gradedTotal > 0 ? Math.round((correctCount / gradedTotal) * 100) : 100;
       const attempt = { id: `at${Date.now()}`, date: new Date().toISOString().slice(0,10), score, passed: score >= (quiz.passingScore ?? 90), answers: answerList };
       onComplete(attempt);
     } else {
@@ -9106,6 +9309,143 @@ function QuizTakingView({ quiz, onComplete, onExit }) {
               </button>
             )}
           </div>
+        ) : isPin ? (
+          /* ── Pin Answer ── */
+          <div style={{ display: "flex", flexDirection: "column", alignItems: "center", gap: 14 }}>
+            <div
+              onClick={e => {
+                if (revealed) return;
+                const rect = e.currentTarget.getBoundingClientRect();
+                const x = Math.round(((e.clientX - rect.left) / rect.width) * 100);
+                const y = Math.round(((e.clientY - rect.top) / rect.height) * 100);
+                setPinDraft({ x, y });
+              }}
+              style={{
+                position: "relative", width: "100%", height: 220, borderRadius: 14,
+                cursor: revealed ? "default" : "crosshair",
+                background: q.imageUrl ? `url(${q.imageUrl}) center/cover no-repeat` : C.pageBg,
+                border: `2px solid ${C.creamBorder}`, overflow: "hidden",
+              }}
+            >
+              {!q.imageUrl && !pinVal && (
+                <div style={{ position: "absolute", inset: 0, display: "flex", flexDirection: "column", alignItems: "center", justifyContent: "center", gap: 8 }}>
+                  <span style={{ fontSize: 28, color: C.textMuted }}>●</span>
+                  <p style={{ margin: 0, fontSize: 13, color: C.textMuted, fontWeight: 600 }}>Click to place your pin</p>
+                </div>
+              )}
+              {pinVal && (
+                <div style={{ position: "absolute", left: `${pinVal.x}%`, top: `${pinVal.y}%`, transform: "translate(-50%,-100%)", fontSize: 26, color: C.orange, pointerEvents: "none" }}>●</div>
+              )}
+              {revealed && q.correctX !== undefined && (
+                <>
+                  <div style={{
+                    position: "absolute", left: `${q.correctX}%`, top: `${q.correctY}%`, transform: "translate(-50%,-50%)",
+                    width: (q.tolerance ?? 15) * 2 + "%", height: (q.tolerance ?? 15) * 2 * (220 / 680) + "%",
+                    borderRadius: "50%", background: "rgba(16,185,129,0.2)", border: "2px solid #86EFAC", pointerEvents: "none",
+                  }} />
+                  <div style={{ position: "absolute", left: `${q.correctX}%`, top: `${q.correctY}%`, transform: "translate(-50%,-100%)", fontSize: 26, color: C.trueGreen, pointerEvents: "none" }}>●</div>
+                </>
+              )}
+            </div>
+            {revealed && (
+              <div style={{ width: "100%", padding: "10px 14px", borderRadius: 10, background: isCorrect ? "#F0FDF4" : "#FFF7ED", border: `1px solid ${isCorrect ? "#86EFAC" : C.creamBorder}`, fontSize: 13, color: C.text, boxSizing: "border-box" }}>
+                <strong style={{ color: isCorrect ? "#166534" : C.orange }}>{isCorrect ? "Correct!" : "Not quite."}</strong>
+              </div>
+            )}
+            {!revealed && (
+              <button onClick={commitPin} disabled={!pinDraft} style={{
+                padding: "12px 28px", borderRadius: 12, border: "none", alignSelf: "flex-end",
+                background: pinDraft ? C.orange : C.muted, color: pinDraft ? "#fff" : C.textMuted,
+                fontSize: 14, fontWeight: 700, cursor: pinDraft ? "pointer" : "default",
+              }}>
+                {pinDraft ? "Confirm Pin" : "Click the image to place pin"}
+              </button>
+            )}
+          </div>
+        ) : isMatch ? (
+          /* ── Matching ── */
+          <div style={{ display: "flex", gap: 14 }}>
+            <div style={{ flex: 1, display: "flex", flexDirection: "column", gap: 8 }}>
+              <p style={{ margin: "0 0 4px", fontSize: 10, fontWeight: 700, color: C.textMuted, textTransform: "uppercase", letterSpacing: "0.08em" }}>Prompts</p>
+              {matchPrompts.map((pair, li) => {
+                const pairInfo  = getPairForLeft(li);
+                const isSelLeft = matchSelLeft === li;
+                const isRevealCorrect = revealed && pairInfo && pairInfo.rightText === pair.right;
+                const isRevealWrong   = revealed && pairInfo && pairInfo.rightText !== pair.right;
+                let border = C.creamBorder, bg = C.cardBg;
+                if (isRevealCorrect)      { border = C.trueGreen; bg = "#DCFCE7"; }
+                else if (isRevealWrong)   { border = "#EF4444";   bg = "#FEE2E2"; }
+                else if (isSelLeft)       { border = C.orange;    bg = C.orangeLight; }
+                else if (pairInfo)        { border = C.orange;    bg = C.orangeLight; }
+                return (
+                  <div key={li} onClick={() => !pairInfo && chooseMatchLeft(li)} style={{
+                    padding: "12px 14px", borderRadius: 12, cursor: pairInfo ? "default" : "pointer",
+                    border: `2px solid ${border}`, background: bg, display: "flex", alignItems: "center", gap: 10,
+                  }}>
+                    <div style={{ width: 24, height: 24, borderRadius: "50%", flexShrink: 0, display: "flex", alignItems: "center", justifyContent: "center", fontSize: 11, fontWeight: 800, background: isRevealCorrect ? C.trueGreen : isRevealWrong ? "#EF4444" : C.muted, color: (isRevealCorrect || isRevealWrong) ? "#fff" : C.textMuted }}>
+                      {isRevealCorrect ? "✓" : isRevealWrong ? "✗" : String.fromCharCode(65 + li)}
+                    </div>
+                    <span style={{ fontSize: 13, fontWeight: 600, color: C.text }}>{pair.left}</span>
+                  </div>
+                );
+              })}
+            </div>
+            <div style={{ flex: 1, display: "flex", flexDirection: "column", gap: 8 }}>
+              <p style={{ margin: "0 0 4px", fontSize: 10, fontWeight: 700, color: C.textMuted, textTransform: "uppercase", letterSpacing: "0.08em" }}>Matches</p>
+              {shuffledRight.map((pair, ri) => {
+                const pairInfo  = getPairForRight(ri);
+                const isRevealCorrect = revealed && pairInfo && pair.right === matchPrompts[pairInfo.leftIdx]?.right;
+                const isRevealWrong   = revealed && pairInfo && pair.right !== matchPrompts[pairInfo.leftIdx]?.right;
+                const canClick = !revealed && !pairInfo && matchSelLeft !== null && !matchAllDone;
+                let border = C.creamBorder, bg = C.cardBg;
+                if (isRevealCorrect)    { border = C.trueGreen; bg = "#DCFCE7"; }
+                else if (isRevealWrong) { border = "#EF4444";   bg = "#FEE2E2"; }
+                else if (pairInfo)      { border = C.orange;    bg = C.orangeLight; }
+                return (
+                  <div key={ri} onClick={() => canClick && chooseMatchRight(ri)} style={{
+                    padding: "12px 14px", borderRadius: 12, cursor: canClick ? "pointer" : "default",
+                    border: `2px solid ${border}`, background: bg, display: "flex", alignItems: "center", justifyContent: "space-between", gap: 10,
+                  }}>
+                    <span style={{ fontSize: 13, fontWeight: 600, color: C.text }}>{pair.right}</span>
+                    {isRevealCorrect && <span style={{ color: C.trueGreen, fontSize: 13 }}>✓</span>}
+                    {isRevealWrong   && <span style={{ color: "#EF4444",   fontSize: 13 }}>✗</span>}
+                  </div>
+                );
+              })}
+            </div>
+          </div>
+        ) : isOpen ? (
+          /* ── Open Ended ── */
+          <div style={{ display: "flex", flexDirection: "column", gap: 12 }}>
+            <textarea
+              value={revealed ? (typeof selected === "string" ? selected : "") : textDraft}
+              disabled={revealed}
+              onChange={e => !revealed && setTextDraft(e.target.value)}
+              placeholder="Type your response…"
+              rows={4}
+              style={{
+                width: "100%", boxSizing: "border-box", padding: "14px 16px", borderRadius: 12, resize: "none",
+                border: `2px solid ${revealed ? C.creamBorder : C.creamBorder}`,
+                background: revealed ? C.pageBg : C.cardBg,
+                color: C.text, fontSize: 14, fontWeight: 500, outline: "none", fontFamily: "inherit", lineHeight: 1.5,
+              }}
+            />
+            {revealed && (
+              <div style={{ padding: "10px 14px", borderRadius: 10, background: C.pageBg, border: `1px solid ${C.creamBorder}`, fontSize: 13, color: C.textSub }}>
+                <strong style={{ color: C.text }}>Response recorded.</strong> Open-ended answers are reviewed manually and aren't auto-scored.
+              </div>
+            )}
+            {!revealed && (
+              <button onClick={commitOpen} disabled={!textDraft.trim()} style={{
+                padding: "12px 28px", borderRadius: 12, border: "none", alignSelf: "flex-end",
+                background: textDraft.trim() ? C.orange : C.muted,
+                color: textDraft.trim() ? "#fff" : C.textMuted,
+                fontSize: 14, fontWeight: 700, cursor: textDraft.trim() ? "pointer" : "default",
+              }}>
+                Submit Response
+              </button>
+            )}
+          </div>
         ) : (
           /* ── MC / TF ── */
           <div style={{ display: "flex", flexDirection: "column", gap: 10 }}>
@@ -9144,8 +9484,8 @@ function QuizTakingView({ quiz, onComplete, onExit }) {
           </div>
         )}
 
-        {/* Explanation — MC/TF only (slider and type show feedback inline) */}
-        {revealed && !isSlider && !isType && q.explanation && (
+        {/* Explanation — MC/TF/Pin/Match only (slider, type show feedback inline; open isn't graded) */}
+        {revealed && !isSlider && !isType && !isOpen && q.explanation && (
           <div style={{ marginTop: 16, padding: "12px 16px", borderRadius: 10, background: isCorrect ? "#F0FDF4" : "#FFF7ED", border: `1px solid ${isCorrect ? "#86EFAC" : C.creamBorder}` }}>
             <p style={{ margin: 0, fontSize: 13, color: C.text, lineHeight: 1.6 }}><strong style={{ color: isCorrect ? "#166534" : C.orange }}>{isCorrect ? "Correct" : "Not quite"}.</strong> {q.explanation}</p>
           </div>
@@ -9163,37 +9503,39 @@ function QuizTakingView({ quiz, onComplete, onExit }) {
 }
 
 // ── QuizResultsView ───────────────────────────────────────────────────────────
-function QuizResultsView({ quiz, attempt, onRetake, onBack }) {
-  const total   = quiz.questions.length;
-  // Slider: tolerance. Type: case-insensitive string match. MC/TF: index equality.
-  const correct = attempt.answers.filter((a, i) => {
-    const q = quiz.questions[i];
-    if (q?.type === "slider") return a.selected !== null
-      && Math.abs(a.selected - (q.correct ?? 5)) <= (q.tolerance ?? 1);
-    if (q?.type === "type") return typeof a.selected === "string"
-      && (q.acceptedAnswers ?? []).some(aa =>
-          aa.trim().toLowerCase() === a.selected.trim().toLowerCase());
-    return a.selected === a.correct;
-  }).length;
+function QuizResultsView({ quiz, attempt, onRetake, onBack, showRetake = true, showBack = true, backLabel = "← Back to Quizzes", subtitle = null }) {
+  const total = quiz.questions.length; // includes open-ended, for the review list below
+  // Score denominator excludes open-ended (manually graded, never auto right/wrong) —
+  // mirrors the same exclusion QuizTakingView.next() applies when computing attempt.score,
+  // so the score shown here and the score already saved to quiz_attempts never disagree.
+  const gradedTotal = quiz.questions.filter(q => q.type !== "open").length;
+  const correct = attempt.answers.filter((a, i) =>
+    quiz.questions[i].type !== "open" && isAnswerCorrect(quiz.questions[i], a.selected)
+  ).length;
   const passed  = attempt.passed;
 
   return (
     <div style={{ maxWidth: 640, margin: "0 auto", display: "flex", flexDirection: "column", gap: 20 }}>
       {/* Back */}
-      <button onClick={onBack} style={{ background: "none", border: "none", cursor: "pointer", fontSize: 13, fontWeight: 600, color: C.textSub, padding: 0, alignSelf: "flex-start" }}>← Back to Quizzes</button>
+      {showBack && (
+        <button onClick={onBack} style={{ background: "none", border: "none", cursor: "pointer", fontSize: 13, fontWeight: 600, color: C.textSub, padding: 0, alignSelf: "flex-start" }}>{backLabel}</button>
+      )}
 
       {/* Score card */}
       <Card style={{ textAlign: "center", padding: "32px 24px" }}>
         <div style={{ fontSize: 52, fontWeight: 900, color: passed ? C.trueGreen : C.red, lineHeight: 1 }}>{attempt.score}%</div>
         <div style={{ marginTop: 8, marginBottom: 4, fontSize: 16, fontWeight: 800, color: C.text }}>{quiz.title}</div>
-        <div style={{ fontSize: 13, color: C.textSub, marginBottom: 16 }}>{correct} of {total} correct · {attempt.date}</div>
+        {subtitle && <div style={{ fontSize: 12, color: C.textMuted, marginBottom: 4 }}>{subtitle}</div>}
+        <div style={{ fontSize: 13, color: C.textSub, marginBottom: 16 }}>{correct} of {gradedTotal} correct · {attempt.date}</div>
         <div style={{ display: "inline-flex", alignItems: "center", gap: 8, padding: "6px 16px", borderRadius: 99, background: passed ? "#DCFCE7" : "#FEE2E2", border: `1px solid ${passed ? "#86EFAC" : "#FCA5A5"}` }}>
           <span style={{ fontSize: 13, fontWeight: 800, color: passed ? "#166534" : "#991B1B" }}>{passed ? "Passed" : "Retry"}</span>
         </div>
-        {!passed && <p style={{ margin: "12px 0 0", fontSize: 12, color: C.textMuted }}>Score 90% or higher to pass. You've got this.</p>}
-        <button onClick={onRetake} style={{ marginTop: 20, padding: "10px 24px", borderRadius: 10, border: `1px solid ${C.orange}`, background: C.orangeLight, color: C.orange, fontSize: 13, fontWeight: 700, cursor: "pointer" }}>
-          Retake Quiz
-        </button>
+        {!passed && showRetake && <p style={{ margin: "12px 0 0", fontSize: 12, color: C.textMuted }}>Score 90% or higher to pass. You've got this.</p>}
+        {showRetake && onRetake && (
+          <button onClick={onRetake} style={{ marginTop: 20, padding: "10px 24px", borderRadius: 10, border: `1px solid ${C.orange}`, background: C.orangeLight, color: C.orange, fontSize: 13, fontWeight: 700, cursor: "pointer" }}>
+            Retake Quiz
+          </button>
+        )}
       </Card>
 
       {/* Per-question breakdown */}
@@ -9204,44 +9546,80 @@ function QuizResultsView({ quiz, attempt, onRetake, onBack }) {
             const ans       = attempt.answers.find(a => a.questionId === q.id);
             const isSliderQ = q.type === "slider";
             const isTypeQ   = q.type === "type";
+            const isPinQ    = q.type === "pin";
+            const isMatchQ  = q.type === "match";
+            const isOpenQ   = q.type === "open";
 
-            const wasRight = isSliderQ
-              ? (ans?.selected !== null && ans?.selected !== undefined
-                  && Math.abs(ans.selected - (q.correct ?? 5)) <= (q.tolerance ?? 1))
-              : isTypeQ
-              ? (typeof ans?.selected === "string"
-                  && (q.acceptedAnswers ?? []).some(aa =>
-                      aa.trim().toLowerCase() === ans.selected.trim().toLowerCase()))
-              : ans?.selected === q.correct;
+            const wasRight = isAnswerCorrect(q, ans?.selected);
+            const hasAnswer = isMatchQ
+              ? Array.isArray(ans?.selected) && ans.selected.length > 0
+              : (ans?.selected !== null && ans?.selected !== undefined);
 
             const answerLabel = isSliderQ
               ? (ans?.selected != null ? String(ans.selected) : null)
               : isTypeQ
               ? (typeof ans?.selected === "string" ? ans.selected : null)
+              : isPinQ
+              ? (ans?.selected ? `(${ans.selected.x}%, ${ans.selected.y}%)` : null)
+              : isOpenQ
+              ? (typeof ans?.selected === "string" ? ans.selected : null)
+              : isMatchQ
+              ? null // rendered as a per-pair breakdown below instead of a single line
               : ((q.options ?? [])[ans?.selected] || null);
 
             const correctLabel = isSliderQ
               ? `${q.correct ?? 5} ±${q.tolerance ?? 1}`
               : isTypeQ
               ? ((q.acceptedAnswers ?? []).join(", ") || null)
+              : isPinQ
+              ? (q.correctX !== undefined ? `(${q.correctX}%, ${q.correctY}%) ±${q.tolerance ?? 15}` : null)
+              : isOpenQ
+              ? null // no "correct" answer to compare against — manually graded
+              : isMatchQ
+              ? null
               : ((q.options ?? [])[q.correct] || null);
 
+            // Neutral (non red/green) treatment for open-ended — it isn't auto-graded.
+            const badgeBg   = isOpenQ ? C.muted   : wasRight ? "#DCFCE7" : "#FEE2E2";
+            const badgeColor= isOpenQ ? C.textSub : wasRight ? "#166534" : "#991B1B";
+            const badgeText = isOpenQ ? (hasAnswer ? "Submitted" : "Skipped") : (wasRight ? "Correct" : "Incorrect");
+            const borderColor = isOpenQ ? C.creamBorder : wasRight ? C.trueGreen : C.red;
+
             return (
-              <Card key={q.id} style={{ borderLeft: `4px solid ${wasRight ? C.trueGreen : C.red}` }}>
+              <Card key={q.id} style={{ borderLeft: `4px solid ${borderColor}` }}>
                 <div style={{ display: "flex", alignItems: "flex-start", justifyContent: "space-between", gap: 12, marginBottom: 10 }}>
                   <p style={{ margin: 0, fontSize: 14, fontWeight: 600, color: C.text, lineHeight: 1.5 }}>{i+1}. {q.text || q.q}</p>
-                  <span style={{ fontSize: 12, fontWeight: 700, color: wasRight ? "#166534" : "#991B1B", flexShrink: 0, padding: "2px 8px", borderRadius: 99, background: wasRight ? "#DCFCE7" : "#FEE2E2" }}>{wasRight ? "Correct" : "Incorrect"}</span>
+                  <span style={{ fontSize: 12, fontWeight: 700, color: badgeColor, flexShrink: 0, padding: "2px 8px", borderRadius: 99, background: badgeBg }}>{badgeText}</span>
                 </div>
 
-                {/* User answer */}
-                {ans?.selected !== null && ans?.selected !== undefined && (
-                  <div style={{ fontSize: 13, color: wasRight ? "#166534" : "#991B1B", marginBottom: wasRight ? 0 : 4 }}>
-                    <strong>Your answer:</strong> {answerLabel || <em style={{ color: C.textMuted }}>—</em>}
+                {/* Matching — per-pair breakdown */}
+                {isMatchQ && (
+                  <div style={{ display: "flex", flexDirection: "column", gap: 6, marginBottom: q.explanation ? 8 : 0 }}>
+                    {(q.pairs ?? []).map((pair, li) => {
+                      const mp = (ans?.selected ?? []).find(m => m.leftIdx === li);
+                      const pairOk = !!mp && mp.rightText === pair.right;
+                      return (
+                        <div key={li} style={{ fontSize: 13, color: pairOk ? "#166534" : "#991B1B" }}>
+                          <strong>{pair.left}</strong> → {mp ? mp.rightText : <em style={{ color: C.textMuted }}>no match</em>}
+                          {!pairOk && <span style={{ color: "#166534" }}> (correct: {pair.right})</span>}
+                        </div>
+                      );
+                    })}
                   </div>
                 )}
 
+                {/* User answer (non-matching types) */}
+                {!isMatchQ && hasAnswer && (
+                  <div style={{ fontSize: 13, color: isOpenQ ? C.textSub : (wasRight ? "#166534" : "#991B1B"), marginBottom: (wasRight || isOpenQ) ? 0 : 4 }}>
+                    <strong>Your answer:</strong> {answerLabel || <em style={{ color: C.textMuted }}>—</em>}
+                  </div>
+                )}
+                {!isMatchQ && !hasAnswer && (
+                  <div style={{ fontSize: 13, color: C.textMuted }}><em>No answer submitted.</em></div>
+                )}
+
                 {/* Correct answer (only if wrong and a target exists) */}
-                {!wasRight && correctLabel && (
+                {!isMatchQ && !wasRight && !isOpenQ && correctLabel && (
                   <div style={{ fontSize: 13, color: "#166534", marginBottom: q.explanation ? 8 : 0 }}>
                     <strong>Correct answer:</strong> {correctLabel}
                   </div>
@@ -9358,6 +9736,320 @@ function QuizLibraryGrid({ quizzes, onEditQuiz, onNav, onDeleteQuiz, onToggleFav
           </div>
         );
       })}
+    </div>
+  );
+}
+
+// ── Manager Quiz Tracking ──────────────────────────────────────────────────────
+// Expands quiz assignments (tenant_assignments, content_type = "quiz") into one
+// row per assigned rep, joined against real quiz_attempts so status/score/attempt
+// count always reflect the DB — never a locally-cached guess. Mirrors the
+// assignedTo-resolution pattern used by LearnScreen's manager Assignments tab.
+const QUIZ_STATUS_CONFIG = {
+  assigned:    { label: "Assigned",    bg: "#F1F5F9", text: "#475569" },
+  in_progress: { label: "In Progress", bg: "#DBEAFE", text: "#1D4ED8" },
+  completed:   { label: "Completed",   bg: "#DCFCE7", text: "#166534" },
+  overdue:     { label: "Overdue",     bg: "#FEE2E2", text: "#991B1B" },
+};
+
+function resolveAssignedUsers(assignedTo, orgUsers) {
+  if (!assignedTo) return [];
+  if (assignedTo.type === "individual") {
+    const u = orgUsers.find(u => u.id === assignedTo.userId);
+    if (u) return [u];
+    if (assignedTo.userName) return [{ id: assignedTo.userId ?? "__ind__", name: assignedTo.userName, initials: (assignedTo.userName[0] ?? "?").toUpperCase(), color: C.orange }];
+    return [];
+  }
+  if (assignedTo.type === "group") {
+    const users = orgUsers.filter(u => u.role !== "ralli_admin" && u.role !== "superadmin" && u.role !== "orgAdmin");
+    return users.length ? users : [{ id: "__group__", name: "All users", initials: "ALL", color: C.blue, _isAggregate: true }];
+  }
+  if (assignedTo.type === "team") {
+    const users = assignedTo.teamId ? orgUsers.filter(u => u.teamId === assignedTo.teamId) : [];
+    return users.length ? users : [{ id: "__team__", name: assignedTo.teamName ?? "Team", initials: "T", color: C.purple, _isAggregate: true }];
+  }
+  return [];
+}
+
+// Expands quiz assignments into per-rep rows, deriving status from real quiz_attempts.
+// completed  = at least one attempt with passed === true
+// in_progress= attempted, none passed yet
+// assigned   = no attempts yet
+// overdue    = due date has passed AND status !== completed (overrides assigned/in_progress)
+function buildQuizAssignmentRows(assignments, attempts, quizzes, orgUsers) {
+  return assignments.flatMap(a => {
+    const quiz = quizzes.find(q => q.id === a.contentId);
+    if (!quiz) return [];
+    const users = resolveAssignedUsers(a.assignedTo, orgUsers);
+    return users.map(u => {
+      const userAttempts = u._isAggregate ? [] : attempts
+        .filter(at => at.quiz_id === a.contentId && at.user_id === u.id)
+        .slice()
+        .sort((x, y) => new Date(y.created_at) - new Date(x.created_at)); // newest first
+      const attemptCount   = userAttempts.length;
+      const latestScore    = userAttempts[0]?.score ?? null;
+      const passedAttempts = userAttempts.filter(at => at.passed);
+
+      let status = "assigned", completedAt = null;
+      if (attemptCount > 0) {
+        if (passedAttempts.length > 0) {
+          status = "completed";
+          completedAt = passedAttempts
+            .map(at => at.created_at)
+            .sort((x, y) => new Date(x) - new Date(y))[0]; // earliest pass
+        } else {
+          status = "in_progress";
+        }
+      }
+      if (status !== "completed" && a.dueAt && a.dueAt !== "Open") {
+        const d = new Date(a.dueAt);
+        if (!isNaN(d) && d < new Date()) status = "overdue";
+      }
+
+      return {
+        key: `${a.id}-${u.id}`,
+        assignment: a, quiz, user: u,
+        attempts: userAttempts, attemptCount, latestScore, status, completedAt,
+      };
+    });
+  });
+}
+
+// Read-only breakdown of every attempt a rep has made on one quiz — score,
+// completion date, and per-question answers vs. correct answers. Reuses
+// QuizResultsView's grading logic via its read-only mode.
+function QuizAttemptDrilldown({ row, onBack }) {
+  const { quiz, user, attempts } = row;
+  const [openId, setOpenId] = useState(attempts[0]?.id ?? null);
+
+  return (
+    <div style={{ display: "flex", flexDirection: "column", gap: 16 }}>
+      <div style={{ display: "flex", alignItems: "center", gap: 12 }}>
+        <button onClick={onBack} style={{ background: "none", border: "none", cursor: "pointer", color: C.textSub, fontSize: 13, fontWeight: 700, padding: 0 }}>← All Assignments</button>
+      </div>
+      <div style={{ padding: "14px 18px", borderRadius: 12, background: C.white, border: `1px solid ${C.border}`, display: "flex", alignItems: "center", gap: 12 }}>
+        <div style={{ width: 34, height: 34, borderRadius: "50%", background: user.color ?? C.orange, display: "flex", alignItems: "center", justifyContent: "center", fontSize: 13, fontWeight: 700, color: "#fff", flexShrink: 0 }}>
+          {(user.initials ?? user.name?.[0] ?? "?").toUpperCase()}
+        </div>
+        <div style={{ flex: 1, minWidth: 0 }}>
+          <div style={{ fontSize: 14, fontWeight: 700, color: C.text }}>{user.name}</div>
+          <div style={{ fontSize: 12, color: C.textSub }}>{quiz.title ?? quiz.name} · {attempts.length} attempt{attempts.length !== 1 ? "s" : ""}</div>
+        </div>
+      </div>
+
+      {attempts.length === 0 ? (
+        <div style={{ padding: 40, textAlign: "center", color: C.textMuted, fontSize: 14 }}>No attempts recorded yet.</div>
+      ) : (
+        <div style={{ display: "flex", flexDirection: "column", gap: 10 }}>
+          {attempts.map((at, i) => {
+            const isOpen = openId === at.id;
+            const dateLabel = (() => { try { return new Date(at.created_at).toLocaleString("en-US", { month: "short", day: "numeric", year: "numeric", hour: "numeric", minute: "2-digit" }); } catch { return at.created_at; } })();
+            return (
+              <div key={at.id ?? i} style={{ border: `1px solid ${C.border}`, borderRadius: 12, background: C.white, overflow: "hidden" }}>
+                <button onClick={() => setOpenId(isOpen ? null : at.id)} style={{
+                  width: "100%", display: "flex", alignItems: "center", justifyContent: "space-between",
+                  padding: "14px 18px", background: "none", border: "none", cursor: "pointer", textAlign: "left",
+                }}>
+                  <div style={{ display: "flex", alignItems: "center", gap: 12 }}>
+                    <span style={{ fontSize: 13, fontWeight: 700, color: C.text }}>Attempt {at.attempt_num ?? attempts.length - i}</span>
+                    <span style={{ fontSize: 12, color: C.textSub }}>{dateLabel}</span>
+                  </div>
+                  <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
+                    <span style={{ fontSize: 13, fontWeight: 800, color: at.passed ? C.trueGreen : C.red }}>{at.score}%</span>
+                    <span style={{ fontSize: 11, fontWeight: 700, padding: "2px 8px", borderRadius: 99, background: at.passed ? "#DCFCE7" : "#FEE2E2", color: at.passed ? "#166534" : "#991B1B" }}>{at.passed ? "Passed" : "Not passed"}</span>
+                    <span style={{ fontSize: 12, color: C.textMuted }}>{isOpen ? "▲" : "▼"}</span>
+                  </div>
+                </button>
+                {isOpen && (
+                  <div style={{ padding: "0 18px 18px", borderTop: `1px solid ${C.creamBorder}` }}>
+                    <QuizResultsView
+                      quiz={{ ...quiz, title: quiz.title ?? quiz.name }}
+                      attempt={{ score: at.score, passed: at.passed, date: dateLabel, answers: at.answers ?? [] }}
+                      showRetake={false}
+                      showBack={false}
+                    />
+                  </div>
+                )}
+              </div>
+            );
+          })}
+        </div>
+      )}
+    </div>
+  );
+}
+
+// Manager/admin quiz tracking panel — Assigned / In Progress / Completed / Overdue /
+// Drafts / All. Loads assignments + quiz_attempts fresh from Supabase on mount and
+// whenever refreshKey changes (bumped after a new assignment is created), so status
+// is always correct immediately after submission and after a page refresh.
+function QuizTrackingPanel({ quizzes, orgUsers, tenantId, isReal, refreshKey, onAssign, canAssign }) {
+  const [assignments, setAssignments] = useState([]);
+  const [attempts,    setAttempts]    = useState([]);
+  const [loading,     setLoading]     = useState(isReal);
+  const [statusTab,   setStatusTab]   = useState("assigned");
+  const [search,      setSearch]      = useState("");
+  const [selectedKey, setSelectedKey] = useState(null); // row.key of drilled-in assignment
+
+  useEffect(() => {
+    if (!isReal || !tenantId) { setLoading(false); return; }
+    setLoading(true);
+    Promise.all([
+      getTenantAssignments(tenantId),
+      getTenantQuizAttempts(tenantId),
+    ]).then(([{ data: dbAssignments }, { data: dbAttempts }]) => {
+      setAssignments((dbAssignments ?? []).filter(a => a.contentType === "quiz"));
+      setAttempts(dbAttempts ?? []);
+      setLoading(false);
+    }).catch(() => setLoading(false));
+  }, [tenantId, isReal, refreshKey]);
+
+  const allRows = buildQuizAssignmentRows(assignments, attempts, quizzes, orgUsers);
+  const draftQuizzes = quizzes.filter(q => !assignments.some(a => a.contentId === q.id));
+
+  const sq = search.trim().toLowerCase();
+  const searchedRows = sq
+    ? allRows.filter(r => (r.quiz.title ?? r.quiz.name ?? "").toLowerCase().includes(sq) || r.user.name?.toLowerCase().includes(sq))
+    : allRows;
+  const searchedDrafts = sq
+    ? draftQuizzes.filter(q => (q.title ?? q.name ?? "").toLowerCase().includes(sq))
+    : draftQuizzes;
+
+  const counts = {
+    assigned:    allRows.filter(r => r.status === "assigned").length,
+    in_progress: allRows.filter(r => r.status === "in_progress").length,
+    completed:   allRows.filter(r => r.status === "completed").length,
+    overdue:     allRows.filter(r => r.status === "overdue").length,
+    drafts:      draftQuizzes.length,
+    all:         allRows.length + draftQuizzes.length,
+  };
+
+  const selectedRow = selectedKey ? allRows.find(r => r.key === selectedKey) : null;
+  if (selectedRow) {
+    return <QuizAttemptDrilldown row={selectedRow} onBack={() => setSelectedKey(null)} />;
+  }
+
+  if (!isReal) {
+    return (
+      <div style={{ padding: 48, textAlign: "center", background: C.white, borderRadius: 16, border: `1px solid ${C.border}` }}>
+        <p style={{ fontSize: 15, fontWeight: 700, color: C.text, margin: "0 0 4px" }}>Tracking is available for connected accounts</p>
+        <p style={{ fontSize: 13, color: C.textSub, margin: 0 }}>Demo mode doesn't persist quiz assignments or attempts — sign in with a real account to see live tracking.</p>
+      </div>
+    );
+  }
+
+  if (loading) return <LoadingState rows={3} message="Loading quiz assignments…" />;
+
+  const rowsForStatusTab = statusTab === "all" ? searchedRows : statusTab === "drafts" ? [] : searchedRows.filter(r => r.status === statusTab);
+  const draftsToShow = (statusTab === "drafts" || statusTab === "all") ? searchedDrafts : [];
+
+  return (
+    <div style={{ display: "flex", flexDirection: "column", gap: 16 }}>
+      {/* Search */}
+      <div style={{ display: "flex", alignItems: "center", gap: 8, padding: "9px 14px", borderRadius: 10, background: C.cardBg, border: `1px solid ${C.creamBorder}`, maxWidth: 320 }}>
+        <span style={{ fontSize: 13, color: C.textMuted, flexShrink: 0 }}>Search</span>
+        <input
+          type="text" value={search} placeholder="Quiz or rep name…"
+          onChange={e => setSearch(e.target.value)}
+          style={{ flex: 1, border: "none", background: "transparent", fontSize: 13, color: C.text, outline: "none", fontFamily: "inherit" }}
+        />
+        {search && <button onClick={() => setSearch("")} style={{ background: "none", border: "none", cursor: "pointer", fontSize: 12, color: C.textMuted, padding: 0 }}>✕</button>}
+      </div>
+
+      {/* Status tabs */}
+      <div style={{ display: "flex", gap: 6, flexWrap: "wrap" }}>
+        {[
+          ["assigned",    `Assigned (${counts.assigned})`],
+          ["in_progress", `In Progress (${counts.in_progress})`],
+          ["completed",   `Completed (${counts.completed})`],
+          ["overdue",     `Overdue (${counts.overdue})`],
+          ["drafts",      `Drafts (${counts.drafts})`],
+          ["all",         `All (${counts.all})`],
+        ].map(([id, label]) => (
+          <button key={id} onClick={() => setStatusTab(id)} style={{
+            padding: "7px 14px", borderRadius: 8,
+            border: `1px solid ${statusTab === id ? C.orange : C.border}`,
+            background: statusTab === id ? C.orangeLight : C.white,
+            color: statusTab === id ? C.orange : C.textSub,
+            fontSize: 13, fontWeight: 600, cursor: "pointer",
+          }}>{label}</button>
+        ))}
+      </div>
+
+      {/* Assignment rows table */}
+      {rowsForStatusTab.length > 0 && (
+        <div style={{ borderRadius: 12, overflow: "hidden", border: `1px solid ${C.border}` }}>
+          <div style={{ overflowX: "auto", WebkitOverflowScrolling: "touch" }}>
+            <div style={{ minWidth: 780, display: "grid", gridTemplateColumns: "2fr 1.3fr 0.9fr 0.9fr 1fr 0.9fr 0.8fr", gap: 10, padding: "10px 16px", background: C.pageBg, fontSize: 11, fontWeight: 700, color: C.textMuted, letterSpacing: "0.05em" }}>
+              <span>QUIZ</span><span>REP / TEAM</span><span>ASSIGNED</span><span>DUE</span><span>STATUS</span><span>LATEST SCORE</span><span>ATTEMPTS</span>
+            </div>
+            {rowsForStatusTab.map(row => {
+              const sc = QUIZ_STATUS_CONFIG[row.status];
+              const assignedLabel = row.assignment.assignedAt ?? "—";
+              const dueLabel = row.assignment.dueAt && row.assignment.dueAt !== "Open"
+                ? (() => { try { return new Date(row.assignment.dueAt).toLocaleDateString("en-US", { month: "short", day: "numeric" }); } catch { return row.assignment.dueAt; } })()
+                : "Open";
+              const isClickable = row.status === "completed";
+              return (
+                <div key={row.key} style={{ minWidth: 780, display: "grid", gridTemplateColumns: "2fr 1.3fr 0.9fr 0.9fr 1fr 0.9fr 0.8fr", gap: 10, padding: "13px 16px", background: C.white, borderTop: `1px solid ${C.border}`, alignItems: "center" }}>
+                  <div style={{ minWidth: 0 }}>
+                    {isClickable ? (
+                      <button onClick={() => setSelectedKey(row.key)} style={{ background: "none", border: "none", padding: 0, cursor: "pointer", textAlign: "left" }}>
+                        <span style={{ fontSize: 13, fontWeight: 700, color: C.text, textDecoration: "underline", textDecorationColor: C.border }}>{row.quiz.title ?? row.quiz.name}</span>
+                      </button>
+                    ) : (
+                      <span style={{ fontSize: 13, fontWeight: 700, color: C.text }}>{row.quiz.title ?? row.quiz.name}</span>
+                    )}
+                    {row.assignment.required && <div style={{ fontSize: 11, color: C.textSub }}>Required</div>}
+                  </div>
+                  <div style={{ display: "flex", alignItems: "center", gap: 7, minWidth: 0 }}>
+                    <div style={{ width: 22, height: 22, borderRadius: "50%", background: row.user.color ?? C.orange, display: "flex", alignItems: "center", justifyContent: "center", fontSize: 10, fontWeight: 700, color: "#fff", flexShrink: 0 }}>
+                      {(row.user.initials ?? row.user.name?.[0] ?? "?").toUpperCase()}
+                    </div>
+                    <span style={{ fontSize: 13, fontWeight: 600, color: C.text, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{row.user.name}</span>
+                  </div>
+                  <span style={{ fontSize: 12, color: C.textSub }}>{assignedLabel}</span>
+                  <span style={{ fontSize: 12, color: row.status === "overdue" ? C.red : C.textSub, fontWeight: row.status === "overdue" ? 700 : 400 }}>{dueLabel}</span>
+                  <div><span style={{ fontSize: 11, fontWeight: 700, padding: "3px 8px", borderRadius: 6, background: sc.bg, color: sc.text }}>{sc.label}</span></div>
+                  <span style={{ fontSize: 12, color: C.textSub }}>{row.latestScore != null ? `${row.latestScore}%` : "—"}</span>
+                  <span style={{ fontSize: 12, color: C.textSub }}>{row.attemptCount}</span>
+                </div>
+              );
+            })}
+          </div>
+        </div>
+      )}
+
+      {/* Draft quizzes — templates never assigned to anyone */}
+      {draftsToShow.length > 0 && (
+        <div>
+          {statusTab === "all" && <h3 style={{ margin: "8px 0 10px", fontSize: 12, fontWeight: 800, color: C.textMuted, letterSpacing: "0.06em" }}>DRAFTS — NOT YET ASSIGNED ({draftsToShow.length})</h3>}
+          <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
+            {draftsToShow.map(q => (
+              <div key={q.id} style={{ display: "flex", alignItems: "center", gap: 12, padding: "13px 16px", borderRadius: 10, border: `1px solid ${C.border}`, background: C.white }}>
+                <div style={{ flex: 1, minWidth: 0 }}>
+                  <div style={{ fontSize: 13, fontWeight: 700, color: C.text }}>{q.title ?? q.name}</div>
+                  <div style={{ fontSize: 11, color: C.textSub }}>{q.questions?.length ?? 0} questions · Never assigned</div>
+                </div>
+                {canAssign && (
+                  <button onClick={() => onAssign(q)} style={{ padding: "6px 14px", borderRadius: 8, border: `1px solid ${C.orange}`, background: C.orangeLight, color: C.orange, fontSize: 12, fontWeight: 700, cursor: "pointer", flexShrink: 0 }}>Assign</button>
+                )}
+              </div>
+            ))}
+          </div>
+        </div>
+      )}
+
+      {rowsForStatusTab.length === 0 && draftsToShow.length === 0 && (
+        <div style={{ padding: 48, textAlign: "center", background: C.white, borderRadius: 16, border: `1px solid ${C.border}` }}>
+          <p style={{ fontSize: 15, fontWeight: 700, color: C.text, margin: "0 0 4px" }}>
+            {search ? `No results for "${search}"` : "Nothing here yet"}
+          </p>
+          <p style={{ fontSize: 13, color: C.textSub, margin: 0 }}>
+            {search ? "Try a different search term." : statusTab === "drafts" ? "Every quiz in your library has been assigned." : "Assign a quiz from the Library tab to start tracking results."}
+          </p>
+        </div>
+      )}
     </div>
   );
 }
@@ -9677,18 +10369,22 @@ function QuizzesScreen({ role, onNav, quizzes, onEditQuiz, onDeleteQuiz, onToggl
   }
 
   // ── ADMIN VIEW ────────────────────────────────────────────────────────────
-  const [assignModal, setAssignModal] = useState(null); // null | quiz object
+  const [assignModal, setAssignModal]   = useState(null); // null | quiz object
+  const [adminTab,    setAdminTab]      = useState("library"); // "library" | "tracking"
+  const [refreshKey,  setRefreshKey]    = useState(0); // bumped after a new assignment so tracking refetches
 
   return (
     <div style={{ display: "flex", flexDirection: "column", gap: 20 }}>
-      <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center" }}>
+      <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", flexWrap: "wrap", gap: 12 }}>
         <div>
-          <h2 style={{ margin: 0, fontSize: 22, fontWeight: 800, color: C.text }}>Quiz Library</h2>
+          <h2 style={{ margin: 0, fontSize: 22, fontWeight: 800, color: C.text }}>Quizzes</h2>
           <p style={{ margin: "4px 0 0", fontSize: 13, color: C.textSub }}>
-            {quizzes.length} quiz{quizzes.length !== 1 ? "zes" : ""} — use these in ralli sessions
+            {adminTab === "library"
+              ? `${quizzes.length} quiz${quizzes.length !== 1 ? "zes" : ""} — use these in ralli sessions`
+              : "Assignment status and results for every rep"}
           </p>
         </div>
-        {canCreate && (
+        {canCreate && adminTab === "library" && (
           <button onClick={() => { onEditQuiz(null); onNav("rankd-quiz-builder"); }} style={{
             display: "flex", alignItems: "center", gap: 8, padding: "10px 20px",
             borderRadius: 12, border: "none", cursor: "pointer",
@@ -9697,40 +10393,65 @@ function QuizzesScreen({ role, onNav, quizzes, onEditQuiz, onDeleteQuiz, onToggl
         )}
       </div>
 
-      {quizzes.length === 0 ? (
-        <div style={{ padding: 60, borderRadius: 16, border: `2px dashed ${C.border}`, textAlign: "center", background: C.white }}>
-          <p style={{ fontSize: 16, fontWeight: 700, color: C.text, margin: "0 0 6px" }}>No quizzes yet</p>
-          <p style={{ fontSize: 13, color: C.textSub, margin: "0 0 24px" }}>Build quizzes here, then launch them as ralli sessions</p>
-          {canCreate && (
-            <button onClick={() => { onEditQuiz(null); onNav("rankd-quiz-builder"); }} style={{
-              padding: "12px 28px", borderRadius: 14, border: "none", cursor: "pointer",
-              fontSize: 14, fontWeight: 700, background: C.orange, color: "#fff",
-            }}>Build Your First Quiz →</button>
-          )}
-        </div>
+      {/* Library / Assignments tab switcher */}
+      <div style={{ display: "flex", gap: 6 }}>
+        {[["library", "Library"], ["tracking", "Assignments"]].map(([id, label]) => (
+          <button key={id} onClick={() => setAdminTab(id)} style={{
+            padding: "8px 16px", borderRadius: 8,
+            border: `1px solid ${adminTab === id ? C.orange : C.border}`,
+            background: adminTab === id ? C.orangeLight : C.white,
+            color: adminTab === id ? C.orange : C.textSub,
+            fontSize: 13, fontWeight: 700, cursor: "pointer",
+          }}>{label}</button>
+        ))}
+      </div>
+
+      {adminTab === "library" ? (
+        quizzes.length === 0 ? (
+          <div style={{ padding: 60, borderRadius: 16, border: `2px dashed ${C.border}`, textAlign: "center", background: C.white }}>
+            <p style={{ fontSize: 16, fontWeight: 700, color: C.text, margin: "0 0 6px" }}>No quizzes yet</p>
+            <p style={{ fontSize: 13, color: C.textSub, margin: "0 0 24px" }}>Build quizzes here, then launch them as ralli sessions</p>
+            {canCreate && (
+              <button onClick={() => { onEditQuiz(null); onNav("rankd-quiz-builder"); }} style={{
+                padding: "12px 28px", borderRadius: 14, border: "none", cursor: "pointer",
+                fontSize: 14, fontWeight: 700, background: C.orange, color: "#fff",
+              }}>Build Your First Quiz →</button>
+            )}
+          </div>
+        ) : (
+          <QuizLibraryGrid
+            quizzes={quizzes}
+            onEditQuiz={onEditQuiz}
+            onNav={onNav}
+            onDeleteQuiz={onDeleteQuiz}
+            onToggleFavorite={onToggleFavorite}
+            onToggleActive={onToggleActive}
+            onAssign={canAssign ? (quiz) => setAssignModal(quiz) : null}
+            canEdit={canEdit}
+            canDelete={canDelete}
+            canAssign={canAssign}
+            canLaunch={canLaunch}
+            onLaunchQuiz={canLaunch && onLaunchQuiz ? (quiz) => onLaunchQuiz({
+              code:          String(Math.floor(100000 + Math.random() * 900000)),
+              name:          quiz.name,
+              quizId:        quiz.id,
+              questionCount: quiz.questions?.length ?? 0,
+              status:        "waiting",
+              playerCount:   0,
+              demoMode:      false,
+              players:       [],
+            }) : null}
+          />
+        )
       ) : (
-        <QuizLibraryGrid
+        <QuizTrackingPanel
           quizzes={quizzes}
-          onEditQuiz={onEditQuiz}
-          onNav={onNav}
-          onDeleteQuiz={onDeleteQuiz}
-          onToggleFavorite={onToggleFavorite}
-          onToggleActive={onToggleActive}
-          onAssign={canAssign ? (quiz) => setAssignModal(quiz) : null}
-          canEdit={canEdit}
-          canDelete={canDelete}
+          orgUsers={orgUsers}
+          tenantId={tenantId}
+          isReal={isReal}
+          refreshKey={refreshKey}
           canAssign={canAssign}
-          canLaunch={canLaunch}
-          onLaunchQuiz={canLaunch && onLaunchQuiz ? (quiz) => onLaunchQuiz({
-            code:          String(Math.floor(100000 + Math.random() * 900000)),
-            name:          quiz.name,
-            quizId:        quiz.id,
-            questionCount: quiz.questions?.length ?? 0,
-            status:        "waiting",
-            playerCount:   0,
-            demoMode:      false,
-            players:       [],
-          }) : null}
+          onAssign={(quiz) => setAssignModal(quiz)}
         />
       )}
 
@@ -9746,10 +10467,17 @@ function QuizzesScreen({ role, onNav, quizzes, onEditQuiz, onDeleteQuiz, onToggl
           tenantId={tenantId}
           isReal={isReal}
           onAssign={async (assignment) => {
+            let blocked = false;
             if (onAssignQuiz) {
-              await onAssignQuiz(assignment);
+              const result = await onAssignQuiz(assignment);
+              blocked = result?.blocked ?? false;
             }
+            // Keep the modal open on a blocked individual assignment so the
+            // manager can see the error toast and adjust (different user, wait, etc.)
+            // instead of losing their in-progress picks.
+            if (blocked) return;
             setAssignModal(null);
+            setRefreshKey(k => k + 1); // refetch tracking panel so the new assignment shows immediately
           }}
           onClose={() => setAssignModal(null)}
         />
@@ -15927,6 +16655,37 @@ const NAV_ITEMS = [
 
 const FULL_SCREEN_ROUTES = new Set(["rankd-name-entry", "rankd-lobby", "rankd-game", "org-setup"]);
 
+// ── Refresh routing ──────────────────────────────────────────────────────────
+// Screens that are safe to restore verbatim after a page refresh — persistent
+// destinations reachable from the nav, with no dependency on in-memory state
+// that a reload discards (game lobby/session state, the quiz being edited, etc).
+// "team" (Team Settings) is included deliberately: it is never chosen as a
+// fallback default (see defaultScreenForRestore), but if a manager was already
+// on Team Settings and refreshes, that is an intentional prior selection worth
+// preserving, not a default to redirect into.
+const RESTORABLE_SCREENS = new Set([
+  "home", "leaderboard", "rankd", "learn", "battlecards", "quizzes",
+  "settings", "progress", "insights", "team", "organizations",
+]);
+const LAST_SCREEN_KEY = "ralli_last_screen";
+
+// Fallback when there's no valid persisted screen to restore (first login,
+// stale/invalid value, or role no longer matches). Ralli platform admins land
+// on Organizations; everyone else lands on "home", which itself renders the
+// Leadership Dashboard for managers/admins or the Personal Dashboard for reps
+// (see the "home" case in renderScreen).
+function defaultScreenForRestore(isSuperAdminUser) {
+  return isSuperAdminUser ? "organizations" : "home";
+}
+
+// Reads the last screen the user was on, if it's still safe to restore to.
+function getRestorableScreen() {
+  try {
+    const saved = sessionStorage.getItem(LAST_SCREEN_KEY);
+    return saved && RESTORABLE_SCREENS.has(saved) ? saved : null;
+  } catch { return null; }
+}
+
 
 // ── RoleAccessScreen ─────────────────────────────────────────────────────────
 // Admin-only UI for controlling per-role feature visibility and action access.
@@ -16607,6 +17366,16 @@ export default function App() {
 
   const navigate = (s) => setScreen(s);
 
+  // Persist the current screen (when it's a safe-to-restore destination) so a
+  // page refresh can return the user to where they were instead of always
+  // falling back to a default. Session-scoped: cleared on sign-out below, and
+  // naturally gone once the browser tab closes.
+  useEffect(() => {
+    if (!currentUser) return;
+    if (!RESTORABLE_SCREENS.has(screen)) return;
+    try { sessionStorage.setItem(LAST_SCREEN_KEY, screen); } catch {}
+  }, [screen, currentUser?.id]);
+
   // ── Supabase Auth session restore ─────────────────────────────────────────
   // On mount: check for an existing Supabase session (survives page refresh).
   // Also subscribe to auth state changes so sign-out clears the user globally.
@@ -16638,21 +17407,33 @@ export default function App() {
           setCurrentUser({ ...profile, level: profileLevel, xpNext: profileXpNext });
           // Seed last-seen timestamp for assignment "NEW" badge logic
           setLastSeenAt(profile.lastSeenAssignmentsAt ?? null);
+          // Read the persisted screen synchronously, before any `await` below can
+          // yield to a render — the screen-persistence effect only writes once
+          // currentUser is set, and setCurrentUser above may already be queued,
+          // so capturing this now avoids racing our own write of the default
+          // "home" state into sessionStorage ahead of the real restore value.
+          const restoredScreen = getRestorableScreen();
           if (isRalliAdmin(profile.role)) {
-            setScreen("organizations");
+            setScreen(restoredScreen ?? defaultScreenForRestore(true));
             setOrgs([]); // clear seed/mock orgs — ralli admin sees only real Supabase tenants
             supabase.from("tenants").select("*").order("created_at", { ascending: false })
               .then(({ data }) => { setOrgs(data ? data.map(t => ({ ...t, adminEmail: t.admin_email, seatLimit: t.seat_limit ?? 10, seats: t.seat_limit ?? 10, createdAt: t.created_at?.split("T")[0], updatedAt: t.updated_at?.split("T")[0] })) : []); });
           } else if (profile.role === "orgAdmin") {
-            // Check tenant status — if still onboarding, show setup; otherwise go to team
+            // Onboarding always takes priority over any persisted screen — an
+            // org that hasn't finished setup can't skip it via a stale refresh.
+            // Otherwise: restore the screen the manager was actually on, and
+            // only fall back to Home/Leadership Dashboard if there isn't one.
+            // Team Settings is never the fallback — only reachable by restoring
+            // a screen the manager intentionally navigated to before refreshing.
             if (profile.orgId) {
               const { data: tenant } = await supabase.from("tenants").select("status").eq("id", profile.orgId).single();
-              setScreen(tenant?.status === "onboarding" ? "org-setup" : "team");
+              setScreen(tenant?.status === "onboarding" ? "org-setup" : (restoredScreen ?? defaultScreenForRestore(false)));
             } else {
-              setScreen("home");
+              setScreen(restoredScreen ?? defaultScreenForRestore(false));
             }
           } else {
-            setScreen("home");
+            // Standard user (rep) — restore their last screen, else Personal Dashboard.
+            setScreen(restoredScreen ?? defaultScreenForRestore(false));
           }
         }
       }
@@ -16679,6 +17460,7 @@ export default function App() {
         setSessions(INITIAL_SESSIONS);           // prevent real sessions leaking to next demo user
         setBattleCards(INITIAL_BATTLE_CARDS);    // prevent real BC data leaking to next demo user
         setBcCategories(INITIAL_BC_CATEGORIES);  // prevent real BC categories leaking to next demo user
+        try { sessionStorage.removeItem(LAST_SCREEN_KEY); } catch {} // don't leak screen into the next login
         window.location.replace("/login");        // hard-navigate so URL matches the login screen
       }
     });
@@ -17306,17 +18088,31 @@ export default function App() {
     }
   };
 
+  // Returns { blocked } so the caller (AssignContentModal wiring) knows whether
+  // to close the modal / bump the tracking refreshKey. Demo mode always succeeds.
   const handleAssignQuiz = async (assignment) => {
     const tenantId = currentOrg?.id ?? null;
     if (user?._isReal && tenantId) {
-      const { error } = await dbCreateAssignment(tenantId, assignment, user?.id);
-      if (error) { console.error("[ralli] quiz createAssignment failed:", error); toast.error("Failed to assign quiz. Please try again."); return; }
+      const { error, blocked, assignedCount, skippedCount, skipped } = await dbCreateAssignments(tenantId, assignment, user?.id);
+      if (error) { console.error("[ralli] quiz createAssignment failed:", error); toast.error("Failed to assign quiz. Please try again."); return { blocked: false }; }
+      if (blocked) {
+        const who = skipped[0]?.userName || "This user";
+        const due = skipped[0]?.dueAt ? ` (due ${new Date(skipped[0].dueAt).toLocaleDateString("en-US", { month: "short", day: "numeric" })})` : "";
+        toast.error(`${who} already has an active assignment for this quiz${due}. Wait for it to complete, or remove the existing assignment first.`);
+        return { blocked: true };
+      }
       // No App-level setAssignments — assignments state lives inside LearnScreen and QuizzesScreen.
       // Learners receive the assignment on their next visit to Quizzes or Learn (both re-fetch from Supabase on mount).
-      toast.success("Quiz assigned.");
+      if (skippedCount > 0) {
+        toast.success(`${assignedCount} assigned, ${skippedCount} skipped (already assigned).`);
+      } else {
+        toast.success(assignedCount > 1 ? `${assignedCount} assigned.` : "Quiz assigned.");
+      }
+      return { blocked: false };
     } else {
       // Demo mode: no DB write, no local state update needed — toast confirms the action.
       toast.success("Quiz assigned.");
+      return { blocked: false };
     }
   };
 
@@ -17738,6 +18534,7 @@ export default function App() {
                     setSessions(INITIAL_SESSIONS);
                     setBattleCards(INITIAL_BATTLE_CARDS);
                     setBcCategories(INITIAL_BC_CATEGORIES);
+                    try { sessionStorage.removeItem(LAST_SCREEN_KEY); } catch {}
                     window.location.replace("/login");
                   }
                   // Real users: SIGNED_OUT event fires window.location.replace("/login")
