@@ -362,12 +362,14 @@ export async function deleteQuiz(quizId) {
 // membership-expansion path already in rankd-app.jsx (resolveAssignedUsers).
 // Only new writes go through createAssignments() below.
 //
-// "Active" = assigned, in_progress, or overdue (i.e. not completed). A user
-// with a COMPLETED assignment for this content is eligible to be assigned
-// again; a user with an ACTIVE one is not. Enforced here at the application
-// layer (see 026_assignments_update_rls.sql's note) because "completed" is
-// derived from quiz_attempts / lesson_completions, which Postgres can't
-// reference from a table constraint on tenant_assignments.
+// "Active" = assigned, in_progress, or overdue (i.e. not resolved). A user
+// whose assignment for this content is resolved — quiz passed, quiz failed,
+// lesson completed, or course completed — is eligible to be assigned again;
+// a user with an ACTIVE one is not. Assignment age never matters, and there's
+// no separate "cancelled/expired" assignment state in this schema today.
+// Enforced here at the application layer (see 026_assignments_update_rls.sql's
+// note) because resolution is derived from quiz_attempts / lesson_completions,
+// which Postgres can't reference from a table constraint on tenant_assignments.
 // ─────────────────────────────────────────────────────────────────────────────
 
 /** Normalise a DB row → app assignment shape */
@@ -458,8 +460,22 @@ async function resolveTargetCandidates(tenantId, assignedTo) {
 }
 
 /**
- * Which candidate users have already completed this piece of content.
- * Completed users remain eligible for reassignment.
+ * Which candidate users have already resolved this piece of content —
+ * i.e. no longer have an assignment "awaiting completion" — and therefore
+ * remain eligible for reassignment.
+ *
+ * Quiz: ANY recorded attempt (passed or failed), not just passed = true.
+ * quiz_attempts rows are only written on full submission (QuizTakingView's
+ * onComplete → saveQuizAttempt) — there's no partial/in-progress attempt row
+ * and no attempt-count cap in the schema, so "has an attempt" already means
+ * "no longer assigned/open/in-progress" for a quiz. Previously this only
+ * counted passed = true, which left every failed user permanently blocked
+ * from reassignment (see migration 035's header for the full story) — fixed
+ * here and in the SQL mirror, _content_completed_user_ids()
+ * (034_atomic_assignment_engine.sql, replaced by 035), which is what
+ * create_assignments_atomic() actually enforces. This JS function isn't on
+ * that live enforcement path today (see getActiveAssignmentsByUser's docstring)
+ * but is kept in sync so it never silently diverges from the RPC.
  * @returns {Promise<Set<string>>} profile IDs
  */
 async function getCompletedUserIds(tenantId, contentType, contentId) {
@@ -468,8 +484,7 @@ async function getCompletedUserIds(tenantId, contentType, contentId) {
       .from("quiz_attempts")
       .select("user_id")
       .eq("tenant_id", tenantId)
-      .eq("quiz_id", contentId)
-      .eq("passed", true);
+      .eq("quiz_id", contentId);
     return new Set((data ?? []).map(r => r.user_id));
   }
 
@@ -513,10 +528,70 @@ async function getCompletedUserIds(tenantId, contentType, contentId) {
 }
 
 /**
+ * Assignment-instance-aware version of "who currently blocks a new quiz
+ * assignment" — mirrors _quiz_assignment_active_user_ids() in
+ * 036_assignment_aware_quiz_eligibility.sql exactly, field for field, so this
+ * JS path and the live RPC enforcement never silently diverge.
+ *
+ * getCompletedUserIds()'s quiz branch answers "has this user EVER attempted
+ * this quiz" — content-level, with no reference to which assignment is being
+ * evaluated. That permanently exempted a user from duplicate-blocking after
+ * their very first attempt, even for a brand-new, untouched reassignment
+ * created afterward (see migration 036's header for the full story; this is
+ * the JS mirror of that fix, not a second copy of the old check).
+ *
+ * For every user ever targeted by any assignment row for this quiz (expanded
+ * through resolveTargetCandidates() — the same expansion
+ * _assignment_target_user_ids() does in SQL, covering new per-user rows and
+ * legacy team/group aggregate rows identically), finds their most recent
+ * assigned_at across all rows that target them, then checks for a
+ * quiz_attempts row created at or after that timestamp. A user with no such
+ * qualifying attempt is still active.
+ * @returns {Promise<Set<string>>} profile IDs still active (unresolved) for this quiz
+ */
+async function getQuizAssignmentActiveUserIds(tenantId, contentId) {
+  const { data: rows } = await supabase
+    .from("tenant_assignments")
+    .select("assigned_to, assigned_at")
+    .eq("tenant_id", tenantId)
+    .eq("content_type", "quiz")
+    .eq("content_id", contentId);
+
+  const latestAssignedAtByUser = new Map();
+  for (const row of rows ?? []) {
+    const candidates = await resolveTargetCandidates(tenantId, row.assigned_to);
+    for (const c of candidates) {
+      const prev = latestAssignedAtByUser.get(c.userId);
+      if (!prev || new Date(row.assigned_at) > new Date(prev)) latestAssignedAtByUser.set(c.userId, row.assigned_at);
+    }
+  }
+  if (latestAssignedAtByUser.size === 0) return new Set();
+
+  const { data: attempts } = await supabase
+    .from("quiz_attempts")
+    .select("user_id, created_at")
+    .eq("tenant_id", tenantId)
+    .eq("quiz_id", contentId)
+    .in("user_id", [...latestAssignedAtByUser.keys()]);
+
+  const active = new Set();
+  for (const [userId, latestAssignedAt] of latestAssignedAtByUser) {
+    const resolved = (attempts ?? []).some(at => at.user_id === userId && new Date(at.created_at) >= new Date(latestAssignedAt));
+    if (!resolved) active.add(userId);
+  }
+  return active;
+}
+
+/**
  * Which candidate users currently hold an ACTIVE assignment (assigned /
  * in_progress / overdue) for this content. Covers both new-style per-user
  * rows and legacy team/group aggregate rows, so duplicate prevention is
  * correct regardless of when the existing assignment was created.
+ *
+ * Quiz content uses getQuizAssignmentActiveUserIds() (assignment-instance-
+ * aware); lesson/course content uses getCompletedUserIds() (content-level —
+ * unchanged, since lesson_completions carries no timestamp to compare
+ * against an assignment's assigned_at today).
  *
  * NOT used by createAssignments() anymore — a read-then-act check here is
  * inherently racy under concurrent calls (see 034_atomic_assignment_engine.sql).
@@ -534,13 +609,15 @@ async function getActiveAssignmentsByUser(tenantId, contentType, contentId) {
     .eq("content_type", contentType)
     .eq("content_id", contentId);
 
-  const completed = await getCompletedUserIds(tenantId, contentType, contentId);
+  const activeQuizIds = contentType === "quiz" ? await getQuizAssignmentActiveUserIds(tenantId, contentId) : null;
+  const completed = contentType === "quiz" ? null : await getCompletedUserIds(tenantId, contentType, contentId);
   const activeByUser = new Map();
 
   for (const row of rows ?? []) {
     const candidates = await resolveTargetCandidates(tenantId, row.assigned_to);
     for (const c of candidates) {
-      if (completed.has(c.userId)) continue; // completed — doesn't block reassignment
+      const isActive = contentType === "quiz" ? activeQuizIds.has(c.userId) : !completed.has(c.userId);
+      if (!isActive) continue; // resolved — doesn't block reassignment
       if (!activeByUser.has(c.userId)) {
         activeByUser.set(c.userId, { assignmentId: row.id, dueAt: row.due_at, required: row.required });
       }

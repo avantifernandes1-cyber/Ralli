@@ -601,11 +601,19 @@ function HomeScreen({ user, onNav, quizAssignments = [], onResumeLesson, onStart
           isComplete = homeCompleted.has(content.id);
           pct = isComplete ? 100 : 0;
         } else {
-          // Quiz — was previously never marked complete here (isComplete stayed at its
-          // initial `false` for every quiz assignment, so passed quizzes never left
-          // Assigned Learning). A quiz only counts as complete once it has a PASSED
-          // attempt — an attempt existing with a failing score must not count.
-          isComplete = homeQuizAttempts.some(at => at.quiz_id === content.id && at.passed);
+          // Quiz — complete once there's a PASSED attempt *created at or after this
+          // assignment's assigned_at*. Matching on quiz_id alone (regardless of when
+          // the pass happened) made every reassignment of a previously-passed quiz
+          // invisible: create_assignments_atomic() correctly lets a completed user be
+          // reassigned (see 035_fix_quiz_reassignment_eligibility.sql), inserting a
+          // real, RLS-readable row — but this check would immediately mark that brand
+          // new row `isComplete: true` off the stale old pass and drop it straight out
+          // of pendingAssignments, so the "successful" reassignment never appeared
+          // under Assigned Learning. Falls back to "any pass" only if assignedAtRaw is
+          // somehow missing (assigned_at is NOT NULL in the schema, so this is
+          // defensive, not an expected path).
+          isComplete = homeQuizAttempts.some(at => at.quiz_id === content.id && at.passed &&
+            (!a.assignedAtRaw || !at.created_at || new Date(at.created_at) >= new Date(a.assignedAtRaw)));
           pct = isComplete ? 100 : 0;
         }
         const dueStatus = (a.dueAt && a.dueAt !== "Open") ? getDueStatus(a.dueAt) : null;
