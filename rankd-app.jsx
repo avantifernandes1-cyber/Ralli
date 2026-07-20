@@ -9033,6 +9033,62 @@ function isAnswerCorrect(ques, selected) {
   }
 }
 
+// ── MatchCard ────────────────────────────────────────────────────────────────
+// A single draggable "answer" card for the Matching question type. Hoisted to
+// module scope — NOT defined inside QuizTakingView's render body — so its
+// component identity is stable across renders. Defining it inline gave React
+// a brand-new function/type on every re-render, and dragging triggers very
+// frequent re-renders (one per pointermove): React would unmount + remount
+// the card's real DOM node mid-gesture. That silently killed the drag — per
+// the Pointer Events spec, capture is released the instant its element
+// disconnects from the DOM, so after the very first pixel of movement the
+// browser stopped routing pointer events to the (now-destroyed) captured
+// node, and nothing else picked up move/up handling. The interaction never
+// actually broke in an obvious way — it just silently degraded to "press
+// down, nothing visibly follows, release does a click" i.e. click-to-place.
+function MatchCard({ ri, placedLeftIdx, revealed, isPicked, isDragged, rightText, C, onStartDrag, onActivateKey, onUnplace }) {
+  return (
+    <div
+      role="button"
+      tabIndex={revealed ? -1 : 0}
+      aria-pressed={isPicked}
+      aria-label={placedLeftIdx != null
+        ? `${rightText}, placed. Press Enter to pick up and move.`
+        : `${rightText}. Press Enter to pick up, then Enter a prompt to place it.`}
+      onPointerDown={e => onStartDrag(e, ri)}
+      onKeyDown={e => { if (!revealed && (e.key === "Enter" || e.key === " ")) { e.preventDefault(); onActivateKey(ri); } }}
+      // A placed card sits inside its prompt's drop-zone div, which has its own
+      // onClick (zone activation). Without stopping propagation, the native
+      // click synthesized after pointerup would bubble to that zone and fire
+      // zone-activation using a stale "picked" read — capable of silently
+      // relocating a DIFFERENT already-picked card. This card's own pick/drag
+      // behavior is fully handled by the pointer handlers above.
+      onClick={e => e.stopPropagation()}
+      style={{
+        padding: "10px 12px", borderRadius: 10, display: "flex", alignItems: "center",
+        justifyContent: "space-between", gap: 8, fontSize: 13, fontWeight: 600, color: C.text,
+        background: isPicked ? C.orangeLight : C.cardBg,
+        border: `2px solid ${isPicked ? C.orange : C.creamBorder}`,
+        cursor: revealed ? "default" : "grab",
+        opacity: isDragged ? 0.35 : 1,
+        touchAction: "none", // so the browser doesn't scroll instead of dragging on touch
+        userSelect: "none",
+        boxShadow: isPicked ? "0 0 0 3px rgba(253,191,36,0.18)" : "none",
+      }}
+    >
+      <span>{rightText}</span>
+      {placedLeftIdx != null && !revealed && (
+        <span
+          role="button" tabIndex={0} aria-label="Remove from prompt"
+          onClick={e => { e.stopPropagation(); onUnplace(ri); }}
+          onKeyDown={e => { if (e.key === "Enter" || e.key === " ") { e.preventDefault(); e.stopPropagation(); onUnplace(ri); } }}
+          style={{ color: C.textMuted, fontSize: 14, lineHeight: 1, cursor: "pointer", flexShrink: 0 }}
+        >×</span>
+      )}
+    </div>
+  );
+}
+
 // ── QuizTakingView ────────────────────────────────────────────────────────────
 function QuizTakingView({ quiz, onComplete, onExit }) {
   const mobile = useMobile(); // matching is the first two-column layout in this view — needs to stack on narrow screens
@@ -9122,6 +9178,12 @@ function QuizTakingView({ quiz, onComplete, onExit }) {
     setAnswers(prev => {
       const current    = Array.isArray(prev[q.id]) ? prev[q.id] : [];
       const sourcePair  = current.find(mp => mp.rightIdx === rightIdx);       // where this card is now (undefined = pool)
+      // Dropping a card back onto the slot it already occupies is a no-op —
+      // without this guard the code below would push the same {leftIdx,
+      // rightIdx} pair a second time (it reads as both the "moved" card and
+      // the "displaced" card), corrupting the answers array with a duplicate
+      // entry and breaking isAnswerCorrect()'s length check for this question.
+      if (sourcePair && sourcePair.leftIdx === targetLeftIdx) return prev;
       const targetPair  = current.find(mp => mp.leftIdx === targetLeftIdx);   // what's currently in the target slot (undefined = empty)
       const next = current.filter(mp => mp.rightIdx !== rightIdx && mp.leftIdx !== targetLeftIdx);
       next.push({ leftIdx: targetLeftIdx, rightIdx, rightText: shuffledRight[rightIdx]?.right });
@@ -9164,42 +9226,83 @@ function QuizTakingView({ quiz, onComplete, onExit }) {
 
   // Pointer-based drag (mouse + touch + pen, via the Pointer Events API — native
   // HTML5 drag-and-drop doesn't fire on touch devices, so this is hand-rolled).
+  // Move/up tracking lives on `window`, not on the card element: `window` is
+  // never unmounted, so the gesture can't be silently dropped by a remount
+  // (see MatchCard's comment) or by the pointer traveling somewhere that
+  // doesn't itself have a pointermove/pointerup handler (e.g. over a drop
+  // zone, which only has onClick/onKeyDown). `matchDragRef` and
+  // `matchHandlersRef` exist because the window listeners live outside
+  // React's render cycle — reading `matchDrag` state or `placeMatchCard`
+  // etc. via normal closures inside them would use whatever was current
+  // when the listener was attached, not what's current when it actually
+  // fires; the refs are mutated directly so every read is live.
   const MATCH_DRAG_THRESHOLD = 6; // px of movement before a press counts as a drag, not a click
+  const matchDragRef     = useRef(null);
+  const matchHandlersRef = useRef(null);
+  useEffect(() => {
+    matchHandlersRef.current = { placeMatchCard, unplaceMatchCard, handleCardActivate };
+  }); // no deps — refreshed after every render so the window listeners always call the latest closures
+
   const startMatchDrag = (e, rightIdx) => {
     if (revealed) return;
-    e.currentTarget.setPointerCapture(e.pointerId);
+    e.currentTarget.setPointerCapture?.(e.pointerId);
     const fromLeftIdx = getPairForRight(rightIdx)?.leftIdx ?? null;
-    setMatchDrag({ rightIdx, pointerId: e.pointerId, x: e.clientX, y: e.clientY, startX: e.clientX, startY: e.clientY, moved: false, fromLeftIdx });
+    const initial = { rightIdx, pointerId: e.pointerId, x: e.clientX, y: e.clientY, startX: e.clientX, startY: e.clientY, moved: false, fromLeftIdx };
+    matchDragRef.current = initial;
+    setMatchDrag(initial);
     setMatchPicked(null); // dragging takes over from any pending click-pick
   };
-  const moveMatchDrag = (e) => {
-    if (!matchDrag || e.pointerId !== matchDrag.pointerId) return;
-    const dx = e.clientX - matchDrag.startX, dy = e.clientY - matchDrag.startY;
-    const moved = matchDrag.moved || Math.hypot(dx, dy) > MATCH_DRAG_THRESHOLD;
-    setMatchDrag(prev => prev && ({ ...prev, x: e.clientX, y: e.clientY, moved }));
-    if (moved) {
-      const el = document.elementFromPoint(e.clientX, e.clientY);
+
+  useEffect(() => {
+    if (!matchDrag) return;
+    const pointerId = matchDrag.pointerId;
+
+    const zoneAt = (x, y) => {
+      const el = document.elementFromPoint(x, y);
       const zoneEl = el?.closest?.("[data-match-zone]");
       const zone = zoneEl?.getAttribute("data-match-zone") ?? null;
-      setMatchOverZone(zone === "pool" ? "pool" : zone !== null ? Number(zone) : null);
-    }
-  };
-  const endMatchDrag = (e) => {
-    if (!matchDrag || e.pointerId !== matchDrag.pointerId) return;
-    if (matchDrag.moved) {
-      const el = document.elementFromPoint(e.clientX, e.clientY);
-      const zoneEl = el?.closest?.("[data-match-zone]");
-      const zone = zoneEl?.getAttribute("data-match-zone") ?? null;
-      if (zone === "pool") unplaceMatchCard(matchDrag.rightIdx);
-      else if (zone !== null) placeMatchCard(matchDrag.rightIdx, Number(zone));
-      // else: dropped outside any zone — treat as cancelled, card stays where it was
-    } else {
-      // No meaningful movement — this was a click/tap, not a drag.
-      handleCardActivate(matchDrag.rightIdx);
-    }
-    setMatchDrag(null);
-    setMatchOverZone(null);
-  };
+      return zone === "pool" ? "pool" : zone !== null ? Number(zone) : null;
+    };
+
+    const handleMove = (e) => {
+      if (e.pointerId !== pointerId) return;
+      const cur = matchDragRef.current;
+      if (!cur) return;
+      const dx = e.clientX - cur.startX, dy = e.clientY - cur.startY;
+      const moved = cur.moved || Math.hypot(dx, dy) > MATCH_DRAG_THRESHOLD;
+      const next = { ...cur, x: e.clientX, y: e.clientY, moved };
+      matchDragRef.current = next;
+      setMatchDrag(next);
+      if (moved) setMatchOverZone(zoneAt(e.clientX, e.clientY));
+    };
+
+    const handleUp = (e) => {
+      if (e.pointerId !== pointerId) return;
+      const cur = matchDragRef.current;
+      matchDragRef.current = null;
+      const handlers = matchHandlersRef.current;
+      if (cur?.moved) {
+        const zone = zoneAt(e.clientX, e.clientY);
+        if (zone === "pool") handlers.unplaceMatchCard(cur.rightIdx);
+        else if (zone !== null) handlers.placeMatchCard(cur.rightIdx, Number(zone));
+        // else: dropped outside any zone — treat as cancelled, card stays where it was
+      } else if (cur) {
+        // No meaningful movement — this was a click/tap, not a drag.
+        handlers.handleCardActivate(cur.rightIdx);
+      }
+      setMatchDrag(null);
+      setMatchOverZone(null);
+    };
+
+    window.addEventListener("pointermove", handleMove);
+    window.addEventListener("pointerup", handleUp);
+    window.addEventListener("pointercancel", handleUp);
+    return () => {
+      window.removeEventListener("pointermove", handleMove);
+      window.removeEventListener("pointerup", handleUp);
+      window.removeEventListener("pointercancel", handleUp);
+    };
+  }, [matchDrag?.pointerId]); // eslint-disable-line react-hooks/exhaustive-deps
 
   const next = () => {
     if (isLast) {
@@ -9349,57 +9452,14 @@ function QuizTakingView({ quiz, onComplete, onExit }) {
               .map((pair, ri) => ({ pair, ri }))
               .filter(({ ri }) => !getPairForRight(ri));
 
-            const cardStyle = (ri, extra = {}) => {
-              const isPicked  = matchPicked === ri;
-              const isDragged = matchDrag?.rightIdx === ri && matchDrag.moved;
-              return {
-                padding: "10px 12px", borderRadius: 10, display: "flex", alignItems: "center",
-                justifyContent: "space-between", gap: 8, fontSize: 13, fontWeight: 600, color: C.text,
-                background: isPicked ? C.orangeLight : C.cardBg,
-                border: `2px solid ${isPicked ? C.orange : C.creamBorder}`,
-                cursor: revealed ? "default" : "grab",
-                opacity: isDragged ? 0.35 : 1,
-                touchAction: "none", // required so the browser doesn't scroll instead of dragging on touch
-                userSelect: "none",
-                boxShadow: isPicked ? "0 0 0 3px rgba(253,191,36,0.18)" : "none",
-                ...extra,
-              };
+            // Ghost card during an active drag reuses this — MatchCard itself covers
+            // the two real card states (in the pool / placed in a prompt).
+            const ghostCardStyle = {
+              padding: "10px 12px", borderRadius: 10, display: "flex", alignItems: "center",
+              justifyContent: "space-between", gap: 8, fontSize: 13, fontWeight: 600, color: C.text,
+              background: C.cardBg, border: `2px solid ${C.creamBorder}`,
+              cursor: "grabbing", boxShadow: "0 8px 20px rgba(11,18,32,0.25)",
             };
-
-            const Card_ = ({ ri, placedLeftIdx }) => (
-              <div
-                key={ri}
-                role="button"
-                tabIndex={revealed ? -1 : 0}
-                aria-pressed={matchPicked === ri}
-                aria-label={placedLeftIdx != null
-                  ? `${shuffledRight[ri]?.right}, placed. Press Enter to pick up and move.`
-                  : `${shuffledRight[ri]?.right}. Press Enter to pick up, then Enter a prompt to place it.`}
-                onPointerDown={e => startMatchDrag(e, ri)}
-                onPointerMove={moveMatchDrag}
-                onPointerUp={endMatchDrag}
-                onPointerCancel={endMatchDrag}
-                onKeyDown={e => { if (!revealed && (e.key === "Enter" || e.key === " ")) { e.preventDefault(); handleCardActivate(ri); } }}
-                // A placed card sits inside its prompt's drop-zone div, which has its own
-                // onClick (handleZoneActivate). Without stopping propagation, the native
-                // click synthesized after pointerup would bubble to that zone and fire
-                // handleZoneActivate with a stale `matchPicked` closure value — capable of
-                // silently relocating a DIFFERENT already-picked card. The card's own
-                // pick/drag behavior is fully handled by the pointer handlers above.
-                onClick={e => e.stopPropagation()}
-                style={cardStyle(ri)}
-              >
-                <span>{shuffledRight[ri]?.right}</span>
-                {placedLeftIdx != null && !revealed && (
-                  <span
-                    role="button" tabIndex={0} aria-label="Remove from prompt"
-                    onClick={e => { e.stopPropagation(); unplaceMatchCard(ri); }}
-                    onKeyDown={e => { if (e.key === "Enter" || e.key === " ") { e.preventDefault(); e.stopPropagation(); unplaceMatchCard(ri); } }}
-                    style={{ color: C.textMuted, fontSize: 14, lineHeight: 1, cursor: "pointer", flexShrink: 0 }}
-                  >×</span>
-                )}
-              </div>
-            );
 
             return (
               <div style={{ display: "flex", flexDirection: "column", gap: 16 }}>
@@ -9446,7 +9506,15 @@ function QuizTakingView({ quiz, onComplete, onExit }) {
                             }}
                           >
                             {pairInfo
-                              ? <div style={{ flex: 1 }}><Card_ ri={pairInfo.rightIdx} placedLeftIdx={li} /></div>
+                              ? <div style={{ flex: 1 }}>
+                                  <MatchCard
+                                    ri={pairInfo.rightIdx} placedLeftIdx={li} revealed={revealed} C={C}
+                                    isPicked={matchPicked === pairInfo.rightIdx}
+                                    isDragged={matchDrag?.rightIdx === pairInfo.rightIdx && matchDrag.moved}
+                                    rightText={shuffledRight[pairInfo.rightIdx]?.right}
+                                    onStartDrag={startMatchDrag} onActivateKey={handleCardActivate} onUnplace={unplaceMatchCard}
+                                  />
+                                </div>
                               : <span style={{ fontSize: 12, color: C.textMuted, fontStyle: "italic", alignSelf: "center" }}>
                                   {matchPicked !== null ? "Tap to drop here" : "Drop answer here"}
                                 </span>
@@ -9477,7 +9545,15 @@ function QuizTakingView({ quiz, onComplete, onExit }) {
                     >
                       {unplacedRight.length === 0 ? (
                         <p style={{ margin: 0, fontSize: 12, color: C.textMuted, fontStyle: "italic" }}>All answers placed.</p>
-                      ) : unplacedRight.map(({ ri }) => <Card_ key={ri} ri={ri} placedLeftIdx={null} />)}
+                      ) : unplacedRight.map(({ ri }) => (
+                        <MatchCard
+                          key={ri} ri={ri} placedLeftIdx={null} revealed={revealed} C={C}
+                          isPicked={matchPicked === ri}
+                          isDragged={matchDrag?.rightIdx === ri && matchDrag.moved}
+                          rightText={shuffledRight[ri]?.right}
+                          onStartDrag={startMatchDrag} onActivateKey={handleCardActivate} onUnplace={unplaceMatchCard}
+                        />
+                      ))}
                     </div>
                   </div>
                 </div>
@@ -9488,7 +9564,7 @@ function QuizTakingView({ quiz, onComplete, onExit }) {
                     position: "fixed", left: matchDrag.x, top: matchDrag.y, transform: "translate(-50%, -50%)",
                     zIndex: 2000, pointerEvents: "none", width: 180,
                   }}>
-                    <div style={cardStyle(matchDrag.rightIdx, { cursor: "grabbing", boxShadow: "0 8px 20px rgba(11,18,32,0.25)" })}>
+                    <div style={ghostCardStyle}>
                       <span>{shuffledRight[matchDrag.rightIdx]?.right}</span>
                     </div>
                   </div>
@@ -9497,7 +9573,7 @@ function QuizTakingView({ quiz, onComplete, onExit }) {
                 {!revealed && (
                   <>
                     <p style={{ margin: 0, fontSize: 11, color: C.textMuted }}>
-                      Drag an answer beside its prompt, or press Enter on a card to pick it up and Enter on a prompt to place it.
+                      Drag each answer into place, or select an answer and then choose a row. Enter or Space works the same way from the keyboard.
                     </p>
                     <button onClick={commitMatch} disabled={!matchAllDone} style={{
                       padding: "12px 28px", borderRadius: 12, border: "none", alignSelf: "flex-end",
