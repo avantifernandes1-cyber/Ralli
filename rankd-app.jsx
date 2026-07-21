@@ -12798,6 +12798,53 @@ function _relativeActivityLabel(iso) {
   return d.toLocaleDateString();
 }
 
+function _contentTypeLabel(contentType) {
+  return contentType === "course" ? "Course" :
+         contentType === "lesson" ? "Lesson" :
+         contentType === "quiz"   ? "Quiz"   : contentType;
+}
+
+// Rep Drill-Down Final Polish — days a due date is past, floored at 0 (never
+// negative; callers only invoke this for items already known to be overdue).
+function _daysOverdue(dueAt) {
+  if (!dueAt || dueAt === "Open") return null;
+  const d = new Date(dueAt);
+  if (isNaN(d)) return null;
+  return Math.max(0, Math.ceil((Date.now() - d.getTime()) / 86400000));
+}
+
+// Rep Drill-Down Final Polish — shared newest-first sort for every
+// collapsible history list below (Recent Quiz Activity, Assigned Learning,
+// Overdue Assignments detail). Non-mutating; missing/unparsable dates sort
+// last rather than throwing.
+function _sortDesc(list, getDateStr) {
+  return [...(list ?? [])].sort((a, b) => {
+    const db = new Date(getDateStr(b) ?? 0).getTime();
+    const da = new Date(getDateStr(a) ?? 0).getTime();
+    return (isNaN(db) ? 0 : db) - (isNaN(da) ? 0 : da);
+  });
+}
+
+// Rep Drill-Down Final Polish — one small reusable expand/collapse control,
+// reused by every "show 3, then View all (N)" list in RepDrillDownModal
+// instead of each section re-implementing its own button. Renders nothing
+// when there's nothing to collapse.
+function ViewAllToggle({ total, visible = 3, expanded, onToggle }) {
+  if (total <= visible) return null;
+  return (
+    <button
+      onClick={onToggle}
+      style={{
+        marginTop: 2, background: "none", border: "none", padding: 0,
+        color: C.orange, fontSize: 12, fontWeight: 600, cursor: "pointer",
+        alignSelf: "flex-start",
+      }}
+    >
+      {expanded ? "Show less" : `View all (${total})`}
+    </button>
+  );
+}
+
 function RepDrillDownModal({ rep, tenantId, onClose, isReal = false }) {
   const [topicScores,  setTopicScores]  = useState(null);
   const [quizHistory,  setQuizHistory]  = useState(null);
@@ -12809,6 +12856,26 @@ function RepDrillDownModal({ rep, tenantId, onClose, isReal = false }) {
   // activity — see the Promise.all below). null = not yet computed.
   const [stats,        setStats]        = useState(null);
   const [loading,      setLoading]      = useState(true);
+  // Rep Drill-Down Final Polish — one small state object shared by every
+  // collapsible history list in this modal (Recent Quiz Activity, Assigned
+  // Learning, Overdue Assignments detail) instead of a useState per
+  // section. Unmounting the modal (parent clears selectedRep on close)
+  // discards this along with everything else, so reopening — even for the
+  // same rep — always starts collapsed; no explicit reset code needed.
+  const [expandedSections, setExpandedSections] = useState({});
+  // Brief highlight on the Assigned Learning row an Overdue Assignments
+  // item was clicked to jump to — cleared automatically after 1.6s.
+  const [highlightAssignmentId, setHighlightAssignmentId] = useState(null);
+  const toggleSection = (key) => setExpandedSections(prev => ({ ...prev, [key]: !prev[key] }));
+  const expandSection = (key) => setExpandedSections(prev => ({ ...prev, [key]: true }));
+  const jumpToAssignment = (id) => {
+    expandSection("assignments"); // make sure the row is actually rendered before scrolling to it
+    setTimeout(() => {
+      document.getElementById(`al-row-${id}`)?.scrollIntoView({ behavior: "smooth", block: "center" });
+      setHighlightAssignmentId(id);
+      setTimeout(() => setHighlightAssignmentId(cur => cur === id ? null : cur), 1600);
+    }, 50);
+  };
 
   useEffect(() => {
     if (!rep) return;
@@ -12887,17 +12954,26 @@ function RepDrillDownModal({ rep, tenantId, onClose, isReal = false }) {
         .select("id, name")
         .eq("tenant_id", tenantId),
       // Fix 8: fetch assignments + completions for this rep
+      // Rep Drill-Down Final Polish — added assigned_by/source_type/
+      // source_id/source_label (already columns on tenant_assignments,
+      // no schema change) so the new Overdue Assignments detail can show
+      // "assignment source where available" without a second query.
       supabase
         .from("tenant_assignments")
-        .select("id, content_type, content_id, assigned_to, assigned_at, due_at, required")
+        .select("id, content_type, content_id, assigned_to, assigned_at, due_at, required, assigned_by, source_type, source_id, source_label")
         .eq("tenant_id", tenantId),
       supabase
         .from("lesson_completions")
         .select("lesson_id, completed_at")
         .eq("tenant_id", tenantId)
         .eq("profile_id", repId),
-      supabase.from("tenant_courses").select("id, name, lesson_ids").eq("tenant_id", tenantId),
-      supabase.from("tenant_lessons").select("id, name").eq("tenant_id", tenantId),
+      // Fix (found while validating Overdue Assignment content-name accuracy):
+      // these tables use column "title", not "name" — the old select("id, name")
+      // was silently failing (PostgREST 42703), which is why course/lesson
+      // assignment titles were falling back to the generic "Course"/"Lesson"
+      // label for every tenant, not just this one.
+      supabase.from("tenant_courses").select("id, title, lesson_ids").eq("tenant_id", tenantId),
+      supabase.from("tenant_lessons").select("id, title").eq("tenant_id", tenantId),
       // Manager-First Performance Summary — new: canonical XP ledger for
       // this rep, needed for the XP Earned KPI. Also folded into Most
       // Recent Activity below so game/bonus activity (which has no other
@@ -12924,9 +13000,9 @@ function RepDrillDownModal({ rep, tenantId, onClose, isReal = false }) {
       // Build content name maps
       const courseNames = {};
       const courseLessonIds = {};
-      (courses ?? []).forEach(c => { courseNames[c.id] = c.name; courseLessonIds[c.id] = c.lesson_ids ?? []; });
+      (courses ?? []).forEach(c => { courseNames[c.id] = c.title; courseLessonIds[c.id] = c.lesson_ids ?? []; });
       const lessonNames = {};
-      (lessons ?? []).forEach(l => { lessonNames[l.id] = l.name; });
+      (lessons ?? []).forEach(l => { lessonNames[l.id] = l.title; });
       // lesson_id → completed_at, not just a membership Set — resolveAssignmentStatus
       // gates on it being at/after THIS assignment's assigned_at (same
       // assignment-instance-aware rule as _lesson_assignment_active_user_ids()
@@ -12971,7 +13047,10 @@ function RepDrillDownModal({ rep, tenantId, onClose, isReal = false }) {
         // label, so the snapshot KPIs below can tally completion/active/
         // overdue exactly instead of re-deriving them from the display
         // strings (which use a different vocabulary per content type).
-        return { ...a, title, status, engineStatus: engineResult.status };
+        // Rep Drill-Down Final Polish — engineProgress (0-100, only
+        // meaningful for courses; quiz/lesson are binary) feeds the new
+        // Overdue Assignments detail's "current status or progress" field.
+        return { ...a, title, status, engineStatus: engineResult.status, engineProgress: engineResult.progress ?? null };
       });
 
       setAssignments(enriched);
@@ -13063,6 +13142,12 @@ function RepDrillDownModal({ rep, tenantId, onClose, isReal = false }) {
   // block, which was prescriptive advice and no longer fits this contract).
   const strongestTopic = _strongestTopic(topicScores);
   const weakestTopic    = _weakestTopic(topicScores);
+  // Rep Drill-Down Final Polish — Part 2: Low Readiness Supporting Detail.
+  // 65% is the same at-risk threshold used everywhere else (Below
+  // Threshold KPI, coaching tag, band label above).
+  const isLowReadiness = score != null && score < 65;
+  const weakTopics = (topicScores ?? []).filter(t => t.avgScore < 65).sort((a, b) => a.avgScore - b.avgScore);
+  const hasTaggedTopicData = (topicScores ?? []).length > 0;
   const strengths = [];
   const attention = [];
   if (strongestTopic) strengths.push(`Strongest topic: ${strongestTopic.topic} (${Math.round(strongestTopic.avgScore)}%)`);
@@ -13075,7 +13160,26 @@ function RepDrillDownModal({ rep, tenantId, onClose, isReal = false }) {
   if (stats && stats.coursesCompleted > 0) {
     strengths.push(`${stats.coursesCompleted} course${stats.coursesCompleted !== 1 ? "s" : ""} completed.`);
   }
-  if (weakestTopic && weakestTopic.avgScore < 65) attention.push(`Weakest topic: ${weakestTopic.topic} (${Math.round(weakestTopic.avgScore)}%)`);
+  // Readiness score first and explicit — the single most decision-useful
+  // line for a manager scanning Needs Attention.
+  if (isLowReadiness) {
+    attention.push(`Overall readiness is ${score}%, in the At Risk range (below 65%).`);
+  }
+  if (weakestTopic && weakestTopic.avgScore < 65) {
+    attention.push(`Weakest topic: ${weakestTopic.topic} (${Math.round(weakestTopic.avgScore)}%)`);
+  }
+  // Low-scoring topic detail beyond just the single weakest one, when
+  // there's more than one to show — capped at 2 more to stay scannable.
+  if (weakTopics.length > 1) {
+    attention.push(`Also below threshold: ${weakTopics.slice(1, 3).map(t => `${t.topic} (${Math.round(t.avgScore)}%)`).join(", ")}.`);
+  }
+  // Honest explanation instead of a silent gap — a manager looking at an
+  // At Risk rep with no weakest-topic line above needs to know WHY, not
+  // just that skill detail is missing (this is the copy fix from Knowledge
+  // Heatmap: "not tagged" is a config gap, not a data-doesn't-exist gap).
+  if (isLowReadiness && !hasTaggedTopicData) {
+    attention.push("Skill-level detail is not available yet because completed quizzes have not been tagged.");
+  }
   if (stats && stats.quizzesFailed > 0) {
     attention.push(`${stats.quizzesFailed} quiz${stats.quizzesFailed !== 1 ? "zes" : ""} not currently passed (latest attempt).`);
   }
@@ -13088,6 +13192,13 @@ function RepDrillDownModal({ rep, tenantId, onClose, isReal = false }) {
   if (stats && stats.incompleteRequired > 0) {
     attention.push(`${stats.incompleteRequired} required assignment${stats.incompleteRequired !== 1 ? "s" : ""} not yet complete.`);
   }
+
+  // Rep Drill-Down Final Polish — Part 1: Overdue Assignments detail list.
+  // Reuses the SAME engineStatus the Snapshot's overdueAssignments count
+  // and the "N overdue assignments" bullet above are already built from —
+  // one calculation, not a second one. Sorted newest-assigned-first, same
+  // rule as every other list in this modal.
+  const overdueList = _sortDesc((assignments ?? []).filter(_repAssignmentOverdue), a => a.assigned_at);
 
   return (
     <div
@@ -13235,6 +13346,55 @@ function RepDrillDownModal({ rep, tenantId, onClose, isReal = false }) {
               </div>
             </div>
 
+            {/* Overdue Assignments detail — Rep Drill-Down Final Polish Part 1.
+                Only rendered when overdue items exist; the count alone (in
+                Needs Attention above) doesn't tell a manager WHICH ones. */}
+            {overdueList.length > 0 && (() => {
+              const expanded = !!expandedSections.overdue;
+              const visible = expanded ? overdueList : overdueList.slice(0, 3);
+              return (
+                <div>
+                  <div style={{ fontWeight: 700, fontSize: 14, color: C.red, marginBottom: 12 }}>
+                    Overdue Assignments ({overdueList.length})
+                  </div>
+                  <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
+                    {visible.map(a => {
+                      const days = _daysOverdue(a.due_at);
+                      const progressLabel =
+                        a.content_type === "course" && a.engineProgress != null ? `${a.engineProgress}% complete` :
+                        "Not yet completed";
+                      return (
+                        <div
+                          key={a.id}
+                          onClick={() => jumpToAssignment(a.id)}
+                          title="Jump to this item in Assigned Learning"
+                          style={{
+                            padding: "10px 14px", background: C.redBg, borderRadius: C.radiusSm,
+                            border: `1px solid ${C.red}33`, cursor: "pointer",
+                          }}
+                        >
+                          <div style={{ display: "flex", justifyContent: "space-between", alignItems: "flex-start", gap: 10 }}>
+                            <div style={{ fontSize: 13, fontWeight: 600, color: C.text }}>{a.title}</div>
+                            <span style={{ fontSize: 11, fontWeight: 700, color: C.red, whiteSpace: "nowrap" }}>
+                              {days != null ? `${days} day${days !== 1 ? "s" : ""} overdue` : "Overdue"}
+                            </span>
+                          </div>
+                          <div style={{ fontSize: 11, color: C.textMuted, marginTop: 3 }}>
+                            {_contentTypeLabel(a.content_type)}
+                            {a.due_at && a.due_at !== "Open" ? ` · Due ${new Date(a.due_at).toLocaleDateString()}` : ""}
+                            {" · "}{a.required ? "Required" : "Recommended"}
+                            {a.source_label ? ` · via ${a.source_label}` : ""}
+                            {` · ${progressLabel}`}
+                          </div>
+                        </div>
+                      );
+                    })}
+                  </div>
+                  <ViewAllToggle total={overdueList.length} expanded={expanded} onToggle={() => toggleSection("overdue")} />
+                </div>
+              );
+            })()}
+
             {/* ── 3. Detailed Activity ── */}
 
             {/* Topic Breakdown */}
@@ -13257,68 +13417,95 @@ function RepDrillDownModal({ rep, tenantId, onClose, isReal = false }) {
                   })}
                 </div>
               ) : (
-                <div style={{ fontSize: 13, color: C.textMuted }}>No tagged quiz data available yet.</div>
+                // Rep Drill-Down Final Polish Part 2 — same honest copy as the
+                // Knowledge Heatmap fix: this is a tagging gap, not an
+                // activity gap. Never say "no data" when quizzes have simply
+                // never been tagged.
+                <div style={{ fontSize: 13, color: C.textMuted }}>Skill-level detail is not available yet because completed quizzes have not been tagged.</div>
               )}
             </div>
 
-            {/* Quiz History */}
+            {/* Quiz History — Rep Drill-Down Final Polish Part 3: collapsible,
+                newest-first, 3 by default. */}
             <div>
               <div style={{ fontWeight: 700, fontSize: 14, color: C.text, marginBottom: 12 }}>Recent Quiz Activity</div>
-              {quizHistory?.length ? (
-                <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
-                  {quizHistory.slice(0, 8).map(a => (
-                    <div key={a.id} style={{ display: "flex", alignItems: "center", justifyContent: "space-between", padding: "10px 14px", background: C.pageBg, borderRadius: C.radiusSm }}>
-                      <div>
-                        <div style={{ fontSize: 13, fontWeight: 600, color: C.text }}>{quizNames[a.quiz_id] || "Quiz"}</div>
-                        <div style={{ fontSize: 11, color: C.textMuted, marginTop: 2 }}>{new Date(a.created_at).toLocaleDateString()}</div>
+              {quizHistory?.length ? (() => {
+                const sorted = _sortDesc(quizHistory, a => a.created_at);
+                const expanded = !!expandedSections.quiz;
+                const visible = expanded ? sorted : sorted.slice(0, 3);
+                return (
+                  <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
+                    {visible.map(a => (
+                      <div key={a.id} style={{ display: "flex", alignItems: "center", justifyContent: "space-between", padding: "10px 14px", background: C.pageBg, borderRadius: C.radiusSm }}>
+                        <div>
+                          <div style={{ fontSize: 13, fontWeight: 600, color: C.text }}>{quizNames[a.quiz_id] || "Quiz"}</div>
+                          <div style={{ fontSize: 11, color: C.textMuted, marginTop: 2 }}>{new Date(a.created_at).toLocaleDateString()}</div>
+                        </div>
+                        <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
+                          <span style={{ fontSize: 13, fontWeight: 700, color: a.score >= 65 ? C.trueGreen : C.red }}>{a.score}%</span>
+                          <span style={{ fontSize: 11, padding: "2px 8px", borderRadius: 99, background: a.passed ? C.trueGreenBg : C.redBg, color: a.passed ? C.trueGreen : C.red, fontWeight: 600 }}>{a.passed ? "Passed" : "Failed"}</span>
+                        </div>
                       </div>
-                      <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
-                        <span style={{ fontSize: 13, fontWeight: 700, color: a.score >= 65 ? C.trueGreen : C.red }}>{a.score}%</span>
-                        <span style={{ fontSize: 11, padding: "2px 8px", borderRadius: 99, background: a.passed ? C.trueGreenBg : C.redBg, color: a.passed ? C.trueGreen : C.red, fontWeight: 600 }}>{a.passed ? "Passed" : "Failed"}</span>
-                      </div>
-                    </div>
-                  ))}
-                </div>
-              ) : (
+                    ))}
+                    <ViewAllToggle total={sorted.length} expanded={expanded} onToggle={() => toggleSection("quiz")} />
+                  </div>
+                );
+              })() : (
                 <div style={{ fontSize: 13, color: C.textMuted }}>No quiz attempts recorded yet.</div>
               )}
             </div>
 
-            {/* Fix 8: Assigned Learning */}
+            {/* Fix 8: Assigned Learning — Rep Drill-Down Final Polish Part 3:
+                collapsible, newest-first (by assigned_at), 3 by default. Each
+                row keeps a stable DOM id + brief highlight so a click on an
+                Overdue Assignments item above can jump straight to it. */}
             <div>
               <div style={{ fontWeight: 700, fontSize: 14, color: C.text, marginBottom: 12 }}>Assigned Learning</div>
               {assignments === null ? (
                 <div style={{ fontSize: 13, color: C.textMuted }}>Loading…</div>
               ) : assignments.length === 0 ? (
                 <div style={{ fontSize: 13, color: C.textMuted }}>No individual assignments for this rep.</div>
-              ) : (
-                <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
-                  {assignments.map(a => {
-                    const statusColor =
-                      a.status === "Passed"   ? C.trueGreen :
-                      a.status === "Complete" ? C.blue      : C.textMuted;
-                    const typeLabel =
-                      a.content_type === "course" ? "Course" :
-                      a.content_type === "lesson" ? "Lesson" :
-                      a.content_type === "quiz"   ? "Quiz"   : a.content_type;
-                    return (
-                      <div key={a.id} style={{ display: "flex", alignItems: "center", justifyContent: "space-between", padding: "10px 14px", background: C.pageBg, borderRadius: C.radiusSm }}>
-                        <div>
-                          <div style={{ fontSize: 13, fontWeight: 600, color: C.text }}>{a.title}</div>
-                          <div style={{ fontSize: 11, color: C.textMuted, marginTop: 2 }}>
-                            {typeLabel}
-                            {a.due_at && a.due_at !== "Open" ? ` · Due ${new Date(a.due_at).toLocaleDateString()}` : ""}
-                            {a.required ? " · Required" : ""}
+              ) : (() => {
+                const sorted = _sortDesc(assignments, a => a.assigned_at);
+                const expanded = !!expandedSections.assignments;
+                const visible = expanded ? sorted : sorted.slice(0, 3);
+                return (
+                  <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
+                    {visible.map(a => {
+                      const statusColor =
+                        a.status === "Passed"   ? C.trueGreen :
+                        a.status === "Complete" ? C.blue      : C.textMuted;
+                      const isHighlighted = highlightAssignmentId === a.id;
+                      return (
+                        <div
+                          key={a.id}
+                          id={`al-row-${a.id}`}
+                          style={{
+                            display: "flex", alignItems: "center", justifyContent: "space-between",
+                            padding: "10px 14px", borderRadius: C.radiusSm,
+                            background: isHighlighted ? C.orangeLight : C.pageBg,
+                            border: isHighlighted ? `1px solid ${C.orange}66` : "1px solid transparent",
+                            transition: "background 0.3s, border-color 0.3s",
+                          }}
+                        >
+                          <div>
+                            <div style={{ fontSize: 13, fontWeight: 600, color: C.text }}>{a.title}</div>
+                            <div style={{ fontSize: 11, color: C.textMuted, marginTop: 2 }}>
+                              {_contentTypeLabel(a.content_type)}
+                              {a.due_at && a.due_at !== "Open" ? ` · Due ${new Date(a.due_at).toLocaleDateString()}` : ""}
+                              {a.required ? " · Required" : ""}
+                            </div>
                           </div>
+                          <span style={{ fontSize: 11, padding: "2px 8px", borderRadius: 99, fontWeight: 600, background: a.status === "Pending" ? C.pageBg : `${statusColor}18`, color: statusColor, border: `1px solid ${statusColor}44` }}>
+                            {a.status}
+                          </span>
                         </div>
-                        <span style={{ fontSize: 11, padding: "2px 8px", borderRadius: 99, fontWeight: 600, background: a.status === "Pending" ? C.pageBg : `${statusColor}18`, color: statusColor, border: `1px solid ${statusColor}44` }}>
-                          {a.status}
-                        </span>
-                      </div>
-                    );
-                  })}
-                </div>
-              )}
+                      );
+                    })}
+                    <ViewAllToggle total={sorted.length} expanded={expanded} onToggle={() => toggleSection("assignments")} />
+                  </div>
+                );
+              })()}
             </div>
 
             {/* Battle Card Engagement — placeholder until BC tracking is built */}
