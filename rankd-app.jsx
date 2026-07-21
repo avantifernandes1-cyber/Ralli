@@ -13049,7 +13049,11 @@ function LeadershipDashboardScreen({ currentOrg, orgUsers = [], isReal = false }
   const mobile      = useMobile();
   const realMembers = orgUsers.filter(u => u._isReal);
   const hasRealData = !isReal || realMembers.length > 0;
-  const [liveData,     setLiveData]     = useState(null);   // null = not yet loaded
+  // Blocking Fix 3 — raw, orgUsers-independent fetch results only. Name/role
+  // resolution against orgUsers happens in the `liveData` useMemo below, not
+  // here — see that memo's comment for why. `rawFetch` never needs orgUsers
+  // in its shape.
+  const [rawFetch,      setRawFetch]     = useState(null);  // null = not yet loaded
   const [loading,      setLoading]      = useState(isReal); // true while Supabase fetch in flight
   // Blocking Fix 1 — distinct from "loaded but empty". Set only when the
   // fetch itself throws (network/RLS/etc.), never for an honest empty
@@ -13064,7 +13068,15 @@ function LeadershipDashboardScreen({ currentOrg, orgUsers = [], isReal = false }
   const [orgMetrics,   setOrgMetrics]   = useState(null);  // getOrgMetrics result
   const [topicFilter,  setTopicFilter]  = useState(null);  // string | null — filter people by weak topic
 
-  // Load readiness scores + topic heatmap + org metrics from Supabase
+  // Load readiness scores + topic heatmap + org metrics from Supabase.
+  // Blocking Fix 3 — deliberately does NOT depend on orgUsers. orgUsers is
+  // loaded by a separate, independently-timed effect in the parent
+  // component; if this fetch had depended on it, either (a) it would refire
+  // (and re-hit Supabase) every time orgUsers changes, or (b) if left out of
+  // the deps array as it was before this fix, whatever orgUsers happened to
+  // be at the moment this fetch resolved would get baked permanently into
+  // people[]/risk — which is exactly the bug this fix addresses. Fetching
+  // stays orgUsers-free; orgUsers is applied reactively in the memo below.
   useEffect(() => {
     const tid = currentOrg?.id;
     if (!isReal || !tid) { setLoading(false); return; }
@@ -13099,7 +13111,7 @@ function LeadershipDashboardScreen({ currentOrg, orgUsers = [], isReal = false }
       // here and blank the ENTIRE dashboard, discarding org metrics, the
       // heatmap, assignments, and risk data that had already loaded
       // successfully in the same Promise.all above. Now we always finish
-      // building liveData from whatever came back; `hasReadinessScores`
+      // storing rawFetch from whatever came back; `hasReadinessScores`
       // (below) lets the render layer show an honest "not yet available"
       // state for the specific widgets that genuinely depend on per-rep
       // readiness scores (Overall Readiness, Below Threshold, People
@@ -13113,120 +13125,17 @@ function LeadershipDashboardScreen({ currentOrg, orgUsers = [], isReal = false }
       const seen = new Set();
       const unique = rowsSafe.filter(r => { if (seen.has(r.user_id)) return false; seen.add(r.user_id); return true; });
 
-      // Build people array from orgUsers + readiness_scores rows.
-      // Beta Cleanup — `tag` is now computed from the real score (reusing the
-      // same 85 / 65 band thresholds already used everywhere else in this
-      // file — scoreColor/scoreBg, RepDrillDownModal's band, Insights'
-      // distribution buckets), so the People Insights "Highest" / "Needs
-      // Coaching" filters work for real tenants. "promotion" / "improved"
-      // are NOT set here — both require a real prior-period snapshot that
-      // doesn't exist yet (see the Team Readiness / Readiness Trends BETA
-      // NOTE below); those two filters correctly show "No reps match this
-      // filter" for real data rather than a fabricated result.
-      const people = unique.map((r, i) => {
-        const member = orgUsers.find(u => u.id === r.user_id);
-        const readinessScore = r.score ?? 0;
-        return {
-          id:            r.user_id,
-          name:          member?.name ?? "Team Member",
-          title:         member?.title ?? member?.role ?? "Rep",
-          email:         member?.email ?? "",
-          readinessScore,
-          previousScore:  readinessScore,
-          trend:         0,
-          tag:           readinessScore >= 85 ? "top" : readinessScore < 65 ? "coaching" : undefined,
-          color:         ["#6366f1","#f59e0b","#10b981","#ec4899","#3b82f6"][i % 5],
-        };
-      });
-
-      const avg = people.length ? Math.round(people.reduce((s, p) => s + p.readinessScore, 0) / people.length) : 0;
-
-      // Beta Cleanup — Active/Overdue Assignments, computed by expanding every
-      // tenant_assignments row to its targeted users (resolveAssignedUsers,
-      // same helper QuizTrackingPanel uses) and resolving each (assignment,
-      // user) pair through the shared Resolved Assignment engine
-      // (resolveAssignmentStatus, assignmentEngine.js) — the ONE status
-      // calculator, reused rather than re-derived. Synthetic aggregate
-      // placeholders (a team/group assignment with zero current real
-      // members) are skipped — they don't correspond to an actual rep to
-      // count as active or overdue.
-      const courseLessonIds = new Map((courses ?? []).map(c => [c.id, c.lessonIds ?? []]));
-      const completedAtByUserLesson = new Map(
-        (lessonCompletions ?? []).map(c => [`${c.profileId}::${c.lessonId}`, c.completedAt])
-      );
-      let activeAssignmentCount = 0;
-      let overdueAssignmentCount = 0;
-      const overdueRepNames = new Set();
-      for (const a of (assignments ?? [])) {
-        const targetedUsers = resolveAssignedUsers(a.assignedTo, orgUsers);
-        for (const u of targetedUsers) {
-          if (u._isAggregate) continue;
-          let status;
-          if (a.contentType === "quiz") {
-            const userAttempts = (quizAttempts ?? []).filter(at => at.quiz_id === a.contentId && at.user_id === u.id);
-            status = resolveAssignmentStatus("quiz", a, { attempts: userAttempts }).status;
-          } else if (a.contentType === "lesson") {
-            const completedAt = completedAtByUserLesson.get(`${u.id}::${a.contentId}`) ?? null;
-            status = resolveAssignmentStatus("lesson", a, { completedAt }).status;
-          } else if (a.contentType === "course") {
-            const lessonIds = courseLessonIds.get(a.contentId) ?? [];
-            const completedAtByLesson = new Map(lessonIds.map(lid => [lid, completedAtByUserLesson.get(`${u.id}::${lid}`) ?? null]));
-            status = resolveAssignmentStatus("course", a, { lessonIds, completedAtByLesson }).status;
-          } else {
-            continue;
-          }
-          if (status !== "completed") activeAssignmentCount++;
-          if (status === "overdue") {
-            overdueAssignmentCount++;
-            overdueRepNames.add(u.name);
-          }
-        }
-      }
-
-      setLiveData({
+      // Blocking Fix 3 — store raw rows only; orgUsers name/role resolution
+      // and the assignment-status loop (which also reads orgUsers via
+      // resolveAssignedUsers) now live in the liveData useMemo below.
+      setRawFetch({
         hasReadinessScores,
-        company: { readinessScore: avg, previousScore: avg, targetScore: 90, trend: [], period: "Current" },
-        // BETA NOTE:
-        // Hidden until supporting infrastructure is production-ready.
-        // Do not remove.
-        // Planned for post-beta Manager Intelligence milestone.
-        // (teams: no team-level readiness aggregation query exists yet —
-        // Team Readiness / Top Team / Needs Attention are hidden below.)
-        teams:   [],
-        people: people.map(p => ({
-          ...p,
-          score:    p.readinessScore,
-          prev:     p.previousScore,
-          initials: (p.name ?? "").split(" ").map(w => w[0] ?? "").join("").slice(0, 2).toUpperCase() || "TM",
-        })),
-        heatmap:   heatmap ?? [],
-        // BETA NOTE:
-        // Hidden until supporting infrastructure is production-ready.
-        // Do not remove.
-        // Planned for post-beta Manager Intelligence milestone.
-        // (trends: no historical readiness time-series is stored yet —
-        // Readiness Trends is hidden below.)
-        trends:    {},
-        // BETA NOTE:
-        // Hidden until supporting infrastructure is production-ready.
-        // Do not remove.
-        // Planned for post-beta Manager Intelligence milestone.
-        // (aiSummary: org-scope AI summary was never wired up — AI
-        // Performance Summary is hidden below.)
-        aiSummary: null,
-        risk: {
-          activeAssignments:     activeAssignmentCount,
-          overdueAssignments:    overdueAssignmentCount,
-          overdueAssignmentReps: [...overdueRepNames],
-          // BETA NOTE — certifications/teams-below-target/coaching-gaps have
-          // no backing data model yet; kept as empty (not fabricated) and
-          // their cards are hidden below rather than shown with fake zeros.
-          overdueCertifications: 0,
-          certExpiringSoon:      [],
-          lowReadinessReps:      people.filter(p => p.readinessScore < 65).map(p => ({ id: p.id, name: p.name, score: p.readinessScore })),
-          teamsBelowTarget:      [],
-          coachingGaps:          [],
-        },
+        rows: unique,
+        heatmap: heatmap ?? [],
+        assignments: assignments ?? [],
+        quizAttempts: quizAttempts ?? [],
+        lessonCompletions: lessonCompletions ?? [],
+        courses: courses ?? [],
       });
       setLoading(false);
     }).catch(e => {
@@ -13241,6 +13150,137 @@ function LeadershipDashboardScreen({ currentOrg, orgUsers = [], isReal = false }
       setLoading(false);
     });
   }, [isReal, currentOrg?.id, retryKey]); // eslint-disable-line react-hooks/exhaustive-deps
+
+  // Blocking Fix 3 — People Insights / Low-Readiness Reps / Rep Drill-down
+  // names were going permanently stale ("Team Member" placeholder) whenever
+  // the readiness fetch above resolved before the parent's separate orgUsers
+  // fetch did, because names used to be baked into liveData once, inside
+  // that fetch's .then(). Deriving liveData here instead — from the raw,
+  // orgUsers-independent rawFetch plus the current orgUsers prop — means
+  // this recomputes (cheaply, no network call) the instant orgUsers arrives
+  // late, with no manual refresh and no remount required. Assignment status
+  // resolution (resolveAssignmentStatus) and readiness math are unchanged
+  // from before this fix — only *when* orgUsers gets applied changed.
+  const liveData = useMemo(() => {
+    if (!rawFetch) return null;
+    const { hasReadinessScores, rows, heatmap, assignments, quizAttempts, lessonCompletions, courses } = rawFetch;
+
+    // Build people array from orgUsers + readiness_scores rows.
+    // Beta Cleanup — `tag` is now computed from the real score (reusing the
+    // same 85 / 65 band thresholds already used everywhere else in this
+    // file — scoreColor/scoreBg, RepDrillDownModal's band, Insights'
+    // distribution buckets), so the People Insights "Highest" / "Needs
+    // Coaching" filters work for real tenants. "promotion" / "improved"
+    // are NOT set here — both require a real prior-period snapshot that
+    // doesn't exist yet (see the Team Readiness / Readiness Trends BETA
+    // NOTE below); those two filters correctly show "No reps match this
+    // filter" for real data rather than a fabricated result.
+    const people = rows.map((r, i) => {
+      const member = orgUsers.find(u => u.id === r.user_id);
+      const readinessScore = r.score ?? 0;
+      return {
+        id:            r.user_id,
+        name:          member?.name ?? "Team Member",
+        title:         member?.title ?? member?.role ?? "Rep",
+        email:         member?.email ?? "",
+        readinessScore,
+        previousScore:  readinessScore,
+        trend:         0,
+        tag:           readinessScore >= 85 ? "top" : readinessScore < 65 ? "coaching" : undefined,
+        color:         ["#6366f1","#f59e0b","#10b981","#ec4899","#3b82f6"][i % 5],
+      };
+    });
+
+    const avg = people.length ? Math.round(people.reduce((s, p) => s + p.readinessScore, 0) / people.length) : 0;
+
+    // Beta Cleanup — Active/Overdue Assignments, computed by expanding every
+    // tenant_assignments row to its targeted users (resolveAssignedUsers,
+    // same helper QuizTrackingPanel uses) and resolving each (assignment,
+    // user) pair through the shared Resolved Assignment engine
+    // (resolveAssignmentStatus, assignmentEngine.js) — the ONE status
+    // calculator, reused rather than re-derived. Synthetic aggregate
+    // placeholders (a team/group assignment with zero current real
+    // members) are skipped — they don't correspond to an actual rep to
+    // count as active or overdue.
+    const courseLessonIds = new Map(courses.map(c => [c.id, c.lessonIds ?? []]));
+    const completedAtByUserLesson = new Map(
+      lessonCompletions.map(c => [`${c.profileId}::${c.lessonId}`, c.completedAt])
+    );
+    let activeAssignmentCount = 0;
+    let overdueAssignmentCount = 0;
+    const overdueRepNames = new Set();
+    for (const a of assignments) {
+      const targetedUsers = resolveAssignedUsers(a.assignedTo, orgUsers);
+      for (const u of targetedUsers) {
+        if (u._isAggregate) continue;
+        let status;
+        if (a.contentType === "quiz") {
+          const userAttempts = quizAttempts.filter(at => at.quiz_id === a.contentId && at.user_id === u.id);
+          status = resolveAssignmentStatus("quiz", a, { attempts: userAttempts }).status;
+        } else if (a.contentType === "lesson") {
+          const completedAt = completedAtByUserLesson.get(`${u.id}::${a.contentId}`) ?? null;
+          status = resolveAssignmentStatus("lesson", a, { completedAt }).status;
+        } else if (a.contentType === "course") {
+          const lessonIds = courseLessonIds.get(a.contentId) ?? [];
+          const completedAtByLesson = new Map(lessonIds.map(lid => [lid, completedAtByUserLesson.get(`${u.id}::${lid}`) ?? null]));
+          status = resolveAssignmentStatus("course", a, { lessonIds, completedAtByLesson }).status;
+        } else {
+          continue;
+        }
+        if (status !== "completed") activeAssignmentCount++;
+        if (status === "overdue") {
+          overdueAssignmentCount++;
+          overdueRepNames.add(u.name);
+        }
+      }
+    }
+
+    return {
+      hasReadinessScores,
+      company: { readinessScore: avg, previousScore: avg, targetScore: 90, trend: [], period: "Current" },
+      // BETA NOTE:
+      // Hidden until supporting infrastructure is production-ready.
+      // Do not remove.
+      // Planned for post-beta Manager Intelligence milestone.
+      // (teams: no team-level readiness aggregation query exists yet —
+      // Team Readiness / Top Team / Needs Attention are hidden below.)
+      teams:   [],
+      people: people.map(p => ({
+        ...p,
+        score:    p.readinessScore,
+        prev:     p.previousScore,
+        initials: (p.name ?? "").split(" ").map(w => w[0] ?? "").join("").slice(0, 2).toUpperCase() || "TM",
+      })),
+      heatmap,
+      // BETA NOTE:
+      // Hidden until supporting infrastructure is production-ready.
+      // Do not remove.
+      // Planned for post-beta Manager Intelligence milestone.
+      // (trends: no historical readiness time-series is stored yet —
+      // Readiness Trends is hidden below.)
+      trends:    {},
+      // BETA NOTE:
+      // Hidden until supporting infrastructure is production-ready.
+      // Do not remove.
+      // Planned for post-beta Manager Intelligence milestone.
+      // (aiSummary: org-scope AI summary was never wired up — AI
+      // Performance Summary is hidden below.)
+      aiSummary: null,
+      risk: {
+        activeAssignments:     activeAssignmentCount,
+        overdueAssignments:    overdueAssignmentCount,
+        overdueAssignmentReps: [...overdueRepNames],
+        // BETA NOTE — certifications/teams-below-target/coaching-gaps have
+        // no backing data model yet; kept as empty (not fabricated) and
+        // their cards are hidden below rather than shown with fake zeros.
+        overdueCertifications: 0,
+        certExpiringSoon:      [],
+        lowReadinessReps:      people.filter(p => p.readinessScore < 65).map(p => ({ id: p.id, name: p.name, score: p.readinessScore })),
+        teamsBelowTarget:      [],
+        coachingGaps:          [],
+      },
+    };
+  }, [rawFetch, orgUsers]);
 
   // Loading / empty guards — real users only. Demo always falls through to LEADERSHIP_SEED.
   if (loading) {
