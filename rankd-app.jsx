@@ -13051,6 +13051,12 @@ function LeadershipDashboardScreen({ currentOrg, orgUsers = [], isReal = false }
   const hasRealData = !isReal || realMembers.length > 0;
   const [liveData,     setLiveData]     = useState(null);   // null = not yet loaded
   const [loading,      setLoading]      = useState(isReal); // true while Supabase fetch in flight
+  // Blocking Fix 1 — distinct from "loaded but empty". Set only when the
+  // fetch itself throws (network/RLS/etc.), never for an honest empty
+  // tenant, so the UI can tell the two apart instead of showing the same
+  // "No readiness data yet" copy for both.
+  const [fetchError,   setFetchError]   = useState(null);
+  const [retryKey,     setRetryKey]     = useState(0);      // bump to re-run the fetch effect
   const [trendPeriod,  setTrendPeriod]  = useState("weekly");
   const [peopleFilter, setPeopleFilter] = useState("all"); // all | top | improved | promotion | coaching
   const [teamFilter,   setTeamFilter]   = useState("all"); // all | team id
@@ -13062,6 +13068,9 @@ function LeadershipDashboardScreen({ currentOrg, orgUsers = [], isReal = false }
   useEffect(() => {
     const tid = currentOrg?.id;
     if (!isReal || !tid) { setLoading(false); return; }
+
+    setLoading(true);
+    setFetchError(null);
 
     Promise.all([
       supabase
@@ -13086,11 +13095,23 @@ function LeadershipDashboardScreen({ currentOrg, orgUsers = [], isReal = false }
       // Org metrics are independent of whether scores exist
       if (metrics) setOrgMetrics(metrics);
 
-      if (!rows || rows.length === 0) { setLoading(false); return; }
+      // Blocking Fix 1 — readiness_scores having zero rows used to bail out
+      // here and blank the ENTIRE dashboard, discarding org metrics, the
+      // heatmap, assignments, and risk data that had already loaded
+      // successfully in the same Promise.all above. Now we always finish
+      // building liveData from whatever came back; `hasReadinessScores`
+      // (below) lets the render layer show an honest "not yet available"
+      // state for the specific widgets that genuinely depend on per-rep
+      // readiness scores (Overall Readiness, Below Threshold, People
+      // Insights, Low-Readiness Reps) without blocking anything else
+      // (Avg Quiz Score, Content Completion, Active Learners, Active/
+      // Overdue Assignments, Knowledge Heatmap) that doesn't need them.
+      const hasReadinessScores = Boolean(rows && rows.length > 0);
+      const rowsSafe = rows ?? [];
 
       // Deduplicate — take the most recent row per user (handles pre-migration multi-row data)
       const seen = new Set();
-      const unique = rows.filter(r => { if (seen.has(r.user_id)) return false; seen.add(r.user_id); return true; });
+      const unique = rowsSafe.filter(r => { if (seen.has(r.user_id)) return false; seen.add(r.user_id); return true; });
 
       // Build people array from orgUsers + readiness_scores rows.
       // Beta Cleanup — `tag` is now computed from the real score (reusing the
@@ -13163,6 +13184,7 @@ function LeadershipDashboardScreen({ currentOrg, orgUsers = [], isReal = false }
       }
 
       setLiveData({
+        hasReadinessScores,
         company: { readinessScore: avg, previousScore: avg, targetScore: 90, trend: [], period: "Current" },
         // BETA NOTE:
         // Hidden until supporting infrastructure is production-ready.
@@ -13207,8 +13229,18 @@ function LeadershipDashboardScreen({ currentOrg, orgUsers = [], isReal = false }
         },
       });
       setLoading(false);
-    }).catch(e => { console.error("[ralli] LeadershipDashboard fetch failed:", e); setLoading(false); });
-  }, [isReal, currentOrg?.id]); // eslint-disable-line react-hooks/exhaustive-deps
+    }).catch(e => {
+      console.error("[ralli] LeadershipDashboard fetch failed:", e);
+      // Blocking Fix 1 — a genuine request failure (network/RLS/etc.) is
+      // now distinct from an honest empty tenant: it sets fetchError, which
+      // the render layer shows as a dedicated ErrorState with Retry,
+      // instead of silently falling through to the same "No readiness data
+      // yet" copy an empty-but-healthy tenant would see. Never surfaces the
+      // raw Supabase error to the user.
+      setFetchError("We couldn't load your dashboard data. Please try again.");
+      setLoading(false);
+    });
+  }, [isReal, currentOrg?.id, retryKey]); // eslint-disable-line react-hooks/exhaustive-deps
 
   // Loading / empty guards — real users only. Demo always falls through to LEADERSHIP_SEED.
   if (loading) {
@@ -13216,6 +13248,17 @@ function LeadershipDashboardScreen({ currentOrg, orgUsers = [], isReal = false }
       <div style={{ display: "flex", flexDirection: "column", gap: 20 }}>
         <h2 style={{ margin: 0, fontSize: 22, fontWeight: 800, color: C.text }}>Leadership Dashboard</h2>
         <LoadingState rows={5} message="Loading readiness data…" />
+      </div>
+    );
+  }
+  // Blocking Fix 1 — a genuine fetch failure gets its own state + Retry,
+  // checked before the "no data" empty state so the two are never
+  // conflated. Retry just bumps retryKey, which re-runs the fetch effect.
+  if (isReal && fetchError) {
+    return (
+      <div style={{ display: "flex", flexDirection: "column", gap: 20 }}>
+        <h2 style={{ margin: 0, fontSize: 22, fontWeight: 800, color: C.text }}>Leadership Dashboard</h2>
+        <ErrorState message={fetchError} onRetry={() => setRetryKey(k => k + 1)} />
       </div>
     );
   }
@@ -13234,6 +13277,15 @@ function LeadershipDashboardScreen({ currentOrg, orgUsers = [], isReal = false }
 
   // Use live data when available; fall back to LEADERSHIP_SEED for demo / no data yet
   const data = liveData ?? LEADERSHIP_SEED;
+
+  // Blocking Fix 1 — whether we have any real per-rep readiness scores to
+  // summarize. Demo data always has a full people[] from LEADERSHIP_SEED,
+  // so this is always true there; for real tenants it reflects whether
+  // readiness_scores actually returned rows (see hasReadinessScores set in
+  // the fetch effect above). Overall Readiness, Below Threshold,
+  // Low-Readiness Reps, and People Insights all read this instead of
+  // treating an empty score set as a real "0".
+  const hasReadinessData = !isReal || (data.hasReadinessScores ?? data.people.length > 0);
 
   // ── helpers ──
   const scoreColor = (s) => s >= 85 ? C.trueGreen : s >= 70 ? C.orange : C.red;
@@ -13361,11 +13413,17 @@ function LeadershipDashboardScreen({ currentOrg, orgUsers = [], isReal = false }
             Sales Readiness · {company.period}{currentOrg ? ` · ${currentOrg.name}` : ""}
           </p>
         </div>
-        <div style={{ display: "flex", gap: 8 }}>
-          <ScoreBadge score={company.readinessScore} size={16} />
-          <span style={{ fontSize: 13, fontWeight: 600, color: deltaColor(companyDelta) }}>
-            {deltaLabel(companyDelta)} pts
-          </span>
+        <div style={{ display: "flex", gap: 8, alignItems: "center" }}>
+          {hasReadinessData ? (
+            <>
+              <ScoreBadge score={company.readinessScore} size={16} />
+              <span style={{ fontSize: 13, fontWeight: 600, color: deltaColor(companyDelta) }}>
+                {deltaLabel(companyDelta)} pts
+              </span>
+            </>
+          ) : (
+            <span style={{ fontSize: 12, fontWeight: 600, color: C.textMuted }}>Readiness not yet available</span>
+          )}
         </div>
       </div>
 
@@ -13379,10 +13437,15 @@ function LeadershipDashboardScreen({ currentOrg, orgUsers = [], isReal = false }
         const active     = m?.activeLearners    ?? null;
         const cards = [
           {
+            // Blocking Fix 1 — readiness_scores having no rows yet is not
+            // the same as a real, computed 0. Show an honest "not yet
+            // available" state instead of fabricating a score.
             label: "Overall Readiness",
-            value: `${readiness}%`,
-            sub: m ? `${m.totalMembersScored} members scored` : `${deltaLabel(companyDelta)} pts vs last period`,
-            color: scoreColor(readiness),
+            value: hasReadinessData ? `${readiness}%` : "—",
+            sub: hasReadinessData
+              ? (m ? `${m.totalMembersScored} members scored` : `${deltaLabel(companyDelta)} pts vs last period`)
+              : "Not yet available",
+            color: hasReadinessData ? scoreColor(readiness) : C.textMuted,
           },
           {
             label: "Avg Quiz Score",
@@ -13397,10 +13460,12 @@ function LeadershipDashboardScreen({ currentOrg, orgUsers = [], isReal = false }
             color: completion !== null ? scoreColor(completion) : C.textMuted,
           },
           {
+            // Blocking Fix 1 — same honesty rule as Overall Readiness above:
+            // 0 reps scored is not the same claim as "0 reps below threshold".
             label: "Below Threshold",
-            value: `${below}`,
-            sub: "Reps below 65% readiness",
-            color: below > 0 ? C.red : C.trueGreen,
+            value: hasReadinessData ? `${below}` : "—",
+            sub: hasReadinessData ? "Reps below 65% readiness" : "Not yet available",
+            color: hasReadinessData ? (below > 0 ? C.red : C.trueGreen) : C.textMuted,
           },
           {
             label: "Active Learners",
@@ -13908,6 +13973,17 @@ function LeadershipDashboardScreen({ currentOrg, orgUsers = [], isReal = false }
         </div>
 
         <div style={{ display: "flex", flexDirection: "column", gap: 1, borderRadius: 10, overflow: "hidden", border: `1px solid ${C.border}` }}>
+          {/* Blocking Fix 1 — an honest, dedicated empty state for "no
+              readiness scores computed yet", kept distinct from the
+              filter-produced "No reps match this filter" below it (which
+              only makes sense once real scores exist to filter). Filter
+              chips above stay visible/usable either way. */}
+          {!hasReadinessData ? (
+            <div style={{ padding: 32, textAlign: "center", fontSize: 13, color: C.textSub }}>
+              Readiness scores haven't been calculated yet. Scores appear automatically once your team completes lessons, quizzes, or courses.
+            </div>
+          ) : (
+          <>
           {/* Header */}
           <div style={{ display: "flex", alignItems: "center", gap: 12, padding: "8px 16px", background: C.pageBg }}>
             <div style={{ width: 36 }} />
@@ -13966,6 +14042,8 @@ function LeadershipDashboardScreen({ currentOrg, orgUsers = [], isReal = false }
             <div style={{ padding: 32, textAlign: "center", fontSize: 13, color: C.textSub }}>
               No reps match this filter.
             </div>
+          )}
+          </>
           )}
         </div>
       </Card>
@@ -14029,14 +14107,23 @@ function LeadershipDashboardScreen({ currentOrg, orgUsers = [], isReal = false }
           <div style={{ padding: 16, borderRadius: 10, background: C.redBg, border: `1px solid ${C.red}33` }}>
             <div style={{ fontSize: 13, fontWeight: 700, color: C.text, marginBottom: 10 }}>Low-Readiness Reps</div>
             <div style={{ display: "flex", flexDirection: "column", gap: 6 }}>
-              {data.risk.lowReadinessReps.map(r => (
-                <div key={r.id ?? r.name} style={{ display: "flex", justifyContent: "space-between", alignItems: "center" }}>
-                  <span style={{ fontSize: 12, color: C.textSub }}>{r.name}</span>
-                  <ScoreBadge score={r.score} />
-                </div>
-              ))}
-              {data.risk.lowReadinessReps.length === 0 && (
-                <div style={{ fontSize: 11, color: C.textMuted }}>No reps below the readiness threshold.</div>
+              {/* Blocking Fix 1 — this list is derived from readiness scores,
+                  same as the KPI cards above. An empty readiness set must
+                  not read as "everyone's fine". */}
+              {!hasReadinessData ? (
+                <div style={{ fontSize: 11, color: C.textMuted }}>Readiness scores not yet available.</div>
+              ) : (
+                <>
+                  {data.risk.lowReadinessReps.map(r => (
+                    <div key={r.id ?? r.name} style={{ display: "flex", justifyContent: "space-between", alignItems: "center" }}>
+                      <span style={{ fontSize: 12, color: C.textSub }}>{r.name}</span>
+                      <ScoreBadge score={r.score} />
+                    </div>
+                  ))}
+                  {data.risk.lowReadinessReps.length === 0 && (
+                    <div style={{ fontSize: 11, color: C.textMuted }}>No reps below the readiness threshold.</div>
+                  )}
+                </>
               )}
             </div>
           </div>
