@@ -66,7 +66,7 @@ import {
   updateLastSeenAssignmentsAt,
   subscribeToTenantAssignments,
 } from "./src/lib/contentService.js";
-import { resolveAssignmentStatus, isQualifyingEvent } from "./src/lib/assignmentEngine.js";
+import { resolveAssignmentStatus, isQualifyingEvent, daysUntilDue } from "./src/lib/assignmentEngine.js";
 import { getProfile, createMissingProfile, getTenantProfiles } from "./src/lib/profileService.js";
 import { sendInviteEmail } from "./src/lib/emailService.js";
 import { provisionTenant, buildInviteUrl, normalizeProvisionedOrg, createMemberInvite } from "./src/lib/provisioningService.js";
@@ -357,14 +357,25 @@ function ProgressBar({ value, max = 100, color = C.orange, height = 6, trackColo
   );
 }
 
-function Card({ children, style = {}, onClick, id }) {
+// Leadership Dashboard — Actionable KPI Cards: Card now optionally forwards
+// a11y/interaction props (role, tabIndex, onKeyDown, focus/hover handlers) so
+// a Card can become keyboard-activatable without a second, parallel
+// clickable-card component. All new props are optional and default to
+// undefined, so every existing <Card> usage (the overwhelming majority,
+// non-interactive) renders exactly as before.
+function Card({ children, style = {}, onClick, id, role, tabIndex, onKeyDown, onMouseEnter, onMouseLeave, onFocus, onBlur, ariaLabel }) {
   return (
-    <div id={id} onClick={onClick} style={{
-      background: C.white, borderRadius: 16,
-      border: `1px solid ${C.border}`,
-      boxShadow: C.shadowSm,
-      padding: 20, ...style,
-    }}>
+    <div
+      id={id} onClick={onClick} role={role} tabIndex={tabIndex} onKeyDown={onKeyDown}
+      onMouseEnter={onMouseEnter} onMouseLeave={onMouseLeave} onFocus={onFocus} onBlur={onBlur}
+      aria-label={ariaLabel}
+      style={{
+        background: C.white, borderRadius: 16,
+        border: `1px solid ${C.border}`,
+        boxShadow: C.shadowSm,
+        padding: 20, ...style,
+      }}
+    >
       {children}
     </div>
   );
@@ -599,11 +610,19 @@ function useSharedUserAssignmentData(tenantId, userId, enabled) {
     if (!rows?.length) return;
     setAssignments(prev => [...prev, ...rows]);
   }, []);
+  // Assignment Experience Priority 1 — optimistic counterpart to
+  // applyLocalAssignmentsCreated above, so Home/Learn/Quizzes drop a removed
+  // assignment immediately instead of waiting on the ~400ms debounced
+  // realtime refetch (subscribeToTenantAssignments above already covers the
+  // case where the removal happened in a different tab/session).
+  const applyLocalAssignmentsRemoved = useCallback((assignmentId) => {
+    setAssignments(prev => prev.filter(a => a.id !== assignmentId));
+  }, []);
 
   return {
     assignments, lessonCompletionsAt, quizAttempts,
     loading, error, loadedAt, retry,
-    applyLocalLessonCompletion, applyLocalQuizAttempt, applyLocalAssignmentsCreated,
+    applyLocalLessonCompletion, applyLocalQuizAttempt, applyLocalAssignmentsCreated, applyLocalAssignmentsRemoved,
   };
 }
 
@@ -1256,7 +1275,11 @@ function PersonalDashboardScreen({
                 <div style={{ display: "flex", alignItems: "center", gap: 6, marginBottom: 10 }}>
                   <div style={{ width: 8, height: 8, borderRadius: 2, background: typeColor }} />
                   <span style={{ fontSize: 11, fontWeight: 700, color: typeColor, letterSpacing: "0.06em" }}>{typeLabel}</span>
-                  {item.required && <span style={{ fontSize: 10, fontWeight: 700, padding: "2px 6px", borderRadius: 4, background: C.redBg, color: C.red }}>REQUIRED</span>}
+                  {/* Assignment Experience Priority 5 — always show one of
+                      Required/Recommended, never omit the badge. Neutral gray
+                      for Recommended so it never looks like the blue "NEW"
+                      badge next to it. */}
+                  <span style={{ fontSize: 10, fontWeight: 700, padding: "2px 6px", borderRadius: 4, background: item.required ? C.redBg : "#F1F5F9", color: item.required ? C.red : "#475569" }}>{item.required ? "REQUIRED" : "RECOMMENDED"}</span>
                   {item.isNew    && <span style={{ fontSize: 10, fontWeight: 700, padding: "2px 6px", borderRadius: 4, background: "#DBEAFE", color: "#2563EB" }}>NEW</span>}
                   {dueStatus && (
                     <span style={{ fontSize: 10, fontWeight: 700, padding: "2px 7px", borderRadius: 4,
@@ -6379,6 +6402,49 @@ function LearnScreen({ role, user, orgUsers = [], orgs = [], onNav, onAwardXp, p
   const [selectedRowKey, setSelectedRowKey] = useState(null); // manager per-rep drill-down (Task 11)
   const [assignTimeframe,  setAssignTimeframe]  = useState("all"); // "all" | "week" | "month" | "custom"
   const [assignDateRange,  setAssignDateRange]  = useState({ start: "", end: "" }); // ISO date strings for custom range
+  // Assignment Experience Priority 1 — assignment removal. confirmRemove
+  // holds the row pending confirmation (null = no dialog open);
+  // removingId guards against a double-click firing two deletes for the
+  // same row while the first request is still in flight.
+  const [confirmRemoveAssignment, setConfirmRemoveAssignment] = useState(null);
+  const [removingAssignmentId, setRemovingAssignmentId] = useState(null);
+
+  // Assignment Experience Priority 1 — reuses the existing deleteAssignment()
+  // infrastructure (src/lib/contentService.js) rather than a new delete path.
+  // deleteAssignment() only removes the one tenant_assignments row by id —
+  // it never touches quiz_attempts, lesson_completions, or any other table,
+  // so historical completions/attempts are preserved by construction, not by
+  // anything this handler has to do. Scoped to `assignedTo.type ===
+  // "individual"` rows only (enforced by only ever being invoked from rows
+  // where the confirm dialog was allowed to open — see renderTable below) —
+  // legacy team/group aggregate rows are never offered a remove action here,
+  // since one such row can represent many reps at once and deleting it would
+  // silently unassign all of them, not just the one being viewed.
+  const handleRemoveAssignment = async () => {
+    const row = confirmRemoveAssignment;
+    if (!row) return;
+    const { a, u } = row;
+    setRemovingAssignmentId(a.id);
+    try {
+      const { error } = await dbDeleteAssignment(a.id);
+      if (error) {
+        console.error("[ralli] deleteAssignment failed:", error);
+        toast.error("Failed to remove assignment. Please try again.");
+        return;
+      }
+      // Optimistic — Home/Learn/Quizzes (all fed by the same shared hook)
+      // update immediately; the realtime subscription is the backstop for
+      // any other open tab/session (Leadership Dashboard, Rep Drill-down,
+      // Quizzes' own tracking panel all have their own subscriptions).
+      sharedAssignmentData?.applyLocalAssignmentsRemoved?.(a.id);
+      if (selectedAssignmentId === a.id) setSelectedAssignmentId(null);
+      if (selectedRowKey === `${a.id}-${u.id}`) setSelectedRowKey(null);
+      toast.success(`Assignment removed for ${u.name}.`);
+    } finally {
+      setRemovingAssignmentId(null);
+      setConfirmRemoveAssignment(null);
+    }
+  };
 
   // ── Load content from Supabase for real users ────────────────────────────
   // Task 13 — this is now course/lesson catalog (content-CRUD-owned, stays
@@ -6917,7 +6983,9 @@ function LearnScreen({ role, user, orgUsers = [], orgs = [], onNav, onAwardXp, p
                       <span style={{ fontSize: 11, fontWeight: 700, color: typeColor, letterSpacing: "0.06em" }}>
                         {isCourse ? `COURSE · ${courseLessons.length} LESSONS` : `LESSON · ${content.type.toUpperCase()}`}
                       </span>
-                      {a.required && <span style={{ fontSize: 10, fontWeight: 700, padding: "1px 6px", borderRadius: 4, background: C.redBg, color: C.red }}>REQUIRED</span>}
+                      {/* Assignment Experience Priority 5 — always show one of
+                          Required/Recommended, never omit the badge. */}
+                      <span style={{ fontSize: 10, fontWeight: 700, padding: "1px 6px", borderRadius: 4, background: a.required ? C.redBg : "#F1F5F9", color: a.required ? C.red : "#475569" }}>{a.required ? "REQUIRED" : "RECOMMENDED"}</span>
                       {isComplete && <span style={{ fontSize: 10, fontWeight: 700, padding: "1px 6px", borderRadius: 4, background: C.greenBg, color: C.green }}>COMPLETE</span>}
                       {dueStatus && (
                         <span style={{ fontSize: 10, fontWeight: 700, padding: "1px 6px", borderRadius: 4,
@@ -7475,14 +7543,19 @@ function LearnScreen({ role, user, orgUsers = [], orgs = [], onNav, onAwardXp, p
         // PROGRESS / SCORE / DONE — identical for every content type (Task
         // 11 baseline). SCORE is quiz-only; lesson/course rows show "—"
         // rather than a fabricated score or attempt count.
-        const TRACKING_GRID = "1.7fr 1.1fr 0.75fr 0.75fr 0.85fr 0.95fr 1fr 0.75fr";
+        // Assignment Experience Priority 1 — one extra narrow column for the
+        // Remove action, added to the end so CONTENT/REP/.../DONE keep their
+        // existing widths and ordering unchanged. minWidth bumped by the same
+        // amount so the table's existing horizontal-scroll-on-mobile behavior
+        // (unchanged) still fits every column at the same relative size.
+        const TRACKING_GRID = "1.7fr 1.1fr 0.75fr 0.75fr 0.85fr 0.95fr 1fr 0.75fr 0.6fr";
         const fmtShort = (iso) => { try { return new Date(iso).toLocaleDateString("en-US", { month: "short", day: "numeric" }); } catch { return "—"; } };
 
         const renderTable = (rows) => (
           <div style={{ borderRadius: 12, overflow: "hidden", border: `1px solid ${C.border}` }}>
             <div style={{ overflowX: "auto", WebkitOverflowScrolling: "touch" }}>
-            <div style={{ minWidth: 860, display: "grid", gridTemplateColumns: TRACKING_GRID, gap: 10, padding: "10px 16px", background: C.pageBg, fontSize: 11, fontWeight: 700, color: C.textMuted, letterSpacing: "0.05em" }}>
-              <span>CONTENT</span><span>REP</span><span>ASSIGNED</span><span>DUE DATE</span><span>STATUS</span><span>PROGRESS</span><span>SCORE</span><span>DONE</span>
+            <div style={{ minWidth: 940, display: "grid", gridTemplateColumns: TRACKING_GRID, gap: 10, padding: "10px 16px", background: C.pageBg, fontSize: 11, fontWeight: 700, color: C.textMuted, letterSpacing: "0.05em" }}>
+              <span>CONTENT</span><span>REP</span><span>ASSIGNED</span><span>DUE DATE</span><span>STATUS</span><span>PROGRESS</span><span>SCORE</span><span>DONE</span><span></span>
             </div>
             {rows.map((row, i) => {
               const { a, content, isCourse, isQuiz, u, progress, status, completedAt, userAttempts } = row;
@@ -7501,11 +7574,21 @@ function LearnScreen({ role, user, orgUsers = [], orgs = [], onNav, onAwardXp, p
               const bestScore      = sortedAttempts.length ? Math.max(...sortedAttempts.map(at => at.score ?? 0)) : null;
               const canDrilldown   = !u._isAggregate;
               const rowKey = `${a.id}-${u.id}`;
+              // Assignment Experience Priority 1 — remove is offered only for
+              // true per-user assignment rows (the current, default shape
+              // every new assignment now takes — see contentService.js's
+              // ASSIGNMENTS header). A legacy assigned_to.type === "team"/
+              // "group" aggregate row can still expand to multiple reps
+              // sharing one row id; deleting that id would unassign all of
+              // them, not just the one in this row, so those rows don't get a
+              // remove control here.
+              const canRemove = canDrilldown && a.assignedTo?.type === "individual";
+              const isRemoving = removingAssignmentId === a.id;
               return (
                 <div
                   key={`${rowKey}-${i}`}
                   onClick={canDrilldown ? () => setSelectedRowKey(rowKey) : undefined}
-                  style={{ minWidth: 860, display: "grid", gridTemplateColumns: TRACKING_GRID, gap: 10, padding: "13px 16px", background: C.white, borderTop: `1px solid ${C.border}`, alignItems: "center", cursor: canDrilldown ? "pointer" : "default" }}
+                  style={{ minWidth: 940, display: "grid", gridTemplateColumns: TRACKING_GRID, gap: 10, padding: "13px 16px", background: C.white, borderTop: `1px solid ${C.border}`, alignItems: "center", cursor: canDrilldown ? "pointer" : "default" }}
                 >
                   {/* Content — also independently clickable to drill into this assignment across all reps */}
                   <div style={{ display: "flex", alignItems: "center", gap: 10, minWidth: 0 }}>
@@ -7555,6 +7638,26 @@ function LearnScreen({ role, user, orgUsers = [], orgs = [], onNav, onAwardXp, p
                   </div>
                   {/* Completed at */}
                   <span style={{ fontSize: 12, color: C.textSub }}>{completedAt ? fmtShort(completedAt) : "—"}</span>
+                  {/* Assignment Experience Priority 1 — Remove action.
+                      Individual rows only (see canRemove above); legacy
+                      team/group aggregate rows show nothing here rather than
+                      a control that would silently remove the whole group. */}
+                  <div onClick={e => e.stopPropagation()}>
+                    {canRemove ? (
+                      <button
+                        onClick={() => setConfirmRemoveAssignment(row)}
+                        disabled={isRemoving}
+                        title={`Remove this assignment for ${u.name}`}
+                        style={{
+                          padding: "5px 10px", borderRadius: 7, border: "1px solid #fca5a5",
+                          background: "#fef2f2", color: "#ef4444", fontSize: 11, fontWeight: 600,
+                          cursor: isRemoving ? "default" : "pointer", opacity: isRemoving ? 0.6 : 1,
+                        }}
+                      >
+                        {isRemoving ? "…" : "Remove"}
+                      </button>
+                    ) : null}
+                  </div>
                 </div>
               );
             })}
@@ -7627,7 +7730,7 @@ function LearnScreen({ role, user, orgUsers = [], orgs = [], onNav, onAwardXp, p
                 )}
                 <div style={{ flex: 1, minWidth: 0 }}>
                   <div style={{ fontSize: 14, fontWeight: 700, color: C.text }}>{detailContent.title ?? detailContent.name}</div>
-                  <div style={{ fontSize: 11, color: C.textSub }}>{detailAssignment?.contentType === "course" ? "Course" : detailAssignment?.contentType === "quiz" ? "Quiz" : "Lesson"}{detailAssignment?.required ? " · Required" : ""} · {visibleRows.length} rep{visibleRows.length !== 1 ? "s" : ""}</div>
+                  <div style={{ fontSize: 11, color: C.textSub }}>{detailAssignment?.contentType === "course" ? "Course" : detailAssignment?.contentType === "quiz" ? "Quiz" : "Lesson"} · {detailAssignment?.required ? "Required" : "Recommended"} · {visibleRows.length} rep{visibleRows.length !== 1 ? "s" : ""}</div>
                 </div>
               </div>
             )}
@@ -7831,6 +7934,40 @@ function LearnScreen({ role, user, orgUsers = [], orgs = [], onNav, onAwardXp, p
           }}
           onClose={() => setAssignModal(null)}
         />
+      )}
+
+      {/* Assignment Experience Priority 1 — remove-assignment confirmation.
+          Same visual pattern as the "Remove {member}?" confirmation used
+          elsewhere in the app (OrgDetailScreen), for visual consistency. */}
+      {confirmRemoveAssignment && (
+        <div
+          style={{ position: "fixed", inset: 0, background: "rgba(0,0,0,0.45)", display: "flex", alignItems: "center", justifyContent: "center", zIndex: 1100, padding: 20 }}
+          onClick={e => { if (e.target === e.currentTarget && !removingAssignmentId) setConfirmRemoveAssignment(null); }}
+        >
+          <div style={{ background: C.white, borderRadius: 16, padding: 28, width: "100%", maxWidth: 420, boxShadow: "0 24px 60px rgba(0,0,0,0.2)", boxSizing: "border-box" }}>
+            <h3 style={{ margin: "0 0 8px", fontSize: 17, fontWeight: 800, color: C.text, textAlign: "center" }}>
+              Remove this assignment?
+            </h3>
+            <p style={{ margin: "0 0 20px", fontSize: 13, color: C.textSub, textAlign: "center", lineHeight: 1.6 }}>
+              {(confirmRemoveAssignment.content?.title ?? confirmRemoveAssignment.content?.name ?? "This content")} will no longer be assigned to {confirmRemoveAssignment.u?.name ?? "this rep"}.
+              Their completed quiz attempts, lesson completions, and course progress are never deleted — only the assignment itself is removed. This cannot be undone, but the content can be reassigned at any time.
+            </p>
+            <div style={{ display: "flex", gap: 10 }}>
+              <button
+                onClick={() => setConfirmRemoveAssignment(null)}
+                disabled={!!removingAssignmentId}
+                style={{ flex: 1, padding: "11px", borderRadius: 10, border: `1px solid ${C.border}`, background: C.white, color: C.text, fontSize: 13, fontWeight: 700, cursor: removingAssignmentId ? "default" : "pointer" }}
+              >Cancel</button>
+              <button
+                onClick={handleRemoveAssignment}
+                disabled={!!removingAssignmentId}
+                style={{ flex: 1, padding: "11px", borderRadius: 10, border: "none", background: "#ef4444", color: "#fff", fontSize: 13, fontWeight: 700, cursor: removingAssignmentId ? "not-allowed" : "pointer", opacity: removingAssignmentId ? 0.7 : 1 }}
+              >
+                {removingAssignmentId ? "Removing…" : "Yes, remove"}
+              </button>
+            </div>
+          </div>
+        </div>
       )}
     </div>
   );
@@ -9068,17 +9205,34 @@ function AssignContentModal({ contentType, contentId, content, orgUsers, orgs, c
                 // dropped) but can't be selected; a status badge explains why.
                 const unavailable = isUnavailable(u);
                 const isActive = eligibilityReady && activeAssignments.has(u.id);
+                // Assignment Experience Priority 4 — a candidate who already
+                // holds an active assignment for this exact content can no
+                // longer be selected here (previously they could be picked
+                // and would only find out via a post-submit error toast).
+                // Reuses the same eligibilityReady/activeAssignments data the
+                // "Active"/"Eligible" badge below already reads — no second
+                // eligibility check. The atomic RPC (create_assignments_atomic)
+                // remains the real enforcement; this only front-loads the
+                // explanation to before submit.
+                const blocked = unavailable || isActive;
+                const activeDue = isActive ? activeAssignments.get(u.id)?.dueAt : null;
+                const blockedReason = unavailable
+                  ? (u.status === "suspended" ? "Suspended — cannot be assigned content." : "Inactive — cannot be assigned content.")
+                  : isActive
+                    ? `Already has an active assignment for this content${activeDue ? ` (due ${new Date(activeDue).toLocaleDateString("en-US", { month: "short", day: "numeric" })})` : ""}. Remove it or wait for completion before reassigning.`
+                    : undefined;
                 return (
                 <button
                   key={u.id}
-                  onClick={() => { if (!unavailable) setSelectedUserId(u.id); }}
-                  disabled={unavailable}
+                  onClick={() => { if (!blocked) setSelectedUserId(u.id); }}
+                  disabled={blocked}
+                  title={blockedReason}
                   style={{
                     display: "flex", alignItems: "center", gap: 10, padding: "10px 14px", borderRadius: 10,
                     border: `2px solid ${selectedUserId === u.id ? C.orange : C.border}`,
                     background: selectedUserId === u.id ? C.orangeLight : C.pageBg,
-                    cursor: unavailable ? "not-allowed" : "pointer", textAlign: "left",
-                    opacity: unavailable ? 0.55 : 1,
+                    cursor: blocked ? "not-allowed" : "pointer", textAlign: "left",
+                    opacity: blocked ? 0.55 : 1,
                   }}>
                   <Avatar initials={u.initials ?? (u.name?.[0] ?? "U").toUpperCase()} size={32} color={u.color} />
                   <div style={{ flex: 1, minWidth: 0 }}>
@@ -9463,14 +9617,17 @@ const DEMO_CONTINUE_LEARNING_SEED = [
 const diffColors = { Easy: C.green, Medium: C.orange, Hard: C.red };
 
 // ── Due-date helpers ──────────────────────────────────────────────────────────
+// Assignment Experience Priority 2 — diff now comes from assignmentEngine.js's
+// daysUntilDue(), the same local-day-boundary comparison resolveAssignmentStatus()
+// uses for its "overdue" status. Previously this function re-derived its own
+// day math, which happened to be correct (local-midnight normalized) while the
+// engine compared raw timestamps — the two only diverged because of that
+// duplication, not because either one was wrong on its own. One definition now,
+// shared, so "Due today" here and "Overdue" on a manager screen can never
+// disagree about the same assignment again.
 function getDueStatus(dueAtStr) {
-  if (!dueAtStr) return null;
-  const now   = new Date(); now.setHours(0,0,0,0);
-  const due   = new Date(dueAtStr); due.setHours(0,0,0,0);
-  const diff  = Math.round((due - now) / 86400000); // days
-  const thisMonday  = new Date(now); thisMonday.setDate(now.getDate()  - now.getDay() + 1);
-  const nextSunday  = new Date(thisMonday); nextSunday.setDate(thisMonday.getDate() + 13);
-  const nextSaturday = new Date(thisMonday); nextSaturday.setDate(thisMonday.getDate() + 12);
+  const diff = daysUntilDue(dueAtStr);
+  if (diff == null) return null;
 
   if (diff < 0)  return { label: "Overdue",        color: C.red,    urgent: true  };
   if (diff === 0)return { label: "Due today",       color: C.red,    urgent: true  };
@@ -10435,8 +10592,17 @@ function QuizLibraryGrid({ quizzes, onEditQuiz, onNav, onDeleteQuiz, onToggleFav
 // row per assigned rep, joined against real quiz_attempts so status/score/attempt
 // count always reflect the DB — never a locally-cached guess. Mirrors the
 // assignedTo-resolution pattern used by LearnScreen's manager Assignments tab.
+// Assignment Experience Priority 6 — label normalized from "Assigned" to
+// "Not Started" so this specific engine status (`not_started`) reads
+// identically here and in LearnScreen's unified tracking table /
+// ContentAssignmentDrilldown's STATUS_CONFIG, which already used "Not
+// Started" for the same status. The internal key stays "assigned" (it's
+// wired into statusTab state/filters below) — only the displayed word
+// changes. "Active" is left as-is elsewhere: it names a different,
+// already-consistent concept (not_started + in_progress + overdue combined,
+// see contentService.js's ASSIGNMENTS header), not this single status.
 const QUIZ_STATUS_CONFIG = {
-  assigned:    { label: "Assigned",    bg: "#F1F5F9", text: "#475569" },
+  assigned:    { label: "Not Started", bg: "#F1F5F9", text: "#475569" },
   in_progress: { label: "In Progress", bg: "#DBEAFE", text: "#1D4ED8" },
   completed:   { label: "Completed",   bg: "#DCFCE7", text: "#166534" },
   overdue:     { label: "Overdue",     bg: "#FEE2E2", text: "#991B1B" },
@@ -10484,9 +10650,10 @@ function buildQuizAssignmentRows(assignments, attempts, quizzes, orgUsers) {
       const engineResult = u._isAggregate
         ? { status: "not_started", progress: 0, completedAt: null }
         : resolveAssignmentStatus("quiz", a, { attempts: userAttempts });
-      // QUIZ_STATUS_CONFIG uses "assigned" for the not-yet-started state;
-      // the engine's vocabulary is "not_started" — translate so the existing
-      // labels/config stay untouched.
+      // QUIZ_STATUS_CONFIG's internal key for the not-yet-started state is
+      // still "assigned" (wired into statusTab filtering below); its
+      // displayed label is "Not Started" (Assignment Experience Priority 6),
+      // matching the engine's own "not_started" vocabulary.
       const status = engineResult.status === "not_started" ? "assigned" : engineResult.status;
 
       return {
@@ -10750,7 +10917,7 @@ function QuizTrackingPanel({ quizzes, orgUsers, tenantId, isReal, refreshKey, on
       {/* Status tabs */}
       <div style={{ display: "flex", gap: 6, flexWrap: "wrap" }}>
         {[
-          ["assigned",    `Assigned (${counts.assigned})`],
+          ["assigned",    `Not Started (${counts.assigned})`],
           ["in_progress", `In Progress (${counts.in_progress})`],
           ["completed",   `Completed (${counts.completed})`],
           ["overdue",     `Overdue (${counts.overdue})`],
@@ -12806,11 +12973,13 @@ function _contentTypeLabel(contentType) {
 
 // Rep Drill-Down Final Polish — days a due date is past, floored at 0 (never
 // negative; callers only invoke this for items already known to be overdue).
+// Assignment Experience Priority 2 — now derived from the same
+// daysUntilDue() the shared engine's own "overdue" status and getDueStatus()
+// use, instead of this component's own raw-timestamp diff (which could
+// disagree with both by up to a day depending on timezone/time-of-day).
 function _daysOverdue(dueAt) {
-  if (!dueAt || dueAt === "Open") return null;
-  const d = new Date(dueAt);
-  if (isNaN(d)) return null;
-  return Math.max(0, Math.ceil((Date.now() - d.getTime()) / 86400000));
+  const diff = daysUntilDue(dueAt);
+  return diff != null && diff < 0 ? -diff : null;
 }
 
 // Rep Drill-Down Final Polish — shared newest-first sort for every
@@ -12866,6 +13035,9 @@ function RepDrillDownModal({ rep, tenantId, onClose, isReal = false }) {
   // Brief highlight on the Assigned Learning row an Overdue Assignments
   // item was clicked to jump to — cleared automatically after 1.6s.
   const [highlightAssignmentId, setHighlightAssignmentId] = useState(null);
+  // Assignment Experience Priority 1 — bump to re-run the fetch effect below
+  // when tenant_assignments changes elsewhere while this modal is open.
+  const [refreshKey, setRefreshKey] = useState(0);
   const toggleSection = (key) => setExpandedSections(prev => ({ ...prev, [key]: !prev[key] }));
   const expandSection = (key) => setExpandedSections(prev => ({ ...prev, [key]: true }));
   const jumpToAssignment = (id) => {
@@ -13119,7 +13291,17 @@ function RepDrillDownModal({ rep, tenantId, onClose, isReal = false }) {
 
       setLoading(false);
     }).catch(() => setLoading(false));
-  }, [rep?.id, rep?.user_id, tenantId, isReal]);
+  }, [rep?.id, rep?.user_id, tenantId, isReal, refreshKey]);
+
+  // Assignment Experience Priority 1 — live updates while this modal is
+  // open: if a manager removes (or creates) an assignment for this rep from
+  // Learn's Assignments tab in another view, this drill-down reflects it
+  // without needing to close and reopen. Same pattern as
+  // LeadershipDashboardScreen's and QuizTrackingPanel's subscriptions.
+  useEffect(() => {
+    if (!isReal || !tenantId) return;
+    return subscribeToTenantAssignments(tenantId, "rep-drilldown", () => setRefreshKey(k => k + 1));
+  }, [isReal, tenantId]);
 
   if (!rep) return null;
 
@@ -13240,6 +13422,15 @@ function RepDrillDownModal({ rep, tenantId, onClose, isReal = false }) {
             {(() => {
               const s = stats ?? {};
               const scoreClr = (v) => v == null ? C.textMuted : v >= 85 ? C.trueGreen : v >= 65 ? C.orange : C.red;
+              // Assignment Experience Priority 3 — presentation-only split of
+              // s.activeAssignments (unchanged: still totalAssignments minus
+              // completedAssignments, still includes overdue) into two
+              // mutually-exclusive numbers for display, so "active" and
+              // "overdue" can't be read as double-counted or misadded against
+              // the total. activeNotOverdue is never persisted anywhere —
+              // it's derived fresh at render time from the same two numbers
+              // the old copy already showed.
+              const activeNotOverdue = Math.max(0, (s.activeAssignments ?? 0) - (s.overdueAssignments ?? 0));
               const Tile = ({ label, value, sub, color = C.text }) => (
                 <div style={{ background: C.pageBg, borderRadius: C.radiusSm, padding: "12px 14px", minWidth: 0 }}>
                   <div style={{ fontSize: 20, fontWeight: 800, color }}>{value}</div>
@@ -13278,7 +13469,7 @@ function RepDrillDownModal({ rep, tenantId, onClose, isReal = false }) {
                       value={s.assignmentCompletionRate != null ? `${s.assignmentCompletionRate}%` : "No data"}
                       sub={
                         s.totalAssignments
-                          ? `${s.completedAssignments} of ${s.totalAssignments} instances · ${s.activeAssignments} active · ${s.overdueAssignments} overdue`
+                          ? `${s.completedAssignments} completed · ${activeNotOverdue} active · ${s.overdueAssignments} overdue · ${s.totalAssignments} total`
                           : "No individual assignments"
                       }
                       color={scoreClr(s.assignmentCompletionRate)}
@@ -13493,7 +13684,9 @@ function RepDrillDownModal({ rep, tenantId, onClose, isReal = false }) {
                             <div style={{ fontSize: 11, color: C.textMuted, marginTop: 2 }}>
                               {_contentTypeLabel(a.content_type)}
                               {a.due_at && a.due_at !== "Open" ? ` · Due ${new Date(a.due_at).toLocaleDateString()}` : ""}
-                              {a.required ? " · Required" : ""}
+                              {/* Assignment Experience Priority 5 — always
+                                  show one of Required/Recommended. */}
+                              {` · ${a.required ? "Required" : "Recommended"}`}
                             </div>
                           </div>
                           <span style={{ fontSize: 11, padding: "2px 8px", borderRadius: 99, fontWeight: 600, background: a.status === "Pending" ? C.pageBg : `${statusColor}18`, color: statusColor, border: `1px solid ${statusColor}44` }}>
@@ -13518,6 +13711,68 @@ function RepDrillDownModal({ rep, tenantId, onClose, isReal = false }) {
 
           </div>
         )}
+      </div>
+    </div>
+  );
+}
+
+// Leadership Dashboard — Actionable KPI Cards: one reusable detail
+// modal/panel shared by Below Threshold, Active Learners, and Active
+// Assignments, rather than three near-identical modals. Visual shell mirrors
+// RepDrillDownModal's existing pattern (fixed backdrop, white card, sticky
+// header, close button) for consistency — same house style, not a new one.
+// Escape closes it; the close button is focused on open so keyboard users
+// land somewhere useful immediately.
+function KPIDetailModal({ title, subtitle, onClose, isEmpty, emptyMessage, children }) {
+  const closeBtnRef = useRef(null);
+  useEffect(() => {
+    closeBtnRef.current?.focus();
+    const onKey = (e) => { if (e.key === "Escape") onClose(); };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, [onClose]);
+
+  return (
+    <div
+      onClick={onClose}
+      style={{
+        position: "fixed", inset: 0, zIndex: 1000,
+        background: "rgba(11,18,32,0.45)", display: "flex",
+        alignItems: "center", justifyContent: "center", padding: 16,
+      }}
+    >
+      <div
+        onClick={e => e.stopPropagation()}
+        role="dialog"
+        aria-modal="true"
+        aria-label={title}
+        style={{
+          background: C.white, borderRadius: C.radius, width: "100%", maxWidth: 640,
+          maxHeight: "85vh", overflowY: "auto",
+          boxShadow: "0 8px 40px rgba(11,18,32,0.18)",
+        }}
+      >
+        <div style={{
+          padding: "20px 24px", borderBottom: `1px solid ${C.border}`,
+          display: "flex", alignItems: "flex-start", justifyContent: "space-between", gap: 14,
+          position: "sticky", top: 0, background: C.white, zIndex: 1,
+        }}>
+          <div>
+            <div style={{ fontWeight: 700, fontSize: 17, color: C.text }}>{title}</div>
+            {subtitle && <div style={{ fontSize: 13, color: C.textMuted, marginTop: 2 }}>{subtitle}</div>}
+          </div>
+          <button
+            ref={closeBtnRef}
+            onClick={onClose}
+            aria-label="Close"
+            style={{ background: "none", border: "none", cursor: "pointer", fontSize: 20, color: C.textMuted, lineHeight: 1, flexShrink: 0 }}
+          >✕</button>
+        </div>
+        <div style={{ padding: 24 }}>
+          {isEmpty ? (
+            <div style={{ padding: "36px 16px", textAlign: "center", color: C.textMuted, fontSize: 14 }}>{emptyMessage}</div>
+          ) : children}
+        </div>
       </div>
     </div>
   );
@@ -13549,6 +13804,17 @@ function LeadershipDashboardScreen({ currentOrg, orgUsers = [], isReal = false }
   const [selectedRep,  setSelectedRep]  = useState(null);  // rep object for drill-down modal
   const [orgMetrics,   setOrgMetrics]   = useState(null);  // getOrgMetrics result
   const [topicFilter,  setTopicFilter]  = useState(null);  // string | null — filter people by weak topic
+  // Actionable KPI Cards — null | "belowThreshold" | "activeLearners" | "activeAssignments"
+  const [openKpiDetail, setOpenKpiDetail] = useState(null);
+  const [hoveredKpiCard, setHoveredKpiCard] = useState(null);
+  const [focusedKpiCard, setFocusedKpiCard] = useState(null);
+  // Actionable KPI Cards — Active Learners' inactivity window. Named
+  // constant (not inlined) so this is the one place to change it, and so a
+  // future Settings-driven override just needs to replace this line with a
+  // prop/context read rather than hunting down the threshold across the
+  // component (explicitly out of scope for this task — thresholds/Settings
+  // are not being wired up here).
+  const LEARNING_ACTIVITY_INACTIVE_DAYS = 30;
 
   // Load readiness scores + topic heatmap + org metrics from Supabase.
   // Blocking Fix 3 — deliberately does NOT depend on orgUsers. orgUsers is
@@ -13582,9 +13848,29 @@ function LeadershipDashboardScreen({ currentOrg, orgUsers = [], isReal = false }
       getTenantQuizAttempts(tid),
       getTenantLessonCompletions(tid),
       getTenantCourses(tid),
+      // Actionable KPI Cards — lessons/quizzes added so the Active Assignments
+      // detail view can show real content names (previously this screen only
+      // had enough data to compute counts, not the underlying rows). Reuses
+      // the same getTenantLessons/getTenantQuizzes already used by Learn and
+      // Quizzes — no new column-name bugs, both already select("*") + map
+      // through dbToLesson/dbToQuiz.
+      getTenantLessons(tid),
+      getTenantQuizzes(tid),
+      // user_point_events added so "most recent activity" (Below Threshold
+      // detail) and "Active Learners" (its own KPI card's detail view) both
+      // read the same three-source activity signal RepDrillDownModal's
+      // "Most Recent Activity" KPI already established (quiz attempts +
+      // lesson completions + point events) — not a new definition, just
+      // applied org-wide instead of one rep at a time. This is also exactly
+      // what getOrgMetrics()'s own activeLearners count is derived from
+      // (see insightsService.js), so the detail view can never disagree
+      // with the summary number on the card that opens it.
+      supabase.from("user_point_events").select("user_id, created_at").eq("tenant_id", tid),
     ]).then(([
       { data: rows }, heatmap, metrics,
       { data: assignments }, { data: quizAttempts }, { data: lessonCompletions }, { data: courses },
+      { data: lessons }, { data: quizzes },
+      { data: pointEvents },
     ]) => {
       // Org metrics are independent of whether scores exist
       if (metrics) setOrgMetrics(metrics);
@@ -13618,6 +13904,9 @@ function LeadershipDashboardScreen({ currentOrg, orgUsers = [], isReal = false }
         quizAttempts: quizAttempts ?? [],
         lessonCompletions: lessonCompletions ?? [],
         courses: courses ?? [],
+        lessons: lessons ?? [],
+        quizzes: quizzes ?? [],
+        pointEvents: pointEvents ?? [],
       });
       setLoading(false);
     }).catch(e => {
@@ -13633,6 +13922,19 @@ function LeadershipDashboardScreen({ currentOrg, orgUsers = [], isReal = false }
     });
   }, [isReal, currentOrg?.id, retryKey]); // eslint-disable-line react-hooks/exhaustive-deps
 
+  // Assignment Experience Priority 1 — live updates for Company Risk /
+  // Active & Overdue Assignments when an assignment is created or removed
+  // anywhere else in the app (Learn's Assignments tab, Quizzes tracking).
+  // Same scoped-channel + debounced-refetch pattern QuizTrackingPanel's
+  // "quizzes-tracking" subscription already uses; this dashboard previously
+  // had no realtime subscription at all and only refreshed on manual retry
+  // or remount.
+  useEffect(() => {
+    const tid = currentOrg?.id;
+    if (!isReal || !tid) return;
+    return subscribeToTenantAssignments(tid, "leadership-dashboard", () => setRetryKey(k => k + 1));
+  }, [isReal, currentOrg?.id]);
+
   // Blocking Fix 3 — People Insights / Low-Readiness Reps / Rep Drill-down
   // names were going permanently stale ("Team Member" placeholder) whenever
   // the readiness fetch above resolved before the parent's separate orgUsers
@@ -13645,7 +13947,34 @@ function LeadershipDashboardScreen({ currentOrg, orgUsers = [], isReal = false }
   // from before this fix — only *when* orgUsers gets applied changed.
   const liveData = useMemo(() => {
     if (!rawFetch) return null;
-    const { hasReadinessScores, rows, heatmap, assignments, quizAttempts, lessonCompletions, courses } = rawFetch;
+    const { hasReadinessScores, rows, heatmap, assignments, quizAttempts, lessonCompletions, courses, lessons, quizzes, pointEvents } = rawFetch;
+
+    // Actionable KPI Cards — content-name lookups for the Active Assignments
+    // detail view. Reuses the already-correct getTenantLessons/getTenantCourses/
+    // getTenantQuizzes (select("*") + dbTo* mapping) fetched above — not the
+    // raw inline "id, name" queries RepDrillDownModal had to fix earlier for
+    // the same two tables.
+    const lessonTitleById = new Map(lessons.map(l => [l.id, l.title]));
+    const courseTitleById = new Map(courses.map(c => [c.id, c.title]));
+    const quizNameById    = new Map(quizzes.map(q => [q.id, q.name]));
+
+    // Actionable KPI Cards — last learning-activity per user, combining the
+    // same three sources RepDrillDownModal's "Most Recent Activity" KPI
+    // already combines (quiz attempts, lesson completions, point events).
+    // Applied org-wide here (one map over all users) instead of one rep at a
+    // time. Explicitly NOT login/authentication activity — this tenant's
+    // schema has no last-sign-in field anywhere (confirmed: no such column
+    // on profiles, and the app never queries auth.users) — so this is always
+    // labeled "Learning Activity" at the UI layer, never "Last Sign-In."
+    const lastActivityByUser = new Map();
+    const noteActivity = (userId, iso) => {
+      if (!userId || !iso) return;
+      const prev = lastActivityByUser.get(userId);
+      if (!prev || new Date(iso) > new Date(prev)) lastActivityByUser.set(userId, iso);
+    };
+    for (const a of quizAttempts) noteActivity(a.user_id, a.created_at);
+    for (const c of lessonCompletions) noteActivity(c.profileId, c.completedAt);
+    for (const e of pointEvents) noteActivity(e.user_id, e.created_at);
 
     // Knowledge Heatmap empty-state diagnosis — getTopicHeatmap (called in
     // the fetch effect above) returns [] for three different underlying
@@ -13675,6 +14004,10 @@ function LeadershipDashboardScreen({ currentOrg, orgUsers = [], isReal = false }
         name:          member?.name ?? "Team Member",
         title:         member?.title ?? member?.role ?? "Rep",
         email:         member?.email ?? "",
+        // Actionable KPI Cards — Below Threshold detail's "most recent
+        // activity" column. null (not 0/fabricated) when this rep has no
+        // recorded learning activity at all.
+        lastActivityAt: lastActivityByUser.get(r.user_id) ?? null,
         readinessScore,
         previousScore:  readinessScore,
         trend:         0,
@@ -13705,28 +14038,56 @@ function LeadershipDashboardScreen({ currentOrg, orgUsers = [], isReal = false }
     // RepDrillDownModal a rep's name opens from People Insights / Low-
     // Readiness Reps, instead of being a dead label.
     const overdueReps = new Map();
+    // Actionable KPI Cards — Active Assignments detail view. Built in the
+    // SAME loop that already computes activeAssignmentCount/overdueAssignmentCount
+    // (not a second pass, not a second status calculation) — every row here
+    // is exactly one (assignment, user) pair already resolved through
+    // resolveAssignmentStatus above.
+    const unresolvedAssignments = [];
     for (const a of assignments) {
       const targetedUsers = resolveAssignedUsers(a.assignedTo, orgUsers);
       for (const u of targetedUsers) {
         if (u._isAggregate) continue;
-        let status;
+        let engineResult;
         if (a.contentType === "quiz") {
           const userAttempts = quizAttempts.filter(at => at.quiz_id === a.contentId && at.user_id === u.id);
-          status = resolveAssignmentStatus("quiz", a, { attempts: userAttempts }).status;
+          engineResult = resolveAssignmentStatus("quiz", a, { attempts: userAttempts });
         } else if (a.contentType === "lesson") {
           const completedAt = completedAtByUserLesson.get(`${u.id}::${a.contentId}`) ?? null;
-          status = resolveAssignmentStatus("lesson", a, { completedAt }).status;
+          engineResult = resolveAssignmentStatus("lesson", a, { completedAt });
         } else if (a.contentType === "course") {
           const lessonIds = courseLessonIds.get(a.contentId) ?? [];
           const completedAtByLesson = new Map(lessonIds.map(lid => [lid, completedAtByUserLesson.get(`${u.id}::${lid}`) ?? null]));
-          status = resolveAssignmentStatus("course", a, { lessonIds, completedAtByLesson }).status;
+          engineResult = resolveAssignmentStatus("course", a, { lessonIds, completedAtByLesson });
         } else {
           continue;
         }
+        const status = engineResult.status;
         if (status !== "completed") activeAssignmentCount++;
         if (status === "overdue") {
           overdueAssignmentCount++;
           overdueReps.set(u.id, u.name);
+        }
+        if (status !== "completed") {
+          const contentTitle =
+            a.contentType === "course" ? (courseTitleById.get(a.contentId) ?? "Course") :
+            a.contentType === "lesson" ? (lessonTitleById.get(a.contentId) ?? "Lesson") :
+            a.contentType === "quiz"   ? (quizNameById.get(a.contentId)   ?? "Quiz")   : "Content";
+          unresolvedAssignments.push({
+            key: `${a.id}-${u.id}`,
+            assignmentId: a.id,
+            contentType: a.contentType,
+            contentTitle,
+            userId: u.id,
+            userName: u.name,
+            assignedAt: a.assignedAt,
+            assignedAtRaw: a.assignedAtRaw,
+            dueAt: a.dueAt,
+            required: a.required,
+            status,
+            progress: engineResult.progress,
+            sourceLabel: a.source?.label ?? null,
+          });
         }
       }
     }
@@ -13748,6 +14109,17 @@ function LeadershipDashboardScreen({ currentOrg, orgUsers = [], isReal = false }
         prev:     p.previousScore,
         initials: (p.name ?? "").split(" ").map(w => w[0] ?? "").join("").slice(0, 2).toUpperCase() || "TM",
       })),
+      // Actionable KPI Cards — org-wide last-activity lookup (keyed by
+      // profile id), for the Active Learners detail view, which needs every
+      // tenant member (not just those with a computed readiness score, i.e.
+      // not just `people` above).
+      lastActivityByUser,
+      // Actionable KPI Cards — every unresolved (assignment, user) pair,
+      // already resolved through the shared engine above. Backs the Active
+      // Assignments card's detail view; the card's own count
+      // (activeAssignmentCount, in risk.activeAssignments below) is always
+      // unresolvedAssignments.length by construction — same loop, same array.
+      unresolvedAssignments,
       heatmap,
       // BETA NOTE:
       // Hidden until supporting infrastructure is production-ready.

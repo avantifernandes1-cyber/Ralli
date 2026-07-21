@@ -74,6 +74,48 @@ function dueAtOf(assignment) {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
+// SHARED DUE-DATE BOUNDARY (Assignment Experience Priority 2)
+// ─────────────────────────────────────────────────────────────────────────────
+
+/**
+ * Days until a due date, at LOCAL-DAY granularity — the single due-date
+ * comparison shared by every consumer: this module's own "overdue" override
+ * below, and rankd-app.jsx's learner-facing getDueStatus() ("Due today" /
+ * "Due in N days" / "Overdue" badges) and RepDrillDownModal's days-overdue
+ * badge. Both sides of the comparison are normalized to local midnight, so
+ * "today" is never overdue and a due date boundary reads identically
+ * regardless of what time of day or which timezone it's evaluated in.
+ *
+ * Previously this engine compared raw timestamps directly
+ * (`new Date(dueAt) < new Date()`), which — because a date-only due_at like
+ * "2026-07-21" parses as UTC midnight — could mark an assignment "Overdue"
+ * several hours before its due day had even started in the viewer's local
+ * time, while getDueStatus()'s own local-midnight math still correctly
+ * showed "Due today" for the identical assignment. A manager on the
+ * Leadership Dashboard or Rep Drill-down could see "Overdue" for the exact
+ * assignment a rep's Home screen showed as "Due today." This function is now
+ * the one place that logic lives.
+ *
+ * @param {string|null|undefined} dueAtStr - "YYYY-MM-DD" or ISO date string; "Open" or falsy means no due date (never overdue, returns null)
+ * @param {Date} [now] - injectable for tests; defaults to current local time
+ * @returns {number|null} negative = overdue by that many days, 0 = due today, positive = days remaining, null = no due date
+ */
+export function daysUntilDue(dueAtStr, now = new Date()) {
+  if (!dueAtStr || dueAtStr === "Open") return null;
+  const due = new Date(dueAtStr);
+  if (isNaN(due.getTime())) return null;
+  const n = new Date(now); n.setHours(0, 0, 0, 0);
+  const d = new Date(due); d.setHours(0, 0, 0, 0);
+  return Math.round((d.getTime() - n.getTime()) / 86400000);
+}
+
+/** Is this due date in the past (local-day granularity)? Due-today is never overdue. */
+function isPastDueDate(dueAtStr, now = new Date()) {
+  const diff = daysUntilDue(dueAtStr, now);
+  return diff != null && diff < 0;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
 // PER-CONTENT-TYPE RESOLUTION
 // ─────────────────────────────────────────────────────────────────────────────
 
@@ -183,9 +225,8 @@ export function resolveAssignmentStatus(contentType, assignment, data = {}) {
 
   let status = result.status;
   const dueAt = dueAtOf(assignment);
-  if (status !== "completed" && dueAt && dueAt !== "Open") {
-    const d = new Date(dueAt);
-    if (!isNaN(d) && d < new Date()) status = "overdue";
+  if (status !== "completed" && isPastDueDate(dueAt)) {
+    status = "overdue";
   }
 
   return { ...result, status, isActive: !result.isResolved };
