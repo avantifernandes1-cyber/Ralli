@@ -14205,6 +14205,228 @@ function LeadershipDashboardScreen({ currentOrg, orgUsers = [], isReal = false }
   // Fix 1: safe accessor handles both real data (avgScore) and seed data (score)
   const getTopicScore = (t) => Number(t?.avgScore ?? t?.score ?? 0);
 
+  // ── Actionable KPI Cards — detail view renderers ──────────────────────────
+  // Each opens the shared KPIDetailModal shell; row clicks reuse the exact
+  // same setSelectedRep(...) → RepDrillDownModal path People Insights,
+  // Low-Readiness Reps, and Overdue Assignments already use — no second
+  // rep-detail experience.
+  const openRepFromDetail = (rep) => { setOpenKpiDetail(null); setSelectedRep(rep); };
+
+  const renderBelowThresholdDetail = () => {
+    const reps = data.people
+      .filter(p => (p.readinessScore ?? p.score ?? 0) < 65)
+      .sort((a, b) => (a.readinessScore ?? 0) - (b.readinessScore ?? 0)); // most at-risk first
+    return (
+      <KPIDetailModal
+        title="Below Threshold"
+        subtitle="Reps currently below 65% readiness, most at-risk first"
+        onClose={() => setOpenKpiDetail(null)}
+        isEmpty={reps.length === 0}
+        emptyMessage="No reps are currently below the 65% readiness threshold."
+      >
+        <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
+          {reps.map(p => {
+            const activityLabel = _relativeActivityLabel(p.lastActivityAt);
+            return (
+              <div
+                key={p.id}
+                onClick={() => openRepFromDetail(p)}
+                role="button" tabIndex={0}
+                onKeyDown={e => { if (e.key === "Enter" || e.key === " ") { e.preventDefault(); openRepFromDetail(p); } }}
+                style={{ display: "flex", alignItems: "center", gap: 12, padding: "12px 14px", borderRadius: C.radiusSm, background: C.pageBg, cursor: "pointer" }}
+              >
+                <Avatar initials={p.initials} size={36} color={p.color ?? C.orange} />
+                <div style={{ flex: 1, minWidth: 0 }}>
+                  <div style={{ fontSize: 14, fontWeight: 700, color: C.text, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{p.name}</div>
+                  <div style={{ fontSize: 12, color: C.textSub, marginTop: 1 }}>
+                    {p.title ? `${p.title} · ` : ""}
+                    {/* Honest — "No recorded activity yet" rather than a
+                        fabricated date when this rep has none. */}
+                    {activityLabel ? `Active ${activityLabel}` : "No recorded activity yet"}
+                  </div>
+                </div>
+                <div style={{ fontSize: 18, fontWeight: 800, color: scoreColor(p.readinessScore ?? 0), flexShrink: 0 }}>{p.readinessScore}%</div>
+                <span style={{ color: C.textMuted, fontSize: 14, flexShrink: 0 }}>›</span>
+              </div>
+            );
+          })}
+        </div>
+        {reps.length > 0 && (
+          <div style={{ fontSize: 11, color: C.textMuted, marginTop: 12 }}>
+            Strongest/weakest skill detail is available on each rep's full profile — click a row to open it.
+          </div>
+        )}
+      </KPIDetailModal>
+    );
+  };
+
+  const renderActiveLearnersDetail = () => {
+    // "Active" here still means the tenant-membership sense (excludes
+    // removed/inactive profiles) — same filter getOrgMetrics() uses for its
+    // own activeMemberCount, not a second definition.
+    const members = orgUsers.filter(u => u.status !== "inactive");
+    const cutoffMs = Date.now() - LEARNING_ACTIVITY_INACTIVE_DAYS * 86400000;
+    const withActivity = members.map(u => ({ ...u, lastActivityAt: data.lastActivityByUser?.get(u.id) ?? null }));
+    const recentlyActive = withActivity
+      .filter(u => u.lastActivityAt && new Date(u.lastActivityAt).getTime() >= cutoffMs)
+      .sort((a, b) => new Date(b.lastActivityAt) - new Date(a.lastActivityAt));
+    const inactiveList = withActivity
+      .filter(u => !u.lastActivityAt || new Date(u.lastActivityAt).getTime() < cutoffMs)
+      .sort((a, b) => (b.lastActivityAt ? new Date(b.lastActivityAt).getTime() : 0) - (a.lastActivityAt ? new Date(a.lastActivityAt).getTime() : 0));
+
+    const renderRow = (u) => {
+      const daysSince = u.lastActivityAt ? Math.floor((Date.now() - new Date(u.lastActivityAt).getTime()) / 86400000) : null;
+      return (
+        <div
+          key={u.id}
+          onClick={() => openRepFromDetail(u)}
+          role="button" tabIndex={0}
+          onKeyDown={e => { if (e.key === "Enter" || e.key === " ") { e.preventDefault(); openRepFromDetail(u); } }}
+          style={{ display: "flex", alignItems: "center", gap: 12, padding: "10px 14px", borderRadius: C.radiusSm, background: C.pageBg, cursor: "pointer" }}
+        >
+          <Avatar initials={u.initials ?? (u.name?.[0] ?? "U").toUpperCase()} size={32} color={u.color ?? C.orange} />
+          <div style={{ flex: 1, minWidth: 0 }}>
+            <div style={{ fontSize: 13, fontWeight: 700, color: C.text, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{u.name}</div>
+            <div style={{ fontSize: 11, color: C.textSub }}>{u.role ?? "Rep"}</div>
+          </div>
+          <div style={{ textAlign: "right", fontSize: 11, color: C.textMuted, flexShrink: 0 }}>
+            {u.lastActivityAt ? (
+              <>
+                <div>{new Date(u.lastActivityAt).toLocaleDateString()}</div>
+                <div>{daysSince === 0 ? "Today" : `${daysSince} day${daysSince !== 1 ? "s" : ""} ago`}</div>
+              </>
+            ) : "No activity recorded"}
+          </div>
+        </div>
+      );
+    };
+
+    return (
+      <KPIDetailModal
+        title="Active Learners"
+        // Explicitly "Learning Activity," never "Last Sign-In" — this
+        // tenant's schema has no authentication/login timestamp anywhere
+        // (profiles has no last-login column; the app never queries
+        // auth.users), so claiming sign-in data would be dishonest. This is
+        // derived from quiz attempts, lesson completions, and XP/point
+        // events instead — the same three sources RepDrillDownModal's own
+        // "Most Recent Activity" KPI already uses.
+        subtitle={`Learning Activity — based on quiz attempts, lesson completions, and XP events in the last ${LEARNING_ACTIVITY_INACTIVE_DAYS} days. Not login activity.`}
+        onClose={() => setOpenKpiDetail(null)}
+        isEmpty={members.length === 0}
+        emptyMessage="No members found for this organization yet."
+      >
+        <div style={{ display: "flex", flexDirection: "column", gap: 20 }}>
+          <div>
+            <div style={{ fontSize: 11, fontWeight: 800, color: C.trueGreen, letterSpacing: "0.06em", marginBottom: 8 }}>
+              RECENTLY ACTIVE ({recentlyActive.length})
+            </div>
+            {recentlyActive.length ? (
+              <div style={{ display: "flex", flexDirection: "column", gap: 6 }}>{recentlyActive.map(renderRow)}</div>
+            ) : (
+              <div style={{ fontSize: 12, color: C.textMuted }}>No one has recorded learning activity in the last {LEARNING_ACTIVITY_INACTIVE_DAYS} days.</div>
+            )}
+          </div>
+          <div>
+            <div style={{ fontSize: 11, fontWeight: 800, color: C.red, letterSpacing: "0.06em", marginBottom: 8 }}>
+              INACTIVE ({inactiveList.length})
+            </div>
+            {inactiveList.length ? (
+              <div style={{ display: "flex", flexDirection: "column", gap: 6 }}>{inactiveList.map(renderRow)}</div>
+            ) : (
+              <div style={{ fontSize: 12, color: C.textMuted }}>Everyone has recorded learning activity in the last {LEARNING_ACTIVITY_INACTIVE_DAYS} days.</div>
+            )}
+          </div>
+        </div>
+      </KPIDetailModal>
+    );
+  };
+
+  // Overdue first, then soonest-due, then no-due-date/later — using the same
+  // daysUntilDue() the shared engine's own overdue check uses, not a second
+  // date comparison.
+  const sortAssignmentsForDetail = (list) => {
+    const rank = (d) => d == null ? 2 : d < 0 ? 0 : 1; // 0=overdue, 1=has a due date, 2=no due date
+    return [...list].sort((a, b) => {
+      const da = daysUntilDue(a.dueAt);
+      const db = daysUntilDue(b.dueAt);
+      const ra = rank(da), rb = rank(db);
+      if (ra !== rb) return ra - rb;
+      if (ra === 2) return 0;
+      return da - db; // overdue: most-overdue first; due-soon: soonest first
+    });
+  };
+
+  const ACTIVE_ASSIGNMENT_STATUS_CONFIG = {
+    not_started: { label: "Not Started", bg: C.muted,  text: C.textSub },
+    in_progress: { label: "In Progress", bg: C.blueBg, text: C.blue    },
+    overdue:     { label: "Overdue",     bg: C.redBg,  text: C.red     },
+  };
+
+  const renderActiveAssignmentsDetail = () => {
+    const list = sortAssignmentsForDetail(data.unresolvedAssignments ?? []);
+    return (
+      <KPIDetailModal
+        title="Active Assignments"
+        subtitle="Every unresolved assignment — overdue first, then soonest due"
+        onClose={() => setOpenKpiDetail(null)}
+        isEmpty={list.length === 0}
+        emptyMessage="No unresolved assignments right now — everything assigned has been completed."
+      >
+        <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
+          {list.map(row => {
+            const days = _daysOverdue(row.dueAt);
+            const sc = ACTIVE_ASSIGNMENT_STATUS_CONFIG[row.status] ?? ACTIVE_ASSIGNMENT_STATUS_CONFIG.not_started;
+            // Clicking opens the same RepDrillDownModal every other rep
+            // reference on this dashboard opens — including this row's own
+            // assignee, so the assignment's full detail (via the Rep
+            // Drill-down's Overdue Assignments / Assigned Learning sections)
+            // is one click away without a second assignment-detail screen.
+            const rep = data.people.find(p => p.id === row.userId)
+              ?? orgUsers.find(u => u.id === row.userId)
+              ?? { id: row.userId, name: row.userName, initials: (row.userName?.[0] ?? "?").toUpperCase() };
+            return (
+              <div
+                key={row.key}
+                onClick={() => openRepFromDetail(rep)}
+                role="button" tabIndex={0}
+                onKeyDown={e => { if (e.key === "Enter" || e.key === " ") { e.preventDefault(); openRepFromDetail(rep); } }}
+                style={{
+                  padding: "12px 14px", borderRadius: C.radiusSm, cursor: "pointer",
+                  background: row.status === "overdue" ? C.redBg : C.pageBg,
+                  border: row.status === "overdue" ? `1px solid ${C.red}33` : "1px solid transparent",
+                }}
+              >
+                <div style={{ display: "flex", justifyContent: "space-between", alignItems: "flex-start", gap: 10 }}>
+                  <div style={{ minWidth: 0 }}>
+                    <div style={{ fontSize: 13, fontWeight: 700, color: C.text, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{row.contentTitle}</div>
+                    <div style={{ fontSize: 11, color: C.textSub, marginTop: 2 }}>
+                      {_contentTypeLabel(row.contentType)} · {row.userName} · {row.required ? "Required" : "Recommended"}
+                      {row.sourceLabel ? ` · via ${row.sourceLabel}` : ""}
+                    </div>
+                  </div>
+                  <span style={{ fontSize: 11, fontWeight: 700, padding: "3px 8px", borderRadius: 6, background: sc.bg, color: sc.text, whiteSpace: "nowrap", flexShrink: 0 }}>
+                    {sc.label}
+                  </span>
+                </div>
+                <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginTop: 8, gap: 10 }}>
+                  <div style={{ fontSize: 11, color: C.textMuted }}>
+                    Assigned {row.assignedAt ?? "—"}
+                    {row.dueAt && row.dueAt !== "Open" ? ` · Due ${new Date(row.dueAt).toLocaleDateString()}` : " · No due date"}
+                    {days != null ? ` · ${days} day${days !== 1 ? "s" : ""} overdue` : ""}
+                  </div>
+                  {row.contentType === "course" && row.progress != null && (
+                    <div style={{ fontSize: 11, fontWeight: 700, color: C.textSub, flexShrink: 0 }}>{row.progress}% complete</div>
+                  )}
+                </div>
+              </div>
+            );
+          })}
+        </div>
+      </KPIDetailModal>
+    );
+  };
+
   const trendPoints = data.trends?.[trendPeriod] ?? [];
   const maxTrendVal = 100;
 
@@ -14371,16 +14593,22 @@ function LeadershipDashboardScreen({ currentOrg, orgUsers = [], isReal = false }
           {
             // Blocking Fix 1 — same honesty rule as Overall Readiness above:
             // 0 reps scored is not the same claim as "0 reps below threshold".
+            // Actionable KPI Cards — clickable only once real readiness data
+            // exists; a "—" card has nothing meaningful to open.
             label: "Below Threshold",
             value: hasReadinessData ? `${below}` : "—",
             sub: hasReadinessData ? "Reps below 65% readiness" : "Not yet available",
             color: hasReadinessData ? (below > 0 ? C.red : C.trueGreen) : C.textMuted,
+            detailKey: hasReadinessData ? "belowThreshold" : null,
           },
           {
+            // Actionable KPI Cards — always clickable; the detail view's own
+            // empty state covers the "nothing recorded yet" case honestly.
             label: "Active Learners",
             value: active !== null ? `${active}` : "—",
             sub: "Engaged in last 30 days",
             color: C.blue,
+            detailKey: "activeLearners",
           },
           {
             // Beta Cleanup — added per beta requirements. Sourced from
@@ -14391,20 +14619,63 @@ function LeadershipDashboardScreen({ currentOrg, orgUsers = [], isReal = false }
             value: `${data.risk.activeAssignments ?? 0}`,
             sub: "Not yet completed",
             color: C.blue,
+            detailKey: "activeAssignments",
           },
         ];
         return (
           <div style={{ display: "grid", gridTemplateColumns: mobile ? "repeat(2, 1fr)" : "repeat(6, 1fr)", gap: 14 }}>
-            {cards.map((s, i) => (
-              <Card key={i}>
-                <div style={{ fontSize: 26, fontWeight: 900, color: s.color }}>{s.value}</div>
-                <div style={{ fontSize: 12, fontWeight: 700, color: C.text, marginTop: 4 }}>{s.label}</div>
-                <div style={{ fontSize: 11, color: C.textSub, marginTop: 2 }}>{s.sub}</div>
-              </Card>
-            ))}
+            {cards.map((s, i) => {
+              // Actionable KPI Cards — clickable/keyboard-activatable only
+              // for cards with a detailKey; the other three (Overall
+              // Readiness, Avg Quiz Score, Content Completion) are
+              // intentionally left non-interactive — out of scope for this
+              // task ("implement only this task").
+              const clickable = !!s.detailKey;
+              const isHovered = clickable && hoveredKpiCard === s.detailKey;
+              const isFocused = clickable && focusedKpiCard === s.detailKey;
+              const open = () => clickable && setOpenKpiDetail(s.detailKey);
+              return (
+                <Card
+                  key={i}
+                  onClick={clickable ? open : undefined}
+                  role={clickable ? "button" : undefined}
+                  tabIndex={clickable ? 0 : undefined}
+                  ariaLabel={clickable ? `${s.label}: ${s.value}. View details.` : undefined}
+                  onKeyDown={clickable ? (e => { if (e.key === "Enter" || e.key === " ") { e.preventDefault(); open(); } }) : undefined}
+                  onMouseEnter={clickable ? (() => setHoveredKpiCard(s.detailKey)) : undefined}
+                  onMouseLeave={clickable ? (() => setHoveredKpiCard(null)) : undefined}
+                  onFocus={clickable ? (() => setFocusedKpiCard(s.detailKey)) : undefined}
+                  onBlur={clickable ? (() => setFocusedKpiCard(null)) : undefined}
+                  style={{
+                    position: "relative",
+                    cursor: clickable ? "pointer" : "default",
+                    borderColor: (isHovered || isFocused) ? C.orange : C.border,
+                    boxShadow: (isHovered || isFocused) ? "0 4px 16px rgba(11,18,32,0.10)" : C.shadowSm,
+                    outline: isFocused ? `2px solid ${C.orange}` : "none",
+                    outlineOffset: 2,
+                    transition: "border-color 0.15s, box-shadow 0.15s",
+                  }}
+                >
+                  <div style={{ fontSize: 26, fontWeight: 900, color: s.color }}>{s.value}</div>
+                  <div style={{ fontSize: 12, fontWeight: 700, color: C.text, marginTop: 4 }}>{s.label}</div>
+                  <div style={{ fontSize: 11, color: C.textSub, marginTop: 2 }}>{s.sub}</div>
+                  {/* Clear clickable affordance — small chevron, doesn't
+                      change the card's existing layout/sizing. */}
+                  {clickable && (
+                    <span style={{ position: "absolute", top: 14, right: 14, fontSize: 13, color: isHovered || isFocused ? C.orange : C.textMuted }}>›</span>
+                  )}
+                </Card>
+              );
+            })}
           </div>
         );
       })()}
+
+      {/* Actionable KPI Cards — detail views. One reusable modal shell,
+          three content renderers, opened by the clickable cards above. */}
+      {openKpiDetail === "belowThreshold" && renderBelowThresholdDetail()}
+      {openKpiDetail === "activeLearners" && renderActiveLearnersDetail()}
+      {openKpiDetail === "activeAssignments" && renderActiveAssignmentsDetail()}
 
       {/* ── Threshold Alert Banner — real orgs only (Fix 5: suppress for demo) ── */}
       {isReal && (() => {
