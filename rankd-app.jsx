@@ -6846,6 +6846,10 @@ function LearnScreen({ role, user, orgUsers = [], orgs = [], onNav, onAwardXp, p
             const bonusXp   = isCourse ? Math.round(totalXp * 0.2) : 0;
             const estMin    = isCourse ? courseLessons.reduce((s, l) => s + (parseInt(l.duration) || 0), 0) : (parseInt(content.duration) || 0);
             const typeColor = isCourse ? content.color : LESSON_TYPE_COLORS[content.type];
+            // Task 14 — same getDueStatus() helper Home/Quizzes already use, so
+            // "Overdue"/"Due today"/"Due in N days" read identically everywhere.
+            // Never shown once complete (matches Home's overdueAssignments gate).
+            const dueStatus = (!isComplete && a.dueAt && a.dueAt !== "Open") ? getDueStatus(a.dueAt) : null;
             return (
               <Card key={a.id}>
                 <div style={{ display: "flex", alignItems: "flex-start", gap: 16 }}>
@@ -6864,11 +6868,17 @@ function LearnScreen({ role, user, orgUsers = [], orgs = [], onNav, onAwardXp, p
                       </span>
                       {a.required && <span style={{ fontSize: 10, fontWeight: 700, padding: "1px 6px", borderRadius: 4, background: C.redBg, color: C.red }}>REQUIRED</span>}
                       {isComplete && <span style={{ fontSize: 10, fontWeight: 700, padding: "1px 6px", borderRadius: 4, background: C.greenBg, color: C.green }}>COMPLETE</span>}
+                      {dueStatus && (
+                        <span style={{ fontSize: 10, fontWeight: 700, padding: "1px 6px", borderRadius: 4,
+                          background: dueStatus.color + "18", color: dueStatus.color, marginLeft: "auto" }}>
+                          {dueStatus.label}
+                        </span>
+                      )}
                     </div>
                     <div style={{ fontSize: 15, fontWeight: 700, color: C.text, marginBottom: 4, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{content.title}</div>
                     <div style={{ display: "flex", gap: 12, fontSize: 12, color: C.textSub, flexWrap: "wrap" }}>
                       <span>⏱ {estMin} min</span>
-                      <span>Due {a.dueAt}</span>
+                      {a.dueAt && a.dueAt !== "Open" && <span>Due {a.dueAt}</span>}
                       <span style={{ color: C.orange, fontWeight: 700 }}>{totalXp}{bonusXp ? ` +${bonusXp} bonus` : ""} XP</span>
                     </div>
                     {pct > 0 && !isComplete && (
