@@ -10059,6 +10059,17 @@ function QuizTakingView({ quiz, onComplete, onExit }) {
       const attempt = { id: `at${Date.now()}`, date: new Date().toISOString().slice(0,10), score, passed: score >= (quiz.passingScore ?? 90), answers: answerList, submissionId: submissionIdRef.current };
       onComplete(attempt);
     } else {
+      // Self-Paced Quiz Timers — reset timeLeft in this SAME batch as
+      // revealed=false, not via the separate qIdx-keyed effect further down.
+      // That effect only runs after the next render, so on the render in
+      // between, the countdown effect would see this question's leftover
+      // stale timeLeft (often 0, if the previous question's timer had just
+      // expired) paired with the freshly-false `revealed` — and immediately
+      // fire handleTimeUp() for the new question before its real timer ever
+      // started. Setting it here closes that race; the qIdx effect still
+      // runs too and just redundantly confirms the same value.
+      const nextQ = quiz.questions[qIdx + 1];
+      setTimeLeft(nextQ?.timeLimit > 0 ? nextQ.timeLimit : null);
       setQIdx(i => i + 1);
       setRevealed(false);
     }
