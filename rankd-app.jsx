@@ -5906,7 +5906,14 @@ function QuizBuilderScreen({ onNav, onSave, initialQuiz }) {
   const activeQ = qs[activeIdx];
 
   const updateQ  = (updates) => setQs(prev => prev.map((q, i) => i === activeIdx ? { ...q, ...updates } : q));
-  const changeType = (type)  => { const b = makeBlank(type); updateQ({ ...b, q: activeQ.q, id: activeQ.id }); };
+  // Switching a question's type has to discard type-specific fields (options,
+  // pairs, correct answer, etc. — makeBlank() gives a clean slate for those),
+  // but the time limit isn't tied to type at all, and a manager who already
+  // set a custom time (e.g. 45s) wouldn't expect it to silently reset to that
+  // type's default (e.g. 10s for True/False) just from picking a different
+  // question type. Preserve it explicitly instead of taking makeBlank()'s
+  // per-type default.
+  const changeType = (type)  => { const b = makeBlank(type); updateQ({ ...b, q: activeQ.q, id: activeQ.id, timeLimit: activeQ.timeLimit }); };
   const addQ     = ()        => { const nq = makeBlank(); setQs(prev => [...prev, nq]); setActiveIdx(qs.length); };
   const removeQ  = (idx)     => { if (qs.length <= 1) return; setQs(prev => prev.filter((_, i) => i !== idx)); setActiveIdx(Math.max(0, Math.min(activeIdx, qs.length - 2))); };
   const moveQ    = (from, to) => {
@@ -9863,6 +9870,17 @@ function QuizTakingView({ quiz, onComplete, onExit }) {
   // own independent timer state (RankdGameScreen/RankdLobbyScreen) — this is
   // a separate implementation for the self-paced flow only.
   const [timeLeft, setTimeLeft] = useState(null);
+  // Self-Paced Quiz Timers — Map<questionId, secondsSpent>, only ever
+  // populated for questions that had a timeLimit. Captured centrally (one
+  // effect below, keyed on `revealed`) rather than in every individual
+  // commit function (choose/commitSlider/commitType/commitOpen/commitMatch/
+  // handleTimeUp) — whichever one fires, it always ends with setRevealed(true)
+  // in the same synchronous handler as writing `answers`, so `timeLeft` at
+  // the moment `revealed` flips true is always this question's true
+  // remaining time, regardless of which path got there. Feeds the "time"
+  // column in QuizResultsView's per-question review, which previously had no
+  // timing data at all even for timed questions.
+  const [answerTimes, setAnswerTimes] = useState({});
 
   // Task 15 — one stable idempotency key per quiz-taking session, generated
   // once and reused across any retry of the SAME submission (network retry,
@@ -9916,6 +9934,17 @@ function QuizTakingView({ quiz, onComplete, onExit }) {
     const t = setTimeout(() => setTimeLeft(n => (n == null ? n : n - 1)), 1000);
     return () => clearTimeout(t);
   }, [timeLeft, revealed]); // eslint-disable-line react-hooks/exhaustive-deps
+
+  // Self-Paced Quiz Timers — records how long this question actually took,
+  // the instant it's revealed (answered manually or timed out). q.timeLimit
+  // is null for legacy questions saved before timers existed, so those never
+  // get an entry — QuizResultsView falls back to showing nothing for them,
+  // same as today. Guards against double-write (harmless either way, but
+  // keeps the map from churning on unrelated re-renders while revealed stays true).
+  useEffect(() => {
+    if (!revealed || !(q.timeLimit > 0)) return;
+    setAnswerTimes(prev => (q.id in prev) ? prev : { ...prev, [q.id]: Math.max(0, q.timeLimit - (timeLeft ?? 0)) });
+  }, [revealed]); // eslint-disable-line react-hooks/exhaustive-deps
 
   // Time's up — commit whatever answer already exists (a slider always has a
   // value; mc/tf/match write straight to `answers` as soon as something is
@@ -10118,6 +10147,10 @@ function QuizTakingView({ quiz, onComplete, onExit }) {
         questionId: ques.id,
         selected:   answers[ques.id] ?? null,
         correct:    ques.correct,
+        // Self-Paced Quiz Timers — seconds actually spent, only present for
+        // questions that had a timeLimit (see the `revealed`-keyed effect
+        // above). Purely additive to the existing answer shape.
+        timeSpent:  answerTimes[ques.id] ?? null,
       }));
       // Open-ended questions are manually graded — there is no in-app grader here,
       // so they're excluded entirely from the automatic score (not counted right,
@@ -10612,12 +10645,26 @@ function QuizResultsView({ quiz, attempt, onRetake, onBack, showRetake = true, s
             const badgeText = !isKnownQ ? "Unsupported" : isOpenQ ? (hasAnswer ? "Submitted" : "Skipped") : (wasRight ? "Correct" : "Incorrect");
             const borderColor = (isOpenQ || !isKnownQ) ? C.creamBorder : wasRight ? C.trueGreen : C.red;
 
+            // "Time if applicable" — only for questions that actually had a
+            // timeLimit configured (legacy questions saved before timers
+            // existed have none, so this simply doesn't render for them,
+            // same as every other type-conditional field on this card).
+            // ans?.timeSpent is only present on attempts taken after this
+            // was added; older attempts on a still-timed question fall back
+            // to just showing the limit rather than a false "0s".
+            const timeLabel = q.timeLimit > 0
+              ? (ans?.timeSpent != null ? `Answered in ${ans.timeSpent}s (limit ${q.timeLimit}s)` : `Time limit: ${q.timeLimit}s`)
+              : null;
+
             return (
               <Card key={q.id} style={{ borderLeft: `4px solid ${borderColor}` }}>
-                <div style={{ display: "flex", alignItems: "flex-start", justifyContent: "space-between", gap: 12, marginBottom: 10 }}>
+                <div style={{ display: "flex", alignItems: "flex-start", justifyContent: "space-between", gap: 12, marginBottom: 4 }}>
                   <p style={{ margin: 0, fontSize: 14, fontWeight: 600, color: C.text, lineHeight: 1.5 }}>{i+1}. {q.text || q.q}</p>
                   <span style={{ fontSize: 12, fontWeight: 700, color: badgeColor, flexShrink: 0, padding: "2px 8px", borderRadius: 99, background: badgeBg }}>{badgeText}</span>
                 </div>
+                {timeLabel && (
+                  <div style={{ fontSize: 11, color: C.textMuted, marginBottom: 8 }}>{timeLabel}</div>
+                )}
 
                 {/* Matching — per-pair breakdown */}
                 {isMatchQ && (
