@@ -6254,6 +6254,7 @@ function LearnScreen({ role, user, orgUsers = [], orgs = [], onNav, onAwardXp, p
   const [confirmArchive,    setConfirmArchive]    = useState(null); // { type: "course"|"lesson", id, title }
   const [archiveInFlight,  setArchiveInFlight]  = useState(new Set()); // IDs currently being archived/restored
   const [tenantCompletions, setTenantCompletions] = useState([]); // manager/admin only
+  const [tenantQuizAttempts, setTenantQuizAttempts] = useState([]); // manager/admin only — real quiz_attempts rows, powers Assignments tab quiz status
   const [selectedAssignmentId, setSelectedAssignmentId] = useState(null); // manager click-through
   const [assignTimeframe,  setAssignTimeframe]  = useState("all"); // "all" | "week" | "month" | "custom"
   const [assignDateRange,  setAssignDateRange]  = useState({ start: "", end: "" }); // ISO date strings for custom range
@@ -6279,6 +6280,12 @@ function LearnScreen({ role, user, orgUsers = [], orgs = [], onNav, onAwardXp, p
       });
       getTenantLessonCompletions(tenantId).then(({ data }) => {
         if (data) setTenantCompletions(data);
+      });
+      // Real quiz_attempts rows — powers the Assignments tab quiz status column
+      // below (previously hardcoded to "not_started"; see buildQuizAssignmentRows
+      // in QuizTrackingPanel for the reference status-derivation pattern).
+      getTenantQuizAttempts(tenantId).then(({ data }) => {
+        if (data) setTenantQuizAttempts(data);
       });
     }
   }, [tenantId, isReal]); // eslint-disable-line react-hooks/exhaustive-deps
@@ -6963,11 +6970,18 @@ function LearnScreen({ role, user, orgUsers = [], orgs = [], onNav, onAwardXp, p
       users = orgUsers.filter(u => !["ralli_admin", "superadmin", "orgAdmin"].includes(u.role));
     }
     if (!users.length) return true;
-    if (a.contentType === "quiz") return true;
     // Assignment-instance-aware, same rule as the per-rep status table above:
     // a completion recorded before THIS assignment's assignedAt doesn't count
     // toward resolving it (see 037_assignment_aware_lesson_course_eligibility.sql).
     const isQualifyingComp = (comp) => !!comp?.completedAt && (!a.assignedAtRaw || new Date(comp.completedAt) >= new Date(a.assignedAtRaw));
+    if (a.contentType === "quiz") {
+      // Same instance-aware gate, applied to a passed quiz_attempts row instead
+      // of a lesson_completions row — mirrors the row-level quiz status logic
+      // in the Assignments table below.
+      return users.some(u => !tenantQuizAttempts.some(at =>
+        at.quiz_id === a.contentId && at.user_id === u.id && at.passed && isQualifyingComp({ completedAt: at.created_at })
+      ));
+    }
     return users.some(u => {
       const comps = tenantCompletions.filter(c => c.profileId === u.id);
       if (a.contentType === "lesson") return !isQualifyingComp(comps.find(c => c.lessonId === a.contentId));
@@ -7190,8 +7204,26 @@ function LearnScreen({ role, user, orgUsers = [], orgs = [], onNav, onAwardXp, p
                 // Lesson
                 const comp = userComps.find(c => c.lessonId === a.contentId);
                 if (isQualifying(comp)) { progress = 100; status = "completed"; completedAt = comp.completedAt; }
+              } else {
+                // Quiz — status derived from real quiz_attempts, same
+                // instance-aware gate as lessons/courses above (isQualifying)
+                // so a reassigned quiz doesn't read "Completed" off a
+                // pre-reassignment pass. Mirrors buildQuizAssignmentRows()
+                // (QuizTrackingPanel's manager quiz tracking panel) — reusing
+                // that status shape (no attempts → not started; attempts, none
+                // qualifying-passed → in progress; a qualifying pass →
+                // completed) rather than a second, separate implementation.
+                const userAttempts = tenantQuizAttempts.filter(at => at.quiz_id === a.contentId && at.user_id === u.id);
+                const qualifyingAttempts = userAttempts.filter(at => isQualifying({ completedAt: at.created_at }));
+                const qualifyingPasses = qualifyingAttempts.filter(at => at.passed);
+                if (qualifyingPasses.length > 0) {
+                  status = "completed";
+                  progress = 100;
+                  completedAt = qualifyingPasses.map(at => at.created_at).sort()[0]; // earliest qualifying pass
+                } else if (qualifyingAttempts.length > 0) {
+                  status = "in_progress";
+                }
               }
-              // Quiz: no completion table yet — shows as not_started (overdue check still applies)
               if (status !== "completed" && a.dueAt && a.dueAt !== "Open") {
                 const d = new Date(a.dueAt);
                 if (!isNaN(d) && d < new Date()) status = "overdue";
