@@ -6458,11 +6458,15 @@ function LearnScreen({ role, user, orgUsers = [], orgs = [], onNav, onAwardXp, p
 
         awardLessonPoints(tid, uid, id, { dueAt: lessonAssignment?.dueAt })
           .then(() => {
-            // Lesson XP is now committed — safe to recalculate readiness.
-            triggerReadinessUpdate(tid, uid);
-
             // Detect course completion: any course containing this lesson that
             // wasn't already complete before this lesson is now fully done.
+            // Task 17 — collect each course-XP write as a promise instead of
+            // firing readiness inline per-course. One handleCompleteLesson
+            // call is one user action; it should trigger readiness exactly
+            // once, after EVERY XP write it caused (lesson, and course if
+            // this lesson also completed an assigned course) has committed
+            // — not once right after lesson XP and then again per course.
+            const courseXpWrites = [];
             courses.forEach(course => {
               if (!course.lessonIds?.includes(id)) return;
               const wasComplete = course.lessonIds.every(lid => completedLessons.has(lid));
@@ -6487,12 +6491,18 @@ function LearnScreen({ role, user, orgUsers = [], orgs = [], onNav, onAwardXp, p
               // instance-aware shared engine (assignmentEngine.js), which is
               // untouched by this gate.
               if (!courseAssignment) return;
-              // Award course XP, then trigger a second readiness update so the
-              // final score includes both lesson and course XP.
-              awardCoursePoints(tid, uid, course.id, { dueAt: courseAssignment.dueAt })
-                .then(() => triggerReadinessUpdate(tid, uid))
-                .catch(e => console.error("[ralli] awardCoursePoints failed:", e));
+              courseXpWrites.push(
+                awardCoursePoints(tid, uid, course.id, { dueAt: courseAssignment.dueAt })
+                  .catch(e => console.error("[ralli] awardCoursePoints failed:", e))
+              );
             });
+
+            // Single readiness recalculation for this action — waits for
+            // every course-XP write above (if any) to settle first, so it's
+            // never stale AND never duplicated. Resolves immediately when
+            // courseXpWrites is empty (the ordinary, non-course-completing
+            // case), matching the previous single-call timing exactly.
+            Promise.all(courseXpWrites).then(() => triggerReadinessUpdate(tid, uid));
           })
           .catch(e => console.error("[ralli] awardLessonPoints failed:", e));
       }
