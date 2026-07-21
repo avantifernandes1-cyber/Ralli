@@ -499,7 +499,10 @@ const leaderboardData = [
   { rank: 5, initials: "TW", name: "Tom Walsh", score: 84, change: 0, color: C.textSub },
 ];
 
-// Inline tooltip helper — renders an ℹ badge with a hover tooltip
+// Inline tooltip helper — renders an ℹ badge with a hover tooltip. Also
+// toggles on click/tap (in addition to hover) so it works as an explanation
+// affordance on touch devices, which never fire hover — used e.g. by the
+// Assign modal's "already has an active assignment" row explanation.
 function InfoTooltip({ text }) {
   const [show, setShow] = useState(false);
   return (
@@ -507,7 +510,12 @@ function InfoTooltip({ text }) {
       <span
         onMouseEnter={() => setShow(true)}
         onMouseLeave={() => setShow(false)}
-        style={{ width: 15, height: 15, borderRadius: "50%", background: C.muted, color: C.textMuted, fontSize: 9, fontWeight: 800, display: "inline-flex", alignItems: "center", justifyContent: "center", cursor: "default", userSelect: "none", marginLeft: 4 }}
+        onClick={(e) => { e.stopPropagation(); setShow(s => !s); }}
+        role="button"
+        tabIndex={0}
+        aria-label="More info"
+        onKeyDown={(e) => { if (e.key === "Enter" || e.key === " ") { e.preventDefault(); e.stopPropagation(); setShow(s => !s); } }}
+        style={{ width: 15, height: 15, borderRadius: "50%", background: C.muted, color: C.textMuted, fontSize: 9, fontWeight: 800, display: "inline-flex", alignItems: "center", justifyContent: "center", cursor: "pointer", userSelect: "none", marginLeft: 4 }}
       >i</span>
       {show && (
         <div style={{ position: "absolute", bottom: "calc(100% + 6px)", left: "50%", transform: "translateX(-50%)", background: C.dark, color: "#fff", fontSize: 11, lineHeight: 1.5, padding: "8px 12px", borderRadius: 8, width: 220, zIndex: 999, boxShadow: "0 4px 16px rgba(0,0,0,0.18)", pointerEvents: "none" }}>
@@ -7921,15 +7929,18 @@ function LearnScreen({ role, user, orgUsers = [], orgs = [], onNav, onAwardXp, p
               const { data: created, error, blocked, assignedCount, skippedCount, skipped } =
                 await dbCreateAssignments(tenantId, assignment, user?.id);
               if (error) { console.error("[ralli] createAssignment failed:", error); toast.error("Failed to create assignment. Please try again."); return; }
+              const contentLabel = assignment.contentType === "course" ? "course" : "lesson";
               if (blocked) {
                 // Single-user (individual) assignment blocked entirely — show the
                 // specific reason rather than assuming it's always "already assigned".
-                const who    = skipped[0]?.userName || skipped[0]?.userId || "This user";
+                // This is the "Selection Attempt" safety net: the picker already
+                // disables blocked rows, so reaching here means a manager
+                // submitted anyway (stale state/race condition).
                 const reason = skipped[0]?.reason;
                 if (reason === "already_assigned") {
-                  const due = skipped[0]?.dueAt ? ` (due ${new Date(skipped[0].dueAt).toLocaleDateString("en-US", { month: "short", day: "numeric" })})` : "";
-                  toast.error(`${who} already has an active assignment for this content${due}. Wait for it to complete, or remove the existing assignment first.`);
+                  toast.error(assignmentBlockedToastBody(skipped, contentLabel));
                 } else {
+                  const who = skipped[0]?.userName || skipped[0]?.userId || "This user";
                   toast.error(`${who}: ${humanizeSkipReason(reason)}.`);
                 }
                 return; // keep modal open — manager can adjust and retry
@@ -7939,16 +7950,25 @@ function LearnScreen({ role, user, orgUsers = [], orgs = [], onNav, onAwardXp, p
               // real assignments now live there, not in local LearnScreen state.
               sharedAssignmentData?.applyLocalAssignmentsCreated?.(created);
               if (skippedCount > 0) {
-                const contentLabel = assignment.contentType === "course" ? "course" : "lesson";
-                toast.success(
-                  <span>
-                    {assignedCount} assigned, {skippedCount} skipped.{" "}
-                    <button
-                      onClick={() => assignSkipPanel.open({ assignedCount, skipped, contentLabel })}
-                      style={{ background: "none", border: "none", padding: 0, margin: 0, color: "inherit", textDecoration: "underline", fontWeight: 700, fontSize: 13, cursor: "pointer" }}
-                    >View details</button>
-                  </span>
-                );
+                if (assignedCount === 0) {
+                  // Whole team/group already had this content — same safety-net
+                  // scenario as the individual `blocked` branch above, just for
+                  // a bulk target. `blocked` itself is only ever true for
+                  // individual assigns (see createAssignments in
+                  // contentService.js), so this is how the equivalent case
+                  // surfaces for team/group.
+                  toast.error(assignmentBlockedToastBody(skipped, contentLabel, () => assignSkipPanel.open({ assignedCount, skipped, contentLabel })));
+                } else {
+                  toast.success(
+                    <span>
+                      {assignedCount} assigned, {skippedCount} skipped.{" "}
+                      <button
+                        onClick={() => assignSkipPanel.open({ assignedCount, skipped, contentLabel })}
+                        style={{ background: "none", border: "none", padding: 0, margin: 0, color: "inherit", textDecoration: "underline", fontWeight: 700, fontSize: 13, cursor: "pointer" }}
+                      >View details</button>
+                    </span>
+                  );
+                }
               } else {
                 toast.success("Assignment created.");
               }
@@ -8989,18 +9009,32 @@ function AssignEligibilitySummary({ summary }) {
   const unavailableParts = [];
   if (summary.inactive  > 0) unavailableParts.push(`${summary.inactive} inactive`);
   if (summary.suspended > 0) unavailableParts.push(`${summary.suspended} suspended`);
+  // Assignment Experience — Active Assignment Messaging: Empty State. When
+  // every assignable candidate in the selected team/group already has this
+  // exact content assigned, there is nothing a submit could do — say so
+  // explicitly instead of leaving the manager to infer it from "Eligible: 0".
+  // The Assign button itself is disabled for this same condition (see
+  // canSubmit in AssignContentModal) so this is purely explanatory.
+  const fullyBlocked = summary.total > 0 && summary.eligible === 0;
   return (
-    <div style={{
-      display: "flex", flexWrap: "wrap", alignItems: "center", gap: 14, padding: "8px 12px",
-      borderRadius: 8, background: C.pageBg, marginBottom: 20,
-      fontSize: 12, fontWeight: 600,
-    }}>
-      {summary.total > 0 && <span style={{ color: C.trueGreen }}>Eligible: {summary.eligible}</span>}
-      {summary.active > 0 && <span style={{ color: C.red }}>Already assigned: {summary.active}</span>}
-      {summary.unavailable > 0 && (
-        <span style={{ color: "#475569" }}>
-          {summary.unavailable} member{summary.unavailable === 1 ? "" : "s"} unavailable ({unavailableParts.join(", ")})
-        </span>
+    <div style={{ marginBottom: 20 }}>
+      <div style={{
+        display: "flex", flexWrap: "wrap", alignItems: "center", gap: 14, padding: "8px 12px",
+        borderRadius: 8, background: C.pageBg,
+        fontSize: 12, fontWeight: 600,
+      }}>
+        {summary.total > 0 && <span style={{ color: C.trueGreen }}>Eligible: {summary.eligible}</span>}
+        {summary.active > 0 && <span style={{ color: C.red }}>Already Assigned: {summary.active}</span>}
+        {summary.unavailable > 0 && (
+          <span style={{ color: "#475569" }}>
+            {summary.unavailable} member{summary.unavailable === 1 ? "" : "s"} unavailable ({unavailableParts.join(", ")})
+          </span>
+        )}
+      </div>
+      {fullyBlocked && (
+        <p style={{ margin: "8px 0 0", fontSize: 12, color: C.red, fontWeight: 600 }}>
+          Everyone selected already has this assignment.
+        </p>
       )}
     </div>
   );
@@ -9132,10 +9166,21 @@ function AssignContentModal({ contentType, contentId, content, orgUsers, orgs, c
     }
   };
 
+  // Assignment Experience — Active Assignment Messaging: Empty State. A
+  // team/group whose eligibility preview has loaded and shows zero eligible
+  // members (everyone assignable already has this exact content) can't
+  // usefully submit — disable Assign so no failed submit is required. Only
+  // applies once the preview has actually loaded (selectedTeamSummary /
+  // selectedGroupSummary non-null); before that, fall back to the prior
+  // "something is selected" check so the button isn't disabled while
+  // eligibility is still loading.
+  const teamFullyBlocked  = selectedTeamSummary  != null && selectedTeamSummary.total  > 0 && selectedTeamSummary.eligible  === 0;
+  const groupFullyBlocked = selectedGroupSummary != null && selectedGroupSummary.total > 0 && selectedGroupSummary.eligible === 0;
+
   const canSubmit = assignType === "team"
-    ? !!selectedTeamId
+    ? !!selectedTeamId && !teamFullyBlocked
     : assignType === "group"
-      ? !!selectedOrgId
+      ? !!selectedOrgId && !groupFullyBlocked
       : !!selectedUserId;
 
   // Toggle options: superadmin sees Group + Individual, org users see Team + Individual
@@ -9243,16 +9288,32 @@ function AssignContentModal({ contentType, contentId, content, orgUsers, orgs, c
                 // explanation to before submit.
                 const blocked = unavailable || isActive;
                 const activeDue = isActive ? activeAssignments.get(u.id)?.dueAt : null;
+                // Assignment Experience — Active Assignment Messaging: exact copy
+                // per spec for the "already has an active assignment" case, used
+                // both as the whole-row hover tooltip (desktop) and the explicit
+                // info-icon tooltip next to the secondary status line below
+                // (desktop hover OR mobile tap — InfoTooltip supports both).
                 const blockedReason = unavailable
                   ? (u.status === "suspended" ? "Suspended — cannot be assigned content." : "Inactive — cannot be assigned content.")
                   : isActive
-                    ? `Already has an active assignment for this content${activeDue ? ` (due ${new Date(activeDue).toLocaleDateString("en-US", { month: "short", day: "numeric" })})` : ""}. Remove it or wait for completion before reassigning.`
+                    ? "This learner already has an active assignment for this content. Complete or remove the current assignment before assigning it again."
                     : undefined;
+                const selectRow = () => { if (!blocked) setSelectedUserId(u.id); };
                 return (
-                <button
+                // A plain <button disabled> would also swallow clicks on the
+                // nested InfoTooltip icon below (disabled form controls don't
+                // dispatch events to their subtree at all) — so this row uses
+                // role="button" + aria-disabled instead, with selection still
+                // gated by the `blocked` check in selectRow(), to keep the row
+                // visually/functionally non-selectable while leaving the info
+                // icon independently clickable/tappable.
+                <div
                   key={u.id}
-                  onClick={() => { if (!blocked) setSelectedUserId(u.id); }}
-                  disabled={blocked}
+                  role="button"
+                  tabIndex={0}
+                  aria-disabled={blocked}
+                  onClick={selectRow}
+                  onKeyDown={(e) => { if (e.key === "Enter" || e.key === " ") { e.preventDefault(); selectRow(); } }}
                   title={blockedReason}
                   style={{
                     display: "flex", alignItems: "center", gap: 10, padding: "10px 14px", borderRadius: 10,
@@ -9265,6 +9326,17 @@ function AssignContentModal({ contentType, contentId, content, orgUsers, orgs, c
                   <div style={{ flex: 1, minWidth: 0 }}>
                     <div style={{ fontSize: 13, fontWeight: 700, color: selectedUserId === u.id ? C.orange : C.text, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{u.name}</div>
                     <div style={{ fontSize: 11, color: C.textSub }}>{u.role}</div>
+                    {/* Assignment Experience — Active Assignment Messaging: secondary
+                        status line, only for the "already has an active assignment"
+                        case (not suspended/inactive, which already has its own badge
+                        and message above). The info icon repeats blockedReason so the
+                        explanation is available via tap on touch devices too. */}
+                    {isActive && (
+                      <div style={{ display: "flex", alignItems: "center", fontSize: 11, color: C.red, marginTop: 2 }}>
+                        Already assigned and not yet completed.
+                        <InfoTooltip text={blockedReason} />
+                      </div>
+                    )}
                   </div>
                   {unavailable ? (
                     <span style={{
@@ -9284,7 +9356,7 @@ function AssignContentModal({ contentType, contentId, content, orgUsers, orgs, c
                     </span>
                   )}
                   {selectedUserId === u.id && <span style={{ color: C.orange }}>✓</span>}
-                </button>
+                </div>
                 );
               })}
             </div>
@@ -19701,6 +19773,44 @@ function humanizeSkipReason(reason) {
   return ASSIGNMENT_SKIP_REASON_LABELS[reason] ?? "Not eligible for this assignment";
 }
 
+// Assignment Experience — Active Assignment Messaging: "Selection Attempt"
+// safety net. The picker already disables blocked rows and the Assign button
+// already disables when every selected candidate is already assigned (see
+// AssignContentModal), so reaching this path means a manager submitted
+// anyway despite that front-end guard — stale state, a race with another
+// manager's assignment, or a keyboard/dev-tools edge case. The backend
+// (create_assignments_atomic) is still the real enforcement; this only
+// improves the explanation shown for the "already assigned" reason
+// specifically. Other skip reasons (ineligible/invalid target) keep using
+// the existing generic `${who}: ${humanizeSkipReason(reason)}.` message at
+// each call site — this helper is only for reason === "already_assigned".
+// `skipped.length <= 1` covers both the individual-assign "blocked" case
+// (always exactly one) and the rare team/group case where only one member
+// was already assigned; `> 1` covers a whole team/group being skipped.
+function assignmentBlockedToastBody(skipped, contentLabel, onViewDetails) {
+  if (skipped.length <= 1) {
+    const who = skipped[0]?.userName || skipped[0]?.userId || "This learner";
+    return (
+      <span>
+        <strong style={{ display: "block", marginBottom: 2 }}>Assignment already active</strong>
+        {who} already has this {contentLabel} assigned and hasn't completed it yet.
+      </span>
+    );
+  }
+  return (
+    <span>
+      <strong style={{ display: "block", marginBottom: 2 }}>{skipped.length} learners skipped</strong>
+      They already have this content assigned.{" "}
+      {onViewDetails ? (
+        <button
+          onClick={onViewDetails}
+          style={{ background: "none", border: "none", padding: 0, margin: 0, color: "inherit", textDecoration: "underline", fontWeight: 700, fontSize: "inherit", cursor: "pointer" }}
+        >View details for the full list.</button>
+      ) : "View details for the full list."}
+    </span>
+  );
+}
+
 // Provider-free event bus, same pattern as the toast system above — lets the
 // two assign call sites (LearnScreen's inline handler, App's handleAssignQuiz)
 // open the same panel without prop drilling. Render <AssignmentSkipPanel />
@@ -20761,12 +20871,14 @@ export default function App() {
       if (blocked) {
         // Single-user (individual) assignment blocked entirely — show the
         // specific reason rather than assuming it's always "already assigned".
-        const who    = skipped[0]?.userName || skipped[0]?.userId || "This user";
+        // This is the "Selection Attempt" safety net: the picker already
+        // disables blocked rows, so reaching here means a manager submitted
+        // anyway (stale state/race condition).
         const reason = skipped[0]?.reason;
         if (reason === "already_assigned") {
-          const due = skipped[0]?.dueAt ? ` (due ${new Date(skipped[0].dueAt).toLocaleDateString("en-US", { month: "short", day: "numeric" })})` : "";
-          toast.error(`${who} already has an active assignment for this quiz${due}. Wait for it to complete, or remove the existing assignment first.`);
+          toast.error(assignmentBlockedToastBody(skipped, "quiz"));
         } else {
+          const who = skipped[0]?.userName || skipped[0]?.userId || "This user";
           toast.error(`${who}: ${humanizeSkipReason(reason)}.`);
         }
         return { blocked: true };
@@ -20779,15 +20891,21 @@ export default function App() {
       // flow patches it directly for instant feedback), so a small delay here
       // is an acceptable, unchanged tradeoff versus this task's actual scope.
       if (skippedCount > 0) {
-        toast.success(
-          <span>
-            {assignedCount} assigned, {skippedCount} skipped.{" "}
-            <button
-              onClick={() => assignSkipPanel.open({ assignedCount, skipped, contentLabel: "quiz" })}
-              style={{ background: "none", border: "none", padding: 0, margin: 0, color: "inherit", textDecoration: "underline", fontWeight: 700, fontSize: 13, cursor: "pointer" }}
-            >View details</button>
-          </span>
-        );
+        if (assignedCount === 0) {
+          // Whole team/group already had this quiz — same safety-net scenario
+          // as the individual `blocked` branch above, just for a bulk target.
+          toast.error(assignmentBlockedToastBody(skipped, "quiz", () => assignSkipPanel.open({ assignedCount, skipped, contentLabel: "quiz" })));
+        } else {
+          toast.success(
+            <span>
+              {assignedCount} assigned, {skippedCount} skipped.{" "}
+              <button
+                onClick={() => assignSkipPanel.open({ assignedCount, skipped, contentLabel: "quiz" })}
+                style={{ background: "none", border: "none", padding: 0, margin: 0, color: "inherit", textDecoration: "underline", fontWeight: 700, fontSize: 13, cursor: "pointer" }}
+              >View details</button>
+            </span>
+          );
+        }
       } else {
         toast.success(assignedCount > 1 ? `${assignedCount} assigned.` : "Quiz assigned.");
       }
