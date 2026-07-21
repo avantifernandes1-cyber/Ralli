@@ -8676,15 +8676,26 @@ function LessonBuilderModal({ lesson, onSave, onClose }) {
 // target is selected, and nothing extra for a 0-member team (existing
 // "No teams yet" / empty states already cover that).
 function AssignEligibilitySummary({ summary }) {
-  if (!summary || summary.total === 0) return null;
+  if (!summary || (summary.total === 0 && summary.unavailable === 0)) return null;
+  // Task 9 — concise unavailable-member breakdown, e.g. "2 members
+  // unavailable (1 inactive, 1 suspended)", shown alongside Task 5's
+  // eligible/already-assigned counts so counts never look unexplained.
+  const unavailableParts = [];
+  if (summary.inactive  > 0) unavailableParts.push(`${summary.inactive} inactive`);
+  if (summary.suspended > 0) unavailableParts.push(`${summary.suspended} suspended`);
   return (
     <div style={{
-      display: "flex", alignItems: "center", gap: 14, padding: "8px 12px",
+      display: "flex", flexWrap: "wrap", alignItems: "center", gap: 14, padding: "8px 12px",
       borderRadius: 8, background: C.pageBg, marginBottom: 20,
       fontSize: 12, fontWeight: 600,
     }}>
-      <span style={{ color: C.trueGreen }}>Eligible: {summary.eligible}</span>
+      {summary.total > 0 && <span style={{ color: C.trueGreen }}>Eligible: {summary.eligible}</span>}
       {summary.active > 0 && <span style={{ color: C.red }}>Already assigned: {summary.active}</span>}
+      {summary.unavailable > 0 && (
+        <span style={{ color: "#475569" }}>
+          {summary.unavailable} member{summary.unavailable === 1 ? "" : "s"} unavailable ({unavailableParts.join(", ")})
+        </span>
+      )}
     </div>
   );
 }
@@ -8713,12 +8724,16 @@ function AssignContentModal({ contentType, contentId, content, orgUsers, orgs, c
 
   useEffect(() => {
     if (!isReal || !tenantId) return;
-    // Load users (team_id included so team-target eligibility can be
-    // previewed locally without a second round-trip per team).
+    // Load users (team_id + status included so team-target eligibility AND
+    // Task 9 availability can be previewed locally without a second
+    // round-trip per team). Inactive/suspended profiles are fetched too
+    // (no status filter here) so the picker can show *why* a rep is
+    // unavailable instead of the row silently disappearing — backend
+    // eligibility enforcement (034_atomic_assignment_engine.sql) is
+    // unchanged and still the source of truth at assign time.
     supabase.from("profiles")
-      .select("id, name, email, role, color, team_id")
+      .select("id, name, email, role, color, team_id, status")
       .eq("tenant_id", tenantId)
-      .neq("status", "inactive")
       .then(({ data }) => {
         if (!data) return;
         setTenantUsers(data.map(m => ({
@@ -8729,6 +8744,7 @@ function AssignContentModal({ contentType, contentId, content, orgUsers, orgs, c
           color:    m.color ?? "#F97316",
           orgId:    tenantId,
           teamId:   m.team_id ?? null,
+          status:   m.status ?? "active",
         })));
       });
     // Load teams
@@ -8767,10 +8783,22 @@ function AssignContentModal({ contentType, contentId, content, orgUsers, orgs, c
   // team_id already present on tenantUsers — no separate eligibility logic.
   const eligibilityReady = isReal && activeAssignments !== null && tenantUsers !== null;
 
+  // Task 9 — availability. "Unavailable" means the profile itself can't be
+  // assigned to (inactive/suspended), independent of Task 5's per-content
+  // active-assignment check. Works in both real and demo mode since every
+  // user object (tenantUsers from Supabase, or orgUsers/SEED_USERS in demo)
+  // already carries a status field.
+  function isUnavailable(u) {
+    return u.status === "inactive" || u.status === "suspended";
+  }
+
   function summarizeCandidates(candidateUsers) {
-    const total    = candidateUsers.length;
-    const active   = candidateUsers.filter(u => activeAssignments.has(u.id)).length;
-    return { total, active, eligible: total - active };
+    const inactive   = candidateUsers.filter(u => u.status === "inactive").length;
+    const suspended  = candidateUsers.filter(u => u.status === "suspended").length;
+    const assignable = candidateUsers.filter(u => !isUnavailable(u));
+    const total      = assignable.length;
+    const active     = assignable.filter(u => activeAssignments.has(u.id)).length;
+    return { total, active, eligible: total - active, inactive, suspended, unavailable: inactive + suspended };
   }
 
   const selectedTeamSummary = eligibilityReady && assignType === "team" && selectedTeamId
@@ -8894,19 +8922,36 @@ function AssignContentModal({ contentType, contentId, content, orgUsers, orgs, c
                 <p style={{ margin: 0, fontSize: 13, color: C.textSub }}>No other users in this tenant yet.</p>
               )}
               {availableUsers.map(u => {
+                // Task 9 — inactive/suspended reps stay visible (never silently
+                // dropped) but can't be selected; a status badge explains why.
+                const unavailable = isUnavailable(u);
                 const isActive = eligibilityReady && activeAssignments.has(u.id);
                 return (
-                <button key={u.id} onClick={() => setSelectedUserId(u.id)} style={{
-                  display: "flex", alignItems: "center", gap: 10, padding: "10px 14px", borderRadius: 10,
-                  border: `2px solid ${selectedUserId === u.id ? C.orange : C.border}`,
-                  background: selectedUserId === u.id ? C.orangeLight : C.pageBg, cursor: "pointer", textAlign: "left",
-                }}>
+                <button
+                  key={u.id}
+                  onClick={() => { if (!unavailable) setSelectedUserId(u.id); }}
+                  disabled={unavailable}
+                  style={{
+                    display: "flex", alignItems: "center", gap: 10, padding: "10px 14px", borderRadius: 10,
+                    border: `2px solid ${selectedUserId === u.id ? C.orange : C.border}`,
+                    background: selectedUserId === u.id ? C.orangeLight : C.pageBg,
+                    cursor: unavailable ? "not-allowed" : "pointer", textAlign: "left",
+                    opacity: unavailable ? 0.55 : 1,
+                  }}>
                   <Avatar initials={u.initials ?? (u.name?.[0] ?? "U").toUpperCase()} size={32} color={u.color} />
                   <div style={{ flex: 1, minWidth: 0 }}>
                     <div style={{ fontSize: 13, fontWeight: 700, color: selectedUserId === u.id ? C.orange : C.text, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{u.name}</div>
                     <div style={{ fontSize: 11, color: C.textSub }}>{u.role}</div>
                   </div>
-                  {eligibilityReady && (
+                  {unavailable ? (
+                    <span style={{
+                      fontSize: 10, fontWeight: 700, padding: "3px 8px", borderRadius: 999, whiteSpace: "nowrap", flexShrink: 0,
+                      background: u.status === "suspended" ? C.redBg : "#F1F5F9",
+                      color:      u.status === "suspended" ? C.red   : "#475569",
+                    }}>
+                      {u.status === "suspended" ? "Suspended" : "Inactive"}
+                    </span>
+                  ) : eligibilityReady && (
                     <span style={{
                       fontSize: 10, fontWeight: 700, padding: "3px 8px", borderRadius: 999, whiteSpace: "nowrap", flexShrink: 0,
                       background: isActive ? C.redBg : C.trueGreenBg,
