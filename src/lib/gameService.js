@@ -161,6 +161,21 @@ export async function endGameSession(pin, { scores = [], tenantId = null } = {})
  * @returns {Promise<{ data: Object|null, error: Object|null }>}
  */
 export async function joinGameSession(sessionId, { playerId, name, emoji = null, color = null, tenantId = null }) {
+  // Emoji identity must be stored once and never silently change on a
+  // rejoin/reconnect (e.g. landing back on name-entry with a different
+  // default avatar). If a participant row already exists for this
+  // (session, player), its stored emoji/color win over whatever the caller
+  // just computed — only a brand-new row gets the freshly computed values.
+  const { data: existing } = await supabase
+    .from("game_session_participants")
+    .select("emoji, color")
+    .eq("session_id", sessionId)
+    .eq("player_id", playerId)
+    .maybeSingle();
+
+  const finalEmoji = existing?.emoji ?? emoji;
+  const finalColor = existing?.color ?? color;
+
   const { data, error } = await supabase
     .from("game_session_participants")
     .upsert(
@@ -169,8 +184,8 @@ export async function joinGameSession(sessionId, { playerId, name, emoji = null,
         player_id:  playerId,
         tenant_id:  tenantId,
         name,
-        emoji,
-        color,
+        emoji: finalEmoji,
+        color: finalColor,
         joined_at:  new Date().toISOString(),
       },
       { onConflict: "session_id,player_id" }

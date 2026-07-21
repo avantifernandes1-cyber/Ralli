@@ -1836,6 +1836,13 @@ function KahootHostView({ onNav, sessionName, pin, sessionDbId, tenantId, questi
   const [questionHistory, setQuestionHistory] = useState([]);
   // DB-backed participant count for countdown — presence may lag behind actual joins
   const [dbParticipantCount, setDbParticipantCount] = useState(chPlayers.length);
+  // DB-backed participant roster (id, name, emoji, color, status) — the
+  // authoritative source for a player's stored emoji. Presence (chPlayers)
+  // can lag on join, and if doReveal() ever needs to build a player row from
+  // chAnswers alone (no scores or presence yet — a real race on the very
+  // first reveal, not just a theoretical one), this is what it now falls
+  // back to INSTEAD OF an array-position-derived emoji. See buildScoreRow().
+  const [dbParticipants, setDbParticipants] = useState([]);
 
   // ── Session restoration ───────────────────────────────────────────────────────
   // "loading" while fetching DB state, "done" when ready, "error" if fetch fails.
@@ -1909,15 +1916,17 @@ function KahootHostView({ onNav, sessionName, pin, sessionDbId, tenantId, questi
 
           // Build merged score rows, starting from full participant list (preserves 0-score players)
           const seen = new Set();
-          const scoreRows = (participants ?? []).map((p, i) => {
+          const scoreRows = (participants ?? []).map((p) => {
             seen.add(p.player_id);
             const t = totals.get(p.player_id);
-            const eidx = i % PLAYER_EMOJIS.length;
+            // p.emoji is the stored participant-record value — the single
+            // source of truth. A fixed placeholder (never array-position-
+            // derived) is the only fallback if a legacy row somehow has none.
             return {
               id:         p.player_id,
               name:       p.name,
-              emoji:      p.emoji ?? PLAYER_EMOJIS[eidx],
-              color:      p.color ?? PLAYER_COLORS[eidx % PLAYER_COLORS.length],
+              emoji:      p.emoji ?? "❔",
+              color:      p.color ?? C.textMuted,
               score:      t?.score ?? 0,
               delta:      0,
               wasCorrect: false,
@@ -1925,20 +1934,17 @@ function KahootHostView({ onNav, sessionName, pin, sessionDbId, tenantId, questi
           });
 
           // Also include any players with answers who are absent from participant list
-          let extra = scoreRows.length;
           for (const [pid, t] of totals.entries()) {
             if (seen.has(pid)) continue;
-            const eidx = extra % PLAYER_EMOJIS.length;
             scoreRows.push({
               id:         pid,
               name:       t.name,
-              emoji:      PLAYER_EMOJIS[eidx],
-              color:      PLAYER_COLORS[eidx % PLAYER_COLORS.length],
+              emoji:      "❔",
+              color:      C.textMuted,
               score:      t.score,
               delta:      0,
               wasCorrect: false,
             });
-            extra++;
           }
 
           scoreRows.sort((a, b) => b.score - a.score);
@@ -1964,8 +1970,86 @@ function KahootHostView({ onNav, sessionName, pin, sessionDbId, tenantId, questi
       if (!data) return;
       const active = data.filter(p => !p.status || p.status === "joined" || p.status === "active").length;
       setDbParticipantCount(Math.max(active, chPlayers.length));
+      setDbParticipants(data);
     });
   }, [sessionDbId, chPlayers.length]); // eslint-disable-line react-hooks/exhaustive-deps
+
+  // `scores` is initially seeded from Presence (chPlayers) so the scoreboard
+  // isn't empty while the DB roster is still loading. But Presence identity
+  // (emoji/color/name) is only ever as good as whatever the player's client
+  // last broadcast — it can be stale on a reconnect. The DB participant
+  // record (dbParticipants) is the single source of truth once loaded, so
+  // patch it onto any matching row here without touching `score` (running
+  // totals must survive this). This is what actually makes emoji identity
+  // stable end-to-end: every render reflects the stored DB value, never a
+  // recomputed or presence-derived one.
+  useEffect(() => {
+    if (dbParticipants.length === 0) return;
+    setScores(prev => prev.map(p => {
+      const dbP = dbParticipants.find(d => (d.player_id ?? d.id) === p.id);
+      if (!dbP) return p;
+      return { ...p, name: dbP.name ?? p.name, emoji: dbP.emoji ?? p.emoji, color: dbP.color ?? p.color };
+    }));
+  }, [dbParticipants]);
+
+  // ── Zero-active-players halt ──────────────────────────────────────────────
+  // If every connected player leaves mid-game, freeze the timer and block
+  // automatic progression instead of letting the game run unattended and
+  // silently mark people wrong. "Active" reuses the same connected-count
+  // definition already computed above (max of Presence chPlayers and the
+  // DB-active participant count). A short debounce absorbs brief Presence
+  // blips (a reconnect, a backgrounded tab) so those don't falsely trigger a
+  // halt. Once triggered, `halted` only clears when the host explicitly
+  // resumes — reconnecting players never auto-resume the game.
+  const [halted, setHalted] = useState(false);
+  const zeroSinceRef = useRef(null);
+  // Refs mirror the latest counts into the watchdog interval below without
+  // forcing the interval to be torn down and recreated on every presence tick.
+  const chPlayersLenRef = useRef(chPlayers.length);
+  chPlayersLenRef.current = chPlayers.length;
+  const dbParticipantCountRef = useRef(dbParticipantCount);
+  dbParticipantCountRef.current = dbParticipantCount;
+
+  useEffect(() => {
+    if (!sessionDbId || restoreState !== "done") return;
+    const HALT_DEBOUNCE_MS = 5000;
+    const interval = setInterval(() => {
+      const activeCount = Math.max(chPlayersLenRef.current, dbParticipantCountRef.current);
+      if (activeCount === 0) {
+        if (zeroSinceRef.current == null) zeroSinceRef.current = Date.now();
+        else if (Date.now() - zeroSinceRef.current >= HALT_DEBOUNCE_MS) setHalted(true);
+      } else {
+        zeroSinceRef.current = null; // a player is back — but stay halted until the host resumes
+      }
+    }, 1000);
+    return () => clearInterval(interval);
+  }, [sessionDbId, restoreState]);
+
+  const resumeFromHalt = () => setHalted(false);
+
+  // Single fixed (non-index) placeholder for the rare case a player row has
+  // no discoverable identity anywhere (not in scores, presence, or the DB
+  // roster) — e.g. a broadcast-only answer that never persisted a
+  // participant row. Deliberately constant, not derived from iteration
+  // order, so it can never look like a real assigned emoji.
+  const UNKNOWN_EMOJI = "❔";
+  const UNKNOWN_COLOR = C.textMuted;
+
+  // Builds a player row for someone who answered but isn't yet in `scores`
+  // or `chPlayers` — looks up their real stored identity from the DB
+  // roster (dbParticipants) by id first. Only falls back to the fixed
+  // UNKNOWN_EMOJI placeholder if the DB roster itself doesn't have them
+  // (never assigns an array-position-derived emoji).
+  const buildScoreRowFromAnswer = (pid, ans) => {
+    const dbP = dbParticipants.find(p => (p.player_id ?? p.id) === pid);
+    return {
+      id:    pid,
+      name:  dbP?.name ?? ans.name ?? pid,
+      emoji: dbP?.emoji ?? UNKNOWN_EMOJI,
+      color: dbP?.color ?? UNKNOWN_COLOR,
+      score: 0,
+    };
+  };
 
   // Persist phase transitions to DB so host can recover on refresh
   const persistPhase = useCallback((nextPhase, nextQIdx, nextPaused) => {
@@ -1992,6 +2076,7 @@ function KahootHostView({ onNav, sessionName, pin, sessionDbId, tenantId, questi
 
   useEffect(() => {
     if (restoreState !== "done") return; // block until restoration finishes
+    if (halted) return; // all players left — freeze progression until host resumes
     if (phase !== "countdown") return;
     if (cdNum <= 0) {
       hasRevealedRef.current = false; // fresh question — arm the reveal guard
@@ -2008,21 +2093,23 @@ function KahootHostView({ onNav, sessionName, pin, sessionDbId, tenantId, questi
     }
     const t = setTimeout(() => setCdNum(n => n - 1), 1000);
     return () => clearTimeout(t);
-  }, [phase, cdNum, restoreState]); // eslint-disable-line react-hooks/exhaustive-deps
+  }, [phase, cdNum, restoreState, halted]); // eslint-disable-line react-hooks/exhaustive-deps
 
   useEffect(() => {
     if (restoreState !== "done") return; // block until restoration finishes
+    if (halted) return; // all players left — freeze progression until host resumes
     if (phase !== "question" || paused) return;
     if (timeLeft <= 0) { doReveal(); return; }
     const t = setTimeout(() => setTimeLeft(n => n - 1), 1000);
     return () => clearTimeout(t);
-  }, [phase, timeLeft, paused, restoreState]); // eslint-disable-line react-hooks/exhaustive-deps
+  }, [phase, timeLeft, paused, restoreState, halted]); // eslint-disable-line react-hooks/exhaustive-deps
 
   useEffect(() => {
     if (restoreState !== "done") return; // block until restoration finishes
+    if (halted) return; // all players left — freeze progression until host resumes
     if (phase !== "question" || answeredCount < playerCount || answeredCount === 0) return;
     doReveal();
-  }, [answeredCount, phase, restoreState]); // eslint-disable-line react-hooks/exhaustive-deps
+  }, [answeredCount, phase, restoreState, halted]); // eslint-disable-line react-hooks/exhaustive-deps
 
   const doReveal = () => {
     // Reentrancy guard — see hasRevealedRef declaration above. Must be the
@@ -2047,7 +2134,7 @@ function KahootHostView({ onNav, sessionName, pin, sessionDbId, tenantId, questi
       let baseScores;
       if (scores.length > 0) { baseScores = scores; }
       else if (chPlayers.length > 0) { baseScores = chPlayers.map(p => ({ ...p, score: 0 })); }
-      else { baseScores = Object.entries(chAnswers).map(([pid, ans], i) => ({ id: pid, name: ans.name ?? pid, emoji: PLAYER_EMOJIS[i % PLAYER_EMOJIS.length], color: PLAYER_COLORS[i % PLAYER_COLORS.length], score: 0 })); }
+      else { baseScores = Object.entries(chAnswers).map(([pid, ans]) => buildScoreRowFromAnswer(pid, ans)); }
       const newScores = baseScores.map(p => {
         const ans = chAnswers[p.id];
         if (!ans?.text) return { ...p, delta: 0, wasCorrect: false };
@@ -2085,7 +2172,7 @@ function KahootHostView({ onNav, sessionName, pin, sessionDbId, tenantId, questi
       let baseScores;
       if (scores.length > 0) { baseScores = scores; }
       else if (chPlayers.length > 0) { baseScores = chPlayers.map(p => ({ ...p, score: 0 })); }
-      else { baseScores = Object.entries(chAnswers).map(([pid, ans], i) => ({ id: pid, name: ans.name ?? pid, emoji: PLAYER_EMOJIS[i % PLAYER_EMOJIS.length], color: PLAYER_COLORS[i % PLAYER_COLORS.length], score: 0 })); }
+      else { baseScores = Object.entries(chAnswers).map(([pid, ans]) => buildScoreRowFromAnswer(pid, ans)); }
       const newScores = baseScores.map(p => {
         const ans = chAnswers[p.id];
         if (ans?.sliderValue == null) return { ...p, delta: 0, wasCorrect: false };
@@ -2125,7 +2212,7 @@ function KahootHostView({ onNav, sessionName, pin, sessionDbId, tenantId, questi
       let baseScores;
       if (scores.length > 0) { baseScores = scores; }
       else if (chPlayers.length > 0) { baseScores = chPlayers.map(p => ({ ...p, score: 0 })); }
-      else { baseScores = Object.entries(chAnswers).map(([pid, ans], i) => ({ id: pid, name: ans.name ?? pid, emoji: PLAYER_EMOJIS[i % PLAYER_EMOJIS.length], color: PLAYER_COLORS[i % PLAYER_COLORS.length], score: 0 })); }
+      else { baseScores = Object.entries(chAnswers).map(([pid, ans]) => buildScoreRowFromAnswer(pid, ans)); }
       const scoreMatch = (mps) => {
         if (!Array.isArray(mps) || mps.length === 0) return 0;
         return mps.filter(mp => shuffledRight[mp.rightIdx]?.right === pairs[mp.leftIdx]?.right).length;
@@ -2168,12 +2255,7 @@ function KahootHostView({ onNav, sessionName, pin, sessionDbId, tenantId, questi
     } else if (chPlayers.length > 0) {
       baseScores = chPlayers.map(p => ({ ...p, score: 0 }));
     } else {
-      baseScores = Object.entries(chAnswers).map(([pid, ans], i) => ({
-        id: pid, name: ans.name ?? pid,
-        emoji: PLAYER_EMOJIS[i % PLAYER_EMOJIS.length],
-        color: PLAYER_COLORS[i % PLAYER_COLORS.length],
-        score: 0,
-      }));
+      baseScores = Object.entries(chAnswers).map(([pid, ans]) => buildScoreRowFromAnswer(pid, ans));
     }
     const newScores = baseScores.map(p => {
       const ans = chAnswers[p.id];
@@ -2476,11 +2558,6 @@ function KahootHostView({ onNav, sessionName, pin, sessionDbId, tenantId, questi
             {paused ? "▶" : "⏸"}
           </button>
           {phase === "question" && (
-            <button onClick={doReveal} title="Reveal now — locks submissions and scores existing answers" style={{ width: 36, height: 36, borderRadius: "50%", border: `1px solid ${C.border}`, background: "rgba(255,255,255,0.9)", color: C.dark, fontSize: 14, cursor: "pointer", display: "flex", alignItems: "center", justifyContent: "center" }}>
-              👁
-            </button>
-          )}
-          {phase === "question" && (
             <button onClick={() => setShowSkipConfirm(true)} title="Skip question — no points awarded" style={{ width: 36, height: 36, borderRadius: "50%", border: `1px solid ${C.border}`, background: "rgba(255,255,255,0.9)", color: C.dark, fontSize: 14, cursor: "pointer", display: "flex", alignItems: "center", justifyContent: "center" }}>
               ⏭
             </button>
@@ -2519,8 +2596,24 @@ function KahootHostView({ onNav, sessionName, pin, sessionDbId, tenantId, questi
         </div>
       )}
 
+      {/* Halted overlay — every connected player left mid-game. Timer/
+          progression are frozen (see the debounced watchdog effect above);
+          this only clears when the host explicitly resumes, never on its
+          own even after someone reconnects. Takes precedence over the
+          ordinary pause overlay below. */}
+      {halted && (
+        <div style={{ position: "fixed", inset: 0, background: "rgba(0,0,0,0.75)", display: "flex", flexDirection: "column", alignItems: "center", justifyContent: "center", gap: 20, zIndex: 101, backdropFilter: "blur(4px)" }}>
+          <div style={{ fontSize: 56 }}>⚠️</div>
+          <p style={{ margin: 0, fontSize: 22, fontWeight: 900, color: "#fff" }}>All players have left.</p>
+          <p style={{ margin: "-12px 0 0", fontSize: 14, color: "rgba(255,255,255,0.7)" }}>The game is paused. No points are being awarded.</p>
+          <button onClick={resumeFromHalt} style={{ marginTop: 4, padding: "14px 36px", borderRadius: 14, border: "none", background: C.orange, color: "#fff", fontSize: 17, fontWeight: 900, cursor: "pointer", display: "flex", alignItems: "center", gap: 10 }}>
+            ▶ Resume Game
+          </button>
+        </div>
+      )}
+
       {/* Paused overlay */}
-      {paused && (
+      {paused && !halted && (
         <div style={{ position: "fixed", inset: 0, background: "rgba(0,0,0,0.65)", display: "flex", flexDirection: "column", alignItems: "center", justifyContent: "center", gap: 20, zIndex: 100, backdropFilter: "blur(4px)" }}>
           <div style={{ fontSize: 56 }}>⏸</div>
           <p style={{ margin: 0, fontSize: 22, fontWeight: 900, color: "#fff" }}>Game Paused</p>
@@ -2676,27 +2769,41 @@ function KahootHostView({ onNav, sessionName, pin, sessionDbId, tenantId, questi
         {(q.options ?? []).map((opt, i) => {
           const OPTION_COLORS = ["#EF4444", "#3B82F6", "#F59E0B", "#22C55E"];
           const optColor = OPTION_COLORS[i % OPTION_COLORS.length];
-          const isCorrect = phase === "reveal" && i === q.correct;
-          const isWrong   = phase === "reveal" && i !== q.correct;
+          const isReveal   = phase === "reveal";
+          const isCorrect  = isReveal && i === q.correct;
+          const wasChosen  = dist[i] > 0;
+          const isWrongChosen   = isReveal && i !== q.correct && wasChosen;
+          const isWrongUnchosen = isReveal && i !== q.correct && !wasChosen;
           const pct = playerCount > 0 ? Math.round((dist[i] / playerCount) * 100) : 0;
-          // During reveal: correct = vivid green, wrong = dimmed colored card
-          const bgColor = isCorrect ? "#059669" : optColor;
+          // During reveal, correctness fully overrides the decorative option
+          // color: correct = vivid green, any option that received wrong
+          // submissions = clear red, options nobody picked = neutral gray.
+          // Pre-reveal (live voting), decorative colors are unchanged.
+          let bgColor, borderColor, opacity, glow;
+          if (isReveal) {
+            if (isCorrect)          { bgColor = "#059669"; borderColor = "#34D399";     opacity = 1;    glow = "0 0 24px rgba(16,185,129,0.4)"; }
+            else if (isWrongChosen) { bgColor = "#DC2626"; borderColor = "transparent";  opacity = 1;    glow = "0 2px 8px rgba(0,0,0,0.15)"; }
+            else                    { bgColor = "#9CA3AF"; borderColor = "transparent";  opacity = 0.45; glow = "none"; }
+          } else {
+            bgColor = optColor; borderColor = "transparent"; opacity = 1; glow = "0 2px 8px rgba(0,0,0,0.15)";
+          }
           return (
             <div key={i} style={{
               borderRadius: 14, padding: "14px 18px",
               background: bgColor,
-              border: `3px solid ${isCorrect ? "#34D399" : "transparent"}`,
-              opacity: isWrong ? 0.35 : 1,
-              transition: "opacity 0.3s",
-              boxShadow: isCorrect ? "0 0 24px rgba(16,185,129,0.4)" : "0 2px 8px rgba(0,0,0,0.15)",
+              border: `3px solid ${borderColor}`,
+              opacity,
+              transition: "opacity 0.3s, background 0.3s",
+              boxShadow: glow,
             }}>
               <div style={{ display: "flex", alignItems: "center", gap: 12, marginBottom: phase === "reveal" ? 8 : 0 }}>
                 <div style={{ width: 28, height: 28, borderRadius: 8, background: "rgba(0,0,0,0.2)", display: "flex", alignItems: "center", justifyContent: "center", fontSize: 12, fontWeight: 900, color: "#fff", flexShrink: 0 }}>
-                  {isCorrect ? "✓" : String.fromCharCode(65 + i)}
+                  {isCorrect ? "✓" : isWrongChosen ? "✗" : String.fromCharCode(65 + i)}
                 </div>
                 <span style={{ fontSize: 15, fontWeight: 700, color: "#fff", flex: 1 }}>{opt}</span>
                 {phase === "reveal" && <span style={{ fontSize: 13, fontWeight: 700, color: "rgba(255,255,255,0.85)" }}>{dist[i]} · {pct}%</span>}
               </div>
+              {isCorrect && <p style={{ margin: "0 0 8px 40px", fontSize: 10, fontWeight: 800, color: "rgba(255,255,255,0.9)", letterSpacing: "0.08em" }}>CORRECT ANSWER</p>}
               {phase === "reveal" && (
                 <div style={{ height: 4, borderRadius: 2, background: "rgba(0,0,0,0.2)" }}>
                   <div style={{ height: "100%", width: `${pct}%`, borderRadius: 2, background: "rgba(255,255,255,0.6)", transition: "width 0.6s" }} />
@@ -4056,11 +4163,16 @@ function RankdGameScreen({ onNav, sessionName, role, playerName, questions = GAM
               const isSel     = i === selectedIdx;
               const isUserLock = role === "user" && isSel && !isReveal;
 
-              let borderColor = oc.bg, bgColor = `${oc.bg}18`, opacity = 1, glow = "none";
+              // Reveal must communicate correctness unambiguously: correct is
+              // always green, this player's own wrong pick is always red, and
+              // everything else goes fully neutral (no decorative option hue
+              // survives into reveal — that's what made the previous reveal
+              // state confusing/hard to read at a glance).
+              let borderColor = oc.bg, bgColor = `${oc.bg}18`, cardBg = C.cardBg, opacity = 1, glow = "none";
               if (isReveal) {
-                if (isCorrect)    { borderColor = C.green; bgColor = "rgba(16,185,129,0.15)"; glow = "0 0 32px rgba(16,185,129,0.3)"; }
-                else if (isSel)   { borderColor = C.red;   bgColor = "rgba(239,68,68,0.13)"; }
-                else              { opacity = 0.28; }
+                if (isCorrect)    { borderColor = C.green; bgColor = "rgba(16,185,129,0.15)"; cardBg = bgColor; glow = "0 0 32px rgba(16,185,129,0.3)"; }
+                else if (isSel)   { borderColor = C.red;   bgColor = "rgba(239,68,68,0.13)";  cardBg = bgColor; }
+                else              { borderColor = C.border; bgColor = "rgba(120,120,120,0.06)"; cardBg = bgColor; opacity = 0.55; }
               } else if (isSel && role === "user") {
                 borderColor = oc.bg; bgColor = `${oc.bg}30`; glow = `0 0 24px ${oc.glow}`;
               } else if (isLocked && role === "user" && !isSel) {
@@ -4076,21 +4188,29 @@ function RankdGameScreen({ onNav, sessionName, role, playerName, questions = GAM
                   display: "flex", alignItems: "center", gap: 12,
                   padding: mobile ? "12px 14px" : (isTF ? "20px 28px" : "16px 20px"),
                   borderRadius: 14, border: `2px solid ${borderColor}`,
-                  background: isReveal && !isCorrect && !isSel ? "rgba(255,252,240,0.7)" : (isReveal && isCorrect ? bgColor : C.cardBg), cursor: (!isReveal && !isLocked && role === "user") ? "pointer" : "default",
+                  background: cardBg, cursor: (!isReveal && !isLocked && role === "user") ? "pointer" : "default",
                   textAlign: "left", opacity, boxShadow: glow, transition: "all 0.25s",
                   minHeight: 52,
                 }}>
                   <div style={{
                     width: 32, height: 32, borderRadius: 9, flexShrink: 0,
                     display: "flex", alignItems: "center", justifyContent: "center",
-                    background: (isReveal && isCorrect) ? C.green : (isReveal && isSel) ? C.red : oc.bg,
+                    background: (isReveal && isCorrect) ? C.green : (isReveal && isSel) ? C.red : (isReveal ? C.textMuted : oc.bg),
                     fontSize: 13, fontWeight: 900, color: "#fff", transition: "background 0.3s",
                   }}>
                     {isReveal ? (isCorrect ? "✓" : isSel ? "✗" : String.fromCharCode(65+i)) : (isUserLock ? "✓" : String.fromCharCode(65+i))}
                   </div>
                   <div style={{ flex: 1 }}>
-                    <span style={{ fontSize: mobile ? 13 : (isTF ? 17 : 14), fontWeight: 600, color: isReveal && isCorrect ? "#059669" : C.text, lineHeight: 1.4 }}>{opt}</span>
+                    <span style={{ fontSize: mobile ? 13 : (isTF ? 17 : 14), fontWeight: 600, color: isReveal && isCorrect ? "#059669" : isReveal && !isCorrect ? C.textMuted : C.text, lineHeight: 1.4 }}>{opt}</span>
                     {isUserLock && <p style={{ margin: "4px 0 0", fontSize: 10, fontWeight: 700, color: oc.bg, letterSpacing: "0.08em" }}>LOCKED IN ✓</p>}
+                    {isReveal && isCorrect && (
+                      <p style={{ margin: "4px 0 0", fontSize: 10, fontWeight: 800, color: "#059669", letterSpacing: "0.06em" }}>
+                        {isSel ? "✓ YOUR ANSWER · CORRECT" : "CORRECT ANSWER"}
+                      </p>
+                    )}
+                    {isReveal && !isCorrect && isSel && (
+                      <p style={{ margin: "4px 0 0", fontSize: 10, fontWeight: 800, color: C.red, letterSpacing: "0.06em" }}>✗ YOUR ANSWER</p>
+                    )}
                   </div>
                 </button>
               );
@@ -4100,7 +4220,11 @@ function RankdGameScreen({ onNav, sessionName, role, playerName, questions = GAM
       })()}
 
       {/* ── Type Answer ── */}
-      {q.type === "type" && (
+      {q.type === "type" && (() => {
+        const acceptedList = (q.acceptedAnswers ?? []).map(a => a.toLowerCase().trim());
+        const typeIsCorrect = isReveal && typedAnswer.trim() && acceptedList.includes(typedAnswer.toLowerCase().trim());
+        const typeWasSubmitted = isReveal && typedAnswer.trim().length > 0;
+        return (
         <div style={{ flex: 1, padding: mobile ? "16px" : "20px 60px", display: "flex", flexDirection: "column", alignItems: "center", justifyContent: "center", gap: 16, maxWidth: 680, margin: "0 auto", width: "100%", boxSizing: "border-box" }}>
           <input
             value={typedAnswer}
@@ -4115,15 +4239,20 @@ function RankdGameScreen({ onNav, sessionName, role, playerName, questions = GAM
             style={{
               width: "100%", textAlign: "center", fontSize: 20, fontWeight: 700, boxSizing: "border-box",
               borderRadius: 16, padding: "18px 24px",
-              background: typeSubmitted ? "rgba(16,185,129,0.08)" : C.cardBg,
-              color: C.text, border: `2px solid ${typeSubmitted ? "rgba(16,185,129,0.5)" : typedAnswer ? C.orange : C.border}`,
+              background: isReveal ? (typeIsCorrect ? "rgba(16,185,129,0.12)" : "rgba(239,68,68,0.1)") : (typeSubmitted ? "rgba(16,185,129,0.08)" : C.cardBg),
+              color: C.text, border: `2px solid ${isReveal ? (typeIsCorrect ? C.green : C.red) : (typeSubmitted ? "rgba(16,185,129,0.5)" : typedAnswer ? C.orange : C.border)}`,
               outline: "none", fontFamily: "inherit",
             }}
           />
           {isReveal && (
+            <p style={{ margin: 0, fontSize: 12, fontWeight: 800, letterSpacing: "0.06em", color: typeIsCorrect ? "#059669" : C.red }}>
+              {typeWasSubmitted ? (typeIsCorrect ? "✓ YOUR ANSWER · CORRECT" : "✗ YOUR ANSWER · INCORRECT") : "— NO ANSWER SUBMITTED"}
+            </p>
+          )}
+          {isReveal && (
             <div style={{ padding: "12px 24px", borderRadius: 12, background: "rgba(255,255,255,0.06)", border: "1px solid rgba(255,255,255,0.1)" }}>
               <p style={{ margin: 0, fontSize: 12, color: C.textMuted, textAlign: "center" }}>
-                Accepted: {(q.acceptedAnswers ?? []).join(" / ")}
+                Correct answer: {(q.acceptedAnswers ?? []).join(" / ")}
               </p>
             </div>
           )}
@@ -4138,7 +4267,8 @@ function RankdGameScreen({ onNav, sessionName, role, playerName, questions = GAM
             <p style={{ margin: 0, fontSize: 13, fontWeight: 700, color: C.green }}>✓ Answer locked — waiting for reveal…</p>
           )}
         </div>
-      )}
+        );
+      })()}
 
       {/* ── Open Ended ── */}
       {q.type === "open" && (
@@ -4187,6 +4317,13 @@ function RankdGameScreen({ onNav, sessionName, role, playerName, questions = GAM
           <div style={{ fontSize: 48, fontWeight: 900, color: isReveal ? (Math.abs(sliderValue - (q.correct ?? 5)) <= (q.tolerance ?? 1) ? C.green : C.red) : C.orange }}>
             {sliderValue}
           </div>
+          {isReveal && (
+            <p style={{ margin: "-12px 0 0", fontSize: 12, fontWeight: 800, letterSpacing: "0.06em", color: Math.abs(sliderValue - (q.correct ?? 5)) <= (q.tolerance ?? 1) ? "#059669" : C.red }}>
+              {sliderSubmitted
+                ? (Math.abs(sliderValue - (q.correct ?? 5)) <= (q.tolerance ?? 1) ? "✓ YOUR ANSWER · CORRECT" : "✗ YOUR ANSWER · OUTSIDE RANGE")
+                : "— NO ANSWER SUBMITTED"}
+            </p>
+          )}
           <div style={{ width: "100%", position: "relative" }}>
             {/* Track */}
             <div style={{ position: "relative", height: 8, borderRadius: 99, background: "rgba(255,255,255,0.15)", marginBottom: 8 }}>
@@ -5556,12 +5693,21 @@ function RankdLobbyScreen({ onNav, pin, playerName, playerEmoji, sessionName, ro
   const realPlayers    = isDemoMode ? [] : combinedRealPlayers;
   const displayPlayers = isDemoMode ? demoAllPlayers.slice(0, visibleCount) : realPlayers;
 
-  // Player side: announce join via channel
+  // Player side: announce join via channel (Presence track).
+  // Identity priority: an already-loaded DB participant record (source of
+  // truth, immutable after first write — see joinGameSession) > the
+  // playerEmoji prop from this session's name-entry > a deterministic hash
+  // fallback. Re-fires when playerEmoji/dbPlayers change so a late-arriving
+  // DB row or prop corrects an early presence guess instead of leaving it
+  // stale for the rest of the game.
   useEffect(() => {
     if (isDemoMode || role === "admin" || !pin || !playerId) return;
+    const dbSelf = dbPlayers.find(p => p.id === playerId);
     const pidx = Math.abs(playerId.charCodeAt(0) + playerId.charCodeAt(1)) % PLAYER_EMOJIS.length;
-    broadcast({ type: GM.PLAYER_JOIN, player: { id: playerId, name: playerName, emoji: playerEmoji ?? PLAYER_EMOJIS[pidx], color: PLAYER_COLORS[pidx % PLAYER_COLORS.length] } });
-  }, [isDemoMode, pin, playerId, role]);
+    const resolvedEmoji = dbSelf?.emoji ?? playerEmoji ?? PLAYER_EMOJIS[pidx];
+    const resolvedColor = dbSelf?.color ?? PLAYER_COLORS[pidx % PLAYER_COLORS.length];
+    broadcast({ type: GM.PLAYER_JOIN, player: { id: playerId, name: playerName, emoji: resolvedEmoji, color: resolvedColor } });
+  }, [isDemoMode, pin, playerId, role, playerEmoji, dbPlayers]); // eslint-disable-line react-hooks/exhaustive-deps
 
   // Player side: watch for GAME_START or first SHOW_QUESTION → navigate to game
   useEffect(() => {
