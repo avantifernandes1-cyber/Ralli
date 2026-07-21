@@ -15,6 +15,7 @@
  */
 
 import { supabase } from "./supabase.js";
+import { isQualifyingEvent } from "./assignmentEngine.js";
 
 // ─────────────────────────────────────────────────────────────────────────────
 // LESSONS
@@ -572,7 +573,7 @@ async function getQuizAssignmentActiveUserIds(tenantId, contentId) {
 
   const active = new Set();
   for (const [userId, latestAssignedAt] of latestAssignedAtByUser) {
-    const resolved = (attempts ?? []).some(at => at.user_id === userId && new Date(at.created_at) >= new Date(latestAssignedAt));
+    const resolved = (attempts ?? []).some(at => at.user_id === userId && isQualifyingEvent(at.created_at, latestAssignedAt));
     if (!resolved) active.add(userId);
   }
   return active;
@@ -616,7 +617,7 @@ async function getLessonAssignmentActiveUserIds(tenantId, contentId) {
 
   const active = new Set();
   for (const [userId, latestAssignedAt] of latestAssignedAtByUser) {
-    const resolved = (completions ?? []).some(c => c.profile_id === userId && new Date(c.completed_at) >= new Date(latestAssignedAt));
+    const resolved = (completions ?? []).some(c => c.profile_id === userId && isQualifyingEvent(c.completed_at, latestAssignedAt));
     if (!resolved) active.add(userId);
   }
   return active;
@@ -669,7 +670,7 @@ async function getCourseAssignmentActiveUserIds(tenantId, contentId) {
   for (const [userId, latestAssignedAt] of latestAssignedAtByUser) {
     const qualifyingLessons = new Set(
       (completions ?? [])
-        .filter(c => c.profile_id === userId && new Date(c.completed_at) >= new Date(latestAssignedAt))
+        .filter(c => c.profile_id === userId && isQualifyingEvent(c.completed_at, latestAssignedAt))
         .map(c => c.lesson_id)
     );
     const resolved = qualifyingLessons.size >= lessonIds.length;
