@@ -53,7 +53,7 @@ import {
   restoreLesson as restoreLessonService,
   getArchivedContent,
   getTenantLessonCompletions,
-  saveQuizAttempt,
+  submitQuizAttemptAtomic,
   getUserQuizAttempts,
   getTenantQuizAttempts,
   getTenantBcCategories,
@@ -70,7 +70,7 @@ import { resolveAssignmentStatus, isQualifyingEvent } from "./src/lib/assignment
 import { getProfile, createMissingProfile, getTenantProfiles } from "./src/lib/profileService.js";
 import { sendInviteEmail } from "./src/lib/emailService.js";
 import { provisionTenant, buildInviteUrl, normalizeProvisionedOrg, createMemberInvite } from "./src/lib/provisioningService.js";
-import { awardLessonPoints, awardCoursePoints, awardQuizPoints, awardGamePointsForSession, getLeaderboard, computeUserMeta, getUserStreak } from "./src/lib/scoringService.js";
+import { awardLessonPoints, awardCoursePoints, awardGamePointsForSession, getLeaderboard, computeUserMeta, getUserStreak } from "./src/lib/scoringService.js";
 import { triggerReadinessUpdate, getTopicHeatmap, getOrgMetrics, getRepTopicScores, getUserPerformance, getRecommendations } from "./src/lib/insightsService.js";
 
 // ── MOBILE HOOK ────────────────────────────────────────────
@@ -9550,6 +9550,18 @@ function QuizTakingView({ quiz, onComplete, onExit }) {
   const [matchDrag,     setMatchDrag]     = useState(null);   // { rightIdx, pointerId, x, y, moved, fromLeftIdx } while a pointer-drag is in flight
   const [matchOverZone, setMatchOverZone] = useState(null);   // leftIdx (number) | "pool" | null — drop zone currently hovered during a drag
 
+  // Task 15 — one stable idempotency key per quiz-taking session, generated
+  // once and reused across any retry of the SAME submission (network retry,
+  // double-click on Finish before the UI reacts). A genuine retake mounts a
+  // fresh QuizTakingView (see retakeQuiz() in QuizzesScreen), which creates
+  // a brand new ref/key — so retakes are never deduped against each other.
+  const submissionIdRef = useRef(null);
+  if (!submissionIdRef.current) {
+    submissionIdRef.current = (typeof crypto !== "undefined" && crypto.randomUUID)
+      ? crypto.randomUUID()
+      : `sub-${Date.now()}-${Math.random().toString(36).slice(2)}`;
+  }
+
   const q        = quiz.questions[qIdx];
   const total    = quiz.questions.length;
   const selected = answers[q.id] ?? null;
@@ -9768,7 +9780,7 @@ function QuizTakingView({ quiz, onComplete, onExit }) {
         quiz.questions[i].type !== "open" && isAnswerCorrect(quiz.questions[i], a.selected)
       ).length;
       const score   = gradedTotal > 0 ? Math.round((correctCount / gradedTotal) * 100) : 100;
-      const attempt = { id: `at${Date.now()}`, date: new Date().toISOString().slice(0,10), score, passed: score >= (quiz.passingScore ?? 90), answers: answerList };
+      const attempt = { id: `at${Date.now()}`, date: new Date().toISOString().slice(0,10), score, passed: score >= (quiz.passingScore ?? 90), answers: answerList, submissionId: submissionIdRef.current };
       onComplete(attempt);
     } else {
       setQIdx(i => i + 1);
@@ -10910,33 +10922,41 @@ function QuizzesScreen({ role, onNav, quizzes, onEditQuiz, onDeleteQuiz, onToggl
       }
       setActiveAttempt(attempt);
       setView("results");
-      // Award quiz XP + persist attempt for real users
+      // Task 15 — persist the attempt AND award its XP atomically via a
+      // single RPC (submit_quiz_attempt_atomic, 039_atomic_quiz_completion.sql)
+      // instead of two independent, un-awaited writes. attempt_num is now
+      // computed server-side under an advisory lock (never client-supplied),
+      // and attempt.submissionId (stable per QuizTakingView session — see
+      // its submissionIdRef) is passed as the idempotency key, so a network
+      // retry or a double-click on Finish can never insert a second attempt
+      // row or award XP twice; the RPC just returns the original result.
       if (isReal && currentUser?.id && tenantId) {
-        // previousAttempts from DB — not assignments[].attempts (which is always [])
-        const previousAttempts = userQuizAttempts[activeId] ?? [];
-        const isRetake = previousAttempts.length > 0;
-        awardQuizPoints(tenantId, currentUser.id, activeId, attempt, { isRetake })
-          .catch(e => console.error("[ralli] awardQuizPoints failed:", e));
-        saveQuizAttempt(tenantId, currentUser.id, activeId, {
-          score:      attempt.score,
-          passed:     attempt.passed,
-          attemptNum: previousAttempts.length + 1,
-          answers:    attempt.answers ?? [],
-        }).catch(e => console.error("[ralli] saveQuizAttempt failed:", e));
-        // Optimistically patch the shared hook's attempt list (Task 13) so
-        // this and every other mounted consumer (Home, manager tracking)
-        // sees the retake state immediately, without waiting for a
-        // refetch/realtime round-trip. Prepend (DESC order to match DB) and
-        // include answers so QuizResultsView works from the list. Needs its
-        // own created_at (unlike the pre-Task-13 optimistic patch, which
-        // didn't set one) — this array now also feeds Task 10's shared
-        // engine elsewhere, and a qualifying attempt without a created_at
-        // would read as unresolved until the real fetch/realtime confirms it.
-        sharedAssignmentData?.applyLocalQuizAttempt?.({
-          quiz_id: activeId, score: attempt.score, passed: attempt.passed,
-          answers: attempt.answers ?? [], created_at: new Date().toISOString(),
-        });
-        triggerReadinessUpdate(tenantId, currentUser.id);
+        submitQuizAttemptAtomic(tenantId, currentUser.id, activeId, attempt, attempt.submissionId)
+          .then(({ data, error }) => {
+            if (error) {
+              console.error("[ralli] submitQuizAttemptAtomic failed:", error);
+              return;
+            }
+            const savedAttempt = data?.attempt;
+            // Optimistically patch the shared hook's attempt list (Task 13)
+            // so this and every other mounted consumer (Home, manager
+            // tracking) sees the retake state immediately, without waiting
+            // for a refetch/realtime round-trip. Use the server's own
+            // created_at/score/passed so it exactly matches the persisted
+            // row (also correct on the alreadyRecorded/dedup path, where
+            // savedAttempt is the ORIGINAL row, not this retry's payload).
+            if (savedAttempt) {
+              sharedAssignmentData?.applyLocalQuizAttempt?.({
+                quiz_id: activeId, score: savedAttempt.score, passed: savedAttempt.passed,
+                answers: savedAttempt.answers ?? [], created_at: savedAttempt.created_at,
+              });
+            }
+            // Readiness is a pure recompute-and-upsert (safely recomputable,
+            // see 039's migration header) — kept as a follow-up fire-and-
+            // forget call outside the atomic transaction, exactly as before.
+            triggerReadinessUpdate(tenantId, currentUser.id);
+          })
+          .catch(e => console.error("[ralli] submitQuizAttemptAtomic failed:", e));
       }
     };
 

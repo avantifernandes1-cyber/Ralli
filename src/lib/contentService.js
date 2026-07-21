@@ -1113,6 +1113,42 @@ export async function saveQuizAttempt(tenantId, userId, quizId, attempt) {
 }
 
 /**
+ * Sprint 3, Task 15 — atomic quiz completion.
+ *
+ * Persists the quiz attempt AND awards its XP in one database transaction
+ * via the submit_quiz_attempt_atomic() RPC (039_atomic_quiz_completion.sql),
+ * instead of the two independent, un-awaited client writes this replaced
+ * (saveQuizAttempt() + scoringService.js's awardQuizPoints(), still exported
+ * above/there for any other caller, but no longer used by the quiz-taking
+ * flow). attempt_num is computed server-side under an advisory lock — never
+ * trust a client-supplied count. Pass/fail itself is still decided entirely
+ * client-side in QuizTakingView (unchanged) and simply carried through here.
+ *
+ * @param {string} tenantId
+ * @param {string} userId
+ * @param {string} quizId
+ * @param {{ score: number, passed: boolean, answers: Array }} attempt
+ * @param {string} idempotencyKey - stable per quiz-taking session (see
+ *   QuizTakingView's submissionIdRef) so a retry or double-click of the SAME
+ *   submission never inserts a second attempt row or awards XP twice. A
+ *   genuine retake uses a new key (new QuizTakingView mount).
+ * @returns {Promise<{ data: { attempt: Object, pointsAwarded: number, alreadyRecorded: boolean }|null, error: Object|null }>}
+ */
+export async function submitQuizAttemptAtomic(tenantId, userId, quizId, attempt, idempotencyKey) {
+  if (!tenantId || !userId || !quizId) return { data: null, error: new Error("Missing required params") };
+  const { data, error } = await supabase.rpc("submit_quiz_attempt_atomic", {
+    p_tenant_id:       tenantId,
+    p_user_id:         userId,
+    p_quiz_id:         quizId,
+    p_score:           attempt.score ?? 0,
+    p_passed:          attempt.passed ?? false,
+    p_answers:         attempt.answers ?? [],
+    p_idempotency_key: idempotencyKey ?? null,
+  });
+  return { data, error };
+}
+
+/**
  * Fetch all quiz attempts for a user within a tenant.
  * Used by insightsService to compute quiz accuracy per topic.
  *
