@@ -562,6 +562,7 @@ function HomeScreen({ user, onNav, quizAssignments = [], onResumeLesson, onStart
                                                                  // "is this assigned quiz done" and the Recent Quizzes list below,
                                                                  // so they can never disagree with each other.
   const [homeLoading,     setHomeLoading]     = useState(isReal);
+  const [homeError,       setHomeError]       = useState(null); // Task 8 — assignment fetch failure vs. genuinely empty
 
   // ── Leaderboard sidebar — reads from user_point_events (single source of truth)
   const [homeLbRows, setHomeLbRows] = useState([]);
@@ -572,8 +573,17 @@ function HomeScreen({ user, onNav, quizAssignments = [], onResumeLesson, onStart
     });
   }, [isReal, tenantId, user?.id]); // eslint-disable-line react-hooks/exhaustive-deps
 
-  useEffect(() => {
+  // Task 8 — this is the assignment fetch chain for Home: courses/lessons
+  // (needed to render assignment cards), assignments themselves, lesson
+  // completion dates, and quiz attempts (both needed to know which assigned
+  // items are already done). A failed piece used to be silently skipped via
+  // `if (x) setX(x)`, so a broken fetch looked identical to "all caught up."
+  // homeError now surfaces that distinction; per-field application below is
+  // otherwise unchanged, including the existing "mark seen only if
+  // assignments themselves loaded" rule.
+  const loadHomeData = useCallback(() => {
     if (!isReal || !tenantId || !user?.id) { setHomeLoading(false); return; }
+    setHomeError(null);
     Promise.all([
       getTenantCourses(tenantId),
       getTenantLessons(tenantId),
@@ -592,9 +602,15 @@ function HomeScreen({ user, onNav, quizAssignments = [], onResumeLesson, onStart
       }
       if (done) setHomeCompletedAt(done);
       if (attempts) setHomeQuizAttempts(attempts); // already ordered newest-first by getUserQuizAttempts
+      setHomeError((!c || !l || !a || !done || !attempts) ? "Could not load your assignments. Please try again." : null);
+      setHomeLoading(false);
+    }).catch(() => {
+      setHomeError("Could not load your assignments. Please try again.");
       setHomeLoading(false);
     });
-  }, [isReal, tenantId, user?.id]); // eslint-disable-line react-hooks/exhaustive-deps
+  }, [isReal, tenantId, user?.id]);
+
+  useEffect(() => { loadHomeData(); }, [loadHomeData]);
 
   // Report new-assignment count to App so the "Learn" nav badge stays in sync.
   // "new" = assigned after lastSeenAt (only meaningful when lastSeenAt is set).
@@ -719,6 +735,8 @@ function HomeScreen({ user, onNav, quizAssignments = [], onResumeLesson, onStart
       completedAssignments={completedAssignments}
       overdueAssignments={overdueAssignments}
       homeLoading={homeLoading}
+      homeError={homeError}
+      onRetryHome={loadHomeData}
       onResumeLesson={onResumeLesson}
       onStartCourse={onStartCourse}
       onStartQuiz={onStartQuiz}
@@ -739,7 +757,7 @@ function HomeScreen({ user, onNav, quizAssignments = [], onResumeLesson, onStart
 function PersonalDashboardScreen({
   user, onNav, isReal, tenantId, orgUsers,
   enrichedAssignments, pendingAssignments, completedAssignments, overdueAssignments,
-  homeLoading, onResumeLesson, onStartCourse, onStartQuiz, homeLbRows, quizzes,
+  homeLoading, homeError, onRetryHome, onResumeLesson, onStartCourse, onStartQuiz, homeLbRows, quizzes,
   quizAssignments = [], homeCourses = [], homeLessons = [], homeQuizAttempts = [],
 }) {
   const mobile     = useMobile();
@@ -1007,6 +1025,20 @@ function PersonalDashboardScreen({
           <p style={{ margin: "4px 0 0", fontSize: 13, color: C.textSub }}>Loading your readiness data…</p>
         </div>
         <LoadingState rows={5} message="Fetching performance data…" />
+      </div>
+    );
+  }
+
+  // Task 8 — a failed assignment fetch used to leave the dashboard showing
+  // stale/empty data with no indication anything went wrong. perf-fetch
+  // errors are out of scope here (separate, non-assignment data).
+  if (homeError && isReal) {
+    return (
+      <div style={{ display: "flex", flexDirection: "column", gap: 20 }}>
+        <div>
+          <h2 style={{ margin: 0, fontSize: 22, fontWeight: 800, color: C.text }}>My Dashboard</h2>
+        </div>
+        <ErrorState message={homeError} onRetry={onRetryHome} />
       </div>
     );
   }
@@ -6262,49 +6294,68 @@ function LearnScreen({ role, user, orgUsers = [], orgs = [], onNav, onAwardXp, p
   const [assignDateRange,  setAssignDateRange]  = useState({ start: "", end: "" }); // ISO date strings for custom range
 
   // ── Load content from Supabase for real users ────────────────────────────
-  useEffect(() => {
-    if (!isReal || !tenantId) return;
-    Promise.all([
+  // Task 8 — all assignment-related reads (course/lesson catalog needed to
+  // render assignment cards, assignments themselves, this user's completion
+  // data, and — for managers — tenant-wide completions/quiz attempts that
+  // power the Assignments tracking tab) are one retryable unit: a failed
+  // request used to be indistinguishable from "nothing assigned yet" because
+  // `dbCourses ?? []` etc. silently turned a null (error) response into an
+  // empty list. learnDataError now surfaces that distinction with a Retry
+  // that re-runs this exact function. getArchivedContent is intentionally
+  // left out — it's content-library housekeeping, not assignment status.
+  const [learnDataError, setLearnDataError] = useState(null);
+
+  const loadLearnData = useCallback(() => {
+    if (!isReal || !tenantId || !user?.id) { setIsLearnLoading(false); return; }
+    setLearnDataError(null);
+    const calls = [
       getTenantCourses(tenantId),
       getTenantLessons(tenantId),
       getTenantAssignments(tenantId),
-    ]).then(([{ data: dbCourses }, { data: dbLessons }, { data: dbAssignments }]) => {
-      // Real tenants always start blank — replace seed data (empty array if no content yet)
-      setCourses(dbCourses ?? []);
-      setLessons(dbLessons ?? []);
-      setAssignments(dbAssignments ?? []);
+      getLessonCompletions(user.id),
+      getLessonCompletionsWithDates(user.id),
+    ];
+    if (isAdmin) {
+      calls.push(getTenantLessonCompletions(tenantId), getTenantQuizAttempts(tenantId));
+    }
+    Promise.all(calls).then((results) => {
+      const [
+        { data: dbCourses }, { data: dbLessons }, { data: dbAssignments },
+        { data: dbCompleted }, { data: dbCompletedAt },
+        ...adminResults
+      ] = results;
+      const adminFailed = isAdmin && adminResults.some(r => !r.data);
+      if (!dbCourses || !dbLessons || !dbAssignments || !dbCompleted || !dbCompletedAt || adminFailed) {
+        setLearnDataError("Could not load your learning data. Please try again.");
+        setIsLearnLoading(false);
+        return;
+      }
+      setCourses(dbCourses);
+      setLessons(dbLessons);
+      setAssignments(dbAssignments);
+      // Replace entirely — do not merge with any prior localStorage state.
+      setCompletedLessons(new Set(dbCompleted));
+      setCompletedLessonsAt(dbCompletedAt);
+      if (isAdmin) {
+        const [{ data: dbTenantCompletions }, { data: dbTenantQuizAttempts }] = adminResults;
+        setTenantCompletions(dbTenantCompletions);
+        setTenantQuizAttempts(dbTenantQuizAttempts);
+      }
       setIsLearnLoading(false);
-    }).catch(() => setIsLearnLoading(false));
-    // Load archived content and all tenant completions for manager view
+    }).catch(() => {
+      setLearnDataError("Could not load your learning data. Please try again.");
+      setIsLearnLoading(false);
+    });
+    // Archived content — content-library housekeeping, not assignment status;
+    // left out of the retryable chain above on purpose (see comment above).
     if (isAdmin) {
       getArchivedContent(tenantId).then(({ data }) => {
         if (data) { setArchivedCourses(data.courses ?? []); setArchivedLessons(data.lessons ?? []); }
       });
-      getTenantLessonCompletions(tenantId).then(({ data }) => {
-        if (data) setTenantCompletions(data);
-      });
-      // Real quiz_attempts rows — powers the Assignments tab quiz status column
-      // below (previously hardcoded to "not_started"; see buildQuizAssignmentRows
-      // in QuizTrackingPanel for the reference status-derivation pattern).
-      getTenantQuizAttempts(tenantId).then(({ data }) => {
-        if (data) setTenantQuizAttempts(data);
-      });
     }
-  }, [tenantId, isReal]); // eslint-disable-line react-hooks/exhaustive-deps
+  }, [tenantId, isReal, isAdmin, user?.id]);
 
-  // ── Load lesson completions from Supabase for real users ─────────────────
-  useEffect(() => {
-    if (!isReal || !user?.id) return;
-    getLessonCompletions(user.id).then(({ data: dbCompleted }) => {
-      if (!dbCompleted) return;
-      // Replace entirely — do not merge with any prior localStorage state.
-      setCompletedLessons(new Set(dbCompleted));
-    });
-    getLessonCompletionsWithDates(user.id).then(({ data: dbCompletedAt }) => {
-      if (!dbCompletedAt) return;
-      setCompletedLessonsAt(dbCompletedAt);
-    });
-  }, [user?.id, isReal]); // eslint-disable-line react-hooks/exhaustive-deps
+  useEffect(() => { loadLearnData(); }, [loadLearnData]);
 
   const handleCompleteLesson = (id) => {
     if (completedLessons.has(id)) return;
@@ -6499,6 +6550,17 @@ function LearnScreen({ role, user, orgUsers = [], orgs = [], onNav, onAwardXp, p
           <p style={{ margin: "4px 0 0", fontSize: 13, color: C.textSub }}>Loading your assignments…</p>
         </div>
         <div style={{ padding: 60, textAlign: "center", color: C.textMuted, fontSize: 14 }}>Loading…</div>
+      </div>
+    );
+
+    // Task 8 — a failed load used to fall through to the same UI as "no
+    // assignments." Distinguish it with ErrorState + Retry (re-runs loadLearnData).
+    if (learnDataError) return (
+      <div style={{ display: "flex", flexDirection: "column", gap: 20 }}>
+        <div>
+          <h2 style={{ margin: 0, fontSize: 22, fontWeight: 800, color: C.text }}>My Learning</h2>
+        </div>
+        <ErrorState message={learnDataError} onRetry={loadLearnData} />
       </div>
     );
 
@@ -7148,7 +7210,10 @@ function LearnScreen({ role, user, orgUsers = [], orgs = [], onNav, onAwardXp, p
       )}
 
       {/* ASSIGNMENTS TAB — manager assignment portal */}
-      {tab === "assignments" && (() => {
+      {tab === "assignments" && learnDataError && (
+        <ErrorState message={learnDataError} onRetry={loadLearnData} />
+      )}
+      {tab === "assignments" && !learnDataError && (() => {
         const STATUS_CONFIG = {
           not_started: { label: "Not Started", bg: C.muted,    text: C.textSub  },
           in_progress: { label: "In Progress", bg: C.blueBg,   text: C.blue     },
@@ -10313,22 +10378,34 @@ function QuizTrackingPanel({ quizzes, orgUsers, tenantId, isReal, refreshKey, on
   const [assignments, setAssignments] = useState([]);
   const [attempts,    setAttempts]    = useState([]);
   const [loading,     setLoading]     = useState(isReal);
+  const [loadError,   setLoadError]   = useState(null); // Task 8 — manager tracking data
   const [statusTab,   setStatusTab]   = useState("assigned");
   const [search,      setSearch]      = useState("");
   const [selectedKey, setSelectedKey] = useState(null); // row.key of drilled-in assignment
 
-  useEffect(() => {
+  const loadTracking = useCallback(() => {
     if (!isReal || !tenantId) { setLoading(false); return; }
     setLoading(true);
+    setLoadError(null);
     Promise.all([
       getTenantAssignments(tenantId),
       getTenantQuizAttempts(tenantId),
     ]).then(([{ data: dbAssignments }, { data: dbAttempts }]) => {
-      setAssignments((dbAssignments ?? []).filter(a => a.contentType === "quiz"));
-      setAttempts(dbAttempts ?? []);
+      if (!dbAssignments || !dbAttempts) {
+        setLoadError("Could not load quiz assignment tracking. Please try again.");
+        setLoading(false);
+        return;
+      }
+      setAssignments(dbAssignments.filter(a => a.contentType === "quiz"));
+      setAttempts(dbAttempts);
       setLoading(false);
-    }).catch(() => setLoading(false));
-  }, [tenantId, isReal, refreshKey]);
+    }).catch(() => {
+      setLoadError("Could not load quiz assignment tracking. Please try again.");
+      setLoading(false);
+    });
+  }, [tenantId, isReal]);
+
+  useEffect(() => { loadTracking(); }, [loadTracking, refreshKey]);
 
   const allRows = buildQuizAssignmentRows(assignments, attempts, quizzes, orgUsers);
   const draftQuizzes = quizzes.filter(q => !assignments.some(a => a.contentId === q.id));
@@ -10365,6 +10442,8 @@ function QuizTrackingPanel({ quizzes, orgUsers, tenantId, isReal, refreshKey, on
   }
 
   if (loading) return <LoadingState rows={3} message="Loading quiz assignments…" />;
+
+  if (loadError) return <ErrorState message={loadError} onRetry={loadTracking} />;
 
   const rowsForStatusTab = statusTab === "all" ? searchedRows : statusTab === "drafts" ? [] : searchedRows.filter(r => r.status === statusTab);
   const draftsToShow = (statusTab === "drafts" || statusTab === "all") ? searchedDrafts : [];
@@ -10490,15 +10569,29 @@ function QuizzesScreen({ role, onNav, quizzes, onEditQuiz, onDeleteQuiz, onToggl
     const [assignmentsLoaded, setAssignmentsLoaded] = useState(!isReal);
     // Attempt history keyed by quiz_id — source of truth for retake detection
     const [userQuizAttempts, setUserQuizAttempts] = useState({});
+    // Task 8 — both fetches below feed assignment status (which quizzes are
+    // assigned, which are already passed) and are treated as one retryable
+    // unit. A failed assignments fetch used to fall straight into "No quizzes
+    // assigned yet" (setAssignmentsLoaded(true) with no data), indistinguishable
+    // from a real empty state; a failed attempts fetch was silently dropped.
+    const [quizDataError, setQuizDataError] = useState(null);
 
-    // Load quiz assignments from Supabase for real users.
+    // Load quiz assignments + attempt history from Supabase for real users.
     // Gated on quizzesReady so the merge always has access to the full quizzes array —
     // prevents the race where assignments resolve before getTenantQuizzes finishes.
-    useEffect(() => {
+    const loadUserQuizData = useCallback(() => {
       if (!isReal || !tenantId || !currentUser) return;
       if (!quizzesReady) return; // wait for App-level quiz load to complete first
-      getTenantAssignments(tenantId).then(({ data }) => {
-        if (!data) { setAssignmentsLoaded(true); return; }
+      setQuizDataError(null);
+      Promise.all([
+        getTenantAssignments(tenantId),
+        getUserQuizAttempts(tenantId, currentUser.id),
+      ]).then(([{ data }, { data: attemptRows }]) => {
+        if (!data || !attemptRows) {
+          setQuizDataError("Could not load your quizzes. Please try again.");
+          setAssignmentsLoaded(true);
+          return;
+        }
         const userTeamId = currentUser.teamId ?? null;
         const myQuizAssignments = data.filter(a =>
           a.contentType === "quiz" && (
@@ -10522,23 +10615,20 @@ function QuizzesScreen({ role, onNav, quizzes, onEditQuiz, onDeleteQuiz, onToggl
           };
         }).filter(Boolean);
         setAssignments(merged);
-        setAssignmentsLoaded(true);
-      });
-    }, [tenantId, isReal, currentUser?.id, quizzesReady]); // eslint-disable-line react-hooks/exhaustive-deps
-
-    // Load quiz attempt history from Supabase (for retake detection / attemptNum)
-    useEffect(() => {
-      if (!isReal || !tenantId || !currentUser?.id) return;
-      getUserQuizAttempts(tenantId, currentUser.id).then(({ data }) => {
-        if (!data) return;
         const byQuiz = {};
-        data.forEach(a => {
+        attemptRows.forEach(a => {
           if (!byQuiz[a.quiz_id]) byQuiz[a.quiz_id] = [];
           byQuiz[a.quiz_id].push(a);
         });
         setUserQuizAttempts(byQuiz);
+        setAssignmentsLoaded(true);
+      }).catch(() => {
+        setQuizDataError("Could not load your quizzes. Please try again.");
+        setAssignmentsLoaded(true);
       });
-    }, [tenantId, isReal, currentUser?.id]); // eslint-disable-line react-hooks/exhaustive-deps
+    }, [tenantId, isReal, currentUser?.id, currentUser?.teamId, currentUser?.orgId, quizzesReady, quizzes]);
+
+    useEffect(() => { loadUserQuizData(); }, [loadUserQuizData]);
 
     // view: "list" | "taking" | "results"
     const [view,         setView]         = useState("list");
@@ -10624,6 +10714,19 @@ function QuizzesScreen({ role, onNav, quizzes, onEditQuiz, onDeleteQuiz, onToggl
     // ── Loading state for real users ──
     if (!assignmentsLoaded) {
       return <LoadingState rows={3} message="Loading quizzes…" />;
+    }
+
+    // ── Error state — Task 8: a failed fetch used to fall straight into the
+    // empty state below; distinguish it with ErrorState + Retry. ──
+    if (quizDataError) {
+      return (
+        <div style={{ display: "flex", flexDirection: "column", gap: 20 }}>
+          <div>
+            <h2 style={{ margin: 0, fontSize: 22, fontWeight: 800, color: C.text }}>Quizzes</h2>
+          </div>
+          <ErrorState message={quizDataError} onRetry={loadUserQuizData} />
+        </div>
+      );
     }
 
     // ── Empty state for real users with no assignments ──
