@@ -12495,6 +12495,7 @@ const LEADERSHIP_SEED = {
 
   // Company risk
   risk: {
+    activeAssignments:     34, // Beta Cleanup — demo parity for the new Active Assignments org-metric card
     overdueAssignments:    7,
     overdueAssignmentReps: ["Carlos Reyes", "Elena Torres", "Brendan Walsh", "Alex Liu", "Tom Walsh", "Nina Barnes", "Dev Patel"],
     overdueCertifications: 4,
@@ -13070,7 +13071,18 @@ function LeadershipDashboardScreen({ currentOrg, orgUsers = [], isReal = false }
         .order("computed_at", { ascending: false }),
       getTopicHeatmap(tid),
       getOrgMetrics(tid),
-    ]).then(([{ data: rows }, heatmap, metrics]) => {
+      // Beta Cleanup — same tenant-wide reads QuizTrackingPanel / LearnScreen's
+      // Assignments tab already use to compute per-assignment status, so the
+      // Active/Overdue Assignments numbers below can never drift from what
+      // those manager-tracking surfaces show for the same tenant.
+      getTenantAssignments(tid),
+      getTenantQuizAttempts(tid),
+      getTenantLessonCompletions(tid),
+      getTenantCourses(tid),
+    ]).then(([
+      { data: rows }, heatmap, metrics,
+      { data: assignments }, { data: quizAttempts }, { data: lessonCompletions }, { data: courses },
+    ]) => {
       // Org metrics are independent of whether scores exist
       if (metrics) setOrgMetrics(metrics);
 
@@ -13080,25 +13092,84 @@ function LeadershipDashboardScreen({ currentOrg, orgUsers = [], isReal = false }
       const seen = new Set();
       const unique = rows.filter(r => { if (seen.has(r.user_id)) return false; seen.add(r.user_id); return true; });
 
-      // Build people array from orgUsers + readiness_scores rows
+      // Build people array from orgUsers + readiness_scores rows.
+      // Beta Cleanup — `tag` is now computed from the real score (reusing the
+      // same 85 / 65 band thresholds already used everywhere else in this
+      // file — scoreColor/scoreBg, RepDrillDownModal's band, Insights'
+      // distribution buckets), so the People Insights "Highest" / "Needs
+      // Coaching" filters work for real tenants. "promotion" / "improved"
+      // are NOT set here — both require a real prior-period snapshot that
+      // doesn't exist yet (see the Team Readiness / Readiness Trends BETA
+      // NOTE below); those two filters correctly show "No reps match this
+      // filter" for real data rather than a fabricated result.
       const people = unique.map((r, i) => {
         const member = orgUsers.find(u => u.id === r.user_id);
+        const readinessScore = r.score ?? 0;
         return {
           id:            r.user_id,
           name:          member?.name ?? "Team Member",
           title:         member?.title ?? member?.role ?? "Rep",
           email:         member?.email ?? "",
-          readinessScore: r.score ?? 0,
-          previousScore:  r.score ?? 0,
+          readinessScore,
+          previousScore:  readinessScore,
           trend:         0,
+          tag:           readinessScore >= 85 ? "top" : readinessScore < 65 ? "coaching" : undefined,
           color:         ["#6366f1","#f59e0b","#10b981","#ec4899","#3b82f6"][i % 5],
         };
       });
 
       const avg = people.length ? Math.round(people.reduce((s, p) => s + p.readinessScore, 0) / people.length) : 0;
 
+      // Beta Cleanup — Active/Overdue Assignments, computed by expanding every
+      // tenant_assignments row to its targeted users (resolveAssignedUsers,
+      // same helper QuizTrackingPanel uses) and resolving each (assignment,
+      // user) pair through the shared Resolved Assignment engine
+      // (resolveAssignmentStatus, assignmentEngine.js) — the ONE status
+      // calculator, reused rather than re-derived. Synthetic aggregate
+      // placeholders (a team/group assignment with zero current real
+      // members) are skipped — they don't correspond to an actual rep to
+      // count as active or overdue.
+      const courseLessonIds = new Map((courses ?? []).map(c => [c.id, c.lessonIds ?? []]));
+      const completedAtByUserLesson = new Map(
+        (lessonCompletions ?? []).map(c => [`${c.profileId}::${c.lessonId}`, c.completedAt])
+      );
+      let activeAssignmentCount = 0;
+      let overdueAssignmentCount = 0;
+      const overdueRepNames = new Set();
+      for (const a of (assignments ?? [])) {
+        const targetedUsers = resolveAssignedUsers(a.assignedTo, orgUsers);
+        for (const u of targetedUsers) {
+          if (u._isAggregate) continue;
+          let status;
+          if (a.contentType === "quiz") {
+            const userAttempts = (quizAttempts ?? []).filter(at => at.quiz_id === a.contentId && at.user_id === u.id);
+            status = resolveAssignmentStatus("quiz", a, { attempts: userAttempts }).status;
+          } else if (a.contentType === "lesson") {
+            const completedAt = completedAtByUserLesson.get(`${u.id}::${a.contentId}`) ?? null;
+            status = resolveAssignmentStatus("lesson", a, { completedAt }).status;
+          } else if (a.contentType === "course") {
+            const lessonIds = courseLessonIds.get(a.contentId) ?? [];
+            const completedAtByLesson = new Map(lessonIds.map(lid => [lid, completedAtByUserLesson.get(`${u.id}::${lid}`) ?? null]));
+            status = resolveAssignmentStatus("course", a, { lessonIds, completedAtByLesson }).status;
+          } else {
+            continue;
+          }
+          if (status !== "completed") activeAssignmentCount++;
+          if (status === "overdue") {
+            overdueAssignmentCount++;
+            overdueRepNames.add(u.name);
+          }
+        }
+      }
+
       setLiveData({
         company: { readinessScore: avg, previousScore: avg, targetScore: 90, trend: [], period: "Current" },
+        // BETA NOTE:
+        // Hidden until supporting infrastructure is production-ready.
+        // Do not remove.
+        // Planned for post-beta Manager Intelligence milestone.
+        // (teams: no team-level readiness aggregation query exists yet —
+        // Team Readiness / Top Team / Needs Attention are hidden below.)
         teams:   [],
         people: people.map(p => ({
           ...p,
@@ -13107,14 +13178,30 @@ function LeadershipDashboardScreen({ currentOrg, orgUsers = [], isReal = false }
           initials: (p.name ?? "").split(" ").map(w => w[0] ?? "").join("").slice(0, 2).toUpperCase() || "TM",
         })),
         heatmap:   heatmap ?? [],
+        // BETA NOTE:
+        // Hidden until supporting infrastructure is production-ready.
+        // Do not remove.
+        // Planned for post-beta Manager Intelligence milestone.
+        // (trends: no historical readiness time-series is stored yet —
+        // Readiness Trends is hidden below.)
         trends:    {},
+        // BETA NOTE:
+        // Hidden until supporting infrastructure is production-ready.
+        // Do not remove.
+        // Planned for post-beta Manager Intelligence milestone.
+        // (aiSummary: org-scope AI summary was never wired up — AI
+        // Performance Summary is hidden below.)
         aiSummary: null,
         risk: {
-          overdueAssignments:    0,
+          activeAssignments:     activeAssignmentCount,
+          overdueAssignments:    overdueAssignmentCount,
+          overdueAssignmentReps: [...overdueRepNames],
+          // BETA NOTE — certifications/teams-below-target/coaching-gaps have
+          // no backing data model yet; kept as empty (not fabricated) and
+          // their cards are hidden below rather than shown with fake zeros.
           overdueCertifications: 0,
-          overdueAssignmentReps: [],
           certExpiringSoon:      [],
-          lowReadinessReps:      people.filter(p => p.readinessScore < 65).map(p => p.id),
+          lowReadinessReps:      people.filter(p => p.readinessScore < 65).map(p => ({ id: p.id, name: p.name, score: p.readinessScore })),
           teamsBelowTarget:      [],
           coachingGaps:          [],
         },
@@ -13321,9 +13408,19 @@ function LeadershipDashboardScreen({ currentOrg, orgUsers = [], isReal = false }
             sub: "Engaged in last 30 days",
             color: C.blue,
           },
+          {
+            // Beta Cleanup — added per beta requirements. Sourced from
+            // data.risk.activeAssignments, computed above via the shared
+            // Resolved Assignment engine (see the useEffect) — same source
+            // as the Company Risk "Overdue Assignments" card below.
+            label: "Active Assignments",
+            value: `${data.risk.activeAssignments ?? 0}`,
+            sub: "Not yet completed",
+            color: C.blue,
+          },
         ];
         return (
-          <div style={{ display: "grid", gridTemplateColumns: mobile ? "repeat(2, 1fr)" : "repeat(5, 1fr)", gap: 14 }}>
+          <div style={{ display: "grid", gridTemplateColumns: mobile ? "repeat(2, 1fr)" : "repeat(6, 1fr)", gap: 14 }}>
             {cards.map((s, i) => (
               <Card key={i}>
                 <div style={{ fontSize: 26, fontWeight: 900, color: s.color }}>{s.value}</div>
@@ -13375,9 +13472,17 @@ function LeadershipDashboardScreen({ currentOrg, orgUsers = [], isReal = false }
       })()}
 
       {/* ── SECTION 2 — Highlights row ── */}
-      <div style={{ display: "grid", gridTemplateColumns: mobile ? "1fr" : "1fr 1fr 1fr", gap: 14 }}>
-        {/* Top team — guard for empty teams array (real orgs with no team assignments yet) */}
-        {(() => {
+      {/* BETA NOTE:
+          Hidden until supporting infrastructure is production-ready.
+          Do not remove.
+          Planned for post-beta Manager Intelligence milestone.
+          (Top Team / Needs Attention need real team-level readiness
+          aggregation, which doesn't exist yet — see the `teams: []` BETA
+          NOTE in the fetch useEffect above.) Grid is single-column while
+          these two are hidden so the remaining Weakest/Strongest Skill card
+          doesn't look stranded in a 3-up layout. */}
+      <div style={{ display: "grid", gridTemplateColumns: mobile ? "1fr" : "1fr", gap: 14 }}>
+        {false && (() => {
           const top = data.teams.length > 0 ? [...data.teams].sort((a, b) => b.readinessScore - a.readinessScore)[0] : null;
           return top ? (
             <Card style={{ background: `linear-gradient(135deg, ${C.trueGreenBg}, #fff)`, borderColor: C.trueGreen + "44" }}>
@@ -13394,8 +13499,7 @@ function LeadershipDashboardScreen({ currentOrg, orgUsers = [], isReal = false }
           );
         })()}
 
-        {/* Needs attention team — guard for empty teams array */}
-        {(() => {
+        {false && (() => {
           const bot = data.teams.length > 0 ? [...data.teams].sort((a, b) => a.readinessScore - b.readinessScore)[0] : null;
           return bot ? (
             <Card style={{ background: `linear-gradient(135deg, ${C.redBg}, #fff)`, borderColor: C.red + "44" }}>
@@ -13449,49 +13553,60 @@ function LeadershipDashboardScreen({ currentOrg, orgUsers = [], isReal = false }
         </Card>
       </div>
 
-      {/* ── SECTION 3 — Team Readiness ── */}
-      <Card>
-        {SH("Team Readiness", "Readiness score by team. Click a team to filter People Insights.")}
-        <div style={{ display: "flex", flexDirection: "column", gap: 10 }}>
-          {data.teams.map(team => {
-            const d = delta(team.readinessScore, team.previousScore);
-            const isActive = teamFilter === team.id;
-            return (
-              <div
-                key={team.id}
-                onClick={() => setTeamFilter(isActive ? "all" : team.id)}
-                style={{
-                  display: "flex", alignItems: "center", gap: 16, padding: "14px 16px",
-                  borderRadius: 10, cursor: "pointer",
-                  border: `1.5px solid ${isActive ? C.orange : C.border}`,
-                  background: isActive ? C.orangeLight : C.pageBg,
-                  transition: "all 0.12s",
-                }}
-              >
-                <div style={{ flex: 1 }}>
-                  <div style={{ display: "flex", alignItems: "center", gap: 8, marginBottom: 8 }}>
-                    <span style={{ fontSize: 13, fontWeight: 700, color: C.text }}>{team.name}</span>
-                    <span style={{ fontSize: 11, color: C.textSub }}>{team.headcount} reps</span>
-                    <span style={{ fontSize: 12, fontWeight: 700, color: deltaColor(d), marginLeft: "auto" }}>
-                      {deltaLabel(d)} pts
-                    </span>
-                    <ScoreBadge score={team.readinessScore} />
+      {/* ── SECTION 3 — Team Readiness ──
+          BETA NOTE:
+          Hidden until supporting infrastructure is production-ready.
+          Do not remove.
+          Planned for post-beta Manager Intelligence milestone.
+          (No team-level readiness aggregation query exists yet — see the
+          `teams: []` BETA NOTE in the fetch useEffect above. This Card is
+          wrapped in `false &&` so it never renders and never runs
+          data.teams.map over an empty array; the flex-column page layout
+          closes the gap automatically with nothing left behind.) */}
+      {false && (
+        <Card>
+          {SH("Team Readiness", "Readiness score by team. Click a team to filter People Insights.")}
+          <div style={{ display: "flex", flexDirection: "column", gap: 10 }}>
+            {data.teams.map(team => {
+              const d = delta(team.readinessScore, team.previousScore);
+              const isActive = teamFilter === team.id;
+              return (
+                <div
+                  key={team.id}
+                  onClick={() => setTeamFilter(isActive ? "all" : team.id)}
+                  style={{
+                    display: "flex", alignItems: "center", gap: 16, padding: "14px 16px",
+                    borderRadius: 10, cursor: "pointer",
+                    border: `1.5px solid ${isActive ? C.orange : C.border}`,
+                    background: isActive ? C.orangeLight : C.pageBg,
+                    transition: "all 0.12s",
+                  }}
+                >
+                  <div style={{ flex: 1 }}>
+                    <div style={{ display: "flex", alignItems: "center", gap: 8, marginBottom: 8 }}>
+                      <span style={{ fontSize: 13, fontWeight: 700, color: C.text }}>{team.name}</span>
+                      <span style={{ fontSize: 11, color: C.textSub }}>{team.headcount} reps</span>
+                      <span style={{ fontSize: 12, fontWeight: 700, color: deltaColor(d), marginLeft: "auto" }}>
+                        {deltaLabel(d)} pts
+                      </span>
+                      <ScoreBadge score={team.readinessScore} />
+                    </div>
+                    <ProgressBar
+                      value={team.readinessScore} max={100}
+                      color={scoreColor(team.readinessScore)}
+                      trackColor={C.border}
+                      height={7}
+                    />
                   </div>
-                  <ProgressBar
-                    value={team.readinessScore} max={100}
-                    color={scoreColor(team.readinessScore)}
-                    trackColor={C.border}
-                    height={7}
-                  />
                 </div>
-              </div>
-            );
-          })}
-        </div>
-        <div style={{ fontSize: 11, color: C.textSub, marginTop: 12 }}>
-          Target: {company.targetScore}% · Colors: green ≥ 85 · orange ≥ 70 · red &lt; 70
-        </div>
-      </Card>
+              );
+            })}
+          </div>
+          <div style={{ fontSize: 11, color: C.textSub, marginTop: 12 }}>
+            Target: {company.targetScore}% · Colors: green ≥ 85 · orange ≥ 70 · red &lt; 70
+          </div>
+        </Card>
+      )}
 
       {/* ── SECTION 4 — Knowledge Heatmap ── */}
       <Card>
@@ -13642,59 +13757,76 @@ function LeadershipDashboardScreen({ currentOrg, orgUsers = [], isReal = false }
         )}
       </Card>
 
-      {/* ── SECTION 5 — Readiness Trends ── */}
-      <Card>
-        <div style={{ display: "flex", justifyContent: "space-between", alignItems: "flex-start", marginBottom: 16 }}>
-          {SH("Readiness Trends", "Scores over time by team.")}
-          <div style={{ display: "flex", gap: 6 }}>
-            {[
-              { id: "weekly", label: "Weekly" },
-              { id: "monthly", label: "Monthly" },
-              { id: "quarterly", label: "Quarterly" },
-            ].map(p => (
-              <button key={p.id} onClick={() => setTrendPeriod(p.id)} style={{
-                padding: "6px 12px", borderRadius: 8,
-                border: `1px solid ${trendPeriod === p.id ? C.orange : C.border}`,
-                background: trendPeriod === p.id ? C.orangeLight : C.white,
-                color: trendPeriod === p.id ? C.orange : C.textSub,
-                fontSize: 12, fontWeight: 600, cursor: "pointer",
-              }}>{p.label}</button>
+      {/* ── SECTION 5 — Readiness Trends ──
+          BETA NOTE:
+          Hidden until supporting infrastructure is production-ready.
+          Do not remove.
+          Planned for post-beta Manager Intelligence milestone.
+          (No historical readiness time-series is stored yet — see the
+          `trends: {}` BETA NOTE in the fetch useEffect above.) */}
+      {false && (
+        <Card>
+          <div style={{ display: "flex", justifyContent: "space-between", alignItems: "flex-start", marginBottom: 16 }}>
+            {SH("Readiness Trends", "Scores over time by team.")}
+            <div style={{ display: "flex", gap: 6 }}>
+              {[
+                { id: "weekly", label: "Weekly" },
+                { id: "monthly", label: "Monthly" },
+                { id: "quarterly", label: "Quarterly" },
+              ].map(p => (
+                <button key={p.id} onClick={() => setTrendPeriod(p.id)} style={{
+                  padding: "6px 12px", borderRadius: 8,
+                  border: `1px solid ${trendPeriod === p.id ? C.orange : C.border}`,
+                  background: trendPeriod === p.id ? C.orangeLight : C.white,
+                  color: trendPeriod === p.id ? C.orange : C.textSub,
+                  fontSize: 12, fontWeight: 600, cursor: "pointer",
+                }}>{p.label}</button>
+              ))}
+            </div>
+          </div>
+
+          {/* Legend */}
+          <div style={{ display: "flex", gap: 16, flexWrap: "wrap", marginBottom: 14 }}>
+            {TREND_SERIES.map(s => (
+              <div key={s.key} style={{ display: "flex", alignItems: "center", gap: 5 }}>
+                <div style={{ width: 10, height: 10, borderRadius: 2, background: s.color }} />
+                <span style={{ fontSize: 11, color: C.textSub }}>{s.label}</span>
+              </div>
             ))}
           </div>
-        </div>
 
-        {/* Legend */}
-        <div style={{ display: "flex", gap: 16, flexWrap: "wrap", marginBottom: 14 }}>
-          {TREND_SERIES.map(s => (
-            <div key={s.key} style={{ display: "flex", alignItems: "center", gap: 5 }}>
-              <div style={{ width: 10, height: 10, borderRadius: 2, background: s.color }} />
-              <span style={{ fontSize: 11, color: C.textSub }}>{s.label}</span>
-            </div>
-          ))}
-        </div>
-
-        {/* Bar chart */}
-        <div style={{ display: "flex", alignItems: "flex-end", gap: 14, height: 140, overflowX: "auto" }}>
-          {trendPoints.map((pt, i) => (
-            <div key={i} style={{ display: "flex", flexDirection: "column", alignItems: "center", gap: 5, flex: 1, minWidth: 48 }}>
-              <div style={{ display: "flex", alignItems: "flex-end", gap: 3, height: 110 }}>
-                {TREND_SERIES.map(s => (
-                  <div key={s.key} style={{
-                    width: 10, borderRadius: "3px 3px 0 0",
-                    height: `${(pt[s.key] / maxTrendVal) * 110}px`,
-                    background: s.color, opacity: 0.85,
-                    flexShrink: 0,
-                  }} title={`${s.label}: ${pt[s.key]}%`} />
-                ))}
+          {/* Bar chart */}
+          <div style={{ display: "flex", alignItems: "flex-end", gap: 14, height: 140, overflowX: "auto" }}>
+            {trendPoints.map((pt, i) => (
+              <div key={i} style={{ display: "flex", flexDirection: "column", alignItems: "center", gap: 5, flex: 1, minWidth: 48 }}>
+                <div style={{ display: "flex", alignItems: "flex-end", gap: 3, height: 110 }}>
+                  {TREND_SERIES.map(s => (
+                    <div key={s.key} style={{
+                      width: 10, borderRadius: "3px 3px 0 0",
+                      height: `${(pt[s.key] / maxTrendVal) * 110}px`,
+                      background: s.color, opacity: 0.85,
+                      flexShrink: 0,
+                    }} title={`${s.label}: ${pt[s.key]}%`} />
+                  ))}
+                </div>
+                <div style={{ fontSize: 10, color: C.textSub, fontWeight: 600, whiteSpace: "nowrap" }}>{pt.label}</div>
               </div>
-              <div style={{ fontSize: 10, color: C.textSub, fontWeight: 600, whiteSpace: "nowrap" }}>{pt.label}</div>
-            </div>
-          ))}
-        </div>
-      </Card>
+            ))}
+          </div>
+        </Card>
+      )}
 
-      {/* ── SECTION 6 — Performance Summary — only rendered when available ── */}
-      {data.aiSummary && (
+      {/* ── SECTION 6 — Performance Summary ──
+          BETA NOTE:
+          Hidden until supporting infrastructure is production-ready.
+          Do not remove.
+          Planned for post-beta Manager Intelligence milestone.
+          (No org-scope AI summary is ever populated — `aiSummary` is always
+          null for real tenants, see the fetch useEffect above. Explicit
+          `false &&` guard added so this can never accidentally reappear
+          before the BETA NOTE above is addressed, even if aiSummary is
+          wired up elsewhere without reading this comment.) */}
+      {false && data.aiSummary && (
         <Card style={{ border: `1.5px solid ${C.orange}44`, background: `linear-gradient(135deg, ${C.orangeLight}50, #fff)` }}>
           {SH("Performance Summary", `Generated ${data.aiSummary.generatedAt} · Based on platform activity`)}
           <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 18 }}>
@@ -13747,10 +13879,24 @@ function LeadershipDashboardScreen({ currentOrg, orgUsers = [], isReal = false }
             {[
               { id: "all",       label: "All" },
               { id: "top",       label: "Highest" },
+              /*
+               * BETA NOTE:
+               * Hidden until supporting infrastructure is production-ready.
+               * Do not remove.
+               * Planned for post-beta Manager Intelligence milestone.
+               *
+               * "Most Improved" and "Promotion Ready" require a prior-period /
+               * trend snapshot that doesn't exist yet for real tenants (same
+               * gap as the hidden Readiness Trends / Team Readiness widgets).
+               * Demo mode intentionally keeps these to showcase the feature,
+               * so they're only stripped from the real-tenant chip list below.
+               */
               { id: "improved",  label: "Most Improved" },
               { id: "promotion", label: "Promotion Ready" },
               { id: "coaching",  label: "Needs Coaching" },
-            ].map(f => (
+            ]
+              .filter(f => isReal ? !["improved", "promotion"].includes(f.id) : true)
+              .map(f => (
               <button key={f.id} onClick={() => setPeopleFilter(f.id)} style={{
                 padding: "5px 12px", borderRadius: 8, fontSize: 12, fontWeight: 600, cursor: "pointer",
                 border: `1px solid ${peopleFilter === f.id ? C.orange : C.border}`,
@@ -13824,12 +13970,18 @@ function LeadershipDashboardScreen({ currentOrg, orgUsers = [], isReal = false }
         </div>
       </Card>
 
-      {/* ── SECTION 8 — Company Risk ── */}
+      {/* ── SECTION 8 — Company Risk ──
+          Beta Cleanup — grid intentionally left at 2 columns: with Expiring
+          Certifications / Teams Below Target / Coaching Gaps hidden below,
+          the two remaining cards (Overdue Assignments, Low-Readiness Reps)
+          auto-flow into a clean 1x2 row — no leftover empty cells. */}
       <Card style={{ border: `1.5px solid ${C.red}33` }}>
         {SH("Company Risk", "Active risks that require manager action.")}
         <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 16 }}>
 
-          {/* Overdue assignments */}
+          {/* Overdue assignments — Beta Cleanup: was hardcoded to 0; now
+              sourced from data.risk.overdueAssignments, computed via the
+              shared Resolved Assignment engine in the fetch useEffect above. */}
           <div style={{ padding: 16, borderRadius: 10, background: C.redBg, border: `1px solid ${C.red}33` }}>
             <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 10 }}>
               <span style={{ fontSize: 13, fontWeight: 700, color: C.text }}>Overdue Assignments</span>
@@ -13842,56 +13994,84 @@ function LeadershipDashboardScreen({ currentOrg, orgUsers = [], isReal = false }
               {data.risk.overdueAssignmentReps.length > 4 && (
                 <div style={{ fontSize: 11, color: C.textMuted }}>+{data.risk.overdueAssignmentReps.length - 4} more</div>
               )}
+              {data.risk.overdueAssignmentReps.length === 0 && (
+                <div style={{ fontSize: 11, color: C.textMuted }}>No overdue assignments.</div>
+              )}
             </div>
           </div>
 
-          {/* Expiring certs */}
-          <div style={{ padding: 16, borderRadius: 10, background: C.orangeLight, border: `1px solid ${C.orange}33` }}>
-            <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 10 }}>
-              <span style={{ fontSize: 13, fontWeight: 700, color: C.text }}>Expiring Certifications</span>
-              <span style={{ fontSize: 22, fontWeight: 900, color: C.orange }}>{data.risk.overdueCertifications}</span>
+          {/* Expiring certs —
+              BETA NOTE:
+              Hidden until supporting infrastructure is production-ready.
+              Do not remove.
+              Planned for post-beta Manager Intelligence milestone.
+              (No certifications feature/data model exists yet — kept as
+              empty data, not fabricated, and hidden rather than shown with
+              a fake 0.) */}
+          {false && (
+            <div style={{ padding: 16, borderRadius: 10, background: C.orangeLight, border: `1px solid ${C.orange}33` }}>
+              <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 10 }}>
+                <span style={{ fontSize: 13, fontWeight: 700, color: C.text }}>Expiring Certifications</span>
+                <span style={{ fontSize: 22, fontWeight: 900, color: C.orange }}>{data.risk.overdueCertifications}</span>
+              </div>
+              <div style={{ display: "flex", flexDirection: "column", gap: 4 }}>
+                {data.risk.certExpiringSoon.map(name => (
+                  <div key={name} style={{ fontSize: 11, color: C.textSub }}>{name}</div>
+                ))}
+              </div>
             </div>
-            <div style={{ display: "flex", flexDirection: "column", gap: 4 }}>
-              {data.risk.certExpiringSoon.map(name => (
-                <div key={name} style={{ fontSize: 11, color: C.textSub }}>{name}</div>
-              ))}
-            </div>
-          </div>
+          )}
 
-          {/* Low-readiness reps */}
+          {/* Low-readiness reps — Beta Cleanup: real-data rows were raw id
+              strings (shape mismatch with this render, which expects
+              {name, score}); now mapped to {id, name, score} in the fetch
+              useEffect above. */}
           <div style={{ padding: 16, borderRadius: 10, background: C.redBg, border: `1px solid ${C.red}33` }}>
             <div style={{ fontSize: 13, fontWeight: 700, color: C.text, marginBottom: 10 }}>Low-Readiness Reps</div>
             <div style={{ display: "flex", flexDirection: "column", gap: 6 }}>
               {data.risk.lowReadinessReps.map(r => (
-                <div key={r.name} style={{ display: "flex", justifyContent: "space-between", alignItems: "center" }}>
+                <div key={r.id ?? r.name} style={{ display: "flex", justifyContent: "space-between", alignItems: "center" }}>
                   <span style={{ fontSize: 12, color: C.textSub }}>{r.name}</span>
                   <ScoreBadge score={r.score} />
                 </div>
               ))}
+              {data.risk.lowReadinessReps.length === 0 && (
+                <div style={{ fontSize: 11, color: C.textMuted }}>No reps below the readiness threshold.</div>
+              )}
             </div>
           </div>
 
-          {/* Teams below target + coaching gaps */}
-          <div style={{ display: "flex", flexDirection: "column", gap: 10 }}>
-            <div style={{ padding: 16, borderRadius: 10, background: C.redBg, border: `1px solid ${C.red}33` }}>
-              <div style={{ fontSize: 13, fontWeight: 700, color: C.text, marginBottom: 8 }}>Teams Below Target</div>
-              {data.risk.teamsBelowTarget.map(t => (
-                <div key={t.name} style={{ display: "flex", justifyContent: "space-between", alignItems: "center" }}>
-                  <span style={{ fontSize: 12, color: C.textSub }}>{t.name}</span>
-                  <span style={{ fontSize: 12, color: C.red, fontWeight: 700 }}>{t.score}% / {t.target}% target</span>
-                </div>
-              ))}
+          {/* Teams below target + coaching gaps —
+              BETA NOTE:
+              Hidden until supporting infrastructure is production-ready.
+              Do not remove.
+              Planned for post-beta Manager Intelligence milestone.
+              (Both depend on the same team-level aggregation that doesn't
+              exist yet — see the `teams: []` BETA NOTE in the fetch
+              useEffect above — plus, for Coaching Gaps specifically, an
+              "attendance" data model that was never built.) */}
+          {false && (
+            <div style={{ display: "flex", flexDirection: "column", gap: 10 }}>
+              <div style={{ padding: 16, borderRadius: 10, background: C.redBg, border: `1px solid ${C.red}33` }}>
+                <div style={{ fontSize: 13, fontWeight: 700, color: C.text, marginBottom: 8 }}>Teams Below Target</div>
+                {data.risk.teamsBelowTarget.map(t => (
+                  <div key={t.name} style={{ display: "flex", justifyContent: "space-between", alignItems: "center" }}>
+                    <span style={{ fontSize: 12, color: C.textSub }}>{t.name}</span>
+                    <span style={{ fontSize: 12, color: C.red, fontWeight: 700 }}>{t.score}% / {t.target}% target</span>
+                  </div>
+                ))}
+              </div>
+              <div style={{ padding: 16, borderRadius: 10, background: C.pageBg, border: `1px solid ${C.border}` }}>
+                <div style={{ fontSize: 13, fontWeight: 700, color: C.text, marginBottom: 8 }}>Coaching Gaps</div>
+                {data.risk.coachingGaps.map(r => (
+                  <div key={r.name} style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 4 }}>
+                    <span style={{ fontSize: 12, color: C.textSub }}>{r.name}</span>
+                    <span style={{ fontSize: 12, color: C.red, fontWeight: 700 }}>{r.attendance}% attendance</span>
+                  </div>
+                ))}
+              </div>
             </div>
-            <div style={{ padding: 16, borderRadius: 10, background: C.pageBg, border: `1px solid ${C.border}` }}>
-              <div style={{ fontSize: 13, fontWeight: 700, color: C.text, marginBottom: 8 }}>Coaching Gaps</div>
-              {data.risk.coachingGaps.map(r => (
-                <div key={r.name} style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 4 }}>
-                  <span style={{ fontSize: 12, color: C.textSub }}>{r.name}</span>
-                  <span style={{ fontSize: 12, color: C.red, fontWeight: 700 }}>{r.attendance}% attendance</span>
-                </div>
-              ))}
-            </div>
-          </div>
+          )}
         </div>
       </Card>
 
