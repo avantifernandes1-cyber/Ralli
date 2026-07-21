@@ -312,6 +312,26 @@ export async function getTenantQuizzes(tenantId) {
 }
 
 /**
+ * Fetch a single quiz by id — used by post-game analytics to resolve the
+ * canonical question set (text, type, correct answer/options/pairs/
+ * tolerance) for a completed Ralli Live session via game_sessions.quiz_id.
+ * Returns { data: null } (not an error) if the quiz was deleted since the
+ * session was played — callers should treat that as "answer detail
+ * unavailable" rather than a hard failure.
+ * @param {string} quizId
+ * @returns {Promise<{ data: Object|null, error: Object|null }>}
+ */
+export async function getQuizById(quizId) {
+  if (!quizId) return { data: null, error: null };
+  const { data, error } = await supabase
+    .from("tenant_quizzes")
+    .select("*")
+    .eq("id", quizId)
+    .maybeSingle();
+  return { data: data ? dbToQuiz(data) : null, error };
+}
+
+/**
  * Upsert a quiz. Detects new vs existing by whether id looks like a legacy string.
  * @param {string} tenantId
  * @param {Object} quiz

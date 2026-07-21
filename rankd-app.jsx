@@ -31,6 +31,7 @@ import {
   getPlayerGameHistory,
   getSessionPlayers,
   getSessionRestoreData,
+  getGameAnswersForSession,
 } from "./src/lib/gameService.js";
 import {
   getTenantCourses,
@@ -65,6 +66,7 @@ import {
   updateUserProfile as dbUpdateUserProfile,
   updateLastSeenAssignmentsAt,
   subscribeToTenantAssignments,
+  getQuizById,
 } from "./src/lib/contentService.js";
 import { resolveAssignmentStatus, isQualifyingEvent, daysUntilDue } from "./src/lib/assignmentEngine.js";
 import { getProfile, createMissingProfile, getTenantProfiles } from "./src/lib/profileService.js";
@@ -2149,11 +2151,17 @@ function KahootHostView({ onNav, sessionName, pin, sessionDbId, tenantId, questi
       persistPhase("reveal", qIdx, false);
       broadcast({ type: GM.REVEAL, correctIdx: null, scores: newScores, acceptedAnswers: q.acceptedAnswers ?? [] });
       if (sessionDbId) {
-        const scoreMap = Object.fromEntries(newScores.map(p => [p.id, p]));
-        const answerRows = Object.entries(chAnswers).map(([pid, ans]) => {
-          const sp = scoreMap[pid];
+        // One row per known player, not just answerers — a player with no
+        // chAnswers entry gets an explicit "unanswered" row (null text,
+        // isCorrect false, 0 points) instead of no row at all. That's what
+        // lets post-game analytics tell "ran out of time" apart from
+        // "question skipped by host" (which never calls doReveal/writes
+        // rows here — see doSkip()).
+        const answerRows = newScores.map(p => {
+          const ans = chAnswers[p.id];
+          if (!ans?.text) return { playerId: p.id, playerName: p.name, questionIdx: qIdx, optionIdx: null, text: null, timeMs: null, isCorrect: false, points: 0, tenantId };
           const correct = (q.acceptedAnswers ?? []).some(a => (ans.text ?? "").toLowerCase().trim() === a.toLowerCase().trim());
-          return { playerId: pid, playerName: ans.name ?? sp?.name ?? pid, questionIdx: qIdx, optionIdx: null, text: ans.text ?? null, timeMs: ans.timeMs ?? null, isCorrect: correct, points: sp?.delta ?? 0, tenantId };
+          return { playerId: p.id, playerName: ans.name ?? p.name, questionIdx: qIdx, optionIdx: null, text: ans.text ?? null, timeMs: ans.timeMs ?? null, isCorrect: correct, points: p.delta ?? 0, tenantId };
         });
         saveGameAnswers(sessionDbId, answerRows).then(({ error }) => { if (error) console.error("[ralli:host] saveGameAnswers (type) failed:", error); });
       }
@@ -2188,11 +2196,14 @@ function KahootHostView({ onNav, sessionName, pin, sessionDbId, tenantId, questi
       persistPhase("reveal", qIdx, false);
       broadcast({ type: GM.REVEAL, correctIdx: null, scores: newScores, sliderTarget: target, sliderTolerance: tol });
       if (sessionDbId) {
-        const scoreMap = Object.fromEntries(newScores.map(p => [p.id, p]));
-        const answerRows = Object.entries(chAnswers).map(([pid, ans]) => {
-          const sp   = scoreMap[pid];
-          const diff = ans.sliderValue != null ? Math.abs(ans.sliderValue - target) : Infinity;
-          return { playerId: pid, playerName: ans.name ?? sp?.name ?? pid, questionIdx: qIdx, optionIdx: null, text: null, timeMs: ans.timeMs ?? null, isCorrect: diff <= tol, points: sp?.delta ?? 0, tenantId, numericValue: ans.sliderValue ?? null };
+        // See the "type" branch above for why this covers every known
+        // player, not just answerers — needed to distinguish "unanswered"
+        // from "skipped" in post-game analytics.
+        const answerRows = newScores.map(p => {
+          const ans = chAnswers[p.id];
+          if (ans?.sliderValue == null) return { playerId: p.id, playerName: p.name, questionIdx: qIdx, optionIdx: null, text: null, timeMs: null, isCorrect: false, points: 0, tenantId, numericValue: null };
+          const diff = Math.abs(ans.sliderValue - target);
+          return { playerId: p.id, playerName: ans.name ?? p.name, questionIdx: qIdx, optionIdx: null, text: null, timeMs: ans.timeMs ?? null, isCorrect: diff <= tol, points: p.delta ?? 0, tenantId, numericValue: ans.sliderValue ?? null };
         });
         saveGameAnswers(sessionDbId, answerRows).then(({ error }) => { if (error) console.error("[ralli:host] saveGameAnswers (slider) failed:", error); });
       }
@@ -2232,10 +2243,19 @@ function KahootHostView({ onNav, sessionName, pin, sessionDbId, tenantId, questi
       persistPhase("reveal", qIdx, false);
       broadcast({ type: GM.REVEAL, correctIdx: null, scores: newScores, matchPairsCorrect: pairs, shuffledRight });
       if (sessionDbId) {
-        const scoreMap = Object.fromEntries(newScores.map(p => [p.id, p]));
-        const answerRows = Object.entries(chAnswers).map(([pid, ans]) => {
-          const sp = scoreMap[pid];
-          return { playerId: pid, playerName: ans.name ?? sp?.name ?? pid, questionIdx: qIdx, optionIdx: null, text: null, timeMs: ans.timeMs ?? null, isCorrect: !!sp?.wasCorrect, points: sp?.delta ?? 0, tenantId, answerJson: ans.matchPairs ?? null };
+        // See the "type" branch above for why this covers every known
+        // player, not just answerers.
+        const answerRows = newScores.map(p => {
+          const ans = chAnswers[p.id];
+          if (!ans?.matchPairs?.length) return { playerId: p.id, playerName: p.name, questionIdx: qIdx, optionIdx: null, text: null, timeMs: null, isCorrect: false, points: 0, tenantId, answerJson: null };
+          // Resolve each submitted rightIdx to its actual text NOW, while
+          // shuffledRight (this question's random shuffle) is still in scope.
+          // shuffledRight itself is never persisted — it's regenerated fresh
+          // every question — so a raw rightIdx would be meaningless once the
+          // game ends. Storing {leftIdx, rightText} instead makes every
+          // Matching answer durably reconstructable for post-game analytics.
+          const resolvedPairs = ans.matchPairs.map(mp => ({ leftIdx: mp.leftIdx, rightText: shuffledRight[mp.rightIdx]?.right ?? null }));
+          return { playerId: p.id, playerName: ans.name ?? p.name, questionIdx: qIdx, optionIdx: null, text: null, timeMs: ans.timeMs ?? null, isCorrect: !!p.wasCorrect, points: p.delta ?? 0, tenantId, answerJson: resolvedPairs };
         });
         saveGameAnswers(sessionDbId, answerRows).then(({ error }) => { if (error) console.error("[ralli:host] saveGameAnswers (match) failed:", error); });
       }
@@ -2268,20 +2288,23 @@ function KahootHostView({ onNav, sessionName, pin, sessionDbId, tenantId, questi
     newScores.sort((a, b) => b.score - a.score);
     setScores(newScores);
     broadcast({ type: GM.REVEAL, correctIdx: q.correct, scores: newScores });
-    // Persist each player's answer to game_answers (fire-and-forget)
+    // Persist each player's answer to game_answers (fire-and-forget).
+    // Covers every known player, not just answerers — see the "type" branch
+    // above for why: an explicit "unanswered" row is what lets post-game
+    // analytics distinguish it from a host-skipped question.
     if (sessionDbId) {
-      const scoreMap = Object.fromEntries(newScores.map(p => [p.id, p]));
-      const answerRows = Object.entries(chAnswers).map(([pid, ans]) => {
-        const sp = scoreMap[pid];
+      const answerRows = newScores.map(p => {
+        const ans = chAnswers[p.id];
+        if (!ans) return { playerId: p.id, playerName: p.name, questionIdx: qIdx, optionIdx: null, text: null, timeMs: null, isCorrect: false, points: 0, tenantId };
         return {
-          playerId:    pid,
-          playerName:  ans.name ?? sp?.name ?? pid,
+          playerId:    p.id,
+          playerName:  ans.name ?? p.name,
           questionIdx: qIdx,
           optionIdx:   ans.optionIdx ?? null,
           text:        ans.text ?? null,
           timeMs:      ans.timeMs ?? null,
           isCorrect:   ans.optionIdx === q.correct,
-          points:      sp?.delta ?? 0,
+          points:      p.delta ?? 0,
           tenantId,
         };
       });
@@ -2361,6 +2384,23 @@ function KahootHostView({ onNav, sessionName, pin, sessionDbId, tenantId, questi
   // diverge in how they handle the last question.
   const doSkip = () => {
     setShowSkipConfirm(false);
+    // Persist one was_skipped row per known player for this question — no
+    // scoring, no correctness — so post-game analytics can show "Question
+    // skipped by host" instead of confusing it with "ran out of time
+    // without answering" (see the was_skipped column / migration 045).
+    // Fire-and-forget, same as every other saveGameAnswers call in this
+    // component: skip must stay instant, not wait on a network round trip.
+    if (sessionDbId && q) {
+      const skipRows = scores.map(p => ({
+        playerId: p.id, playerName: p.name, questionIdx: qIdx,
+        optionIdx: null, text: null, timeMs: null, isCorrect: false, points: 0,
+        tenantId, wasSkipped: true,
+      }));
+      if (skipRows.length > 0) {
+        saveGameAnswers(sessionDbId, skipRows)
+          .then(({ error }) => { if (error) console.error("[ralli:host] saveGameAnswers (skip) failed:", error); });
+      }
+    }
     doNext();
   };
 
@@ -5931,15 +5971,57 @@ function RankdResultsScreen({ onNav, sessionCode, sessions, gameData }) {
     });
   }, [session?.dbId]); // eslint-disable-line react-hooks/exhaustive-deps
 
+  // ── Answer-detail drill-down (Player Breakdown / Questions tabs) ───────────
+  // gameData.questions/questionHistory are in-memory only (lost on refresh or
+  // when opening results from history), and neither ever held the canonical
+  // per-player-per-question answer anyway — only aggregate counts. The
+  // durable source is game_answers (one row per player per question, see
+  // migrations 044/045) joined against the quiz's canonical question set
+  // (fetched by quiz_id, since sessions don't snapshot questions). Either
+  // piece can be legitimately missing for an old session — callers must
+  // treat that as "answer detail unavailable", not an error.
+  const [answerRows,   setAnswerRows]   = useState(null); // raw game_answers rows, or [] once fetched-but-empty
+  const [detailQuestions, setDetailQuestions] = useState(null); // canonical questions from the quiz, or [] if quiz gone
+  const [detailLoaded, setDetailLoaded] = useState(false);
+  const [selectedPlayerId, setSelectedPlayerId] = useState(null);
+  const [selectedQIdx,     setSelectedQIdx]     = useState(null);
+
+  useEffect(() => {
+    if (!session?.dbId) { setDetailLoaded(true); return; }
+    let cancelled = false;
+    Promise.all([
+      getGameAnswersForSession(session.dbId),
+      getQuizById(session.quizId ?? session.quiz_id ?? null),
+    ]).then(([answersRes, quizRes]) => {
+      if (cancelled) return;
+      setAnswerRows(answersRes.data ?? []);
+      setDetailQuestions(quizRes.data?.questions ?? gameData?.questions ?? []);
+      setDetailLoaded(true);
+    }).catch(() => { if (!cancelled) setDetailLoaded(true); });
+    return () => { cancelled = true; };
+  }, [session?.dbId]); // eslint-disable-line react-hooks/exhaustive-deps
+
   // Real data only — no mock fallbacks
   const realScores    = gameData?.scores ?? dbScores ?? null;
-  const realQuestions = gameData?.questions ?? null;
+  const realQuestions = gameData?.questions ?? detailQuestions ?? null;
   const realQHistory  = gameData?.questionHistory ?? null;
 
+  // Detail is only trustworthy once both pieces loaded successfully and are
+  // non-empty — either being empty means we genuinely can't reconstruct
+  // per-question answers for this session (legacy session, deleted quiz, or
+  // a session that never played a single question).
+  const detailAvailable = detailLoaded && (answerRows?.length > 0) && (realQuestions?.length > 0);
+
   const leaderboard = realScores
-    ? realScores.map((p, i) => ({ rank: i+1, name: p.name, emoji: p.emoji ?? "🙂", score: p.score }))
+    ? realScores.map((p, i) => ({ rank: i+1, id: p.id, name: p.name, emoji: p.emoji ?? "🙂", score: p.score }))
     : [];
 
+  // Prefer the in-memory per-question stats (exact — computed live by
+  // doReveal()) when available; otherwise derive the same shape from the
+  // durable game_answers rows so Overview/Questions still work after a
+  // refresh or when opening results from history, not just right after
+  // playing. Skipped questions are excluded from the correct/total ratio —
+  // "skipped" isn't a correctness outcome.
   const questionBreakdown = realQHistory?.length
     ? realQHistory.map((q, i) => ({
         q:       q.q ?? `Question ${i+1}`,
@@ -5948,7 +6030,151 @@ function RankdResultsScreen({ onNav, sessionCode, sessions, gameData }) {
         total:   q.totalAnswers ?? leaderboard.length,
         avgMs:   Math.round(q.avgTimeMs ?? 0),
       }))
-    : [];
+    : (detailAvailable
+        ? realQuestions.map((qq, i) => {
+            const rowsForQ = (answerRows ?? []).filter(r => r.question_idx === i && !r.was_skipped);
+            const withTime = rowsForQ.filter(r => r.time_ms != null);
+            return {
+              q:       qq.q ?? qq.text ?? `Question ${i+1}`,
+              type:    Q_TYPE_LABELS[qq.type] ?? "Question",
+              correct: rowsForQ.filter(r => r.is_correct).length,
+              total:   rowsForQ.length,
+              avgMs:   withTime.length > 0 ? Math.round(withTime.reduce((s, r) => s + r.time_ms, 0) / withTime.length) : 0,
+            };
+          })
+        : []);
+
+  // ── Canonical answer-detail renderer/data contract ─────────────────────────
+  // Single source of truth for "what did this player submit on this
+  // question" — used by both the Player Breakdown and Questions drill-downs
+  // so the two views can never disagree. Resolves a raw game_answers row +
+  // its canonical question definition into a display-ready shape.
+  const getAnswerDetail = (row, question) => {
+    if (!question) return { status: "unavailable" };
+    if (row?.was_skipped) return { status: "skipped", points: 0, timeMs: null };
+    if (!row) return { status: "unavailable" };
+    const type = question.type;
+    const hasSubmission = row.option_idx != null || (row.answer_text != null && row.answer_text !== "")
+      || row.numeric_value != null || (Array.isArray(row.answer_json) && row.answer_json.length > 0);
+    if (!hasSubmission) {
+      let correctLabel = null;
+      if (type === "mc" || type === "tf") correctLabel = question.options?.[question.correct] ?? null;
+      else if (type === "type") correctLabel = (question.acceptedAnswers ?? []).join(" / ") || null;
+      else if (type === "slider") correctLabel = `${question.correct ?? 5} ± ${question.tolerance ?? 1}`;
+      else if (type === "match") correctLabel = (question.pairs ?? []).map(p => `${p.left} → ${p.right}`).join(", ") || null;
+      return { status: "unanswered", correctLabel, points: 0, timeMs: null };
+    }
+    const base = { points: row.points ?? 0, timeMs: row.time_ms ?? null, status: row.is_correct ? "correct" : "incorrect" };
+    if (type === "mc" || type === "tf") {
+      return { ...base,
+        submittedLabel: row.option_idx != null ? (question.options?.[row.option_idx] ?? `Option ${row.option_idx + 1}`) : null,
+        correctLabel:   question.options?.[question.correct] ?? null,
+      };
+    }
+    if (type === "type") {
+      return { ...base,
+        submittedLabel: row.answer_text,
+        correctLabel:   (question.acceptedAnswers ?? []).join(" / ") || null,
+      };
+    }
+    if (type === "slider") {
+      if (row.numeric_value == null) return { ...base, status: "unavailable", points: row.points ?? 0 };
+      return { ...base,
+        submittedLabel: String(row.numeric_value),
+        correctLabel:   `${question.correct ?? 5} ± ${question.tolerance ?? 1}`,
+      };
+    }
+    if (type === "match") {
+      if (!Array.isArray(row.answer_json) || row.answer_json.length === 0 || row.answer_json[0]?.rightText === undefined) {
+        // Legacy shape (raw shuffle-dependent rightIdx, pre-migration-045) or
+        // no data — the shuffle order is gone, so exact pairs can't be shown.
+        return { ...base, status: "unavailable", points: row.points ?? 0 };
+      }
+      const pairs = question.pairs ?? [];
+      const detail = row.answer_json.map(mp => {
+        const canonical = pairs[mp.leftIdx];
+        const isMatch    = canonical && mp.rightText === canonical.right;
+        return { left: canonical?.left ?? `#${mp.leftIdx + 1}`, submitted: mp.rightText, correct: canonical?.right ?? null, isMatch };
+      });
+      return { ...base,
+        matchDetail:    detail,
+        submittedLabel: detail.map(d => `${d.left} → ${d.submitted}`).join(", "),
+        correctLabel:   pairs.map(p => `${p.left} → ${p.right}`).join(", "),
+      };
+    }
+    return { ...base, submittedLabel: row.answer_text ?? null, correctLabel: null };
+  };
+
+  const STATUS_STYLES = {
+    correct:     { label: "Correct",     bg: "#D1FAE5", text: "#059669", icon: "✓" },
+    incorrect:   { label: "Incorrect",   bg: "#FEF2F2", text: C.red,     icon: "✗" },
+    unanswered:  { label: "Unanswered",  bg: C.muted,   text: C.textMuted, icon: "—" },
+    skipped:     { label: "Skipped",     bg: "#FEF3C7", text: "#B45309", icon: "⏭" },
+    unavailable: { label: "Unavailable", bg: C.muted,   text: C.textMuted, icon: "?" },
+  };
+
+  // Shared answer-detail body — used inside both the Player Breakdown
+  // question card (below) and the Questions-tab player row so submitted/
+  // correct/status can never disagree between the two views. Plain function
+  // called inline (not a JSX component) so it never remounts on re-render.
+  const renderDetailBody = (detail) => (
+    <div style={{ display: "flex", flexDirection: "column", gap: 4, fontSize: 12 }}>
+      {detail.status === "unavailable" && <p style={{ margin: 0, fontSize: 12, color: C.textMuted, fontStyle: "italic" }}>Answer detail unavailable.</p>}
+      {detail.status === "skipped" && <p style={{ margin: 0, fontSize: 12, color: "#B45309", fontStyle: "italic" }}>Question skipped by host — no correctness penalty, no points.</p>}
+      {(detail.status === "correct" || detail.status === "incorrect") && (
+        <div><span style={{ color: C.textMuted }}>Submitted: </span><span style={{ fontWeight: 700, color: detail.status === "correct" ? "#059669" : C.red }}>{detail.submittedLabel ?? "—"}</span></div>
+      )}
+      {detail.status !== "unavailable" && detail.status !== "skipped" && detail.correctLabel != null && (
+        <div><span style={{ color: C.textMuted }}>Correct answer: </span><span style={{ fontWeight: 700, color: "#059669" }}>{detail.correctLabel}</span></div>
+      )}
+      {detail.matchDetail && (
+        <div style={{ marginTop: 4, display: "flex", flexDirection: "column", gap: 3 }}>
+          {detail.matchDetail.map((d, di) => (
+            <div key={di} style={{ display: "flex", alignItems: "center", gap: 6, fontSize: 11 }}>
+              <span style={{ fontWeight: 700, color: C.text }}>{d.left}</span>
+              <span style={{ color: C.textMuted }}>→</span>
+              <span style={{ color: d.isMatch ? "#059669" : C.red, fontWeight: 700 }}>{d.submitted ?? "—"}</span>
+              {!d.isMatch && <span style={{ color: C.textMuted, fontSize: 10 }}>(correct: {d.correct})</span>}
+            </div>
+          ))}
+        </div>
+      )}
+      <div style={{ display: "flex", gap: 16, marginTop: 6, paddingTop: 8, borderTop: `1px solid ${C.border}` }}>
+        <span style={{ color: C.textMuted }}>Points: <strong style={{ color: C.text }}>{detail.points ?? 0}</strong></span>
+        {detail.timeMs != null && <span style={{ color: C.textMuted }}>Time: <strong style={{ color: C.text }}>{(detail.timeMs / 1000).toFixed(1)}s</strong></span>}
+      </div>
+    </div>
+  );
+
+  // Player Breakdown drill-down: one card per question, in game order.
+  const renderQuestionCardForPlayer = (question, i, detail) => {
+    const st = STATUS_STYLES[detail.status] ?? STATUS_STYLES.unavailable;
+    return (
+      <Card key={i}>
+        <div style={{ display: "flex", alignItems: "flex-start", justifyContent: "space-between", gap: 10, marginBottom: 8 }}>
+          <span style={{ fontSize: 11, fontWeight: 700, color: C.textMuted }}>Q{i + 1} · {Q_TYPE_LABELS[question.type] ?? "Question"}</span>
+          <span style={{ fontSize: 10, fontWeight: 800, padding: "3px 9px", borderRadius: 99, background: st.bg, color: st.text, flexShrink: 0 }}>{st.icon} {st.label}</span>
+        </div>
+        <p style={{ margin: "0 0 10px", fontSize: 13, fontWeight: 600, color: C.text }}>{question.q ?? question.text}</p>
+        {renderDetailBody(detail)}
+      </Card>
+    );
+  };
+
+  // Questions-tab drill-down: one compact row per player, grouped by status.
+  const renderPlayerRowForQuestion = (player, detail) => {
+    const st = STATUS_STYLES[detail.status] ?? STATUS_STYLES.unavailable;
+    return (
+      <div key={player.id ?? player.name} style={{ borderRadius: 12, border: `1px solid ${C.border}`, padding: "10px 14px", background: C.cardBg, marginBottom: 8 }}>
+        <div style={{ display: "flex", alignItems: "center", gap: 10, marginBottom: 6 }}>
+          <span style={{ fontSize: 18, flexShrink: 0 }}>{player.emoji}</span>
+          <span style={{ fontSize: 13, fontWeight: 700, color: C.text, flex: 1, minWidth: 0, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{player.name}</span>
+          <span style={{ fontSize: 10, fontWeight: 800, padding: "3px 9px", borderRadius: 99, background: st.bg, color: st.text, flexShrink: 0 }}>{st.icon} {st.label}</span>
+        </div>
+        {renderDetailBody(detail)}
+      </div>
+    );
+  };
 
   const podium  = [...leaderboard].sort((a,b) => a.rank - b.rank).slice(0,3);
   const podiumDisplay = podium.length >= 3 ? [podium[1], podium[0], podium[2]] : podium;
@@ -5975,6 +6201,7 @@ function RankdResultsScreen({ onNav, sessionCode, sessions, gameData }) {
     "Type Answer":     { bg: C.orangeLight, text: C.orange  },
     "Open Ended":      { bg: C.purpleBg,   text: "#7C3AED" },
     "Slider":          { bg: C.purpleBg,   text: "#7C3AED" },
+    "Matching":        { bg: C.limeBg,     text: "#059669" },
     "Question":        { bg: C.muted,      text: C.textSub },
   };
 
@@ -6088,24 +6315,54 @@ function RankdResultsScreen({ onNav, sessionCode, sessions, gameData }) {
         )}
 
         {tab === "players" && (
-          leaderboard.length === 0
-            ? <div style={{ textAlign: "center", padding: 60, color: C.textMuted, fontSize: 14 }}>No player data available</div>
-            : <Card style={{ padding: 0, overflow: "hidden" }}>
-                <div style={{ display: "grid", gridTemplateColumns: "40px 1fr 80px 80px", padding: "10px 20px", borderBottom: `1px solid ${C.border}`, fontSize: 10, fontWeight: 700, color: C.textMuted, letterSpacing: "0.06em", textTransform: "uppercase", background: C.muted }}>
-                  <div>#</div><div>Player</div><div style={{ textAlign: "right" }}>Score</div><div style={{ textAlign: "right" }}>Rank</div>
-                </div>
-                {leaderboard.map((p) => (
-                  <div key={p.name} style={{ display: "grid", gridTemplateColumns: "40px 1fr 80px 80px", padding: "12px 20px", borderBottom: `1px solid ${C.border}`, alignItems: "center" }}>
-                    <span style={{ fontSize: 12, fontWeight: 900, color: p.rank <= 3 ? C.orange : C.textMuted }}>{p.rank}</span>
-                    <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
-                      <span style={{ fontSize: 18 }}>{p.emoji}</span>
-                      <span style={{ fontSize: 13, fontWeight: 600, color: C.text }}>{p.name}</span>
+          selectedPlayerId != null ? (() => {
+            const player = leaderboard.find(p => p.id === selectedPlayerId);
+            if (!player) return <div style={{ textAlign: "center", padding: 60, color: C.textMuted, fontSize: 14 }}>Player not found.</div>;
+            return (
+              <div style={{ display: "flex", flexDirection: "column", gap: 14 }}>
+                <button onClick={() => setSelectedPlayerId(null)} style={{ alignSelf: "flex-start", display: "flex", alignItems: "center", gap: 6, padding: "8px 14px", borderRadius: 10, border: `1px solid ${C.border}`, background: C.white, color: C.textSub, fontSize: 12, fontWeight: 700, cursor: "pointer" }}>‹ Back to Player Breakdown</button>
+                <Card>
+                  <div style={{ display: "flex", alignItems: "center", gap: 12 }}>
+                    <span style={{ fontSize: 32 }}>{player.emoji}</span>
+                    <div style={{ flex: 1 }}>
+                      <p style={{ margin: 0, fontSize: 16, fontWeight: 900, color: C.text }}>{player.name}</p>
+                      <p style={{ margin: 0, fontSize: 12, color: C.textSub }}>Rank #{player.rank} · {player.score.toLocaleString()} pts</p>
                     </div>
-                    <div style={{ textAlign: "right", fontSize: 14, fontWeight: 900, color: C.text }}>{p.score.toLocaleString()}</div>
-                    <div style={{ textAlign: "right", fontSize: 13, fontWeight: 700, color: p.rank <= 3 ? C.orange : C.textMuted }}>#{p.rank}</div>
                   </div>
-                ))}
-              </Card>
+                </Card>
+                {!detailAvailable ? (
+                  <Card><p style={{ margin: 0, fontSize: 13, color: C.textMuted, fontStyle: "italic", textAlign: "center", padding: 20 }}>Answer detail unavailable for this session.</p></Card>
+                ) : (
+                  <div style={{ display: "flex", flexDirection: "column", gap: 10 }}>
+                    {realQuestions.map((question, i) => {
+                      const row = (answerRows ?? []).find(r => r.question_idx === i && r.player_id === player.id);
+                      const detail = getAnswerDetail(row, question);
+                      return renderQuestionCardForPlayer(question, i, detail);
+                    })}
+                  </div>
+                )}
+              </div>
+            );
+          })() : (
+            leaderboard.length === 0
+              ? <div style={{ textAlign: "center", padding: 60, color: C.textMuted, fontSize: 14 }}>No player data available</div>
+              : <Card style={{ padding: 0, overflow: "hidden" }}>
+                  <div style={{ display: "grid", gridTemplateColumns: "40px 1fr 80px 80px", padding: "10px 20px", borderBottom: `1px solid ${C.border}`, fontSize: 10, fontWeight: 700, color: C.textMuted, letterSpacing: "0.06em", textTransform: "uppercase", background: C.muted }}>
+                    <div>#</div><div>Player</div><div style={{ textAlign: "right" }}>Score</div><div style={{ textAlign: "right" }}>Rank</div>
+                  </div>
+                  {leaderboard.map((p) => (
+                    <div key={p.id ?? p.name} onClick={() => setSelectedPlayerId(p.id)} style={{ display: "grid", gridTemplateColumns: "40px 1fr 80px 80px", padding: "12px 20px", borderBottom: `1px solid ${C.border}`, alignItems: "center", cursor: p.id != null ? "pointer" : "default" }}>
+                      <span style={{ fontSize: 12, fontWeight: 900, color: p.rank <= 3 ? C.orange : C.textMuted }}>{p.rank}</span>
+                      <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
+                        <span style={{ fontSize: 18 }}>{p.emoji}</span>
+                        <span style={{ fontSize: 13, fontWeight: 600, color: C.text }}>{p.name}</span>
+                      </div>
+                      <div style={{ textAlign: "right", fontSize: 14, fontWeight: 900, color: C.text }}>{p.score.toLocaleString()}</div>
+                      <div style={{ textAlign: "right", fontSize: 13, fontWeight: 700, color: p.rank <= 3 ? C.orange : C.textMuted }}>#{p.rank}</div>
+                    </div>
+                  ))}
+                </Card>
+          )
         )}
 
         {tab === "leaderboard" && (
@@ -6257,51 +6514,85 @@ function RankdResultsScreen({ onNav, sessionCode, sessions, gameData }) {
         )}
 
         {tab === "questions" && (
-          <div style={{ display: "flex", flexDirection: "column", gap: 12 }}>
-            {questionBreakdown.length === 0 && <div style={{ textAlign: "center", padding: 60, color: C.textMuted, fontSize: 14 }}>No question data available</div>}
-            {questionBreakdown.map((q, i) => {
-              const pct   = Math.round((q.correct / Math.max(q.total,1)) * 100);
-              const color = pct >= 80 ? "#059669" : pct >= 60 ? C.orange : C.red;
-              const tc    = typeColors[q.type] ?? { bg: C.muted, text: C.textSub };
-              return (
-                <Card key={i}>
-                  <div style={{ display: "flex", alignItems: "flex-start", gap: 16 }}>
-                    <div style={{
-                      width: 32, height: 32, borderRadius: 10, background: C.dark, color: "#fff",
-                      display: "flex", alignItems: "center", justifyContent: "center",
-                      fontSize: 11, fontWeight: 900, flexShrink: 0,
-                    }}>Q{i+1}</div>
-                    <div style={{ flex: 1, minWidth: 0 }}>
-                      <div style={{ display: "flex", alignItems: "flex-start", justifyContent: "space-between", gap: 16, marginBottom: 12 }}>
-                        <p style={{ margin: 0, fontSize: 13, fontWeight: 600, color: C.text }}>{q.q}</p>
-                        <span style={{
-                          fontSize: 10, fontWeight: 700, padding: "3px 8px", borderRadius: 8, flexShrink: 0,
-                          background: tc.bg, color: tc.text,
-                        }}>{q.type}</span>
-                      </div>
-                      <div style={{ display: "flex", alignItems: "center", gap: 16 }}>
-                        <div style={{ flex: 1 }}>
-                          <div style={{ display: "flex", justifyContent: "space-between", fontSize: 11, marginBottom: 4 }}>
-                            <span style={{ color: C.textSub }}>{q.correct}/{q.total} correct</span>
-                            <span style={{ fontWeight: 700, color }}>{pct}%</span>
-                          </div>
-                          <div style={{ height: 8, borderRadius: 99, overflow: "hidden", background: C.muted }}>
-                            <div style={{ height: "100%", borderRadius: 99, width: `${pct}%`, background: color }} />
-                          </div>
+          selectedQIdx != null ? (() => {
+            const question = realQuestions?.[selectedQIdx];
+            if (!question) return <div style={{ textAlign: "center", padding: 60, color: C.textMuted, fontSize: 14 }}>Question not found.</div>;
+            const groups = { correct: [], incorrect: [], unanswered: [], skipped: [], unavailable: [] };
+            leaderboard.forEach(player => {
+              const row = (answerRows ?? []).find(r => r.question_idx === selectedQIdx && r.player_id === player.id);
+              const detail = getAnswerDetail(row, question);
+              (groups[detail.status] ?? groups.unavailable).push({ player, detail });
+            });
+            const groupOrder = [
+              { key: "incorrect",   label: "Incorrect" },
+              { key: "correct",     label: "Correct" },
+              { key: "unanswered",  label: "Unanswered" },
+              { key: "skipped",     label: "Skipped" },
+              { key: "unavailable", label: "Detail Unavailable" },
+            ];
+            return (
+              <div style={{ display: "flex", flexDirection: "column", gap: 14 }}>
+                <button onClick={() => setSelectedQIdx(null)} style={{ alignSelf: "flex-start", display: "flex", alignItems: "center", gap: 6, padding: "8px 14px", borderRadius: 10, border: `1px solid ${C.border}`, background: C.white, color: C.textSub, fontSize: 12, fontWeight: 700, cursor: "pointer" }}>‹ Back to Questions</button>
+                <Card>
+                  <span style={{ fontSize: 10, fontWeight: 700, padding: "3px 8px", borderRadius: 8, background: (typeColors[Q_TYPE_LABELS[question.type]] ?? { bg: C.muted, text: C.textSub }).bg, color: (typeColors[Q_TYPE_LABELS[question.type]] ?? { bg: C.muted, text: C.textSub }).text }}>{Q_TYPE_LABELS[question.type] ?? "Question"}</span>
+                  <p style={{ margin: "10px 0 0", fontSize: 15, fontWeight: 700, color: C.text }}>Q{selectedQIdx + 1}: {question.q ?? question.text}</p>
+                </Card>
+                {groupOrder.map(g => groups[g.key].length > 0 && (
+                  <div key={g.key}>
+                    <p style={{ margin: "0 0 8px", fontSize: 11, fontWeight: 700, color: C.textMuted, textTransform: "uppercase", letterSpacing: "0.08em" }}>{g.label} ({groups[g.key].length})</p>
+                    {groups[g.key].map(({ player, detail }) => renderPlayerRowForQuestion(player, detail))}
+                  </div>
+                ))}
+              </div>
+            );
+          })() : (
+            <div style={{ display: "flex", flexDirection: "column", gap: 12 }}>
+              {questionBreakdown.length === 0 && <div style={{ textAlign: "center", padding: 60, color: C.textMuted, fontSize: 14 }}>No question data available</div>}
+              {questionBreakdown.map((q, i) => {
+                const pct   = Math.round((q.correct / Math.max(q.total,1)) * 100);
+                const color = pct >= 80 ? "#059669" : pct >= 60 ? C.orange : C.red;
+                const tc    = typeColors[q.type] ?? { bg: C.muted, text: C.textSub };
+                const clickable = detailAvailable;
+                return (
+                  <Card key={i} onClick={clickable ? () => setSelectedQIdx(i) : undefined} style={clickable ? { cursor: "pointer" } : undefined}>
+                    <div style={{ display: "flex", alignItems: "flex-start", gap: 16 }}>
+                      <div style={{
+                        width: 32, height: 32, borderRadius: 10, background: C.dark, color: "#fff",
+                        display: "flex", alignItems: "center", justifyContent: "center",
+                        fontSize: 11, fontWeight: 900, flexShrink: 0,
+                      }}>Q{i+1}</div>
+                      <div style={{ flex: 1, minWidth: 0 }}>
+                        <div style={{ display: "flex", alignItems: "flex-start", justifyContent: "space-between", gap: 16, marginBottom: 12 }}>
+                          <p style={{ margin: 0, fontSize: 13, fontWeight: 600, color: C.text }}>{q.q}</p>
+                          <span style={{
+                            fontSize: 10, fontWeight: 700, padding: "3px 8px", borderRadius: 8, flexShrink: 0,
+                            background: tc.bg, color: tc.text,
+                          }}>{q.type}</span>
                         </div>
-                        {q.avgMs > 0 && (
-                          <div style={{ textAlign: "right", flexShrink: 0 }}>
-                            <p style={{ margin: 0, fontSize: 10, color: C.textMuted }}>Avg time</p>
-                            <p style={{ margin: 0, fontSize: 14, fontWeight: 700, color: C.text }}>{(q.avgMs / 1000).toFixed(1)}s</p>
+                        <div style={{ display: "flex", alignItems: "center", gap: 16 }}>
+                          <div style={{ flex: 1 }}>
+                            <div style={{ display: "flex", justifyContent: "space-between", fontSize: 11, marginBottom: 4 }}>
+                              <span style={{ color: C.textSub }}>{q.correct}/{q.total} correct</span>
+                              <span style={{ fontWeight: 700, color }}>{pct}%</span>
+                            </div>
+                            <div style={{ height: 8, borderRadius: 99, overflow: "hidden", background: C.muted }}>
+                              <div style={{ height: "100%", borderRadius: 99, width: `${pct}%`, background: color }} />
+                            </div>
                           </div>
-                        )}
+                          {q.avgMs > 0 && (
+                            <div style={{ textAlign: "right", flexShrink: 0 }}>
+                              <p style={{ margin: 0, fontSize: 10, color: C.textMuted }}>Avg time</p>
+                              <p style={{ margin: 0, fontSize: 14, fontWeight: 700, color: C.text }}>{(q.avgMs / 1000).toFixed(1)}s</p>
+                            </div>
+                          )}
+                        </div>
                       </div>
                     </div>
-                  </div>
-                </Card>
-              );
-            })}
-          </div>
+                  </Card>
+                );
+              })}
+            </div>
+          )
         )}
       </div>
     </div>

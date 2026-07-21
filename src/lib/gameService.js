@@ -282,6 +282,7 @@ export async function updateSessionPhase(sessionId, { phase, currentQuestionInde
  *   tenantId?: string|null,
  *   answerJson?: Array<{leftIdx:number,rightIdx:number}>|null,  // Matching
  *   numericValue?: number|null,                                 // Slider
+ *   wasSkipped?: boolean,                                        // true = host skipped this question, not a real (non-)answer
  * }>} answers
  * @returns {Promise<{ error: Object|null }>}
  */
@@ -300,9 +301,28 @@ export async function saveGameAnswers(sessionId, answers = []) {
     points:        a.points ?? 0,
     answer_json:   a.answerJson ?? null,
     numeric_value: a.numericValue ?? null,
+    was_skipped:   a.wasSkipped ?? false,
   }));
   const { error } = await supabase.from("game_answers").insert(rows);
   return { error };
+}
+
+/**
+ * Fetch every per-question, per-player answer row for a completed (or
+ * in-progress) session — the canonical data source for post-game analytics
+ * drill-down (Player Breakdown / Questions tabs in RankdResultsScreen).
+ * Ordered by question_idx so callers can group by question cheaply.
+ *
+ * @param {string} sessionId - game_sessions.id (UUID)
+ * @returns {Promise<{ data: Object[]|null, error: Object|null }>}
+ */
+export async function getGameAnswersForSession(sessionId) {
+  const { data, error } = await supabase
+    .from("game_answers")
+    .select("*")
+    .eq("session_id", sessionId)
+    .order("question_idx", { ascending: true });
+  return { data, error };
 }
 
 /**
