@@ -45,6 +45,7 @@ import {
   markLessonComplete,
   getTenantAssignments,
   createAssignments as dbCreateAssignments,
+  getActiveAssignmentsByUser,
   deleteAssignment as dbDeleteAssignment,
   archiveCourse as archiveCourseService,
   archiveLesson as archiveLessonService,
@@ -8584,6 +8585,26 @@ function LessonBuilderModal({ lesson, onSave, onClose }) {
 }
 
 // ── ASSIGN CONTENT MODAL ────────────────────────────────────
+
+// Task 5 — concise "Eligible: N · Already Assigned: N" line shown once a
+// team/group target is picked, so a manager sees the outcome before
+// submitting. Renders nothing while eligibility hasn't loaded yet or no
+// target is selected, and nothing extra for a 0-member team (existing
+// "No teams yet" / empty states already cover that).
+function AssignEligibilitySummary({ summary }) {
+  if (!summary || summary.total === 0) return null;
+  return (
+    <div style={{
+      display: "flex", alignItems: "center", gap: 14, padding: "8px 12px",
+      borderRadius: 8, background: C.pageBg, marginBottom: 20,
+      fontSize: 12, fontWeight: 600,
+    }}>
+      <span style={{ color: C.trueGreen }}>Eligible: {summary.eligible}</span>
+      {summary.active > 0 && <span style={{ color: C.red }}>Already assigned: {summary.active}</span>}
+    </div>
+  );
+}
+
 function AssignContentModal({ contentType, contentId, content, orgUsers, orgs, currentUser, onAssign, onClose, tenantId, isReal }) {
   const isSuperAdmin = isRalliAdmin(currentUser?.role);
   // "team" for org-scoped users (orgAdmin/manager), "group" (org-wide) for superadmin
@@ -8599,11 +8620,19 @@ function AssignContentModal({ contentType, contentId, content, orgUsers, orgs, c
   const [tenantUsers,  setTenantUsers]  = useState(null); // null = loading
   const [tenantTeams,  setTenantTeams]  = useState(null);
 
+  // Task 5 — pre-assign eligibility preview. Reuses the same
+  // getActiveAssignmentsByUser() read used elsewhere for reporting (see
+  // contentService.js) so this UI never re-derives "active" on its own.
+  // Map<userId, { assignmentId, dueAt, required }> of users currently
+  // blocked from a new assignment to this exact content; null = loading.
+  const [activeAssignments, setActiveAssignments] = useState(null);
+
   useEffect(() => {
     if (!isReal || !tenantId) return;
-    // Load users
+    // Load users (team_id included so team-target eligibility can be
+    // previewed locally without a second round-trip per team).
     supabase.from("profiles")
-      .select("id, name, email, role, color")
+      .select("id, name, email, role, color, team_id")
       .eq("tenant_id", tenantId)
       .neq("status", "inactive")
       .then(({ data }) => {
@@ -8615,6 +8644,7 @@ function AssignContentModal({ contentType, contentId, content, orgUsers, orgs, c
           role:     m.role ?? "user",
           color:    m.color ?? "#F97316",
           orgId:    tenantId,
+          teamId:   m.team_id ?? null,
         })));
       });
     // Load teams
@@ -8624,6 +8654,15 @@ function AssignContentModal({ contentType, contentId, content, orgUsers, orgs, c
       .order("name")
       .then(({ data }) => { setTenantTeams(data ?? []); });
   }, [tenantId, isReal]); // eslint-disable-line react-hooks/exhaustive-deps
+
+  useEffect(() => {
+    if (!isReal || !tenantId || !contentId) return;
+    let cancelled = false;
+    getActiveAssignmentsByUser(tenantId, contentType, contentId).then(map => {
+      if (!cancelled) setActiveAssignments(map);
+    });
+    return () => { cancelled = true; };
+  }, [tenantId, isReal, contentType, contentId]);
 
   // Resolved lists: prefer freshly-loaded Supabase data, fall back to passed props
   const availableUsers = tenantUsers !== null
@@ -8637,6 +8676,28 @@ function AssignContentModal({ contentType, contentId, content, orgUsers, orgs, c
     : orgs.filter(o => o.id === currentUser?.orgId);
 
   const availableTeams = tenantTeams ?? [];
+
+  // Task 5 — eligibility preview helpers. All derived client-side from
+  // activeAssignments (sourced from getActiveAssignmentsByUser, the same
+  // active/eligible determination the atomic assign RPC enforces) plus
+  // team_id already present on tenantUsers — no separate eligibility logic.
+  const eligibilityReady = isReal && activeAssignments !== null && tenantUsers !== null;
+
+  function summarizeCandidates(candidateUsers) {
+    const total    = candidateUsers.length;
+    const active   = candidateUsers.filter(u => activeAssignments.has(u.id)).length;
+    return { total, active, eligible: total - active };
+  }
+
+  const selectedTeamSummary = eligibilityReady && assignType === "team" && selectedTeamId
+    ? summarizeCandidates(tenantUsers.filter(u => u.teamId === selectedTeamId))
+    : null;
+
+  // Group targets are org-wide; only previewable when the selected org is
+  // the tenant we actually loaded profiles for (see load effect above).
+  const selectedGroupSummary = eligibilityReady && assignType === "group" && selectedOrgId === tenantId
+    ? summarizeCandidates(availableUsers)
+    : null;
 
   const handleAssign = () => {
     const base = { contentType, contentId, required, dueAt: dueDate || "Open" };
@@ -8718,6 +8779,7 @@ function AssignContentModal({ contentType, contentId, content, orgUsers, orgs, c
                 </button>
               ))}
             </div>
+            <AssignEligibilitySummary summary={selectedTeamSummary} />
           </>
         ) : assignType === "group" ? (
           <>
@@ -8737,6 +8799,7 @@ function AssignContentModal({ contentType, contentId, content, orgUsers, orgs, c
                 </button>
               ))}
             </div>
+            <AssignEligibilitySummary summary={selectedGroupSummary} />
           </>
         ) : (
           <>
@@ -8746,20 +8809,32 @@ function AssignContentModal({ contentType, contentId, content, orgUsers, orgs, c
               {availableUsers.length === 0 && (tenantUsers !== null || !isReal) && (
                 <p style={{ margin: 0, fontSize: 13, color: C.textSub }}>No other users in this tenant yet.</p>
               )}
-              {availableUsers.map(u => (
+              {availableUsers.map(u => {
+                const isActive = eligibilityReady && activeAssignments.has(u.id);
+                return (
                 <button key={u.id} onClick={() => setSelectedUserId(u.id)} style={{
                   display: "flex", alignItems: "center", gap: 10, padding: "10px 14px", borderRadius: 10,
                   border: `2px solid ${selectedUserId === u.id ? C.orange : C.border}`,
                   background: selectedUserId === u.id ? C.orangeLight : C.pageBg, cursor: "pointer", textAlign: "left",
                 }}>
                   <Avatar initials={u.initials ?? (u.name?.[0] ?? "U").toUpperCase()} size={32} color={u.color} />
-                  <div style={{ flex: 1 }}>
-                    <div style={{ fontSize: 13, fontWeight: 700, color: selectedUserId === u.id ? C.orange : C.text }}>{u.name}</div>
+                  <div style={{ flex: 1, minWidth: 0 }}>
+                    <div style={{ fontSize: 13, fontWeight: 700, color: selectedUserId === u.id ? C.orange : C.text, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{u.name}</div>
                     <div style={{ fontSize: 11, color: C.textSub }}>{u.role}</div>
                   </div>
+                  {eligibilityReady && (
+                    <span style={{
+                      fontSize: 10, fontWeight: 700, padding: "3px 8px", borderRadius: 999, whiteSpace: "nowrap", flexShrink: 0,
+                      background: isActive ? C.redBg : C.trueGreenBg,
+                      color:      isActive ? C.red   : C.trueGreen,
+                    }}>
+                      {isActive ? "Active" : "Eligible"}
+                    </span>
+                  )}
                   {selectedUserId === u.id && <span style={{ color: C.orange }}>✓</span>}
                 </button>
-              ))}
+                );
+              })}
             </div>
           </>
         )}

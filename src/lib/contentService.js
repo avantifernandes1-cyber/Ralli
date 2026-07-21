@@ -696,10 +696,13 @@ async function getCourseAssignmentActiveUserIds(tenantId, contentId) {
  * createAssignments() delegates the check-then-insert to the
  * create_assignments_atomic() RPC, which does it inside one locked
  * transaction. This function is kept as a correct, tenant-safe read-only
- * utility (e.g. for a future "who's currently active on X" report).
+ * utility — used by AssignContentModal (rankd-app.jsx) to show managers each
+ * candidate's active/eligible status BEFORE they submit, and by any future
+ * "who's currently active on X" report. Read-only preview only; the atomic
+ * RPC above remains the sole source of truth for enforcement at submit time.
  * @returns {Promise<Map<string, { assignmentId: string, dueAt: string|null, required: boolean }>>}
  */
-async function getActiveAssignmentsByUser(tenantId, contentType, contentId) {
+export async function getActiveAssignmentsByUser(tenantId, contentType, contentId) {
   const { data: rows } = await supabase
     .from("tenant_assignments")
     .select("id, assigned_to, due_at, required")
