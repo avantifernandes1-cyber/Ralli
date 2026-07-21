@@ -12758,11 +12758,56 @@ const DEMO_REP_DRILL_DATA = {
 // ─────────────────────────────────────────────────────────────
 // RepDrillDownModal — per-rep readiness detail for managers
 // ─────────────────────────────────────────────────────────────
+// Manager-First Performance Summary — shared helpers used by RepDrillDownModal
+// only. Kept module-level (not inline in the component) so they're pure,
+// order-independent functions with no closure surprises.
+
+// Works for both real (engineStatus from assignmentEngine.js) and demo
+// (pre-labeled status strings) assignment shapes — see RepDrillDownModal's
+// enrichment loop for how engineStatus is set on the real path.
+function _repAssignmentDone(a) {
+  return a.engineStatus ? a.engineStatus === "completed" : (a.status === "Complete" || a.status === "Passed");
+}
+function _repAssignmentOverdue(a) {
+  if (a.engineStatus) return a.engineStatus === "overdue";
+  // Demo path has no engine call — approximate from due_at, same rule the
+  // engine itself uses (not resolved + due date in the past).
+  if (_repAssignmentDone(a) || !a.due_at || a.due_at === "Open") return false;
+  const d = new Date(a.due_at);
+  return !isNaN(d) && d < new Date();
+}
+
+// Most-recent-first is NOT guaranteed on either path (getRepTopicScores
+// sorts ascending; demo seed arrays happen to be hand-authored descending) —
+// always find max/min explicitly rather than trusting array position.
+function _strongestTopic(topicScores) {
+  return topicScores?.length ? [...topicScores].sort((a, b) => b.avgScore - a.avgScore)[0] : null;
+}
+function _weakestTopic(topicScores) {
+  return topicScores?.length ? [...topicScores].sort((a, b) => a.avgScore - b.avgScore)[0] : null;
+}
+
+function _relativeActivityLabel(iso) {
+  if (!iso) return null;
+  const d = new Date(iso);
+  if (isNaN(d)) return null;
+  const days = Math.floor((Date.now() - d.getTime()) / 86400000);
+  if (days <= 0) return "Today";
+  if (days === 1) return "Yesterday";
+  if (days < 14) return `${days} days ago`;
+  return d.toLocaleDateString();
+}
+
 function RepDrillDownModal({ rep, tenantId, onClose, isReal = false }) {
   const [topicScores,  setTopicScores]  = useState(null);
   const [quizHistory,  setQuizHistory]  = useState(null);
   const [quizNames,    setQuizNames]    = useState({});
   const [assignments,  setAssignments]  = useState(null); // Fix 8
+  // Manager-First Performance Summary — snapshot KPIs computed once
+  // alongside the existing detail fetches, from the same query results
+  // (plus one additional user_point_events query for XP/most-recent-
+  // activity — see the Promise.all below). null = not yet computed.
+  const [stats,        setStats]        = useState(null);
   const [loading,      setLoading]      = useState(true);
 
   useEffect(() => {
@@ -12777,6 +12822,43 @@ function RepDrillDownModal({ rep, tenantId, onClose, isReal = false }) {
       setQuizHistory(d.quizHistory);
       setQuizNames(DEMO_QUIZ_NAMES);
       setAssignments(d.assignments);
+
+      // Snapshot KPIs from the same seed shapes — demo has no XP ledger, so
+      // XP Earned honestly reports "No data" rather than a fabricated 0.
+      const dq = d.quizHistory ?? [];
+      const dLatestByQuiz = {};
+      for (const a of dq) {
+        if (!dLatestByQuiz[a.quiz_id] || new Date(a.created_at) > new Date(dLatestByQuiz[a.quiz_id].created_at)) {
+          dLatestByQuiz[a.quiz_id] = a;
+        }
+      }
+      const dLatestList = Object.values(dLatestByQuiz);
+      const dQuizzesAttempted = dLatestList.length;
+      const dQuizzesPassed = dLatestList.filter(a => a.passed).length;
+      const dAssignments = d.assignments ?? [];
+      const dCompleted = dAssignments.filter(_repAssignmentDone).length;
+      const dOverdue = dAssignments.filter(_repAssignmentOverdue).length;
+      const dActivityDates = dq.map(a => a.created_at).filter(Boolean);
+
+      setStats({
+        avgQuizScore: dQuizzesAttempted ? Math.round(dLatestList.reduce((s, a) => s + (a.score ?? 0), 0) / dQuizzesAttempted) : null,
+        quizPassRate: dQuizzesAttempted ? Math.round((dQuizzesPassed / dQuizzesAttempted) * 100) : null,
+        quizzesPassed: dQuizzesPassed,
+        quizzesFailed: dQuizzesAttempted - dQuizzesPassed,
+        quizzesAttempted: dQuizzesAttempted,
+        totalQuizAttempts: dq.length,
+        totalAssignments: dAssignments.length,
+        completedAssignments: dCompleted,
+        activeAssignments: dAssignments.length - dCompleted,
+        overdueAssignments: dOverdue,
+        incompleteRequired: dAssignments.filter(a => a.required && !_repAssignmentDone(a)).length,
+        assignmentCompletionRate: dAssignments.length ? Math.round((dCompleted / dAssignments.length) * 100) : null,
+        lessonsCompleted: dAssignments.filter(a => a.content_type === "lesson" && _repAssignmentDone(a)).length,
+        coursesCompleted: dAssignments.filter(a => a.content_type === "course" && _repAssignmentDone(a)).length,
+        xpEarned: null,
+        mostRecentActivityAt: dActivityDates.length ? dActivityDates.reduce((mx, dt) => new Date(dt) > new Date(mx) ? dt : mx) : null,
+      });
+
       setLoading(false);
       return;
     }
@@ -12792,7 +12874,14 @@ function RepDrillDownModal({ rep, tenantId, onClose, isReal = false }) {
         .eq("tenant_id", tenantId)
         .eq("user_id", repId)
         .order("created_at", { ascending: false })
-        .limit(20),
+        // Manager-First Performance Summary — was .limit(20). The snapshot's
+        // Total Quiz Attempts / Average Quiz Score / Pass Rate need this
+        // rep's FULL attempt history to be correct, not just the most
+        // recent 20 (a rep with heavy retake activity — see Dre's Quiz,
+        // attempt_num 15+ on the DeAndre Test tenant — would otherwise
+        // undercount). The "Recent Quiz Activity" list below still only
+        // *displays* the latest 8 (unchanged, see .slice(0, 8) there).
+        .limit(500),
       supabase
         .from("tenant_quizzes")
         .select("id, name")
@@ -12809,7 +12898,16 @@ function RepDrillDownModal({ rep, tenantId, onClose, isReal = false }) {
         .eq("profile_id", repId),
       supabase.from("tenant_courses").select("id, name, lesson_ids").eq("tenant_id", tenantId),
       supabase.from("tenant_lessons").select("id, name").eq("tenant_id", tenantId),
-    ]).then(([topics, { data: attempts }, { data: quizzes }, { data: allAssignments }, { data: completions }, { data: courses }, { data: lessons }]) => {
+      // Manager-First Performance Summary — new: canonical XP ledger for
+      // this rep, needed for the XP Earned KPI. Also folded into Most
+      // Recent Activity below so game/bonus activity (which has no other
+      // record in this modal) isn't invisible to that metric.
+      supabase
+        .from("user_point_events")
+        .select("points, source_type, created_at")
+        .eq("tenant_id", tenantId)
+        .eq("user_id", repId),
+    ]).then(([topics, { data: attempts }, { data: quizzes }, { data: allAssignments }, { data: completions }, { data: courses }, { data: lessons }, { data: pointEvents }]) => {
       setTopicScores(topics ?? []);
       setQuizHistory(attempts ?? []);
 
@@ -12850,49 +12948,146 @@ function RepDrillDownModal({ rep, tenantId, onClose, isReal = false }) {
           a.content_type === "lesson" ? (lessonNames[a.content_id] || "Lesson") :
           a.content_type === "quiz"   ? (names[a.content_id]       || "Quiz")   : "Content";
 
-        let isDone = false;
+        let engineResult;
         if (a.content_type === "quiz") {
           const quizAttempts = (attempts ?? []).filter(at => at.quiz_id === a.content_id);
-          isDone = resolveAssignmentStatus("quiz", a, { attempts: quizAttempts }).status === "completed";
+          engineResult = resolveAssignmentStatus("quiz", a, { attempts: quizAttempts });
         } else if (a.content_type === "lesson") {
-          isDone = resolveAssignmentStatus("lesson", a, { completedAt: completedAtByLesson.get(a.content_id) ?? null }).status === "completed";
+          engineResult = resolveAssignmentStatus("lesson", a, { completedAt: completedAtByLesson.get(a.content_id) ?? null });
         } else if (a.content_type === "course") {
-          isDone = resolveAssignmentStatus("course", a, { lessonIds: courseLessonIds[a.content_id] ?? [], completedAtByLesson }).status === "completed";
+          engineResult = resolveAssignmentStatus("course", a, { lessonIds: courseLessonIds[a.content_id] ?? [], completedAtByLesson });
+        } else {
+          engineResult = { status: "not_started", isResolved: false };
         }
+        const isDone = engineResult.status === "completed";
         const status =
           a.content_type === "quiz"   ? (isDone ? "Passed"   : "Pending") :
           a.content_type === "lesson" ? (isDone ? "Complete" : "Pending") :
           a.content_type === "course" ? (isDone ? "Complete" : "Assigned") :
           "Assigned";
-        return { ...a, title, status };
+        // Manager-First Performance Summary — engineStatus keeps the raw,
+        // unambiguous assignment-engine result ('not_started'|'in_progress'
+        // |'completed'|'overdue') alongside the existing display `status`
+        // label, so the snapshot KPIs below can tally completion/active/
+        // overdue exactly instead of re-deriving them from the display
+        // strings (which use a different vocabulary per content type).
+        return { ...a, title, status, engineStatus: engineResult.status };
       });
 
       setAssignments(enriched);
+
+      // ── Snapshot KPIs (Manager-First Performance Summary) ──────────────
+      // Average Quiz Score / Pass Rate use latest-attempt-per-quiz — same
+      // convention already established tenant-wide by getOrgMetrics /
+      // getTopicHeatmap / getRepTopicScores, so this rep's numbers are
+      // directly comparable to the org-wide "Avg Quiz Score" KPI.
+      const latestByQuiz = {};
+      for (const a of (attempts ?? [])) {
+        if (!latestByQuiz[a.quiz_id] || new Date(a.created_at) > new Date(latestByQuiz[a.quiz_id].created_at)) {
+          latestByQuiz[a.quiz_id] = a;
+        }
+      }
+      const latestList = Object.values(latestByQuiz);
+      const quizzesAttempted = latestList.length;
+      const quizzesPassed = latestList.filter(a => a.passed).length;
+
+      // Assignment Completion Rate — instance-based (one row per assignment
+      // event, including reassignments), not distinct content IDs. Scoped
+      // to this rep's INDIVIDUAL assignments only, matching "Assigned
+      // Learning" directly below — the snapshot's numbers and the detail
+      // list underneath always agree.
+      const totalAssignments = enriched.length;
+      const completedAssignments = enriched.filter(a => a.engineStatus === "completed").length;
+      const overdueAssignments = enriched.filter(a => a.engineStatus === "overdue").length;
+      const incompleteRequired = enriched.filter(a => a.required && a.engineStatus !== "completed").length;
+
+      // Courses Completed — achievement-style (every lesson in the course
+      // has ever been completed by this rep), not assignment-gated, so it
+      // reflects real mastery even for courses that were never formally
+      // assigned. Reuses completedAtByLesson already built above; a
+      // malformed lesson_ids entry (non-string) simply never matches, so a
+      // corrupt course record can't be miscounted as complete.
+      const coursesCompleted = (courses ?? []).filter(c => {
+        const lids = c.lesson_ids ?? [];
+        return lids.length > 0 && lids.every(lid => completedAtByLesson.has(lid));
+      }).length;
+
+      const xpEarned = (pointEvents ?? []).reduce((s, e) => s + (e.points ?? 0), 0);
+      const activityDates = [
+        ...(attempts ?? []).map(a => a.created_at),
+        ...(completions ?? []).map(c => c.completed_at),
+        ...(pointEvents ?? []).map(e => e.created_at),
+      ].filter(Boolean);
+
+      setStats({
+        avgQuizScore: quizzesAttempted ? Math.round(latestList.reduce((s, a) => s + (a.score ?? 0), 0) / quizzesAttempted) : null,
+        quizPassRate: quizzesAttempted ? Math.round((quizzesPassed / quizzesAttempted) * 100) : null,
+        quizzesPassed,
+        quizzesFailed: quizzesAttempted - quizzesPassed,
+        quizzesAttempted,
+        totalQuizAttempts: (attempts ?? []).length,
+        totalAssignments,
+        completedAssignments,
+        activeAssignments: totalAssignments - completedAssignments,
+        overdueAssignments,
+        incompleteRequired,
+        assignmentCompletionRate: totalAssignments ? Math.round((completedAssignments / totalAssignments) * 100) : null,
+        lessonsCompleted: (completions ?? []).length,
+        coursesCompleted,
+        xpEarned,
+        mostRecentActivityAt: activityDates.length ? activityDates.reduce((mx, d) => new Date(d) > new Date(mx) ? d : mx) : null,
+      });
+
       setLoading(false);
     }).catch(() => setLoading(false));
   }, [rep?.id, rep?.user_id, tenantId, isReal]);
 
   if (!rep) return null;
 
-  const name     = rep.name || rep.full_name || rep.initials || "Rep";
-  const score    = rep.score ?? rep.readiness_score ?? 0;
-  const band     = score >= 85 ? { label: "High",     color: C.trueGreen } :
-                   score >= 65 ? { label: "On Track",  color: C.blue      } :
-                                 { label: "At Risk",   color: C.red       };
+  const name = rep.name || rep.full_name || rep.initials || "Rep";
+  // Manager-First Performance Summary — a rep reached via the Company Risk
+  // "Overdue Assignments" link may not have a computed readiness_scores row
+  // yet (that list is assignment-driven, not readiness-driven). Distinguish
+  // "no score computed yet" from a real, low score of 0 — never show a
+  // fabricated 0% for a rep this modal has no readiness data for.
+  const hasScore = rep.score != null || rep.readinessScore != null || rep.readiness_score != null;
+  const score = hasScore ? (rep.score ?? rep.readinessScore ?? rep.readiness_score) : null;
+  const band  = score == null ? { label: "No score yet", color: C.textMuted } :
+                score >= 85   ? { label: "High",     color: C.trueGreen } :
+                score >= 65   ? { label: "On Track",  color: C.blue      } :
+                                { label: "At Risk",   color: C.red       };
 
-  // Coaching recommendations based on topic gaps
-  const recs = [];
-  if (topicScores) {
-    const weakTopics = topicScores.filter(t => t.avgScore < 65);
-    if (weakTopics.length) {
-      recs.push(`Focus coaching on: ${weakTopics.slice(0, 3).map(t => t.topic).join(", ")}.`);
-    }
-    if (topicScores.length && topicScores[0]?.avgScore < 50) {
-      recs.push("Consider re-assigning foundational quizzes before next pipeline review.");
-    }
+  // Strengths / Needs Attention — Manager-First Performance Summary.
+  // Objective, data-backed statements only; no generated coaching advice or
+  // subjective conclusions (replaces the old "Coaching Recommendations"
+  // block, which was prescriptive advice and no longer fits this contract).
+  const strongestTopic = _strongestTopic(topicScores);
+  const weakestTopic    = _weakestTopic(topicScores);
+  const strengths = [];
+  const attention = [];
+  if (strongestTopic) strengths.push(`Strongest topic: ${strongestTopic.topic} (${Math.round(strongestTopic.avgScore)}%)`);
+  if (stats && stats.avgQuizScore != null && stats.avgQuizScore >= 85) {
+    strengths.push(`Averaging ${stats.avgQuizScore}% on quizzes (latest attempt per quiz).`);
   }
-  if (score < 65) recs.push("Schedule a 1:1 coaching session this week.");
-  if (!recs.length) recs.push("Rep is performing well — maintain current cadence.");
+  if (stats && stats.lessonsCompleted > 0) {
+    strengths.push(`${stats.lessonsCompleted} lesson${stats.lessonsCompleted !== 1 ? "s" : ""} completed.`);
+  }
+  if (stats && stats.coursesCompleted > 0) {
+    strengths.push(`${stats.coursesCompleted} course${stats.coursesCompleted !== 1 ? "s" : ""} completed.`);
+  }
+  if (weakestTopic && weakestTopic.avgScore < 65) attention.push(`Weakest topic: ${weakestTopic.topic} (${Math.round(weakestTopic.avgScore)}%)`);
+  if (stats && stats.quizzesFailed > 0) {
+    attention.push(`${stats.quizzesFailed} quiz${stats.quizzesFailed !== 1 ? "zes" : ""} not currently passed (latest attempt).`);
+  }
+  if (stats && stats.avgQuizScore != null && stats.avgQuizScore < 65) {
+    attention.push(`Average quiz score is ${stats.avgQuizScore}%, below the 65% readiness threshold.`);
+  }
+  if (stats && stats.overdueAssignments > 0) {
+    attention.push(`${stats.overdueAssignments} overdue assignment${stats.overdueAssignments !== 1 ? "s" : ""}.`);
+  }
+  if (stats && stats.incompleteRequired > 0) {
+    attention.push(`${stats.incompleteRequired} required assignment${stats.incompleteRequired !== 1 ? "s" : ""} not yet complete.`);
+  }
 
   return (
     <div
@@ -12919,7 +13114,7 @@ function RepDrillDownModal({ rep, tenantId, onClose, isReal = false }) {
             <div style={{ fontSize: 13, color: C.textMuted, marginTop: 2 }}>{rep.email || rep.role || "Team Member"}</div>
           </div>
           <div style={{ textAlign: "right" }}>
-            <div style={{ fontSize: 26, fontWeight: 800, color: band.color }}>{score}%</div>
+            <div style={{ fontSize: 26, fontWeight: 800, color: band.color }}>{score != null ? `${score}%` : "—"}</div>
             <div style={{ fontSize: 12, color: C.textMuted, fontWeight: 600 }}>{band.label}</div>
           </div>
           <button onClick={onClose} style={{ marginLeft: 8, background: "none", border: "none", cursor: "pointer", fontSize: 20, color: C.textMuted, lineHeight: 1 }}>✕</button>
@@ -12929,6 +13124,118 @@ function RepDrillDownModal({ rep, tenantId, onClose, isReal = false }) {
           <div style={{ padding: 32 }}><LoadingState rows={4} message="Loading rep details…" /></div>
         ) : (
           <div style={{ padding: 24, display: "flex", flexDirection: "column", gap: 24 }}>
+
+            {/* ── 1. Performance Snapshot — Manager-First Performance Summary ── */}
+            {(() => {
+              const s = stats ?? {};
+              const scoreClr = (v) => v == null ? C.textMuted : v >= 85 ? C.trueGreen : v >= 65 ? C.orange : C.red;
+              const Tile = ({ label, value, sub, color = C.text }) => (
+                <div style={{ background: C.pageBg, borderRadius: C.radiusSm, padding: "12px 14px", minWidth: 0 }}>
+                  <div style={{ fontSize: 20, fontWeight: 800, color }}>{value}</div>
+                  <div style={{ fontSize: 11, fontWeight: 700, color: C.text, marginTop: 2 }}>{label}</div>
+                  {sub && <div style={{ fontSize: 10, color: C.textMuted, marginTop: 2, lineHeight: 1.4 }}>{sub}</div>}
+                </div>
+              );
+              return (
+                <div>
+                  <div style={{ fontWeight: 700, fontSize: 14, color: C.text, marginBottom: 12 }}>Performance Snapshot</div>
+                  <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(130px, 1fr))", gap: 10 }}>
+                    <Tile
+                      label="Overall Readiness"
+                      value={score != null ? `${score}%` : "No data"}
+                      sub={band.label}
+                      color={score == null ? C.textMuted : band.color}
+                    />
+                    <Tile
+                      label="Avg Quiz Score"
+                      value={s.avgQuizScore != null ? `${s.avgQuizScore}%` : "No data"}
+                      sub="Latest attempt per quiz"
+                      color={scoreClr(s.avgQuizScore)}
+                    />
+                    <Tile
+                      label="Quiz Pass Rate"
+                      value={s.quizPassRate != null ? `${s.quizPassRate}%` : "No data"}
+                      sub={
+                        s.quizzesAttempted
+                          ? `${s.quizzesPassed} of ${s.quizzesAttempted} quizzes passed (distinct) · ${s.totalQuizAttempts} total attempts`
+                          : "No quiz attempts yet"
+                      }
+                      color={scoreClr(s.quizPassRate)}
+                    />
+                    <Tile
+                      label="Assignment Completion"
+                      value={s.assignmentCompletionRate != null ? `${s.assignmentCompletionRate}%` : "No data"}
+                      sub={
+                        s.totalAssignments
+                          ? `${s.completedAssignments} of ${s.totalAssignments} instances · ${s.activeAssignments} active · ${s.overdueAssignments} overdue`
+                          : "No individual assignments"
+                      }
+                      color={scoreClr(s.assignmentCompletionRate)}
+                    />
+                    <Tile
+                      label="Lessons & Courses Completed"
+                      value={`${s.lessonsCompleted ?? 0} lessons`}
+                      sub={`${s.coursesCompleted ?? 0} course${(s.coursesCompleted ?? 0) !== 1 ? "s" : ""} completed`}
+                      color={C.blue}
+                    />
+                    <Tile
+                      label="XP Earned"
+                      value={s.xpEarned != null ? s.xpEarned.toLocaleString() : "No data"}
+                      sub="Total XP"
+                      color={C.orange}
+                    />
+                    <Tile
+                      label="Most Recent Activity"
+                      value={_relativeActivityLabel(s.mostRecentActivityAt) ?? "No activity yet"}
+                      sub={s.mostRecentActivityAt ? new Date(s.mostRecentActivityAt).toLocaleDateString() : null}
+                      color={C.text}
+                    />
+                  </div>
+                </div>
+              );
+            })()}
+
+            {/* ── 2. Strengths & Needs Attention — objective, data-backed only. ──
+                No generated coaching advice or subjective conclusions — every
+                line above is a direct readout of a KPI computed in the
+                Performance Snapshot or the topic scores below it. */}
+            <div>
+              <div style={{ fontWeight: 700, fontSize: 14, color: C.text, marginBottom: 12 }}>Strengths &amp; Needs Attention</div>
+              <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(220px, 1fr))", gap: 16 }}>
+                <div>
+                  <div style={{ fontSize: 11, fontWeight: 800, color: C.trueGreen, letterSpacing: "0.06em", marginBottom: 8 }}>STRENGTHS</div>
+                  {strengths.length ? (
+                    <div style={{ display: "flex", flexDirection: "column", gap: 6 }}>
+                      {strengths.map((r, i) => (
+                        <div key={i} style={{ display: "flex", gap: 8, alignItems: "flex-start" }}>
+                          <div style={{ width: 4, height: 4, borderRadius: "50%", background: C.trueGreen, marginTop: 6, flexShrink: 0 }} />
+                          <span style={{ fontSize: 12, color: C.textSub, lineHeight: 1.5 }}>{r}</span>
+                        </div>
+                      ))}
+                    </div>
+                  ) : (
+                    <div style={{ fontSize: 12, color: C.textMuted }}>Not enough data yet.</div>
+                  )}
+                </div>
+                <div>
+                  <div style={{ fontSize: 11, fontWeight: 800, color: C.red, letterSpacing: "0.06em", marginBottom: 8 }}>NEEDS ATTENTION</div>
+                  {attention.length ? (
+                    <div style={{ display: "flex", flexDirection: "column", gap: 6 }}>
+                      {attention.map((r, i) => (
+                        <div key={i} style={{ display: "flex", gap: 8, alignItems: "flex-start" }}>
+                          <div style={{ width: 4, height: 4, borderRadius: "50%", background: C.red, marginTop: 6, flexShrink: 0 }} />
+                          <span style={{ fontSize: 12, color: C.textSub, lineHeight: 1.5 }}>{r}</span>
+                        </div>
+                      ))}
+                    </div>
+                  ) : (
+                    <div style={{ fontSize: 12, color: C.textMuted }}>Not enough data yet.</div>
+                  )}
+                </div>
+              </div>
+            </div>
+
+            {/* ── 3. Detailed Activity ── */}
 
             {/* Topic Breakdown */}
             <div>
@@ -13019,18 +13326,6 @@ function RepDrillDownModal({ rep, tenantId, onClose, isReal = false }) {
               <div style={{ fontWeight: 700, fontSize: 14, color: C.text, marginBottom: 8 }}>Battle Card Engagement</div>
               <div style={{ padding: "12px 14px", background: C.pageBg, borderRadius: C.radiusSm, fontSize: 13, color: C.textMuted }}>
                 Battle card engagement tracking coming soon.
-              </div>
-            </div>
-
-            {/* Coaching Recommendations */}
-            <div>
-              <div style={{ fontWeight: 700, fontSize: 14, color: C.text, marginBottom: 12 }}>Coaching Recommendations</div>
-              <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
-                {recs.map((r, i) => (
-                  <div key={i} style={{ display: "flex", gap: 10, padding: "10px 14px", background: C.orangeLight, borderRadius: C.radiusSm, borderLeft: `3px solid ${C.orange}` }}>
-                    <span style={{ fontSize: 13, color: C.text }}>{r}</span>
-                  </div>
-                ))}
               </div>
             </div>
 
@@ -13165,6 +13460,16 @@ function LeadershipDashboardScreen({ currentOrg, orgUsers = [], isReal = false }
     if (!rawFetch) return null;
     const { hasReadinessScores, rows, heatmap, assignments, quizAttempts, lessonCompletions, courses } = rawFetch;
 
+    // Knowledge Heatmap empty-state diagnosis — getTopicHeatmap (called in
+    // the fetch effect above) returns [] for three different underlying
+    // reasons (no active quizzes, no attempts yet, or quizzes exist/have
+    // attempts but none carry skill tags) and doesn't distinguish them in
+    // its return value. quizAttempts is already fetched tenant-wide for the
+    // Active/Overdue Assignments calc below, so we get this diagnosis for
+    // free, no new query: if attempts exist tenant-wide but the heatmap
+    // still came back empty, tags — not missing activity — are the reason.
+    const heatmapNeedsTags = heatmap.length === 0 && quizAttempts.length > 0;
+
     // Build people array from orgUsers + readiness_scores rows.
     // Beta Cleanup — `tag` is now computed from the real score (reusing the
     // same 85 / 65 band thresholds already used everywhere else in this
@@ -13208,7 +13513,11 @@ function LeadershipDashboardScreen({ currentOrg, orgUsers = [], isReal = false }
     );
     let activeAssignmentCount = 0;
     let overdueAssignmentCount = 0;
-    const overdueRepNames = new Set();
+    // Manager-First Performance Summary — keyed by id (not just name) so the
+    // Company Risk "Overdue Assignments" card can open the same
+    // RepDrillDownModal a rep's name opens from People Insights / Low-
+    // Readiness Reps, instead of being a dead label.
+    const overdueReps = new Map();
     for (const a of assignments) {
       const targetedUsers = resolveAssignedUsers(a.assignedTo, orgUsers);
       for (const u of targetedUsers) {
@@ -13230,13 +13539,14 @@ function LeadershipDashboardScreen({ currentOrg, orgUsers = [], isReal = false }
         if (status !== "completed") activeAssignmentCount++;
         if (status === "overdue") {
           overdueAssignmentCount++;
-          overdueRepNames.add(u.name);
+          overdueReps.set(u.id, u.name);
         }
       }
     }
 
     return {
       hasReadinessScores,
+      heatmapNeedsTags,
       company: { readinessScore: avg, previousScore: avg, targetScore: 90, trend: [], period: "Current" },
       // BETA NOTE:
       // Hidden until supporting infrastructure is production-ready.
@@ -13269,7 +13579,7 @@ function LeadershipDashboardScreen({ currentOrg, orgUsers = [], isReal = false }
       risk: {
         activeAssignments:     activeAssignmentCount,
         overdueAssignments:    overdueAssignmentCount,
-        overdueAssignmentReps: [...overdueRepNames],
+        overdueAssignmentReps: [...overdueReps].map(([id, name]) => ({ id, name })),
         // BETA NOTE — certifications/teams-below-target/coaching-gaps have
         // no backing data model yet; kept as empty (not fabricated) and
         // their cards are hidden below rather than shown with fake zeros.
@@ -13857,7 +14167,18 @@ function LeadershipDashboardScreen({ currentOrg, orgUsers = [], isReal = false }
           </>
         ) : (
           <div style={{ padding: "24px 0", textAlign: "center", color: C.textSub, fontSize: 13 }}>
-            Skill data will appear here after reps complete tagged quizzes.
+            {/* Knowledge Heatmap Verification — data.heatmapNeedsTags (real
+                tenants only; undefined for demo, where the seed heatmap is
+                never empty) distinguishes "reps just haven't attempted
+                tagged quizzes yet" from the actual live-verified cause on
+                the DeAndre Test tenant: quiz attempts already exist, but the
+                tenant's quiz has no skill tags set, so getTopicHeatmap has
+                nothing to bucket them into. Telling a manager to wait for
+                more quiz activity would be wrong in that case — the fix is
+                adding tags to the quiz, not more attempts. */}
+            {data.heatmapNeedsTags
+              ? "No skill tags are set on this tenant's quizzes yet. Add tags to your quizzes (Quizzes → Edit) to see topic-by-topic readiness here — attempts already exist, they just aren't tagged."
+              : "Skill data will appear here after reps complete tagged quizzes."}
           </div>
         )}
       </Card>
@@ -14106,9 +14427,31 @@ function LeadershipDashboardScreen({ currentOrg, orgUsers = [], isReal = false }
               <span style={{ fontSize: 22, fontWeight: 900, color: C.red }}>{data.risk.overdueAssignments}</span>
             </div>
             <div style={{ display: "flex", flexDirection: "column", gap: 4 }}>
-              {data.risk.overdueAssignmentReps.slice(0, 4).map(name => (
-                <div key={name} style={{ fontSize: 11, color: C.textSub }}>{name}</div>
-              ))}
+              {/* Manager-First Performance Summary — Nav/Usability: rep rows
+                  here open the same RepDrillDownModal as People Insights /
+                  Low-Readiness Reps (no separate rep-detail experience).
+                  Demo entries are plain name strings (LEADERSHIP_SEED); real
+                  entries are {id, name} (see the overdueReps Map in the
+                  fetch memo above). Resolve either shape against data.people
+                  to hand the modal the same rich rep object People Insights
+                  uses; fall back to a minimal {id, name} for a real rep who
+                  has assignments but no readiness_scores row yet — never a
+                  fabricated score, see RepDrillDownModal's hasScore guard. */}
+              {data.risk.overdueAssignmentReps.slice(0, 4).map(entry => {
+                const id = typeof entry === "string" ? null : entry.id;
+                const repName = typeof entry === "string" ? entry : entry.name;
+                const matched = data.people.find(p => (id && p.id === id) || p.name === repName);
+                const clickRep = matched ?? (id ? { id, name: repName } : null);
+                return (
+                  <div
+                    key={id ?? repName}
+                    onClick={clickRep ? () => setSelectedRep(clickRep) : undefined}
+                    style={{ fontSize: 11, color: C.textSub, cursor: clickRep ? "pointer" : "default", textDecoration: clickRep ? "underline" : "none" }}
+                  >
+                    {repName}
+                  </div>
+                );
+              })}
               {data.risk.overdueAssignmentReps.length > 4 && (
                 <div style={{ fontSize: 11, color: C.textMuted }}>+{data.risk.overdueAssignmentReps.length - 4} more</div>
               )}
@@ -14154,12 +14497,23 @@ function LeadershipDashboardScreen({ currentOrg, orgUsers = [], isReal = false }
                 <div style={{ fontSize: 11, color: C.textMuted }}>Readiness scores not yet available.</div>
               ) : (
                 <>
-                  {data.risk.lowReadinessReps.map(r => (
-                    <div key={r.id ?? r.name} style={{ display: "flex", justifyContent: "space-between", alignItems: "center" }}>
-                      <span style={{ fontSize: 12, color: C.textSub }}>{r.name}</span>
-                      <ScoreBadge score={r.score} />
-                    </div>
-                  ))}
+                  {/* Manager-First Performance Summary — Nav/Usability: opens
+                      the same RepDrillDownModal as People Insights / Overdue
+                      Assignments. */}
+                  {data.risk.lowReadinessReps.map(r => {
+                    const matched = data.people.find(p => (r.id && p.id === r.id) || p.name === r.name);
+                    const clickRep = matched ?? r;
+                    return (
+                      <div
+                        key={r.id ?? r.name}
+                        onClick={() => setSelectedRep(clickRep)}
+                        style={{ display: "flex", justifyContent: "space-between", alignItems: "center", cursor: "pointer" }}
+                      >
+                        <span style={{ fontSize: 12, color: C.textSub, textDecoration: "underline" }}>{r.name}</span>
+                        <ScoreBadge score={r.score} />
+                      </div>
+                    );
+                  })}
                   {data.risk.lowReadinessReps.length === 0 && (
                     <div style={{ fontSize: 11, color: C.textMuted }}>No reps below the readiness threshold.</div>
                   )}
