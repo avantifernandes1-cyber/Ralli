@@ -8858,6 +8858,22 @@ function AssignContentModal({ contentType, contentId, content, orgUsers, orgs, c
           </>
         )}
 
+        {/* Task 7 — same Recommended/Required toggle pattern as CourseBuilderModal's
+            CLASSIFICATION control, reused as-is (colors, sizing, two-button layout)
+            rather than inventing a new control. Visible for every assign mode;
+            `required` already flows into handleAssign()'s payload unchanged. */}
+        <label style={{ fontSize: 12, fontWeight: 700, color: C.textSub, display: "block", marginBottom: 8 }}>REQUIRED</label>
+        <div style={{ display: "flex", gap: 8, marginBottom: 20 }}>
+          {[{ val: false, label: "Recommended" }, { val: true, label: "Required" }].map(opt => (
+            <button key={String(opt.val)} onClick={() => setRequired(opt.val)} style={{
+              padding: "7px 16px", borderRadius: 8, cursor: "pointer", fontSize: 12, fontWeight: 700,
+              border: `2px solid ${required === opt.val ? (opt.val ? C.red : C.orange) : C.border}`,
+              background: required === opt.val ? (opt.val ? C.redBg : C.orangeLight) : C.pageBg,
+              color: required === opt.val ? (opt.val ? C.red : C.orange) : C.textSub,
+            }}>{opt.label}</button>
+          ))}
+        </div>
+
         <label style={{ fontSize: 12, fontWeight: 700, color: C.textSub, display: "block", marginBottom: 6 }}>DUE DATE (optional)</label>
         <input type="date" value={dueDate} onChange={e => setDueDate(e.target.value)} style={{
           width: "100%", padding: "9px 12px", borderRadius: 8, border: `1px solid ${C.border}`,
