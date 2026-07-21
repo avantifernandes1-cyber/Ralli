@@ -6219,6 +6219,7 @@ const LESSON_TYPE_COLORS = { video:C.blue, text:C.green, image:C.blue, flipcard:
 function LearnScreen({ role, user, orgUsers = [], orgs = [], onNav, onAwardXp, pendingLessonId, onClearPendingLesson, pendingCourseId, onClearPendingCourse, canCreate = true, canEdit = true, canDelete = true, canAssign = true, tenantId = null, isReal = false, quizzes = [] }) {
   const isAdmin = role === "admin";
   const toast   = useToast();
+  const assignSkipPanel = useAssignmentSkipPanel(); // Sprint 2 Task 6 — "View details" on skipped users
   const [tab, setTab]           = useState(isAdmin ? "courses" : "assigned");
   // Real users start with empty arrays — seed data would flash before DB load completes
   const [courses, setCourses]   = useState(isReal ? [] : INITIAL_LEARN_COURSES);
@@ -7586,16 +7587,34 @@ function LearnScreen({ role, user, orgUsers = [], orgs = [], onNav, onAwardXp, p
                 await dbCreateAssignments(tenantId, assignment, user?.id);
               if (error) { console.error("[ralli] createAssignment failed:", error); toast.error("Failed to create assignment. Please try again."); return; }
               if (blocked) {
-                const who = skipped[0]?.userName || "This user";
-                const due = skipped[0]?.dueAt ? ` (due ${new Date(skipped[0].dueAt).toLocaleDateString("en-US", { month: "short", day: "numeric" })})` : "";
-                toast.error(`${who} already has an active assignment for this content${due}. Wait for it to complete, or remove the existing assignment first.`);
+                // Single-user (individual) assignment blocked entirely — show the
+                // specific reason rather than assuming it's always "already assigned".
+                const who    = skipped[0]?.userName || skipped[0]?.userId || "This user";
+                const reason = skipped[0]?.reason;
+                if (reason === "already_assigned") {
+                  const due = skipped[0]?.dueAt ? ` (due ${new Date(skipped[0].dueAt).toLocaleDateString("en-US", { month: "short", day: "numeric" })})` : "";
+                  toast.error(`${who} already has an active assignment for this content${due}. Wait for it to complete, or remove the existing assignment first.`);
+                } else {
+                  toast.error(`${who}: ${humanizeSkipReason(reason)}.`);
+                }
                 return; // keep modal open — manager can adjust and retry
               }
               // created is one row per eligible fanned-out user (1 for individual, N for team/group)
               setAssignments(prev => [...prev, ...created]);
-              toast.success(skippedCount > 0
-                ? `${assignedCount} assigned, ${skippedCount} skipped (already assigned).`
-                : "Assignment created.");
+              if (skippedCount > 0) {
+                const contentLabel = assignment.contentType === "course" ? "course" : "lesson";
+                toast.success(
+                  <span>
+                    {assignedCount} assigned, {skippedCount} skipped.{" "}
+                    <button
+                      onClick={() => assignSkipPanel.open({ assignedCount, skipped, contentLabel })}
+                      style={{ background: "none", border: "none", padding: 0, margin: 0, color: "inherit", textDecoration: "underline", fontWeight: 700, fontSize: 13, cursor: "pointer" }}
+                    >View details</button>
+                  </span>
+                );
+              } else {
+                toast.success("Assignment created.");
+              }
             } else {
               setAssignments(prev => [...prev, { ...assignment, id: "a" + Date.now(), assignedAt: "Today" }]);
               toast.success("Assignment created.");
@@ -17523,6 +17542,84 @@ function ToastContainer() {
   );
 }
 
+// ── ASSIGNMENT SKIP DETAILS (Sprint 2 Task 6) ─────────────────────────────────
+// Reuses the exact `skipped` array createAssignments()/create_assignments_atomic()
+// already returns (see contentService.js) — no new eligibility check. Internal
+// reason codes are never shown to managers directly; humanizeSkipReason() maps
+// each to plain language, with a safe fallback for any reason not explicitly
+// listed here so a future backend addition can never leak a raw code.
+const ASSIGNMENT_SKIP_REASON_LABELS = {
+  already_assigned:           "Already assigned",
+  invalid_target:              "Not eligible for this assignment",
+  not_in_tenant_or_ineligible: "Not eligible for this assignment",
+};
+function humanizeSkipReason(reason) {
+  return ASSIGNMENT_SKIP_REASON_LABELS[reason] ?? "Not eligible for this assignment";
+}
+
+// Provider-free event bus, same pattern as the toast system above — lets the
+// two assign call sites (LearnScreen's inline handler, App's handleAssignQuiz)
+// open the same panel without prop drilling. Render <AssignmentSkipPanel />
+// once at App root, next to <ToastContainer />.
+const _skipPanelSubs = new Set();
+function _emitSkipPanel(payload) { _skipPanelSubs.forEach(fn => fn(payload)); }
+function useAssignmentSkipPanel() {
+  return { open: (payload) => _emitSkipPanel(payload) };
+}
+
+// Compact result panel — "who was skipped and why," on demand via a toast's
+// "View details" action. Does not touch AssignContentModal (already closed
+// by the time this can open) or the toast system's own rendering.
+function AssignmentSkipPanel() {
+  const [payload, setPayload] = useState(null);
+
+  useEffect(() => {
+    const sub = (p) => setPayload(p);
+    _skipPanelSubs.add(sub);
+    return () => _skipPanelSubs.delete(sub);
+  }, []);
+
+  if (!payload) return null;
+  const { assignedCount = 0, skipped = [], contentLabel = "" } = payload;
+
+  return (
+    <div style={{ position: "fixed", inset: 0, background: "rgba(0,0,0,0.45)", display: "flex", alignItems: "center", justifyContent: "center", zIndex: 1100, padding: 20 }}
+      onClick={e => { if (e.target === e.currentTarget) setPayload(null); }}>
+      <div style={{ background: C.white, borderRadius: 16, padding: 24, width: "100%", maxWidth: 420, boxShadow: C.shadowLg, boxSizing: "border-box" }}>
+        <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", marginBottom: 4 }}>
+          <h3 style={{ margin: 0, fontSize: 16, fontWeight: 800, color: C.text }}>Skipped users</h3>
+          <button onClick={() => setPayload(null)} style={{ background: "none", border: "none", fontSize: 20, cursor: "pointer", color: C.textMuted }}>×</button>
+        </div>
+        <p style={{ margin: "2px 0 16px", fontSize: 12, color: C.textSub }}>
+          {assignedCount} assigned · {skipped.length} skipped{contentLabel ? ` — ${contentLabel}` : ""}
+        </p>
+        <div style={{ display: "flex", flexDirection: "column", gap: 8, maxHeight: 280, overflowY: "auto" }}>
+          {skipped.map((s, i) => (
+            <div key={s.userId ?? i} style={{
+              display: "flex", alignItems: "center", justifyContent: "space-between", gap: 10,
+              padding: "9px 12px", borderRadius: 8, background: C.pageBg,
+            }}>
+              <span style={{ fontSize: 13, fontWeight: 600, color: C.text, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap", minWidth: 0 }}>
+                {s.userName || s.userId || "Unknown user"}
+              </span>
+              <span style={{
+                fontSize: 11, fontWeight: 700, padding: "3px 8px", borderRadius: 999, flexShrink: 0, whiteSpace: "nowrap",
+                background: C.redBg, color: C.red,
+              }}>
+                {humanizeSkipReason(s.reason)}
+              </span>
+            </div>
+          ))}
+        </div>
+        <button onClick={() => setPayload(null)} style={{
+          marginTop: 16, width: "100%", padding: "10px", borderRadius: 8, border: "none",
+          background: C.orange, color: "#fff", fontSize: 13, fontWeight: 700, cursor: "pointer",
+        }}>Done</button>
+      </div>
+    </div>
+  );
+}
+
 // ── App Error Boundary ────────────────────────────────────────────────────────
 // Prevents render crashes (e.g. undefined field access) from showing a blank page.
 // Shows a recovery screen with the error message and a reload button instead.
@@ -17570,6 +17667,7 @@ export default function App() {
   }, []);
   const mobile = useMobile();
   const toast  = useToast();
+  const assignSkipPanel = useAssignmentSkipPanel(); // Sprint 2 Task 6 — "View details" on skipped users
   const [currentUser,      setCurrentUser]      = useState(null);
   const [lastSeenAt,       setLastSeenAt]       = useState(null);   // ISO string from profiles.last_seen_assignments_at
   const [newAssignmentCount, setNewAssignmentCount] = useState(0);  // drives "Learn" nav badge
@@ -18462,15 +18560,30 @@ export default function App() {
       const { error, blocked, assignedCount, skippedCount, skipped } = await dbCreateAssignments(tenantId, assignment, user?.id);
       if (error) { console.error("[ralli] quiz createAssignment failed:", error); toast.error("Failed to assign quiz. Please try again."); return { blocked: false }; }
       if (blocked) {
-        const who = skipped[0]?.userName || "This user";
-        const due = skipped[0]?.dueAt ? ` (due ${new Date(skipped[0].dueAt).toLocaleDateString("en-US", { month: "short", day: "numeric" })})` : "";
-        toast.error(`${who} already has an active assignment for this quiz${due}. Wait for it to complete, or remove the existing assignment first.`);
+        // Single-user (individual) assignment blocked entirely — show the
+        // specific reason rather than assuming it's always "already assigned".
+        const who    = skipped[0]?.userName || skipped[0]?.userId || "This user";
+        const reason = skipped[0]?.reason;
+        if (reason === "already_assigned") {
+          const due = skipped[0]?.dueAt ? ` (due ${new Date(skipped[0].dueAt).toLocaleDateString("en-US", { month: "short", day: "numeric" })})` : "";
+          toast.error(`${who} already has an active assignment for this quiz${due}. Wait for it to complete, or remove the existing assignment first.`);
+        } else {
+          toast.error(`${who}: ${humanizeSkipReason(reason)}.`);
+        }
         return { blocked: true };
       }
       // No App-level setAssignments — assignments state lives inside LearnScreen and QuizzesScreen.
       // Learners receive the assignment on their next visit to Quizzes or Learn (both re-fetch from Supabase on mount).
       if (skippedCount > 0) {
-        toast.success(`${assignedCount} assigned, ${skippedCount} skipped (already assigned).`);
+        toast.success(
+          <span>
+            {assignedCount} assigned, {skippedCount} skipped.{" "}
+            <button
+              onClick={() => assignSkipPanel.open({ assignedCount, skipped, contentLabel: "quiz" })}
+              style={{ background: "none", border: "none", padding: 0, margin: 0, color: "inherit", textDecoration: "underline", fontWeight: 700, fontSize: 13, cursor: "pointer" }}
+            >View details</button>
+          </span>
+        );
       } else {
         toast.success(assignedCount > 1 ? `${assignedCount} assigned.` : "Quiz assigned.");
       }
@@ -19057,6 +19170,7 @@ export default function App() {
         </div>
       )}
       <ToastContainer />
+      <AssignmentSkipPanel />
     </div>
     </AppErrorBoundary>
   );
