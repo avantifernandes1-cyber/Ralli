@@ -1,4 +1,4 @@
-import React, { useState, useEffect, useCallback, useRef } from "react";
+import React, { useState, useEffect, useCallback, useRef, useMemo } from "react";
 
 // ── MULTI-TENANT ARCHITECTURE ─────────────────────────────────────────────────
 // Data models, seed data, permissions, auth, and tenant service layers.
@@ -509,7 +509,105 @@ function InfoTooltip({ text }) {
 }
 
 
-function HomeScreen({ user, onNav, quizAssignments = [], onResumeLesson, onStartQuiz, onStartCourse, orgUsers = [], isReal = false, tenantId = null, quizzes = [], lastSeenAt = null, onNewAssignments = null }) {
+// ── useSharedUserAssignmentData ─────────────────────────────────────────────
+// Sprint 3, Task 13 — the one shared source of truth for a rep's own
+// assignment/completion state. Before this hook, HomeScreen, QuizzesScreen's
+// user branch, and LearnScreen each independently fetched
+// getTenantAssignments/getUserQuizAttempts/getLessonCompletionsWithDates and
+// ran their own copy of Task 12's realtime subscription — up to 3x the
+// network calls and 3 separate channels all listening to the exact same
+// table, with no guarantee the three screens agreed with each other at any
+// given moment. Called once in App() and passed down as props; owns:
+//   - assignments        — full tenant assignment list (dbToAssignment shape).
+//                           Left unfiltered, same as every existing caller
+//                           already did — each screen still filters to "mine"
+//                           itself (HomeScreen/QuizzesScreen), or additionally
+//                           to "everyone" for LearnScreen's manager tab, which
+//                           needs the same underlying list, just unfiltered.
+//   - lessonCompletionsAt — Map<lessonId, completedAt> for THIS user only.
+//   - quizAttempts        — raw quiz_attempts rows for THIS user only.
+//   - loading / error / retry — one composite retryable unit, same contract
+//                           each screen's own loader already had.
+//   - the ONE Task 12 realtime subscription for all three screens.
+//   - applyLocalLessonCompletion / applyLocalQuizAttempt /
+//     applyLocalAssignmentsCreated — optimistic local patches so a user's own
+//     action (completing a lesson, submitting a quiz) or a manager's own
+//     assignment creation still feels instant, without waiting for a
+//     refetch/realtime round-trip.
+//
+// Deliberately NOT included: course/lesson catalog data (getTenantCourses /
+// getTenantLessons). That's mutated by content-CRUD flows in LearnScreen's
+// manager branch (create/edit/archive course & lesson) with ~10 separate
+// call sites — pulling it into this layer would mean this hook also owning
+// content-library management, which is a materially different concern from
+// assignment/completion state and well outside "the smallest practical
+// shared source of truth." HomeScreen and LearnScreen keep their own
+// existing course/lesson fetches unchanged.
+//
+// `enabled` gates everything: only real, tenant-scoped rep sessions
+// (isReal && tenantId && userId) fetch or subscribe. Demo/seed data and
+// manager/admin sessions (who use separate tenant-wide tracking surfaces —
+// see QuizTrackingPanel and LearnScreen's Assignments tab, both untouched by
+// this task) never touch this hook's network calls.
+function useSharedUserAssignmentData(tenantId, userId, enabled) {
+  const active = enabled && !!tenantId && !!userId;
+  const [assignments, setAssignments] = useState([]);
+  const [lessonCompletionsAt, setLessonCompletionsAt] = useState(new Map());
+  const [quizAttempts, setQuizAttempts] = useState([]);
+  const [loading, setLoading] = useState(active);
+  const [error, setError] = useState(null);
+  // Bumped only on a successful assignments load (mirrors the old
+  // "mark seen on every successful load" behavior HomeScreen depends on —
+  // see its own effect that watches this to call updateLastSeenAssignmentsAt).
+  const [loadedAt, setLoadedAt] = useState(null);
+
+  const retry = useCallback(() => {
+    if (!active) { setLoading(false); return; }
+    setError(null);
+    Promise.all([
+      getTenantAssignments(tenantId),
+      getLessonCompletionsWithDates(userId),
+      getUserQuizAttempts(tenantId, userId),
+    ]).then(([{ data: a }, { data: done }, { data: attempts }]) => {
+      if (a) { setAssignments(a); setLoadedAt(Date.now()); }
+      if (done) setLessonCompletionsAt(done);
+      if (attempts) setQuizAttempts(attempts);
+      setError((!a || !done || !attempts) ? "Could not load your assignments. Please try again." : null);
+      setLoading(false);
+    }).catch(() => {
+      setError("Could not load your assignments. Please try again.");
+      setLoading(false);
+    });
+  }, [active, tenantId, userId]);
+
+  useEffect(() => { retry(); }, [retry]);
+
+  // Task 12 realtime — the ONE user-scoped tenant_assignments subscription
+  // for Home + Quizzes + Learn combined (was 3 separate ones per screen).
+  useEffect(() => {
+    if (!active) return;
+    return subscribeToTenantAssignments(tenantId, "user-shared", () => retry());
+  }, [active, tenantId, retry]);
+
+  const applyLocalLessonCompletion = useCallback((lessonId, completedAtIso) => {
+    setLessonCompletionsAt(prev => new Map(prev).set(lessonId, completedAtIso));
+  }, []);
+  const applyLocalQuizAttempt = useCallback((attempt) => {
+    setQuizAttempts(prev => [attempt, ...prev]);
+  }, []);
+  const applyLocalAssignmentsCreated = useCallback((rows) => {
+    if (!rows?.length) return;
+    setAssignments(prev => [...prev, ...rows]);
+  }, []);
+
+  return {
+    assignments, lessonCompletionsAt, quizAttempts,
+    loading, error, loadedAt, retry,
+    applyLocalLessonCompletion, applyLocalQuizAttempt, applyLocalAssignmentsCreated,
+  };
+}
+
+function HomeScreen({ user, onNav, quizAssignments = [], onResumeLesson, onStartQuiz, onStartCourse, orgUsers = [], isReal = false, tenantId = null, quizzes = [], lastSeenAt = null, onNewAssignments = null, sharedAssignmentData = null }) {
   const mobile = useMobile();
   const firstName = user.name.split(" ")[0];
   const hour = new Date().getHours();
@@ -522,15 +620,23 @@ function HomeScreen({ user, onNav, quizAssignments = [], onResumeLesson, onStart
   const [showTasksPanel, setShowTasksPanel] = useState(false);
 
   // ── Real-user assignment data ─────────────────────────────
-  const [homeCourses,     setHomeCourses]     = useState([]);
-  const [homeLessons,     setHomeLessons]     = useState([]);
-  const [homeAssignments, setHomeAssignments] = useState([]);
-  const [homeCompletedAt, setHomeCompletedAt] = useState(new Map()); // lesson_id → completed_at (ISO), assignment-instance-aware
-  const [homeQuizAttempts,setHomeQuizAttempts]= useState([]); // raw quiz_attempts rows, newest first — single source for both
-                                                                 // "is this assigned quiz done" and the Recent Quizzes list below,
-                                                                 // so they can never disagree with each other.
-  const [homeLoading,     setHomeLoading]     = useState(isReal);
-  const [homeError,       setHomeError]       = useState(null); // Task 8 — assignment fetch failure vs. genuinely empty
+  // Task 13 — assignments, lesson completions, and quiz attempts now come
+  // from the shared hook (owned once in App(), see useSharedUserAssignmentData)
+  // instead of HomeScreen fetching and subscribing to them itself. Only the
+  // course/lesson catalog — a materially different, content-CRUD-owned
+  // concern — stays as HomeScreen's own small fetch.
+  const shared = sharedAssignmentData ?? {
+    assignments: [], lessonCompletionsAt: new Map(), quizAttempts: [],
+    loading: false, error: null, loadedAt: null, retry: () => {},
+  };
+  const homeAssignments  = shared.assignments;
+  const homeCompletedAt  = shared.lessonCompletionsAt;
+  const homeQuizAttempts = shared.quizAttempts;
+
+  const [homeCourses,        setHomeCourses]        = useState([]);
+  const [homeLessons,        setHomeLessons]        = useState([]);
+  const [catalogLoading,     setCatalogLoading]     = useState(isReal);
+  const [catalogError,       setCatalogError]       = useState(null);
 
   // ── Leaderboard sidebar — reads from user_point_events (single source of truth)
   const [homeLbRows, setHomeLbRows] = useState([]);
@@ -541,56 +647,42 @@ function HomeScreen({ user, onNav, quizAssignments = [], onResumeLesson, onStart
     });
   }, [isReal, tenantId, user?.id]); // eslint-disable-line react-hooks/exhaustive-deps
 
-  // Task 8 — this is the assignment fetch chain for Home: courses/lessons
-  // (needed to render assignment cards), assignments themselves, lesson
-  // completion dates, and quiz attempts (both needed to know which assigned
-  // items are already done). A failed piece used to be silently skipped via
-  // `if (x) setX(x)`, so a broken fetch looked identical to "all caught up."
-  // homeError now surfaces that distinction; per-field application below is
-  // otherwise unchanged, including the existing "mark seen only if
-  // assignments themselves loaded" rule.
-  const loadHomeData = useCallback(() => {
-    if (!isReal || !tenantId || !user?.id) { setHomeLoading(false); return; }
-    setHomeError(null);
+  // Course/lesson catalog — needed to render assignment cards (title,
+  // lessonIds, etc.). Kept as its own small retryable fetch; combined with
+  // the shared hook's loading/error below into one composite Home experience.
+  const loadHomeCatalog = useCallback(() => {
+    if (!isReal || !tenantId) { setCatalogLoading(false); return; }
+    setCatalogError(null);
     Promise.all([
       getTenantCourses(tenantId),
       getTenantLessons(tenantId),
-      getTenantAssignments(tenantId),
-      getLessonCompletionsWithDates(user.id),
-      getUserQuizAttempts(tenantId, user.id), // needed to know which assigned quizzes are already passed
-    ]).then(([{ data: c }, { data: l }, { data: a }, { data: done }, { data: attempts }]) => {
+    ]).then(([{ data: c }, { data: l }]) => {
       if (c) setHomeCourses(c);
       if (l) setHomeLessons(l);
-      if (a) {
-        setHomeAssignments(a);
-        // Mark as seen only after assignments successfully load.
-        // If the fetch fails (a === null), we do NOT update last_seen_assignments_at
-        // so the user still sees "NEW" badges on the next visit / login.
-        updateLastSeenAssignmentsAt(user.id);
-      }
-      if (done) setHomeCompletedAt(done);
-      if (attempts) setHomeQuizAttempts(attempts); // already ordered newest-first by getUserQuizAttempts
-      setHomeError((!c || !l || !a || !done || !attempts) ? "Could not load your assignments. Please try again." : null);
-      setHomeLoading(false);
+      setCatalogError((!c || !l) ? "Could not load your assignments. Please try again." : null);
+      setCatalogLoading(false);
     }).catch(() => {
-      setHomeError("Could not load your assignments. Please try again.");
-      setHomeLoading(false);
+      setCatalogError("Could not load your assignments. Please try again.");
+      setCatalogLoading(false);
     });
-  }, [isReal, tenantId, user?.id]);
+  }, [isReal, tenantId]);
 
-  useEffect(() => { loadHomeData(); }, [loadHomeData]);
+  useEffect(() => { loadHomeCatalog(); }, [loadHomeCatalog]);
 
-  // Task 12 — live updates. A manager assigning/editing/removing content
-  // shows up here without the rep navigating away and back: re-runs the
-  // exact same retryable loadHomeData() used on mount, so loading/error
-  // handling and the "mark seen" rule stay identical for both paths — no
-  // separate partial-refetch code to keep in sync. Tenant-scoped (see
-  // subscribeToTenantAssignments's docstring); torn down on unmount/tenant
-  // change so navigating away never leaves a stale subscription running.
+  // Composite loading/error — same retryable-unit contract Home always had;
+  // now spans the catalog fetch plus the shared assignment data.
+  const homeLoading = catalogLoading || shared.loading;
+  const homeError   = catalogError ?? shared.error;
+  const retryHome    = useCallback(() => { loadHomeCatalog(); shared.retry(); }, [loadHomeCatalog, shared.retry]); // eslint-disable-line react-hooks/exhaustive-deps
+
+  // Mark assignments "seen" on every successful shared load (mount, retry, or
+  // realtime-triggered refresh) — same rule as before Task 13: a failed
+  // fetch (loadedAt unchanged) never updates last_seen_assignments_at, so
+  // "NEW" badges persist until a load actually succeeds.
   useEffect(() => {
-    if (!isReal || !tenantId) return;
-    return subscribeToTenantAssignments(tenantId, "home", () => loadHomeData());
-  }, [isReal, tenantId, loadHomeData]);
+    if (!isReal || !user?.id || shared.loadedAt == null) return;
+    updateLastSeenAssignmentsAt(user.id);
+  }, [isReal, user?.id, shared.loadedAt]);
 
   // Report new-assignment count to App so the "Learn" nav badge stays in sync.
   // "new" = assigned after lastSeenAt (only meaningful when lastSeenAt is set).
@@ -695,7 +787,7 @@ function HomeScreen({ user, onNav, quizAssignments = [], onResumeLesson, onStart
       overdueAssignments={overdueAssignments}
       homeLoading={homeLoading}
       homeError={homeError}
-      onRetryHome={loadHomeData}
+      onRetryHome={retryHome}
       onResumeLesson={onResumeLesson}
       onStartCourse={onStartCourse}
       onStartQuiz={onStartQuiz}
@@ -6207,7 +6299,7 @@ const INITIAL_ASSIGNMENTS = [
 const LESSON_TYPE_ICONS  = { video:"", text:"", image:"", flipcard:"", quiz:"", recording:"", interactive:"" };
 const LESSON_TYPE_COLORS = { video:C.blue, text:C.green, image:C.blue, flipcard:C.purple, quiz:C.purple, recording:C.red, interactive:C.orange };
 
-function LearnScreen({ role, user, orgUsers = [], orgs = [], onNav, onAwardXp, pendingLessonId, onClearPendingLesson, pendingCourseId, onClearPendingCourse, canCreate = true, canEdit = true, canDelete = true, canAssign = true, tenantId = null, isReal = false, quizzes = [] }) {
+function LearnScreen({ role, user, orgUsers = [], orgs = [], onNav, onAwardXp, pendingLessonId, onClearPendingLesson, pendingCourseId, onClearPendingCourse, canCreate = true, canEdit = true, canDelete = true, canAssign = true, tenantId = null, isReal = false, quizzes = [], sharedAssignmentData = null }) {
   const isAdmin = role === "admin";
   const toast   = useToast();
   const assignSkipPanel = useAssignmentSkipPanel(); // Sprint 2 Task 6 — "View details" on skipped users
@@ -6215,8 +6307,38 @@ function LearnScreen({ role, user, orgUsers = [], orgs = [], onNav, onAwardXp, p
   // Real users start with empty arrays — seed data would flash before DB load completes
   const [courses, setCourses]   = useState(isReal ? [] : INITIAL_LEARN_COURSES);
   const [lessons, setLessons]   = useState(isReal ? [] : INITIAL_LEARN_LESSONS);
-  const [assignments, setAssignments] = useState(isReal ? [] : INITIAL_ASSIGNMENTS);
-  const [isLearnLoading, setIsLearnLoading] = useState(isReal); // cleared once DB load resolves
+  const [catalogLoading, setCatalogLoading] = useState(isReal); // catalog/admin fetch only — cleared once DB load resolves
+
+  // Task 13 — assignments and this user's lesson completions now come from
+  // the shared hook (owned once in App(), see useSharedUserAssignmentData)
+  // for real users, instead of LearnScreen fetching/subscribing to them
+  // itself. Demo mode is untouched — it never talked to Supabase for this
+  // data anyway, so it keeps its own local, localStorage-backed state below.
+  // Both hook trees are always called (Rules of Hooks); only the VALUE
+  // picked via `isReal` differs.
+  const [demoAssignments, setDemoAssignments] = useState(INITIAL_ASSIGNMENTS);
+  const [demoCompletedLessons, setDemoCompletedLessons] = useState(() => {
+    try {
+      const saved = localStorage.getItem(`ralli_learn_progress_${user?.id ?? "guest"}`);
+      return saved ? new Set(JSON.parse(saved)) : new Set();
+    } catch { return new Set(); }
+  });
+  const [demoCompletedLessonsAt, setDemoCompletedLessonsAt] = useState(new Map());
+
+  const sharedCompletedLessonsAt = sharedAssignmentData?.lessonCompletionsAt ?? new Map();
+  // lesson_id → completed_at (ISO), used only for assignment-instance-aware
+  // Due/Complete classification in the ASSIGNED tab below — every other use
+  // of `completedLessons` below (lesson viewer checkmarks, "next up" lesson,
+  // course browse progress, XP tally) is intentionally left as plain
+  // ever-completed membership, since assignment timing doesn't apply there.
+  const sharedCompletedLessons = useMemo(
+    () => new Set(sharedCompletedLessonsAt.keys()),
+    [sharedCompletedLessonsAt]
+  );
+
+  const assignments         = isReal ? (sharedAssignmentData?.assignments ?? []) : demoAssignments;
+  const completedLessonsAt  = isReal ? sharedCompletedLessonsAt : demoCompletedLessonsAt;
+  const completedLessons    = isReal ? sharedCompletedLessons   : demoCompletedLessons;
 
   // Modals
   const [courseModal, setCourseModal]   = useState(null); // null | "new" | course object
@@ -6224,21 +6346,6 @@ function LearnScreen({ role, user, orgUsers = [], orgs = [], onNav, onAwardXp, p
   const [assignModal, setAssignModal]   = useState(null); // null | { contentType, contentId }
   const [activeLesson, setActiveLesson] = useState(null); // { lesson, courseTitle?, nextLesson? }
   const [activeCourse, setActiveCourse] = useState(null); // course object for detail view
-  // Progress — for real users Supabase is the sole source of truth (loaded below).
-  // For demo users, localStorage provides persistence across page refreshes.
-  const [completedLessons, setCompletedLessons] = useState(() => {
-    if (isReal) return new Set(); // avoid seeding with stale localStorage IDs
-    try {
-      const saved = localStorage.getItem(`ralli_learn_progress_${user?.id ?? "guest"}`);
-      return saved ? new Set(JSON.parse(saved)) : new Set();
-    } catch { return new Set(); }
-  });
-  // lesson_id → completed_at (ISO), used only for assignment-instance-aware
-  // Due/Complete classification in the ASSIGNED tab below — every other use of
-  // `completedLessons` above (lesson viewer checkmarks, "next up" lesson,
-  // course browse progress, XP tally) is intentionally left as plain
-  // ever-completed membership, since assignment timing doesn't apply there.
-  const [completedLessonsAt, setCompletedLessonsAt] = useState(new Map());
   const [userTab,    setUserTab]    = useState("assigned");
   const [learnFilter, setLearnFilter] = useState("due"); // "due" | "complete" | "all"
   const [search,     setSearch]     = useState("");
@@ -6254,57 +6361,42 @@ function LearnScreen({ role, user, orgUsers = [], orgs = [], onNav, onAwardXp, p
   const [assignDateRange,  setAssignDateRange]  = useState({ start: "", end: "" }); // ISO date strings for custom range
 
   // ── Load content from Supabase for real users ────────────────────────────
-  // Task 8 — all assignment-related reads (course/lesson catalog needed to
-  // render assignment cards, assignments themselves, this user's completion
-  // data, and — for managers — tenant-wide completions/quiz attempts that
-  // power the Assignments tracking tab) are one retryable unit: a failed
-  // request used to be indistinguishable from "nothing assigned yet" because
-  // `dbCourses ?? []` etc. silently turned a null (error) response into an
-  // empty list. learnDataError now surfaces that distinction with a Retry
-  // that re-runs this exact function. getArchivedContent is intentionally
+  // Task 13 — this is now course/lesson catalog (content-CRUD-owned, stays
+  // here) plus, for managers only, tenant-wide completions/quiz attempts for
+  // the Assignments tracking tab. The rep's own assignments/completions come
+  // from the shared hook above instead. getArchivedContent is intentionally
   // left out — it's content-library housekeeping, not assignment status.
-  const [learnDataError, setLearnDataError] = useState(null);
+  const [catalogError, setCatalogError] = useState(null);
 
-  const loadLearnData = useCallback(() => {
-    if (!isReal || !tenantId || !user?.id) { setIsLearnLoading(false); return; }
-    setLearnDataError(null);
+  const loadLearnCatalog = useCallback(() => {
+    if (!isReal || !tenantId || !user?.id) { setCatalogLoading(false); return; }
+    setCatalogError(null);
     const calls = [
       getTenantCourses(tenantId),
       getTenantLessons(tenantId),
-      getTenantAssignments(tenantId),
-      getLessonCompletions(user.id),
-      getLessonCompletionsWithDates(user.id),
     ];
     if (isAdmin) {
       calls.push(getTenantLessonCompletions(tenantId), getTenantQuizAttempts(tenantId));
     }
     Promise.all(calls).then((results) => {
-      const [
-        { data: dbCourses }, { data: dbLessons }, { data: dbAssignments },
-        { data: dbCompleted }, { data: dbCompletedAt },
-        ...adminResults
-      ] = results;
+      const [{ data: dbCourses }, { data: dbLessons }, ...adminResults] = results;
       const adminFailed = isAdmin && adminResults.some(r => !r.data);
-      if (!dbCourses || !dbLessons || !dbAssignments || !dbCompleted || !dbCompletedAt || adminFailed) {
-        setLearnDataError("Could not load your learning data. Please try again.");
-        setIsLearnLoading(false);
+      if (!dbCourses || !dbLessons || adminFailed) {
+        setCatalogError("Could not load your learning data. Please try again.");
+        setCatalogLoading(false);
         return;
       }
       setCourses(dbCourses);
       setLessons(dbLessons);
-      setAssignments(dbAssignments);
-      // Replace entirely — do not merge with any prior localStorage state.
-      setCompletedLessons(new Set(dbCompleted));
-      setCompletedLessonsAt(dbCompletedAt);
       if (isAdmin) {
         const [{ data: dbTenantCompletions }, { data: dbTenantQuizAttempts }] = adminResults;
         setTenantCompletions(dbTenantCompletions);
         setTenantQuizAttempts(dbTenantQuizAttempts);
       }
-      setIsLearnLoading(false);
+      setCatalogLoading(false);
     }).catch(() => {
-      setLearnDataError("Could not load your learning data. Please try again.");
-      setIsLearnLoading(false);
+      setCatalogError("Could not load your learning data. Please try again.");
+      setCatalogLoading(false);
     });
     // Archived content — content-library housekeeping, not assignment status;
     // left out of the retryable chain above on purpose (see comment above).
@@ -6315,34 +6407,32 @@ function LearnScreen({ role, user, orgUsers = [], orgs = [], onNav, onAwardXp, p
     }
   }, [tenantId, isReal, isAdmin, user?.id]);
 
-  useEffect(() => { loadLearnData(); }, [loadLearnData]);
+  useEffect(() => { loadLearnCatalog(); }, [loadLearnCatalog]);
 
-  // Task 12 — live updates for both the rep-facing "My Learning" tab and the
-  // manager Assignments tracking tab (same component, same underlying
-  // `assignments` state). Re-runs the existing retryable loadLearnData() so
-  // Task 11's tracking columns and Task 10's engine both see fresh data —
-  // no separate partial-refetch path. Tenant-scoped; cleaned up on
-  // unmount/tenant change.
-  useEffect(() => {
-    if (!isReal || !tenantId) return;
-    return subscribeToTenantAssignments(tenantId, "learn", () => loadLearnData());
-  }, [isReal, tenantId, loadLearnData]);
+  // Composite loading/error/retry — same retryable-unit contract LearnScreen
+  // always had (`isLearnLoading` / `learnDataError` / `loadLearnData` are the
+  // names every consumer below already uses), now spanning this screen's own
+  // catalog/admin fetch plus the shared hook's assignment/completion data.
+  const isLearnLoading = isReal ? (catalogLoading || (sharedAssignmentData?.loading ?? false)) : catalogLoading;
+  const learnDataError = isReal ? (catalogError ?? sharedAssignmentData?.error ?? null) : catalogError;
+  const loadLearnData  = useCallback(() => { loadLearnCatalog(); sharedAssignmentData?.retry?.(); }, [loadLearnCatalog, sharedAssignmentData?.retry]);
 
   const handleCompleteLesson = (id) => {
     if (completedLessons.has(id)) return;
     const completedAtNow = new Date().toISOString();
-    setCompletedLessons(prev => {
-      const next = new Set([...prev, id]);
-      // Real users: Supabase is source of truth — skip localStorage to avoid stale data accumulation.
-      if (!isReal) {
+    if (isReal) {
+      // Shared hook owns the data — patch it optimistically so this screen
+      // (and Home/Quizzes, if mounted later) reflect the completion
+      // immediately, without waiting for a refetch/realtime round-trip.
+      sharedAssignmentData?.applyLocalLessonCompletion?.(id, completedAtNow);
+    } else {
+      setDemoCompletedLessons(prev => {
+        const next = new Set([...prev, id]);
         try { localStorage.setItem(`ralli_learn_progress_${user?.id ?? "guest"}`, JSON.stringify([...next])); } catch {}
-      }
-      return next;
-    });
-    // Keep the timestamped map in sync so the ASSIGNED tab reclassifies this
-    // lesson as complete immediately, without waiting for a refetch — same
-    // immediacy the plain completedLessons Set already gets above.
-    setCompletedLessonsAt(prev => new Map(prev).set(id, completedAtNow));
+        return next;
+      });
+      setDemoCompletedLessonsAt(prev => new Map(prev).set(id, completedAtNow));
+    }
     const lessonXp = lessons.find(l => l.id === id)?.xp ?? 0;
     if (lessonXp) onAwardXp?.(lessonXp);
     // Persist to Supabase for real users (fire-and-forget)
@@ -7653,8 +7743,10 @@ function LearnScreen({ role, user, orgUsers = [], orgs = [], onNav, onAwardXp, p
                 }
                 return; // keep modal open — manager can adjust and retry
               }
-              // created is one row per eligible fanned-out user (1 for individual, N for team/group)
-              setAssignments(prev => [...prev, ...created]);
+              // created is one row per eligible fanned-out user (1 for individual, N for team/group).
+              // Patches the shared hook's assignments optimistically (Task 13) —
+              // real assignments now live there, not in local LearnScreen state.
+              sharedAssignmentData?.applyLocalAssignmentsCreated?.(created);
               if (skippedCount > 0) {
                 const contentLabel = assignment.contentType === "course" ? "course" : "lesson";
                 toast.success(
@@ -7670,7 +7762,7 @@ function LearnScreen({ role, user, orgUsers = [], orgs = [], onNav, onAwardXp, p
                 toast.success("Assignment created.");
               }
             } else {
-              setAssignments(prev => [...prev, { ...assignment, id: "a" + Date.now(), assignedAt: "Today" }]);
+              setDemoAssignments(prev => [...prev, { ...assignment, id: "a" + Date.now(), assignedAt: "Today" }]);
               toast.success("Assignment created.");
             }
             setAssignModal(null);
@@ -10696,85 +10788,66 @@ function QuizTrackingPanel({ quizzes, orgUsers, tenantId, isReal, refreshKey, on
 }
 
 // ── QuizzesScreen (user branch rewritten, admin branch preserved) ─────────────
-function QuizzesScreen({ role, onNav, quizzes, onEditQuiz, onDeleteQuiz, onToggleFavorite, onToggleActive, pendingQuizId, onClearPendingQuiz, canCreate = true, canEdit = true, canDelete = true, canLaunch = true, canAssign = true, onAssignQuiz, onLaunchQuiz, orgUsers = [], orgs = [], currentUser = null, tenantId = null, isReal = false, quizzesReady = false }) {
+function QuizzesScreen({ role, onNav, quizzes, onEditQuiz, onDeleteQuiz, onToggleFavorite, onToggleActive, pendingQuizId, onClearPendingQuiz, canCreate = true, canEdit = true, canDelete = true, canLaunch = true, canAssign = true, onAssignQuiz, onLaunchQuiz, orgUsers = [], orgs = [], currentUser = null, tenantId = null, isReal = false, quizzesReady = false, sharedAssignmentData = null }) {
 
   // ── USER VIEW ─────────────────────────────────────────────────────────────
   if (role === "user") {
-    // Assignment state — seed for demo; replaced with real data when isReal
-    const [assignments, setAssignments] = useState(isReal ? [] : USER_QUIZ_ASSIGNMENTS_SEED);
-    const [assignmentsLoaded, setAssignmentsLoaded] = useState(!isReal);
-    // Attempt history keyed by quiz_id — source of truth for retake detection
-    const [userQuizAttempts, setUserQuizAttempts] = useState({});
-    // Task 8 — both fetches below feed assignment status (which quizzes are
-    // assigned, which are already passed) and are treated as one retryable
-    // unit. A failed assignments fetch used to fall straight into "No quizzes
-    // assigned yet" (setAssignmentsLoaded(true) with no data), indistinguishable
-    // from a real empty state; a failed attempts fetch was silently dropped.
-    const [quizDataError, setQuizDataError] = useState(null);
+    // Task 13 — assignments and attempt history now come from the shared
+    // hook (owned once in App(), see useSharedUserAssignmentData) for real
+    // users, instead of QuizzesScreen fetching/subscribing to them itself.
+    // Demo mode is untouched — it keeps its own local seed state below,
+    // exactly as before, since it never talked to Supabase for this data.
+    const [demoAssignments, setDemoAssignments] = useState(USER_QUIZ_ASSIGNMENTS_SEED);
 
-    // Load quiz assignments + attempt history from Supabase for real users.
-    // Gated on quizzesReady so the merge always has access to the full quizzes array —
-    // prevents the race where assignments resolve before getTenantQuizzes finishes.
-    const loadUserQuizData = useCallback(() => {
-      if (!isReal || !tenantId || !currentUser) return;
-      if (!quizzesReady) return; // wait for App-level quiz load to complete first
-      setQuizDataError(null);
-      Promise.all([
-        getTenantAssignments(tenantId),
-        getUserQuizAttempts(tenantId, currentUser.id),
-      ]).then(([{ data }, { data: attemptRows }]) => {
-        if (!data || !attemptRows) {
-          setQuizDataError("Could not load your quizzes. Please try again.");
-          setAssignmentsLoaded(true);
-          return;
-        }
-        const userTeamId = currentUser.teamId ?? null;
-        const myQuizAssignments = data.filter(a =>
-          a.contentType === "quiz" && (
-            (a.assignedTo.type === "group"      && a.assignedTo.orgId === currentUser.orgId)  ||
-            (a.assignedTo.type === "individual" && a.assignedTo.userId === currentUser.id)    ||
-            (a.assignedTo.type === "team"       && userTeamId && userTeamId === a.assignedTo.teamId)
-          )
-        );
-        // Merge with quiz data from the quizzes prop (which has questions)
-        const merged = myQuizAssignments.map(a => {
-          const quiz = quizzes.find(q => q.id === a.contentId);
-          if (!quiz) return null;
-          return {
-            ...quiz,
-            id:         quiz.id,
-            title:      quiz.name,
-            dueAt:      a.dueAt === "Open" ? null : a.dueAt,
-            assignedAt: a.assignedAt,
-            required:   a.required,
-            attempts:   [],
-          };
-        }).filter(Boolean);
-        setAssignments(merged);
-        const byQuiz = {};
-        attemptRows.forEach(a => {
-          if (!byQuiz[a.quiz_id]) byQuiz[a.quiz_id] = [];
-          byQuiz[a.quiz_id].push(a);
-        });
-        setUserQuizAttempts(byQuiz);
-        setAssignmentsLoaded(true);
-      }).catch(() => {
-        setQuizDataError("Could not load your quizzes. Please try again.");
-        setAssignmentsLoaded(true);
-      });
-    }, [tenantId, isReal, currentUser?.id, currentUser?.teamId, currentUser?.orgId, quizzesReady, quizzes]);
+    // Merge shared assignments (filtered to "mine", same filter every other
+    // consumer of this shared data already applies) with the quizzes prop
+    // (which carries questions) — same merge loadUserQuizData used to do,
+    // now derived instead of fetched+stored. quiz.attempts stays [] for real
+    // users — userQuizAttempts (below) is the real source; see its comment.
+    const realAssignments = useMemo(() => {
+      if (!isReal || !currentUser) return [];
+      const userTeamId = currentUser.teamId ?? null;
+      const mine = (sharedAssignmentData?.assignments ?? []).filter(a =>
+        a.contentType === "quiz" && (
+          (a.assignedTo.type === "group"      && a.assignedTo.orgId === currentUser.orgId)  ||
+          (a.assignedTo.type === "individual" && a.assignedTo.userId === currentUser.id)    ||
+          (a.assignedTo.type === "team"       && userTeamId && userTeamId === a.assignedTo.teamId)
+        )
+      );
+      return mine.map(a => {
+        const quiz = quizzes.find(q => q.id === a.contentId);
+        if (!quiz) return null;
+        return {
+          ...quiz,
+          id:         quiz.id,
+          title:      quiz.name,
+          dueAt:      a.dueAt === "Open" ? null : a.dueAt,
+          assignedAt: a.assignedAt,
+          required:   a.required,
+          attempts:   [],
+        };
+      }).filter(Boolean);
+    }, [isReal, currentUser, sharedAssignmentData?.assignments, quizzes]);
 
-    useEffect(() => { loadUserQuizData(); }, [loadUserQuizData]);
+    // Attempt history keyed by quiz_id — source of truth for retake detection.
+    // For real users, comes from userQuizAttempts (DB-backed, shared).
+    // quiz.attempts is always [] for real users — only used as demo fallback.
+    const realUserQuizAttempts = useMemo(() => {
+      const byQuiz = {};
+      for (const at of sharedAssignmentData?.quizAttempts ?? []) {
+        if (!byQuiz[at.quiz_id]) byQuiz[at.quiz_id] = [];
+        byQuiz[at.quiz_id].push(at);
+      }
+      return byQuiz;
+    }, [sharedAssignmentData?.quizAttempts]);
 
-    // Task 12 — live updates. Re-runs the existing retryable
-    // loadUserQuizData() so a newly assigned/reassigned/removed quiz shows
-    // up without navigating away and back, using the same merge logic and
-    // error handling as the mount-time load. Tenant-scoped; cleaned up on
-    // unmount/tenant change.
-    useEffect(() => {
-      if (!isReal || !tenantId) return;
-      return subscribeToTenantAssignments(tenantId, "quizzes-user", () => loadUserQuizData());
-    }, [isReal, tenantId, loadUserQuizData]);
+    const assignments      = isReal ? realAssignments      : demoAssignments;
+    const userQuizAttempts = isReal ? realUserQuizAttempts : {};
+    // quizzesReady gates the merge above (needs the full quizzes array); demo
+    // is always "loaded". Mirrors the old loadUserQuizData's readiness gate.
+    const assignmentsLoaded = isReal ? (quizzesReady && !(sharedAssignmentData?.loading ?? false)) : true;
+    const quizDataError     = isReal ? (sharedAssignmentData?.error ?? null) : null;
+    const loadUserQuizData  = useCallback(() => { sharedAssignmentData?.retry?.(); }, [sharedAssignmentData?.retry]);
 
     // view: "list" | "taking" | "results"
     const [view,         setView]         = useState("list");
@@ -10815,10 +10888,16 @@ function QuizzesScreen({ role, onNav, quizzes, onEditQuiz, onDeleteQuiz, onToggl
     }, [pendingQuizId, assignmentsLoaded]); // eslint-disable-line react-hooks/exhaustive-deps
 
     const onComplete = (attempt) => {
-      setAssignments(prev => prev.map(q => q.id === activeId
-        ? { ...q, attempts: [...q.attempts, attempt] }
-        : q
-      ));
+      if (!isReal) {
+        // Demo only — quiz.attempts is the sole source of truth for demo
+        // (userQuizAttempts always stays {} in demo mode). Real users don't
+        // need this: userQuizAttempts (derived from the shared hook below)
+        // is what every downstream read actually uses.
+        setDemoAssignments(prev => prev.map(q => q.id === activeId
+          ? { ...q, attempts: [...q.attempts, attempt] }
+          : q
+        ));
+      }
       setActiveAttempt(attempt);
       setView("results");
       // Award quiz XP + persist attempt for real users
@@ -10834,15 +10913,19 @@ function QuizzesScreen({ role, onNav, quizzes, onEditQuiz, onDeleteQuiz, onToggl
           attemptNum: previousAttempts.length + 1,
           answers:    attempt.answers ?? [],
         }).catch(e => console.error("[ralli] saveQuizAttempt failed:", e));
-        // Optimistically update local attempt map so immediate re-open shows correct retake state.
-        // Prepend (DESC order to match DB) and include answers so QuizResultsView works from the list.
-        setUserQuizAttempts(prev => ({
-          ...prev,
-          [activeId]: [
-            { quiz_id: activeId, score: attempt.score, passed: attempt.passed, answers: attempt.answers ?? [] },
-            ...(prev[activeId] ?? []),
-          ],
-        }));
+        // Optimistically patch the shared hook's attempt list (Task 13) so
+        // this and every other mounted consumer (Home, manager tracking)
+        // sees the retake state immediately, without waiting for a
+        // refetch/realtime round-trip. Prepend (DESC order to match DB) and
+        // include answers so QuizResultsView works from the list. Needs its
+        // own created_at (unlike the pre-Task-13 optimistic patch, which
+        // didn't set one) — this array now also feeds Task 10's shared
+        // engine elsewhere, and a qualifying attempt without a created_at
+        // would read as unresolved until the real fetch/realtime confirms it.
+        sharedAssignmentData?.applyLocalQuizAttempt?.({
+          quiz_id: activeId, score: attempt.score, passed: attempt.passed,
+          answers: attempt.answers ?? [], created_at: new Date().toISOString(),
+        });
         triggerReadinessUpdate(tenantId, currentUser.id);
       }
     };
@@ -18047,6 +18130,19 @@ export default function App() {
   // Production hook: replace with billing provider plan lookup (e.g. Stripe subscription).
   const userPlan = isSuperAdmin ? "enterprise" : normalizePlan(currentOrg?.plan);
 
+  // Task 13 — the one shared source of truth for this rep's own assignment/
+  // completion state, consumed by HomeScreen, QuizzesScreen, and LearnScreen
+  // below instead of each fetching + subscribing independently (see
+  // useSharedUserAssignmentData's header for the full rationale). Gated to
+  // "user" role sessions only — admin-type users are routed to
+  // LeadershipDashboardScreen / the manager tracking surfaces instead, which
+  // stay on their own separate tenant-wide fetches.
+  const sharedAssignmentData = useSharedUserAssignmentData(
+    currentOrg?.id ?? null,
+    user?.id ?? null,
+    !!user?._isReal && gameRole === "user"
+  );
+
   // Tenant feature_access overrides — loaded from tenant_settings for real users.
   // Ralli Admin can toggle these per-tenant; they override the plan-based defaults.
   const [tenantFeatureAccess, setTenantFeatureAccess] = useState(null); // null = not yet loaded
@@ -18851,8 +18947,13 @@ export default function App() {
         }
         return { blocked: true };
       }
-      // No App-level setAssignments — assignments state lives inside LearnScreen and QuizzesScreen.
-      // Learners receive the assignment on their next visit to Quizzes or Learn (both re-fetch from Supabase on mount).
+      // Task 13 — no explicit optimistic patch needed here: the created row(s)
+      // reach the shared assignment hook (useSharedUserAssignmentData, owned
+      // once in App() and passed to Home/Quizzes/Learn) via Task 12's realtime
+      // subscription within a short debounce window. This handler isn't the
+      // shared hook's own creation path (LearnScreen's course/lesson assign
+      // flow patches it directly for instant feedback), so a small delay here
+      // is an acceptable, unchanged tradeoff versus this task's actual scope.
       if (skippedCount > 0) {
         toast.success(
           <span>
@@ -19121,7 +19222,7 @@ export default function App() {
       }} />;
       case "home":              return isAdminType
         ? <LeadershipDashboardScreen currentOrg={currentOrg} orgUsers={orgUsers} isReal={!!user?._isReal} />
-        : <HomeScreen user={user} onNav={navigate} quizAssignments={user?._isReal ? [] : USER_QUIZ_ASSIGNMENTS_SEED} onResumeLesson={(id) => { setPendingLessonId(id); navigate("learn"); }} onStartCourse={(id) => { setPendingCourseId(id); navigate("learn"); }} onStartQuiz={(id) => { setPendingQuizId(id); navigate("quizzes"); }} orgUsers={orgUsers} isReal={!!user?._isReal} tenantId={currentOrg?.id ?? null} quizzes={quizzes} lastSeenAt={lastSeenAt} onNewAssignments={(n) => setNewAssignmentCount(n)} />;
+        : <HomeScreen user={user} onNav={navigate} quizAssignments={user?._isReal ? [] : USER_QUIZ_ASSIGNMENTS_SEED} onResumeLesson={(id) => { setPendingLessonId(id); navigate("learn"); }} onStartCourse={(id) => { setPendingCourseId(id); navigate("learn"); }} onStartQuiz={(id) => { setPendingQuizId(id); navigate("quizzes"); }} orgUsers={orgUsers} isReal={!!user?._isReal} tenantId={currentOrg?.id ?? null} quizzes={quizzes} lastSeenAt={lastSeenAt} onNewAssignments={(n) => setNewAssignmentCount(n)} sharedAssignmentData={sharedAssignmentData} />;
       case "rankd":             return <RankdScreen onNav={navigate} onJoin={handleEnterPin} sessions={sessions} onLaunch={handleLaunch} onViewResults={handleViewResults} onRelaunch={handleRelaunch} role={gameRole} currentUser={currentUser} />;
       case "rankd-new":         return <NewSessionScreen onNav={navigate} quizzes={quizzes} onCreateSession={handleCreateSession} />;
       case "rankd-quiz-builder":return <QuizBuilderScreen onNav={navigate} onSave={handleSaveQuiz} initialQuiz={editingQuiz} onEditQuiz={handleEditQuiz} />;
@@ -19129,8 +19230,8 @@ export default function App() {
       case "rankd-lobby":       return <RankdLobbyScreen onNav={navigate} pin={lobbyPin} playerName={lobbyPlayerName} playerEmoji={lobbyPlayerEmoji} sessionName={lobbySessionName} role={gameRole} sessions={sessions} currentUser={currentUser} onGameStart={handleGameStart} chPlayers={chPlayers} broadcast={broadcast} playerId={playerId} chMsg={chMsg} onHostEnd={async () => { await endGameSession(lobbyPin, { tenantId: currentOrg?.id ?? null }); navigate("rankd"); }} />;
       case "rankd-game":        return <RankdGameScreen onNav={navigate} sessionName={lobbySessionName} role={gameRole} playerName={lobbyPlayerName ?? user.name} questions={gameQuestions ?? GAME_QUESTIONS} demoMode={gameRole === "admin" && sessions.find(s => s.code === lobbyPin)?.demoMode !== false} pin={lobbyPin} sessionDbId={sessions.find(s => s.code === lobbyPin)?.dbId ?? null} tenantId={currentOrg?.id ?? user?.orgId ?? null} broadcast={broadcast} chMsg={chMsg} chAnswers={chAnswers} chPlayers={chPlayers} playerId={playerId} onGameEnd={handleGameEnd} setChAnswers={setChAnswers} />;
       case "rankd-results":     return <RankdResultsScreen onNav={navigate} sessionCode={viewResultsCode} sessions={sessions} gameData={gameResultsData} />;
-      case "learn":             return <LearnScreen role={gameRole} user={user} orgUsers={orgUsers} orgs={orgs} onNav={navigate} onAwardXp={handleAwardXp} pendingLessonId={pendingLessonId} onClearPendingLesson={() => setPendingLessonId(null)} pendingCourseId={pendingCourseId} onClearPendingCourse={() => setPendingCourseId(null)} canCreate={perm("actions","create")} canEdit={perm("actions","edit")} canDelete={perm("actions","delete")} canAssign={perm("actions","assign")} tenantId={currentOrg?.id ?? null} isReal={!!user?._isReal} quizzes={quizzes} />;
-      case "quizzes":           return <QuizzesScreen role={gameRole} onNav={navigate} quizzes={quizzes} onEditQuiz={handleEditQuiz} onDeleteQuiz={handleDeleteQuiz} onToggleFavorite={handleToggleFavorite} onToggleActive={handleToggleActive} pendingQuizId={pendingQuizId} onClearPendingQuiz={() => setPendingQuizId(null)} canCreate={perm("actions","create")} canEdit={perm("actions","edit")} canDelete={perm("actions","delete")} canLaunch={perm("actions","launch")} canAssign={perm("actions","assign")} onAssignQuiz={handleAssignQuiz} onLaunchQuiz={handleCreateSession} orgUsers={orgUsers} orgs={orgs} currentUser={currentUser} tenantId={currentOrg?.id ?? null} isReal={!!user?._isReal} quizzesReady={quizzesReady} />;
+      case "learn":             return <LearnScreen role={gameRole} user={user} orgUsers={orgUsers} orgs={orgs} onNav={navigate} onAwardXp={handleAwardXp} pendingLessonId={pendingLessonId} onClearPendingLesson={() => setPendingLessonId(null)} pendingCourseId={pendingCourseId} onClearPendingCourse={() => setPendingCourseId(null)} canCreate={perm("actions","create")} canEdit={perm("actions","edit")} canDelete={perm("actions","delete")} canAssign={perm("actions","assign")} tenantId={currentOrg?.id ?? null} isReal={!!user?._isReal} quizzes={quizzes} sharedAssignmentData={sharedAssignmentData} />;
+      case "quizzes":           return <QuizzesScreen role={gameRole} onNav={navigate} quizzes={quizzes} onEditQuiz={handleEditQuiz} onDeleteQuiz={handleDeleteQuiz} onToggleFavorite={handleToggleFavorite} onToggleActive={handleToggleActive} pendingQuizId={pendingQuizId} onClearPendingQuiz={() => setPendingQuizId(null)} canCreate={perm("actions","create")} canEdit={perm("actions","edit")} canDelete={perm("actions","delete")} canLaunch={perm("actions","launch")} canAssign={perm("actions","assign")} onAssignQuiz={handleAssignQuiz} onLaunchQuiz={handleCreateSession} orgUsers={orgUsers} orgs={orgs} currentUser={currentUser} tenantId={currentOrg?.id ?? null} isReal={!!user?._isReal} quizzesReady={quizzesReady} sharedAssignmentData={sharedAssignmentData} />;
       case "battlecards":       return (isAdminType && perm("actions","edit"))
         ? <BattleCardsAdminScreen categories={bcCategories} cards={battleCards} onSaveCategory={handleSaveBcCategory} onDeleteCategory={handleDeleteBcCategory} onSaveCard={handleSaveBattleCard} onDeleteCard={handleDeleteBattleCard} />
         : <BattleCardsScreen categories={bcCategories} cards={battleCards} isLoading={bcLoading} isReal={!!user?._isReal} />;
