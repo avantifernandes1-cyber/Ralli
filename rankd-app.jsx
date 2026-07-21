@@ -626,7 +626,7 @@ function useSharedUserAssignmentData(tenantId, userId, enabled) {
   };
 }
 
-function HomeScreen({ user, onNav, quizAssignments = [], onResumeLesson, onStartQuiz, onStartCourse, orgUsers = [], isReal = false, tenantId = null, quizzes = [], lastSeenAt = null, onNewAssignments = null, sharedAssignmentData = null }) {
+function HomeScreen({ user, onNav, quizAssignments = [], onResumeLesson, onStartQuiz, onStartCourse, orgUsers = [], isReal = false, tenantId = null, quizzes = [], lastSeenAt = null, onNewAssignments = null, sharedAssignmentData = null, readinessThreshold = 80 }) {
   const mobile = useMobile();
   const firstName = user.name.split(" ")[0];
   const hour = new Date().getHours();
@@ -816,6 +816,7 @@ function HomeScreen({ user, onNav, quizAssignments = [], onResumeLesson, onStart
       homeCourses={homeCourses}
       homeLessons={homeLessons}
       homeQuizAttempts={homeQuizAttempts}
+      readinessThreshold={readinessThreshold}
     />
   );
 }
@@ -829,6 +830,7 @@ function PersonalDashboardScreen({
   enrichedAssignments, pendingAssignments, completedAssignments, overdueAssignments,
   homeLoading, homeError, onRetryHome, onResumeLesson, onStartCourse, onStartQuiz, homeLbRows, quizzes,
   quizAssignments = [], homeCourses = [], homeLessons = [], homeQuizAttempts = [],
+  readinessThreshold = 80,
 }) {
   const mobile     = useMobile();
   const firstName  = (user.name ?? "").split(" ")[0];
@@ -1453,7 +1455,7 @@ function PersonalDashboardScreen({
             <div style={{ display: "flex", flexDirection: "column", gap: 10 }}>
               {[...displayTopicScores].sort((a, b) => b.avgScore - a.avgScore).map(t => {
                 const s = t.avgScore ?? 0;
-                const barColor = s >= 85 ? C.trueGreen : s >= 65 ? C.orange : C.red;
+                const barColor = s >= 85 ? C.trueGreen : s >= readinessThreshold ? C.orange : C.red;
                 return (
                   <div key={t.topic}>
                     <div style={{ display: "flex", justifyContent: "space-between", marginBottom: 5 }}>
@@ -1465,7 +1467,7 @@ function PersonalDashboardScreen({
                 );
               })}
               <div style={{ display: "flex", gap: 12, marginTop: 4 }}>
-                {[{ label: "Strong ≥85", color: C.trueGreen }, { label: "On Track ≥65", color: C.orange }, { label: "At Risk <65", color: C.red }]
+                {[{ label: "Strong ≥85", color: C.trueGreen }, { label: `On Track ≥${readinessThreshold}`, color: C.orange }, { label: `At Risk <${readinessThreshold}`, color: C.red }]
                   .map(({ label, color }) => (
                     <div key={label} style={{ display: "flex", alignItems: "center", gap: 4 }}>
                       <div style={{ width: 8, height: 8, borderRadius: 2, background: color }} />
@@ -1783,6 +1785,13 @@ const Q_TYPES = [
   { id: "slider", label: "Slider Scale",    icon: "", color: "#D97706", desc: "Rate on a numeric scale" },
   { id: "match",  label: "Matching",        icon: "", color: "#8B5CF6", desc: "Connect pairs together"  },
 ];
+
+// Question types a manager can pick when creating/changing a question in the
+// builder. "open" (Open Ended) is intentionally excluded here — new
+// open-ended questions can no longer be created — but it stays in Q_TYPES
+// itself so legacy quizzes that already have one still resolve a label
+// (question list, Ralli Live, Q_TYPE_LABELS) instead of showing "undefined".
+const CREATABLE_Q_TYPES = Q_TYPES.filter(t => t.id !== "open");
 
 const Q_TYPE_LABELS = { mc: "Multiple Choice", tf: "True / False", type: "Type Answer", open: "Open Ended", slider: "Slider", match: "Matching" };
 const Q_TYPE_ICONS  = { mc: "", tf: "", type: "", open: "", slider: "", match: "" };
@@ -5864,7 +5873,6 @@ function QuizBuilderScreen({ onNav, onSave, initialQuiz }) {
       case "mc":     return { ...base, options: ["","","",""], correct: 0, timeLimit: 20 };
       case "tf":     return { ...base, options: ["True","False"], correct: 0, timeLimit: 10 };
       case "type":   return { ...base, acceptedAnswers: [""], timeLimit: 30 };
-      case "open":   return { ...base, timeLimit: 60 };
       case "slider": return { ...base, min: 0, max: 10, minLabel: "", maxLabel: "", correct: 5, tolerance: 1, timeLimit: 20 };
       case "match":  return { ...base, pairs: [{left:"",right:""},{left:"",right:""}], timeLimit: 45 };
       default: return base;
@@ -5872,6 +5880,15 @@ function QuizBuilderScreen({ onNav, onSave, initialQuiz }) {
   };
 
   const [name,      setName]      = useState(initialQuiz?.name ?? "");
+  // Passing score — per-quiz, editable. New quizzes default to 100%
+  // (requirement: "set the default for newly created quizzes to 100%").
+  // Existing quizzes with no stored value (created before this field
+  // existed) show 90% here — the same fallback grading already uses
+  // (quiz.passingScore ?? 90) — rather than silently implying they're set
+  // to 100 when they're not.
+  const [passingScore, setPassingScore] = useState(
+    typeof initialQuiz?.passingScore === "number" ? initialQuiz.passingScore : (initialQuiz ? 90 : 100)
+  );
   const [qs,        setQs]        = useState(
     initialQuiz?.questions?.length
       ? initialQuiz.questions.map(q => ({ ...q, id: q.id ?? `q_${Date.now()}_${Math.random()}` }))
@@ -5915,6 +5932,7 @@ function QuizBuilderScreen({ onNav, onSave, initialQuiz }) {
       id: initialQuiz?.id ?? Date.now().toString(),
       name: name.trim(),
       questions: qs,
+      passingScore: Math.max(0, Math.min(100, Math.round(Number(passingScore) || 0))),
       createdAt: initialQuiz?.createdAt ?? new Date().toLocaleDateString("en-US", { month: "short", day: "numeric" }),
     });
   };
@@ -6002,13 +6020,12 @@ function QuizBuilderScreen({ onNav, onSave, initialQuiz }) {
         </div>
       );
 
-      // ── Open Ended ──
-      case "open": return (
-        <div style={{ padding: "16px 20px", borderRadius: 14, background: "#F5F3FF", border: "2px solid #DDD6FE" }}>
-          <p style={{ margin: "0 0 4px", fontSize: 13, fontWeight: 800, color: "#7C3AED" }}>Open-ended question</p>
-          <p style={{ margin: 0, fontSize: 12, color: "#6D28D9" }}>Players type a free-form response. You grade all submissions manually before moving to the next question.</p>
-        </div>
-      );
+      // "open" (Open Ended) has no builder controls anymore — new open-ended
+      // questions can't be created (see CREATABLE_Q_TYPES), and a legacy quiz
+      // that still has one now falls through to the `default:` case below,
+      // which shows the same "no longer supported, replace or remove it"
+      // notice as any other retired question type. Quiz-taking is untouched —
+      // QuizTakingView still renders and scores "open" questions normally.
 
       // ── Slider ──
       case "slider": return (
@@ -6125,6 +6142,16 @@ function QuizBuilderScreen({ onNav, onSave, initialQuiz }) {
           flex:1, fontSize:20, fontWeight:900, color:C.text, border:"none", background:"transparent", outline:"none", fontFamily:"inherit",
           borderBottom:`2px solid ${name.trim() ? C.orange : C.border}`, paddingBottom:4,
         }} />
+        <div title="Minimum score a rep needs to pass this quiz" style={{ display:"flex", alignItems:"center", gap:6, flexShrink:0 }}>
+          <label style={{ fontSize:11, fontWeight:700, color:C.textSub, letterSpacing:"0.04em", textTransform:"uppercase" }}>Passing score</label>
+          <input
+            type="number" min={0} max={100} value={passingScore}
+            onChange={e => setPassingScore(e.target.value === "" ? "" : Number(e.target.value))}
+            onBlur={() => setPassingScore(p => Math.max(0, Math.min(100, Math.round(Number(p) || 0))))}
+            style={{ width:56, padding:"6px 8px", borderRadius:8, border:`1px solid ${C.border}`, fontSize:13, fontWeight:700, color:C.text, fontFamily:"inherit", textAlign:"center" }}
+          />
+          <span style={{ fontSize:13, fontWeight:700, color:C.textSub }}>%</span>
+        </div>
         <div style={{ fontSize:12, color: canSave ? "#059669" : C.textMuted, fontWeight:600, flexShrink:0 }}>
           {canSave ? `✓ ${qs.length} q${qs.length!==1?"s":""} ready` : `${qs.filter(isQComplete).length} / ${qs.length} complete`}
         </div>
@@ -6185,7 +6212,7 @@ function QuizBuilderScreen({ onNav, onSave, initialQuiz }) {
             <div>
               <label style={{ fontSize:11, fontWeight:700, color:C.textSub, letterSpacing:"0.06em", textTransform:"uppercase", display:"block", marginBottom:10 }}>Question Type</label>
               <div style={{ display:"grid", gridTemplateColumns:"repeat(3,1fr)", gap:8 }}>
-                {Q_TYPES.map(t => (
+                {CREATABLE_Q_TYPES.map(t => (
                   <button key={t.id} onClick={() => changeType(t.id)} style={{
                     display:"flex", alignItems:"center", gap:8, padding:"10px 12px", borderRadius:10,
                     border:`2px solid ${activeQ.type===t.id ? t.color : C.border}`,
@@ -9757,6 +9784,13 @@ function QuizTakingView({ quiz, onComplete, onExit }) {
   const [matchPicked,   setMatchPicked]   = useState(null);   // rightIdx "picked up" via click/keyboard, awaiting a drop target
   const [matchDrag,     setMatchDrag]     = useState(null);   // { rightIdx, pointerId, x, y, moved, fromLeftIdx } while a pointer-drag is in flight
   const [matchOverZone, setMatchOverZone] = useState(null);   // leftIdx (number) | "pool" | null — drop zone currently hovered during a drag
+  // Self-Paced Quiz Timers — seconds left on the CURRENT question, or null
+  // when this question has no configured time limit (legacy questions saved
+  // before timeLimit existed). Reset per-question in the effect below, same
+  // place every other per-question draft already resets. Ralli Live has its
+  // own independent timer state (RankdGameScreen/RankdLobbyScreen) — this is
+  // a separate implementation for the self-paced flow only.
+  const [timeLeft, setTimeLeft] = useState(null);
 
   // Task 15 — one stable idempotency key per quiz-taking session, generated
   // once and reused across any retry of the SAME submission (network retry,
@@ -9793,7 +9827,41 @@ function QuizTakingView({ quiz, onComplete, onExit }) {
     setShuffledRight(q.type === "match" && q.pairs?.length
       ? [...q.pairs].sort(() => Math.random() - 0.5)
       : []);
+    // Self-Paced Quiz Timers — fresh countdown for the question that just
+    // became active. A question with no timeLimit (legacy data) gets `null`,
+    // which the countdown effect below treats as "no timer" rather than 0s.
+    setTimeLeft(q.timeLimit > 0 ? q.timeLimit : null);
   }, [qIdx]); // eslint-disable-line react-hooks/exhaustive-deps
+
+  // Self-Paced Quiz Timers — one-second countdown for the active question.
+  // Stops counting once the question is revealed (answered, or already timed
+  // out) and naturally stops on unmount/qIdx-change via the cleanup below —
+  // covers "pauses when quiz completed" (unmounts on the last question's
+  // Next → onComplete) and "pauses when view unmounts" (onExit).
+  useEffect(() => {
+    if (revealed || timeLeft == null) return;
+    if (timeLeft <= 0) { handleTimeUp(); return; }
+    const t = setTimeout(() => setTimeLeft(n => (n == null ? n : n - 1)), 1000);
+    return () => clearTimeout(t);
+  }, [timeLeft, revealed]); // eslint-disable-line react-hooks/exhaustive-deps
+
+  // Time's up — commit whatever answer already exists (a slider always has a
+  // value; mc/tf/match write straight to `answers` as soon as something is
+  // picked/placed, so there's nothing extra to do for those; type/open only
+  // have an uncommitted value in `textDraft`) using the exact same shape the
+  // manual Check/Submit buttons write, then reveal — same "existing safe
+  // behavior" isAnswerCorrect() already applies to a null/partial answer.
+  // Never auto-advances past reveal — the learner still sees feedback and
+  // clicks Next themselves, same as answering manually.
+  const handleTimeUp = () => {
+    if (revealed) return;
+    if ((q.type === "type" || q.type === "open") && textDraft.trim()) {
+      setAnswers(prev => ({ ...prev, [q.id]: textDraft }));
+    } else if (q.type === "slider") {
+      setAnswers(prev => ({ ...prev, [q.id]: sliderVal }));
+    }
+    setRevealed(true);
+  };
 
   // Slider helpers
   const sliderMin = q.min ?? 0;
@@ -9999,9 +10067,31 @@ function QuizTakingView({ quiz, onComplete, onExit }) {
   return (
     <div style={{ maxWidth: 640, margin: "0 auto", display: "flex", flexDirection: "column", gap: 20 }}>
       {/* Header */}
-      <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between" }}>
+      <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", gap: 12 }}>
         <button onClick={onExit} style={{ background: "none", border: "none", cursor: "pointer", fontSize: 13, fontWeight: 600, color: C.textSub, padding: 0 }}>← Exit</button>
-        <span style={{ fontSize: 12, fontWeight: 700, color: C.textMuted }}>{qIdx + 1} / {total}</span>
+        <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
+          {/* Self-Paced Quiz Timers — hidden once revealed (question is answered/
+              timed out) and hidden entirely for legacy questions with no
+              configured time limit, rather than showing a fake "0s". */}
+          {timeLeft != null && !revealed && (() => {
+            const timerPct = q.timeLimit > 0 ? (timeLeft / q.timeLimit) * 100 : 0;
+            const timerColor = timerPct > 50 ? C.trueGreen : timerPct > 25 ? C.orange : "#EF4444";
+            return (
+              <div
+                role="timer" aria-live="polite" aria-label={`${timeLeft} seconds remaining`}
+                style={{
+                  width: 30, height: 30, borderRadius: "50%", flexShrink: 0,
+                  display: "flex", alignItems: "center", justifyContent: "center",
+                  border: `2px solid ${timerColor}`, background: `${timerColor}14`,
+                  transition: "border-color 0.5s, background 0.5s",
+                }}
+              >
+                <span style={{ fontSize: 12, fontWeight: 900, color: timerColor }}>{timeLeft}</span>
+              </div>
+            );
+          })()}
+          <span style={{ fontSize: 12, fontWeight: 700, color: C.textMuted }}>{qIdx + 1} / {total}</span>
+        </div>
       </div>
 
       {/* Progress bar */}
@@ -13014,7 +13104,7 @@ function ViewAllToggle({ total, visible = 3, expanded, onToggle }) {
   );
 }
 
-function RepDrillDownModal({ rep, tenantId, onClose, isReal = false }) {
+function RepDrillDownModal({ rep, tenantId, onClose, isReal = false, readinessThreshold = 80 }) {
   const [topicScores,  setTopicScores]  = useState(null);
   const [quizHistory,  setQuizHistory]  = useState(null);
   const [quizNames,    setQuizNames]    = useState({});
@@ -13315,7 +13405,7 @@ function RepDrillDownModal({ rep, tenantId, onClose, isReal = false }) {
   const score = hasScore ? (rep.score ?? rep.readinessScore ?? rep.readiness_score) : null;
   const band  = score == null ? { label: "No score yet", color: C.textMuted } :
                 score >= 85   ? { label: "High",     color: C.trueGreen } :
-                score >= 65   ? { label: "On Track",  color: C.blue      } :
+                score >= readinessThreshold ? { label: "On Track",  color: C.blue      } :
                                 { label: "At Risk",   color: C.red       };
 
   // Strengths / Needs Attention — Manager-First Performance Summary.
@@ -13325,10 +13415,11 @@ function RepDrillDownModal({ rep, tenantId, onClose, isReal = false }) {
   const strongestTopic = _strongestTopic(topicScores);
   const weakestTopic    = _weakestTopic(topicScores);
   // Rep Drill-Down Final Polish — Part 2: Low Readiness Supporting Detail.
-  // 65% is the same at-risk threshold used everywhere else (Below
-  // Threshold KPI, coaching tag, band label above).
-  const isLowReadiness = score != null && score < 65;
-  const weakTopics = (topicScores ?? []).filter(t => t.avgScore < 65).sort((a, b) => a.avgScore - b.avgScore);
+  // readinessThreshold is the same at-risk threshold used everywhere else
+  // (Below Threshold KPI, coaching tag, band label above) — tenant-
+  // configurable, see insightsService.getReadinessThreshold.
+  const isLowReadiness = score != null && score < readinessThreshold;
+  const weakTopics = (topicScores ?? []).filter(t => t.avgScore < readinessThreshold).sort((a, b) => a.avgScore - b.avgScore);
   const hasTaggedTopicData = (topicScores ?? []).length > 0;
   const strengths = [];
   const attention = [];
@@ -13345,9 +13436,9 @@ function RepDrillDownModal({ rep, tenantId, onClose, isReal = false }) {
   // Readiness score first and explicit — the single most decision-useful
   // line for a manager scanning Needs Attention.
   if (isLowReadiness) {
-    attention.push(`Overall readiness is ${score}%, in the At Risk range (below 65%).`);
+    attention.push(`Overall readiness is ${score}%, in the At Risk range (below ${readinessThreshold}%).`);
   }
-  if (weakestTopic && weakestTopic.avgScore < 65) {
+  if (weakestTopic && weakestTopic.avgScore < readinessThreshold) {
     attention.push(`Weakest topic: ${weakestTopic.topic} (${Math.round(weakestTopic.avgScore)}%)`);
   }
   // Low-scoring topic detail beyond just the single weakest one, when
@@ -13365,8 +13456,8 @@ function RepDrillDownModal({ rep, tenantId, onClose, isReal = false }) {
   if (stats && stats.quizzesFailed > 0) {
     attention.push(`${stats.quizzesFailed} quiz${stats.quizzesFailed !== 1 ? "zes" : ""} not currently passed (latest attempt).`);
   }
-  if (stats && stats.avgQuizScore != null && stats.avgQuizScore < 65) {
-    attention.push(`Average quiz score is ${stats.avgQuizScore}%, below the 65% readiness threshold.`);
+  if (stats && stats.avgQuizScore != null && stats.avgQuizScore < readinessThreshold) {
+    attention.push(`Average quiz score is ${stats.avgQuizScore}%, below the ${readinessThreshold}% readiness threshold.`);
   }
   if (stats && stats.overdueAssignments > 0) {
     attention.push(`${stats.overdueAssignments} overdue assignment${stats.overdueAssignments !== 1 ? "s" : ""}.`);
@@ -13421,7 +13512,7 @@ function RepDrillDownModal({ rep, tenantId, onClose, isReal = false }) {
             {/* ── 1. Performance Snapshot — Manager-First Performance Summary ── */}
             {(() => {
               const s = stats ?? {};
-              const scoreClr = (v) => v == null ? C.textMuted : v >= 85 ? C.trueGreen : v >= 65 ? C.orange : C.red;
+              const scoreClr = (v) => v == null ? C.textMuted : v >= 85 ? C.trueGreen : v >= readinessThreshold ? C.orange : C.red;
               // Assignment Experience Priority 3 — presentation-only split of
               // s.activeAssignments (unchanged: still totalAssignments minus
               // completedAssignments, still includes overdue) into two
@@ -13594,7 +13685,7 @@ function RepDrillDownModal({ rep, tenantId, onClose, isReal = false }) {
               {topicScores?.length ? (
                 <div style={{ display: "flex", flexDirection: "column", gap: 10 }}>
                   {topicScores.map(t => {
-                    const tColor = t.avgScore >= 85 ? C.trueGreen : t.avgScore >= 65 ? C.blue : C.red;
+                    const tColor = t.avgScore >= 85 ? C.trueGreen : t.avgScore >= readinessThreshold ? C.blue : C.red;
                     return (
                       <div key={t.topic}>
                         <div style={{ display: "flex", justifyContent: "space-between", marginBottom: 4 }}>
@@ -13633,7 +13724,7 @@ function RepDrillDownModal({ rep, tenantId, onClose, isReal = false }) {
                           <div style={{ fontSize: 11, color: C.textMuted, marginTop: 2 }}>{new Date(a.created_at).toLocaleDateString()}</div>
                         </div>
                         <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
-                          <span style={{ fontSize: 13, fontWeight: 700, color: a.score >= 65 ? C.trueGreen : C.red }}>{a.score}%</span>
+                          <span style={{ fontSize: 13, fontWeight: 700, color: a.score >= readinessThreshold ? C.trueGreen : C.red }}>{a.score}%</span>
                           <span style={{ fontSize: 11, padding: "2px 8px", borderRadius: 99, background: a.passed ? C.trueGreenBg : C.redBg, color: a.passed ? C.trueGreen : C.red, fontWeight: 600 }}>{a.passed ? "Passed" : "Failed"}</span>
                         </div>
                       </div>
@@ -13782,7 +13873,7 @@ function KPIDetailModal({ title, subtitle, onClose, isEmpty, emptyMessage, child
 // Production hook: replace LEADERSHIP_SEED with API fetch on mount.
 // All data shapes mirror the final backend response model.
 // ─────────────────────────────────────────────────────────────
-function LeadershipDashboardScreen({ currentOrg, orgUsers = [], isReal = false }) {
+function LeadershipDashboardScreen({ currentOrg, orgUsers = [], isReal = false, readinessThreshold = 80 }) {
   const mobile      = useMobile();
   const realMembers = orgUsers.filter(u => u._isReal);
   const hasRealData = !isReal || realMembers.length > 0;
@@ -13838,8 +13929,8 @@ function LeadershipDashboardScreen({ currentOrg, orgUsers = [], isReal = false }
         .select("user_id, score, computed_at")
         .eq("tenant_id", tid)
         .order("computed_at", { ascending: false }),
-      getTopicHeatmap(tid),
-      getOrgMetrics(tid),
+      getTopicHeatmap(tid, { threshold: readinessThreshold }),
+      getOrgMetrics(tid, { threshold: readinessThreshold }),
       // Beta Cleanup — same tenant-wide reads QuizTrackingPanel / LearnScreen's
       // Assignments tab already use to compute per-assignment status, so the
       // Active/Overdue Assignments numbers below can never drift from what
@@ -13920,7 +14011,7 @@ function LeadershipDashboardScreen({ currentOrg, orgUsers = [], isReal = false }
       setFetchError("We couldn't load your dashboard data. Please try again.");
       setLoading(false);
     });
-  }, [isReal, currentOrg?.id, retryKey]); // eslint-disable-line react-hooks/exhaustive-deps
+  }, [isReal, currentOrg?.id, retryKey, readinessThreshold]); // eslint-disable-line react-hooks/exhaustive-deps
 
   // Assignment Experience Priority 1 — live updates for Company Risk /
   // Active & Overdue Assignments when an assignment is created or removed
@@ -13988,9 +14079,9 @@ function LeadershipDashboardScreen({ currentOrg, orgUsers = [], isReal = false }
 
     // Build people array from orgUsers + readiness_scores rows.
     // Beta Cleanup — `tag` is now computed from the real score (reusing the
-    // same 85 / 65 band thresholds already used everywhere else in this
-    // file — scoreColor/scoreBg, RepDrillDownModal's band, Insights'
-    // distribution buckets), so the People Insights "Highest" / "Needs
+    // same 85 / readinessThreshold band thresholds already used everywhere
+    // else in this file — RepDrillDownModal's band, Insights' distribution
+    // buckets), so the People Insights "Highest" / "Needs
     // Coaching" filters work for real tenants. "promotion" / "improved"
     // are NOT set here — both require a real prior-period snapshot that
     // doesn't exist yet (see the Team Readiness / Readiness Trends BETA
@@ -14011,7 +14102,7 @@ function LeadershipDashboardScreen({ currentOrg, orgUsers = [], isReal = false }
         readinessScore,
         previousScore:  readinessScore,
         trend:         0,
-        tag:           readinessScore >= 85 ? "top" : readinessScore < 65 ? "coaching" : undefined,
+        tag:           readinessScore >= 85 ? "top" : readinessScore < readinessThreshold ? "coaching" : undefined,
         color:         ["#6366f1","#f59e0b","#10b981","#ec4899","#3b82f6"][i % 5],
       };
     });
@@ -14144,12 +14235,12 @@ function LeadershipDashboardScreen({ currentOrg, orgUsers = [], isReal = false }
         // their cards are hidden below rather than shown with fake zeros.
         overdueCertifications: 0,
         certExpiringSoon:      [],
-        lowReadinessReps:      people.filter(p => p.readinessScore < 65).map(p => ({ id: p.id, name: p.name, score: p.readinessScore })),
+        lowReadinessReps:      people.filter(p => p.readinessScore < readinessThreshold).map(p => ({ id: p.id, name: p.name, score: p.readinessScore })),
         teamsBelowTarget:      [],
         coachingGaps:          [],
       },
     };
-  }, [rawFetch, orgUsers]);
+  }, [rawFetch, orgUsers, readinessThreshold]);
 
   // Loading / empty guards — real users only. Demo always falls through to LEADERSHIP_SEED.
   if (loading) {
@@ -14214,15 +14305,15 @@ function LeadershipDashboardScreen({ currentOrg, orgUsers = [], isReal = false }
 
   const renderBelowThresholdDetail = () => {
     const reps = data.people
-      .filter(p => (p.readinessScore ?? p.score ?? 0) < 65)
+      .filter(p => (p.readinessScore ?? p.score ?? 0) < readinessThreshold)
       .sort((a, b) => (a.readinessScore ?? 0) - (b.readinessScore ?? 0)); // most at-risk first
     return (
       <KPIDetailModal
         title="Below Threshold"
-        subtitle="Reps currently below 65% readiness, most at-risk first"
+        subtitle={`Reps currently below ${readinessThreshold}% readiness, most at-risk first`}
         onClose={() => setOpenKpiDetail(null)}
         isEmpty={reps.length === 0}
-        emptyMessage="No reps are currently below the 65% readiness threshold."
+        emptyMessage={`No reps are currently below the ${readinessThreshold}% readiness threshold.`}
       >
         <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
           {reps.map(p => {
@@ -14435,7 +14526,7 @@ function LeadershipDashboardScreen({ currentOrg, orgUsers = [], isReal = false }
     if (!topicFilter || !data.heatmap.length) return false;
     const entry = data.heatmap.find(t => t.topic === topicFilter);
     if (!entry?.repScores?.length) return false;
-    return entry.repScores.filter(r => r.score < 65).length === 0;
+    return entry.repScores.filter(r => r.score < readinessThreshold).length === 0;
   })();
 
   const filteredPeople = (() => {
@@ -14443,7 +14534,7 @@ function LeadershipDashboardScreen({ currentOrg, orgUsers = [], isReal = false }
     if (topicFilter && data.heatmap.length > 0) {
       const topicEntry = data.heatmap.find(t => t.topic === topicFilter);
       if (topicEntry?.repScores?.length) {
-        const belowIds = new Set(topicEntry.repScores.filter(r => r.score < 65).map(r => r.userId));
+        const belowIds = new Set(topicEntry.repScores.filter(r => r.score < readinessThreshold).map(r => r.userId));
         if (belowIds.size > 0) {
           // Some reps below threshold — show only them
           list = list.filter(p => belowIds.has(p.id));
@@ -14597,7 +14688,7 @@ function LeadershipDashboardScreen({ currentOrg, orgUsers = [], isReal = false }
             // exists; a "—" card has nothing meaningful to open.
             label: "Below Threshold",
             value: hasReadinessData ? `${below}` : "—",
-            sub: hasReadinessData ? "Reps below 65% readiness" : "Not yet available",
+            sub: hasReadinessData ? `Reps below ${readinessThreshold}% readiness` : "Not yet available",
             color: hasReadinessData ? (below > 0 ? C.red : C.trueGreen) : C.textMuted,
             detailKey: hasReadinessData ? "belowThreshold" : null,
           },
@@ -14679,7 +14770,7 @@ function LeadershipDashboardScreen({ currentOrg, orgUsers = [], isReal = false }
 
       {/* ── Threshold Alert Banner — real orgs only (Fix 5: suppress for demo) ── */}
       {isReal && (() => {
-        const atRisk = (liveData ?? data).people?.filter(p => (p.score ?? p.readinessScore ?? 0) < 65) ?? [];
+        const atRisk = (liveData ?? data).people?.filter(p => (p.score ?? p.readinessScore ?? 0) < readinessThreshold) ?? [];
         if (!atRisk.length) return null;
         return (
           <div style={{
@@ -14690,7 +14781,7 @@ function LeadershipDashboardScreen({ currentOrg, orgUsers = [], isReal = false }
             <span style={{ fontSize: 18, flexShrink: 0 }}>⚠️</span>
             <div>
               <div style={{ fontSize: 13, fontWeight: 700, color: C.red }}>
-                {atRisk.length} rep{atRisk.length !== 1 ? "s" : ""} below readiness threshold (65%)
+                {atRisk.length} rep{atRisk.length !== 1 ? "s" : ""} below readiness threshold ({readinessThreshold}%)
               </div>
               <div style={{ fontSize: 12, color: C.textSub, marginTop: 4 }}>
                 {atRisk.slice(0, 5).map(p => p.name || p.initials).join(", ")}
@@ -14874,9 +14965,9 @@ function LeadershipDashboardScreen({ currentOrg, orgUsers = [], isReal = false }
               const CELL_W  = 54;
               const CELL_H  = 38;
               const sortedTopics = [...data.heatmap].sort((a, b) => (b.avgScore ?? b.score ?? 0) - (a.avgScore ?? a.score ?? 0));
-              const cellBg    = (s) => s == null ? C.pageBg      : s >= 85 ? C.trueGreenBg : s >= 65 ? C.orangeLight : C.redBg;
-              const cellClr   = (s) => s == null ? C.textMuted   : s >= 85 ? C.trueGreen   : s >= 65 ? C.orangeDeep  : C.red;
-              const cellBdr   = (s) => s == null ? C.border      : s >= 85 ? "#86EFAC"     : s >= 65 ? C.orangeBorder : "#FECACA";
+              const cellBg    = (s) => s == null ? C.pageBg      : s >= 85 ? C.trueGreenBg : s >= readinessThreshold ? C.orangeLight : C.redBg;
+              const cellClr   = (s) => s == null ? C.textMuted   : s >= 85 ? C.trueGreen   : s >= readinessThreshold ? C.orangeDeep  : C.red;
+              const cellBdr   = (s) => s == null ? C.border      : s >= 85 ? "#86EFAC"     : s >= readinessThreshold ? C.orangeBorder : "#FECACA";
               return (
                 <div style={{ overflowX: "auto", WebkitOverflowScrolling: "touch", margin: "0 -2px" }}>
                   <div style={{ minWidth: TOPIC_W + data.people.length * (CELL_W + 4) }}>
@@ -14949,7 +15040,7 @@ function LeadershipDashboardScreen({ currentOrg, orgUsers = [], isReal = false }
                     })}
                     {/* Legend */}
                     <div style={{ display: "flex", gap: 12, marginTop: 10, paddingLeft: TOPIC_W + 4 }}>
-                      {[{ label: "Strong ≥85", bg: C.trueGreenBg, clr: C.trueGreen, bdr: "#86EFAC" }, { label: "On Track ≥65", bg: C.orangeLight, clr: C.orangeDeep, bdr: C.orangeBorder }, { label: "At Risk <65", bg: C.redBg, clr: C.red, bdr: "#FECACA" }, { label: "No data", bg: C.pageBg, clr: C.textMuted, bdr: C.border }].map(({ label, bg, clr, bdr }) => (
+                      {[{ label: "Strong ≥85", bg: C.trueGreenBg, clr: C.trueGreen, bdr: "#86EFAC" }, { label: `On Track ≥${readinessThreshold}`, bg: C.orangeLight, clr: C.orangeDeep, bdr: C.orangeBorder }, { label: `At Risk <${readinessThreshold}`, bg: C.redBg, clr: C.red, bdr: "#FECACA" }, { label: "No data", bg: C.pageBg, clr: C.textMuted, bdr: C.border }].map(({ label, bg, clr, bdr }) => (
                         <div key={label} style={{ display: "flex", alignItems: "center", gap: 4 }}>
                           <div style={{ width: 12, height: 12, borderRadius: 3, background: bg, border: `1px solid ${bdr}` }} />
                           <span style={{ fontSize: 10, color: C.textMuted }}>{label}</span>
@@ -14980,12 +15071,12 @@ function LeadershipDashboardScreen({ currentOrg, orgUsers = [], isReal = false }
                           onClick={() => setTopicFilter(topicFilter === t.topic ? null : t.topic)}
                           style={{
                             padding: "12px 14px", borderRadius: C.radiusSm, cursor: "pointer",
-                            background: s < 65 ? C.redBg : C.orangeLight,
-                            border: `1px solid ${s < 65 ? C.red + "33" : C.orange + "44"}`,
+                            background: s < readinessThreshold ? C.redBg : C.orangeLight,
+                            border: `1px solid ${s < readinessThreshold ? C.red + "33" : C.orange + "44"}`,
                           }}
                         >
-                          <div style={{ fontSize: 12, fontWeight: 700, color: s < 65 ? C.red : C.orangeDeep, textTransform: "capitalize" }}>{t.topic}</div>
-                          <div style={{ fontSize: 20, fontWeight: 900, color: s < 65 ? C.red : C.orange, margin: "4px 0" }}>{s}%</div>
+                          <div style={{ fontSize: 12, fontWeight: 700, color: s < readinessThreshold ? C.red : C.orangeDeep, textTransform: "capitalize" }}>{t.topic}</div>
+                          <div style={{ fontSize: 20, fontWeight: 900, color: s < readinessThreshold ? C.red : C.orange, margin: "4px 0" }}>{s}%</div>
                           {t.repsBelow > 0 && <div style={{ fontSize: 11, color: C.textMuted }}>{t.repsBelow} rep{t.repsBelow !== 1 ? "s" : ""} need coaching</div>}
                         </div>
                       );
@@ -15393,6 +15484,7 @@ function LeadershipDashboardScreen({ currentOrg, orgUsers = [], isReal = false }
           tenantId={currentOrg?.id}
           onClose={() => setSelectedRep(null)}
           isReal={isReal}
+          readinessThreshold={readinessThreshold}
         />
       )}
 
@@ -18576,11 +18668,12 @@ function LoginScreen({ onLogin, users = USERS }) {
 // ── OrgAdminSettingsScreen ────────────────────────────────────────────────────
 // Tabbed settings for Organization Admin: Role Access + Team Settings
 // ─────────────────────────────────────────────────────────────────────────────
-function OrgAdminSettingsScreen({ rolePermissions, onSaveRolePermissions, currentOrg, orgId, orgName, orgUsers, onAddUser }) {
-  const [tab, setTab] = useState("roles"); // "roles" | "team"
+function OrgAdminSettingsScreen({ rolePermissions, onSaveRolePermissions, currentOrg, orgId, orgName, orgUsers, onAddUser, readinessThreshold = 80, onSaveReadinessThreshold }) {
+  const [tab, setTab] = useState("roles"); // "roles" | "team" | "learning"
   const tabs = [
-    { id: "roles", label: "Role Access" },
-    { id: "team",  label: "Team Settings" },
+    { id: "roles",    label: "Role Access" },
+    { id: "team",     label: "Team Settings" },
+    { id: "learning", label: "Learning" },
   ];
   return (
     <div style={{ display: "flex", flexDirection: "column", gap: 20 }}>
@@ -18596,8 +18689,103 @@ function OrgAdminSettingsScreen({ rolePermissions, onSaveRolePermissions, curren
           }}>{t.label}</button>
         ))}
       </div>
-      {tab === "roles" && <RoleAccessScreen rolePermissions={rolePermissions} onSave={onSaveRolePermissions} currentOrg={currentOrg} />}
-      {tab === "team"  && <TeamScreen orgId={orgId} orgName={orgName} orgUsers={orgUsers} onAddUser={onAddUser} />}
+      {tab === "roles"    && <RoleAccessScreen rolePermissions={rolePermissions} onSave={onSaveRolePermissions} currentOrg={currentOrg} />}
+      {tab === "team"     && <TeamScreen orgId={orgId} orgName={orgName} orgUsers={orgUsers} onAddUser={onAddUser} />}
+      {tab === "learning" && <LearningSettingsScreen readinessThreshold={readinessThreshold} onSave={onSaveReadinessThreshold} />}
+    </div>
+  );
+}
+
+// ── LearningSettingsScreen — Readiness Threshold ──────────────────────────
+// Smallest-pattern copy of RoleAccessScreen's draft/isDirty/Save shell.
+// Tenant-scoped (persisted via tenant_settings.learning_settings), editable
+// by orgAdmin only — this screen is only reachable through
+// OrgAdminSettingsScreen, which App only renders for isOrgAdmin (see the
+// "settings" case in the main router). Ordinary users are routed to
+// UserSettingsScreen instead and never see this control. Backend RLS
+// (tenant_settings_update_org_admin policy, migration 031) is the real
+// enforcement layer — this UI gate is a convenience, not the security
+// boundary.
+const READINESS_THRESHOLD_DEFAULT = 80;
+
+function LearningSettingsScreen({ readinessThreshold = READINESS_THRESHOLD_DEFAULT, onSave }) {
+  const [draft, setDraft] = useState(readinessThreshold);
+  const [saved, setSaved] = useState(false);
+
+  // Keep the draft in sync if the prop changes underneath us (e.g. after a
+  // fresh load from Supabase resolves post-mount).
+  useEffect(() => { setDraft(readinessThreshold); }, [readinessThreshold]);
+
+  const isValid = draft !== "" && Number.isFinite(Number(draft)) && Number(draft) >= 0 && Number(draft) <= 100;
+  const isDirty = isValid && Math.round(Number(draft)) !== readinessThreshold;
+
+  const handleSave = () => {
+    if (!isValid) return;
+    onSave?.(Math.round(Number(draft)));
+    setSaved(true);
+    setTimeout(() => setSaved(false), 2000);
+  };
+
+  const handleReset = () => setDraft(READINESS_THRESHOLD_DEFAULT);
+
+  return (
+    <div style={{ background: C.white, borderRadius: 16, border: `1px solid ${C.border}`, padding: 24, maxWidth: 520 }}>
+      <div style={{ fontSize: 16, fontWeight: 800, color: C.text, marginBottom: 6 }}>Readiness Threshold</div>
+      <p style={{ margin: "0 0 18px", fontSize: 13, color: C.textSub, lineHeight: 1.6 }}>
+        The minimum readiness score a rep needs to be considered "on track." Reps scoring
+        below this line are flagged as below threshold and tagged "Needs Coaching" across
+        the Leadership Dashboard — the Below Threshold KPI card, Low-Readiness Reps,
+        Company Risk, People Insights, and the readiness alert banner all use this same value.
+        It does not change any rep's stored readiness score, only how scores are categorized.
+      </p>
+      <label style={{ fontSize: 11, fontWeight: 700, color: C.textSub, letterSpacing: "0.06em", textTransform: "uppercase" }}>
+        Threshold (0–100)
+      </label>
+      <div style={{ display: "flex", alignItems: "center", gap: 10, marginTop: 8 }}>
+        <input
+          type="number" min={0} max={100} value={draft}
+          onChange={e => setDraft(e.target.value === "" ? "" : Number(e.target.value))}
+          onBlur={() => { if (isValid) setDraft(Math.round(Number(draft))); }}
+          style={{
+            width: 90, padding: "10px 12px", borderRadius: 10, fontFamily: "inherit",
+            border: `1px solid ${isValid ? C.border : C.red}`, fontSize: 15, fontWeight: 700,
+            color: C.text, outline: "none",
+          }}
+        />
+        <span style={{ fontSize: 14, fontWeight: 700, color: C.textSub }}>%</span>
+        <button
+          onClick={handleSave}
+          disabled={!isDirty}
+          style={{
+            padding: "10px 20px", borderRadius: 10, border: "none", marginLeft: 8,
+            cursor: isDirty ? "pointer" : "not-allowed", fontSize: 13, fontWeight: 700,
+            color: "#fff", background: isDirty ? C.orange : C.muted,
+          }}
+        >
+          Save
+        </button>
+        <button
+          onClick={handleReset}
+          disabled={Number(draft) === READINESS_THRESHOLD_DEFAULT}
+          style={{
+            padding: "10px 16px", borderRadius: 10, border: `1px solid ${C.border}`,
+            cursor: Number(draft) === READINESS_THRESHOLD_DEFAULT ? "not-allowed" : "pointer",
+            fontSize: 13, fontWeight: 600, color: C.textSub, background: C.white,
+          }}
+        >
+          Reset to default ({READINESS_THRESHOLD_DEFAULT}%)
+        </button>
+      </div>
+      {!isValid && (
+        <div style={{ fontSize: 12, color: C.red, marginTop: 8, fontWeight: 600 }}>
+          Enter a whole number between 0 and 100.
+        </div>
+      )}
+      {saved && (
+        <div style={{ fontSize: 12, color: "#059669", marginTop: 8, fontWeight: 700 }}>
+          ✓ Saved
+        </div>
+      )}
     </div>
   );
 }
@@ -18630,7 +18818,7 @@ const USERS             = SEED_USERS;        // alias — used by LoginScreen
 //   3. Optionally fetch AI prose summary via /api/ai-insights (graceful fallback)
 //   4. Cache AI result in ai_insights table to avoid redundant calls
 // ─────────────────────────────────────────────────────────────────────────────
-function InsightsScreen({ user, isReal = false, tenantId = null, orgUsers = [], isAdmin = false }) {
+function InsightsScreen({ user, isReal = false, tenantId = null, orgUsers = [], isAdmin = false, readinessThreshold = 80 }) {
   const mobile     = useMobile();
   const [loading,  setLoading]  = useState(isReal);
   const [perf,     setPerf]     = useState(null);
@@ -18658,7 +18846,7 @@ function InsightsScreen({ user, isReal = false, tenantId = null, orgUsers = [], 
       try {
         if (isAdmin) {
           // Manager/Admin: fetch team insights
-          const { data: team, error: teamErr } = await insightsSvc.getTeamInsights(tenantId);
+          const { data: team, error: teamErr } = await insightsSvc.getTeamInsights(tenantId, null, { threshold: readinessThreshold });
           if (teamErr) { setError("Could not load team insights."); return; }
           setTeamData(team);
           // Also load own perf if available
@@ -18712,7 +18900,9 @@ function InsightsScreen({ user, isReal = false, tenantId = null, orgUsers = [], 
     load();
   }, [isReal, tenantId, user?.id, insightsSvc, isAdmin]);
 
-  const band = insightsSvc?.getReadinessBand ?? (s => ({ label: s >= 85 ? "High" : s >= 65 ? "On Track" : "At Risk", color: s >= 85 ? "#22c55e" : s >= 65 ? "#f59e0b" : "#ef4444", bg: s >= 85 ? "#f0fdf4" : s >= 65 ? "#fffbeb" : "#fef2f2" }));
+  const band = (s) => (insightsSvc?.getReadinessBand
+    ? insightsSvc.getReadinessBand(s, readinessThreshold)
+    : { label: s >= 85 ? "High" : s >= readinessThreshold ? "On Track" : "At Risk", color: s >= 85 ? "#22c55e" : s >= readinessThreshold ? "#f59e0b" : "#ef4444", bg: s >= 85 ? "#f0fdf4" : s >= readinessThreshold ? "#fffbeb" : "#fef2f2" });
 
   // ── Mock data for demo users ──
   const mockPerf = {
@@ -18898,8 +19088,8 @@ function InsightsScreen({ user, isReal = false, tenantId = null, orgUsers = [], 
         const distribution = team.distribution ?? { high: 0, onTrack: 0, atRisk: 0 };
         const distBars = [
           { label: "High (85+)",    count: distribution.high,    color: "#22c55e" },
-          { label: "On Track (65+)",count: distribution.onTrack, color: "#f59e0b" },
-          { label: "At Risk (<65)", count: distribution.atRisk,  color: "#ef4444" },
+          { label: `On Track (${readinessThreshold}+)`,count: distribution.onTrack, color: "#f59e0b" },
+          { label: `At Risk (<${readinessThreshold})`, count: distribution.atRisk,  color: "#ef4444" },
         ];
 
         return (
@@ -19755,6 +19945,41 @@ export default function App() {
     loadRolePermissions(currentOrg?.id)
   );
 
+  // Readiness threshold — tenant-configurable "below threshold" cutoff for
+  // the Leadership Dashboard (Below Threshold KPI, Low-Readiness Reps, Needs
+  // Coaching tag, Company Risk, People Insights bands, readiness alert
+  // banner) and the rep-facing Knowledge-by-Topic / Insights bands, so a rep
+  // and their manager always see the same "on track vs at risk" line.
+  // Single shared source of truth: tenant_settings.learning_settings.readinessThreshold
+  // (see insightsService.getReadinessThreshold/DEFAULT_READINESS_THRESHOLD).
+  // Defaults to 80 until the real value loads from Supabase (real users) or
+  // is absent entirely (demo users always use the 80 default).
+  const [readinessThreshold, setReadinessThreshold] = useState(80);
+
+  const handleSaveReadinessThreshold = (value) => {
+    const clamped = Math.max(0, Math.min(100, Math.round(Number(value))));
+    setReadinessThreshold(clamped);
+    if (user?._isReal && currentOrg?.id) {
+      supabase.from("tenant_settings")
+        .select("learning_settings")
+        .eq("tenant_id", currentOrg.id)
+        .single()
+        .then(({ data: ts }) => {
+          const nextLearningSettings = { ...(ts?.learning_settings ?? {}), readinessThreshold: clamped };
+          return supabase.from("tenant_settings")
+            .update({ learning_settings: nextLearningSettings })
+            .eq("tenant_id", currentOrg.id);
+        })
+        .then(({ error } = {}) => {
+          if (error) { console.error("[ralli] save readinessThreshold failed:", error); toast.error("Failed to save readiness threshold."); }
+          else { toast.success("Readiness threshold saved."); }
+        })
+        .catch(e => { console.error("[ralli] save readinessThreshold failed:", e); toast.error("Failed to save readiness threshold."); });
+    } else {
+      toast.success("Readiness threshold saved.");
+    }
+  };
+
   const handleSaveRolePermissions = (updated) => {
     setRolePermissions(updated);
     saveRolePermissions(currentOrg?.id, updated); // localStorage — demo users + offline fallback
@@ -19868,6 +20093,7 @@ export default function App() {
         setOrgs(INITIAL_ORGS);     // restore seed tenants so demo accounts work
         setOrgUsers(INITIAL_ORG_USERS);
         setQuizzesReady(false);    // reset so next real user waits for their quiz load
+        setReadinessThreshold(80); // prevent prior tenant's threshold leaking to next demo user
         setSessions(INITIAL_SESSIONS);           // prevent real sessions leaking to next demo user
         setBattleCards(INITIAL_BATTLE_CARDS);    // prevent real BC data leaking to next demo user
         setBcCategories(INITIAL_BC_CATEGORIES);  // prevent real BC categories leaking to next demo user
@@ -19929,7 +20155,7 @@ export default function App() {
 
     // Feature access + role permissions — load from tenant_settings for real users.
     // role_permissions was localStorage-only; now persisted in the DB column added in migration 004.
-    supabase.from("tenant_settings").select("feature_access, role_permissions").eq("tenant_id", tenantId).single()
+    supabase.from("tenant_settings").select("feature_access, role_permissions, learning_settings").eq("tenant_id", tenantId).single()
       .then(({ data: ts }) => {
         if (ts?.feature_access) setTenantFeatureAccess(ts.feature_access);
         // Deep-merge: DB values take precedence, but any new default keys are always present.
@@ -19946,6 +20172,12 @@ export default function App() {
             },
           });
         }
+        // Readiness threshold — default to 80 (DEFAULT_READINESS_THRESHOLD in
+        // insightsService.js) when absent or out of range; never trust a raw
+        // DB value blindly even though the CHECK constraint (migration 043)
+        // should already guarantee validity.
+        const rt = ts?.learning_settings?.readinessThreshold;
+        setReadinessThreshold(typeof rt === "number" && rt >= 0 && rt <= 100 ? rt : 80);
       });
   }, [currentUser?.id, currentUser?._isReal]); // eslint-disable-line react-hooks/exhaustive-deps
 
@@ -20793,8 +21025,8 @@ export default function App() {
         setScreen("team");
       }} />;
       case "home":              return isAdminType
-        ? <LeadershipDashboardScreen currentOrg={currentOrg} orgUsers={orgUsers} isReal={!!user?._isReal} />
-        : <HomeScreen user={user} onNav={navigate} quizAssignments={user?._isReal ? [] : USER_QUIZ_ASSIGNMENTS_SEED} onResumeLesson={(id) => { setPendingLessonId(id); navigate("learn"); }} onStartCourse={(id) => { setPendingCourseId(id); navigate("learn"); }} onStartQuiz={(id) => { setPendingQuizId(id); navigate("quizzes"); }} orgUsers={orgUsers} isReal={!!user?._isReal} tenantId={currentOrg?.id ?? null} quizzes={quizzes} lastSeenAt={lastSeenAt} onNewAssignments={(n) => setNewAssignmentCount(n)} sharedAssignmentData={sharedAssignmentData} />;
+        ? <LeadershipDashboardScreen currentOrg={currentOrg} orgUsers={orgUsers} isReal={!!user?._isReal} readinessThreshold={readinessThreshold} />
+        : <HomeScreen user={user} onNav={navigate} quizAssignments={user?._isReal ? [] : USER_QUIZ_ASSIGNMENTS_SEED} onResumeLesson={(id) => { setPendingLessonId(id); navigate("learn"); }} onStartCourse={(id) => { setPendingCourseId(id); navigate("learn"); }} onStartQuiz={(id) => { setPendingQuizId(id); navigate("quizzes"); }} orgUsers={orgUsers} isReal={!!user?._isReal} tenantId={currentOrg?.id ?? null} quizzes={quizzes} lastSeenAt={lastSeenAt} onNewAssignments={(n) => setNewAssignmentCount(n)} sharedAssignmentData={sharedAssignmentData} readinessThreshold={readinessThreshold} />;
       case "rankd":             return <RankdScreen onNav={navigate} onJoin={handleEnterPin} sessions={sessions} onLaunch={handleLaunch} onViewResults={handleViewResults} onRelaunch={handleRelaunch} role={gameRole} currentUser={currentUser} />;
       case "rankd-new":         return <NewSessionScreen onNav={navigate} quizzes={quizzes} onCreateSession={handleCreateSession} />;
       case "rankd-quiz-builder":return <QuizBuilderScreen onNav={navigate} onSave={handleSaveQuiz} initialQuiz={editingQuiz} onEditQuiz={handleEditQuiz} />;
@@ -20807,9 +21039,9 @@ export default function App() {
       case "battlecards":       return (isAdminType && perm("actions","edit"))
         ? <BattleCardsAdminScreen categories={bcCategories} cards={battleCards} onSaveCategory={handleSaveBcCategory} onDeleteCategory={handleDeleteBcCategory} onSaveCard={handleSaveBattleCard} onDeleteCard={handleDeleteBattleCard} />
         : <BattleCardsScreen categories={bcCategories} cards={battleCards} isLoading={bcLoading} isReal={!!user?._isReal} />;
-      case "insights":           return <InsightsScreen user={user} isReal={!!user?._isReal} tenantId={currentOrg?.id ?? null} orgUsers={orgUsers} isAdmin={isAdminType} />;
+      case "insights":           return <InsightsScreen user={user} isReal={!!user?._isReal} tenantId={currentOrg?.id ?? null} orgUsers={orgUsers} isAdmin={isAdminType} readinessThreshold={readinessThreshold} />;
       case "progress":          return isAdminType
-        ? <LeadershipDashboardScreen currentOrg={currentOrg} orgUsers={orgUsers} isReal={!!user?._isReal} />
+        ? <LeadershipDashboardScreen currentOrg={currentOrg} orgUsers={orgUsers} isReal={!!user?._isReal} readinessThreshold={readinessThreshold} />
         : <ProgressScreen currentUser={user} isReal={!!user?._isReal} tenantId={currentOrg?.id ?? null} />;
       case "leaderboard":       return <LeaderboardScreen currentUser={user} isReal={!!user?._isReal} tenantId={currentOrg?.id ?? null} />;
       case "organizations":     return selectedOrg
@@ -20818,7 +21050,7 @@ export default function App() {
       case "team":              return <TeamScreen orgId={user.orgId} orgName={currentOrg?.name ?? "Your Team"} orgUsers={orgUsers} onAddUser={handleAddUser} />;
       case "settings":
         if (isSuperAdmin)  return <RoleAccessScreen rolePermissions={rolePermissions} onSave={handleSaveRolePermissions} currentOrg={currentOrg} />;
-        if (isOrgAdmin)    return <OrgAdminSettingsScreen rolePermissions={rolePermissions} onSaveRolePermissions={handleSaveRolePermissions} currentOrg={currentOrg} orgId={user.orgId} orgName={currentOrg?.name ?? "Your Team"} orgUsers={orgUsers} onAddUser={handleAddUser} />;
+        if (isOrgAdmin)    return <OrgAdminSettingsScreen rolePermissions={rolePermissions} onSaveRolePermissions={handleSaveRolePermissions} currentOrg={currentOrg} orgId={user.orgId} orgName={currentOrg?.name ?? "Your Team"} orgUsers={orgUsers} onAddUser={handleAddUser} readinessThreshold={readinessThreshold} onSaveReadinessThreshold={handleSaveReadinessThreshold} />;
         return <UserSettingsScreen user={user} profile={userProfile} notifPrefs={notifPrefs} onSaveProfile={handleSaveProfile} onSaveNotifs={handleSaveNotifs} currentOrg={currentOrg} onSignOut={async () => { if (user?._isReal) { await supabase.auth.signOut(); /* SIGNED_OUT handler redirects */ } else { setCurrentUser(null); setLastSeenAt(null); setNewAssignmentCount(0); setPendingLessonId(null); setPendingCourseId(null); setPendingQuizId(null); setOrgs(INITIAL_ORGS); setOrgUsers(INITIAL_ORG_USERS); setQuizzesReady(false); setSessions(INITIAL_SESSIONS); setBattleCards(INITIAL_BATTLE_CARDS); setBcCategories(INITIAL_BC_CATEGORIES); window.location.replace("/login"); } }} />;
       default:                  return <HomeScreen user={user} />;
     }

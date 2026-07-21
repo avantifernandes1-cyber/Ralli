@@ -28,15 +28,59 @@ const WEIGHTS = {
   game:     0.25, // game participation + accuracy
 };
 
-// ── Readiness score bands ─────────────────────────────────────────────────────
-export const READINESS_BANDS = [
-  { min: 85, label: "High",    color: "#22c55e", bg: "#f0fdf4" },
-  { min: 65, label: "On Track", color: "#f59e0b", bg: "#fffbeb" },
-  { min: 0,  label: "At Risk",  color: "#ef4444", bg: "#fef2f2" },
-];
+// ── Readiness threshold (tenant-configurable) ─────────────────────────────────
+// Single shared source of truth for the "below threshold" cutoff used across
+// the Leadership Dashboard (Below Threshold KPI, Low-Readiness Reps, Needs
+// Coaching tag, Company Risk, People Insights bands, readiness alert banner).
+// Stored at tenant_settings.learning_settings.readinessThreshold. Defaults to
+// 80 when the tenant has no value set (new tenants) or the stored value is
+// invalid — the DB also enforces 0-100 via a CHECK constraint (migration
+// 043), this is a defensive second layer so the UI never breaks on bad data.
+export const DEFAULT_READINESS_THRESHOLD = 80;
 
-export function getReadinessBand(score) {
-  return READINESS_BANDS.find(b => score >= b.min) ?? READINESS_BANDS[READINESS_BANDS.length - 1];
+/**
+ * Resolve the effective readiness threshold for a tenant.
+ * @param {{ learning_settings?: { readinessThreshold?: number } }|null} tenantSettings
+ * @returns {number} 0-100
+ */
+export function getReadinessThreshold(tenantSettings) {
+  const v = tenantSettings?.learning_settings?.readinessThreshold;
+  return (typeof v === "number" && Number.isFinite(v) && v >= 0 && v <= 100)
+    ? v
+    : DEFAULT_READINESS_THRESHOLD;
+}
+
+/**
+ * Clamp a candidate threshold value to the valid 0-100 range.
+ * Used by the Settings UI before persisting a save.
+ * @param {number} v
+ * @returns {number}
+ */
+export function clampReadinessThreshold(v) {
+  const n = Number(v);
+  if (!Number.isFinite(n)) return DEFAULT_READINESS_THRESHOLD;
+  return Math.max(0, Math.min(100, Math.round(n)));
+}
+
+// ── Readiness score bands ─────────────────────────────────────────────────────
+// "High" (85) is a separate, fixed tier unrelated to the configurable
+// threshold. The lower boundary is the tenant's readiness threshold — a
+// score at or above it is "On Track", below it is "At Risk" (same cutoff
+// used everywhere else in the app for "below threshold" comparisons).
+export function getReadinessBands(threshold = DEFAULT_READINESS_THRESHOLD) {
+  return [
+    { min: 85,        label: "High",     color: "#22c55e", bg: "#f0fdf4" },
+    { min: threshold, label: "On Track", color: "#f59e0b", bg: "#fffbeb" },
+    { min: 0,         label: "At Risk",  color: "#ef4444", bg: "#fef2f2" },
+  ];
+}
+
+// Back-compat default export (unthresholded callers keep working at 80).
+export const READINESS_BANDS = getReadinessBands();
+
+export function getReadinessBand(score, threshold = DEFAULT_READINESS_THRESHOLD) {
+  const bands = getReadinessBands(threshold);
+  return bands.find(b => score >= b.min) ?? bands[bands.length - 1];
 }
 
 // ── Internal helpers ──────────────────────────────────────────────────────────
@@ -321,9 +365,10 @@ export function getRecommendations(perf) {
  *
  * @param {string} tenantId
  * @param {string[]} [userIds]  — if provided, restrict to these users
+ * @param {{ threshold?: number }} [opts] — readiness threshold cutoff (default 80, see getReadinessThreshold)
  * @returns {Promise<{ data: TeamInsights|null, error: Object|null }>}
  */
-export async function getTeamInsights(tenantId, userIds = null) {
+export async function getTeamInsights(tenantId, userIds = null, { threshold = DEFAULT_READINESS_THRESHOLD } = {}) {
   if (!tenantId) return { data: null, error: new Error("Missing tenantId") };
 
   // Latest readiness score per user (most recently computed)
@@ -350,14 +395,14 @@ export async function getTeamInsights(tenantId, userIds = null) {
     ? Math.round(members.reduce((s, m) => s + m.score, 0) / members.length)
     : 0;
 
-  const atRisk        = members.filter(m => m.score < 65).map(m => m.user_id);
+  const atRisk        = members.filter(m => m.score < threshold).map(m => m.user_id);
   const topPerformers = members.filter(m => m.score >= 85).map(m => m.user_id);
 
   // Distribution
   const distribution = {
     high:     members.filter(m => m.score >= 85).length,
-    onTrack:  members.filter(m => m.score >= 65 && m.score < 85).length,
-    atRisk:   members.filter(m => m.score < 65).length,
+    onTrack:  members.filter(m => m.score >= threshold && m.score < 85).length,
+    atRisk:   members.filter(m => m.score < threshold).length,
   };
 
   return {
@@ -512,15 +557,16 @@ export function triggerReadinessUpdate(tenantId, userId) {
  *     topic:       string,
  *     avgScore:    number,   // 0–100
  *     repsTotal:   number,
- *     repsBelow:   number,   // score < 65
+ *     repsBelow:   number,   // score < threshold
  *     repsAbove:   number,
  *     repScores:   [{ userId, score, passed }],
  *   }]
  *
  * @param {string} tenantId
+ * @param {{ threshold?: number }} [opts] — readiness threshold cutoff (default 80)
  * @returns {Promise<Array>}
  */
-export async function getTopicHeatmap(tenantId) {
+export async function getTopicHeatmap(tenantId, { threshold = DEFAULT_READINESS_THRESHOLD } = {}) {
   if (!tenantId) return [];
 
   const [{ data: quizzes, error: qErr }, { data: attempts, error: aErr }] =
@@ -577,7 +623,7 @@ export async function getTopicHeatmap(tenantId) {
   // Aggregate per topic
   const result = Object.entries(topicMap).map(([topic, { scores }]) => {
     const avg = scores.reduce((s, r) => s + r.score, 0) / scores.length;
-    const below = scores.filter(r => r.score < 65);
+    const below = scores.filter(r => r.score < threshold);
     return {
       topic,
       avgScore:  Math.round(avg),
@@ -673,15 +719,16 @@ export async function getRepTopicScores(tenantId, userId) {
  *     overallReadiness:   number,   // avg of latest readiness_scores per user
  *     avgQuizScore:       number,   // avg of all quiz_attempts.score
  *     completionPct:      number,   // % of scored users with ≥1 lesson_completion
- *     belowThreshold:     number,   // readiness_scores < 65
+ *     belowThreshold:     number,   // readiness_scores < threshold
  *     activeLearners:     number,   // distinct users in user_point_events last 30d
  *     totalMembersScored: number,
  *   }
  *
  * @param {string} tenantId
+ * @param {{ threshold?: number }} [opts] — readiness threshold cutoff (default 80, see getReadinessThreshold)
  * @returns {Promise<Object>}
  */
-export async function getOrgMetrics(tenantId) {
+export async function getOrgMetrics(tenantId, { threshold = DEFAULT_READINESS_THRESHOLD } = {}) {
   if (!tenantId) return null;
 
   const thirtyDaysAgo = new Date(Date.now() - 30 * 24 * 60 * 60 * 1000).toISOString();
@@ -738,7 +785,7 @@ export async function getOrgMetrics(tenantId) {
     ? Math.round(userScores.reduce((s, v) => s + v, 0) / totalMembersScored)
     : 0;
 
-  const belowThreshold = userScores.filter(s => s < 65).length;
+  const belowThreshold = userScores.filter(s => s < threshold).length;
 
   // Fix 2: deduplicate quiz attempts to latest per user+quiz before averaging
   const latestAttemptMap = {};

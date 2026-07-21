@@ -263,6 +263,12 @@ function dbToQuiz(row) {
     status:     row.status ?? "active",
     favorite:   row.is_favorite ?? false,
     tags:       row.tags ?? [],
+    // passing_score is nullable — quizzes created before migration 043 have
+    // no value here and correctly fall back to the global default (90) at
+    // grading time (see scoringService.SCORING.quiz.passingScore /
+    // rankd-app.jsx's `quiz.passingScore ?? 90`). Do NOT default it here —
+    // that would silently change existing quizzes' effective passing score.
+    passingScore: typeof row.passing_score === "number" ? row.passing_score : null,
     createdAt:  row.created_at ? new Date(row.created_at).toLocaleDateString("en-US", { month: "short", day: "numeric", year: "numeric" }) : "—",
   };
 }
@@ -280,6 +286,12 @@ function quizToDb(quiz, tenantId, userId) {
     status:      quiz.status ?? "active",
     is_favorite: quiz.favorite ?? quiz.is_favorite ?? false,
     tags:        quiz.tags ?? [],
+    // Only write passing_score when the builder explicitly set one (new
+    // quizzes default to 100 in QuizBuilderScreen — see rankd-app.jsx).
+    // Editing an existing quiz that has no passingScore keeps writing null
+    // rather than inventing a value, so we never silently change a legacy
+    // quiz's effective passing score (which stays on the 90 fallback).
+    passing_score: typeof quiz.passingScore === "number" ? quiz.passingScore : null,
     created_by:  userId ?? null,
     updated_at:  new Date().toISOString(),
   };
