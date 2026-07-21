@@ -265,22 +265,26 @@ export async function updateSessionPhase(sessionId, { phase, currentQuestionInde
  *   isCorrect: boolean,
  *   points: number,
  *   tenantId?: string|null,
+ *   answerJson?: Array<{leftIdx:number,rightIdx:number}>|null,  // Matching
+ *   numericValue?: number|null,                                 // Slider
  * }>} answers
  * @returns {Promise<{ error: Object|null }>}
  */
 export async function saveGameAnswers(sessionId, answers = []) {
   if (!answers.length) return { error: null };
   const rows = answers.map(a => ({
-    session_id:   sessionId,
-    tenant_id:    a.tenantId ?? null,
-    player_id:    a.playerId,
-    player_name:  a.playerName,
-    question_idx: a.questionIdx,
-    option_idx:   a.optionIdx ?? null,
-    answer_text:  a.text ?? null,
-    time_ms:      a.timeMs ?? null,
-    is_correct:   a.isCorrect,
-    points:       a.points ?? 0,
+    session_id:    sessionId,
+    tenant_id:     a.tenantId ?? null,
+    player_id:     a.playerId,
+    player_name:   a.playerName,
+    question_idx:  a.questionIdx,
+    option_idx:    a.optionIdx ?? null,
+    answer_text:   a.text ?? null,
+    time_ms:       a.timeMs ?? null,
+    is_correct:    a.isCorrect,
+    points:        a.points ?? 0,
+    answer_json:   a.answerJson ?? null,
+    numeric_value: a.numericValue ?? null,
   }));
   const { error } = await supabase.from("game_answers").insert(rows);
   return { error };
@@ -442,7 +446,7 @@ export async function getSessionRestoreData(sessionId) {
       .single(),
     supabase
       .from("game_answers")
-      .select("player_id, question_idx, points, is_correct, answer")
+      .select("player_id, player_name, question_idx, points, is_correct, answer_text")
       .eq("session_id", sessionId),
   ]);
 

@@ -164,10 +164,12 @@ function useGameChannel(pin, role) {
           setChAnswers((prev) => ({
             ...prev,
             [payload.playerId]: {
-              optionIdx: payload.optionIdx,
-              timeMs:    payload.timeMs,
-              name:      payload.name,
-              text:      payload.text,
+              optionIdx:   payload.optionIdx,
+              timeMs:      payload.timeMs,
+              name:        payload.name,
+              text:        payload.text,
+              sliderValue: payload.sliderValue,   // Slider questions
+              matchPairs:  payload.matchPairs,    // Matching questions — [{leftIdx, rightIdx}]
             },
           }));
         }
@@ -1815,8 +1817,22 @@ function KahootHostView({ onNav, sessionName, pin, sessionDbId, tenantId, questi
   const [timeLeft,   setTimeLeft]   = useState(0);
   const [scores,     setScores]     = useState(() => chPlayers.map(p => ({ ...p, score: 0 })));
   const [openGrades, setOpenGrades] = useState({});  // { idx: "correct"|"incorrect", __showNames: bool }
+  // Matching questions: one shuffle computed by the host and broadcast to all
+  // players in SHOW_QUESTION, so every client renders the same right-column
+  // order and a submitted {leftIdx, rightIdx} pair means the same thing to
+  // the host when scoring it back. Re-shuffled per question in the
+  // countdown→question effect below.
+  const [shuffledRight, setShuffledRight] = useState([]);
   const [paused,     setPaused]     = useState(false);
   const [showEndConfirm, setShowEndConfirm] = useState(false);
+  const [showSkipConfirm, setShowSkipConfirm] = useState(false);
+  // Reentrancy guard for doReveal(): the timer-hitting-zero effect and the
+  // answered-count effect can both fire in the same tick (last player answers
+  // in the same second the timer expires), and the new "Reveal Now" button is
+  // a third caller. A ref (synchronous, unlike state) ensures only the first
+  // call in any tick actually runs — without this, scores/game_answers could
+  // be double-applied. Reset to false whenever a fresh question starts.
+  const hasRevealedRef = useRef(false);
   const [questionHistory, setQuestionHistory] = useState([]);
   // DB-backed participant count for countdown — presence may lag behind actual joins
   const [dbParticipantCount, setDbParticipantCount] = useState(chPlayers.length);
@@ -1978,9 +1994,16 @@ function KahootHostView({ onNav, sessionName, pin, sessionDbId, tenantId, questi
     if (restoreState !== "done") return; // block until restoration finishes
     if (phase !== "countdown") return;
     if (cdNum <= 0) {
+      hasRevealedRef.current = false; // fresh question — arm the reveal guard
       setPhase("question"); setTimeLeft(q.timeLimit);
       persistPhase("question", qIdx, false);
-      broadcast({ type: GM.SHOW_QUESTION, qIdx, question: q, timeLimit: q.timeLimit, questionStartedAt: Date.now() });
+      // Matching: compute one shuffle for this question and send it to every
+      // player in the same broadcast — see shuffledRight declaration above.
+      const shuffled = q.type === "match" && q.pairs?.length
+        ? [...q.pairs].sort(() => Math.random() - 0.5)
+        : [];
+      setShuffledRight(shuffled);
+      broadcast({ type: GM.SHOW_QUESTION, qIdx, question: q, timeLimit: q.timeLimit, questionStartedAt: Date.now(), shuffledRight: shuffled });
       return;
     }
     const t = setTimeout(() => setCdNum(n => n - 1), 1000);
@@ -2002,6 +2025,12 @@ function KahootHostView({ onNav, sessionName, pin, sessionDbId, tenantId, questi
   }, [answeredCount, phase, restoreState]); // eslint-disable-line react-hooks/exhaustive-deps
 
   const doReveal = () => {
+    // Reentrancy guard — see hasRevealedRef declaration above. Must be the
+    // very first thing that runs (synchronous ref write) so a second call in
+    // the same tick from either auto-trigger effect or the Reveal Now button
+    // bails out before touching scores/broadcast/persistence.
+    if (hasRevealedRef.current) return;
+    hasRevealedRef.current = true;
     if (q.type === "open") {
       // Collect open-ended responses and go to grading phase
       setOpenGrades({});
@@ -2040,6 +2069,88 @@ function KahootHostView({ onNav, sessionName, pin, sessionDbId, tenantId, questi
           return { playerId: pid, playerName: ans.name ?? sp?.name ?? pid, questionIdx: qIdx, optionIdx: null, text: ans.text ?? null, timeMs: ans.timeMs ?? null, isCorrect: correct, points: sp?.delta ?? 0, tenantId };
         });
         saveGameAnswers(sessionDbId, answerRows).then(({ error }) => { if (error) console.error("[ralli:host] saveGameAnswers (type) failed:", error); });
+      }
+      return;
+    }
+    if (q.type === "slider") {
+      // Tolerance-based correctness (same rule as self-paced isAnswerCorrect:
+      // |submitted - target| <= tolerance), scaled to this component's own
+      // point economy (100 base + up to 50 speed bonus, same as every other
+      // live question type here) rather than self-paced's 400-1000 partial-
+      // credit scale — keeps every question type feel equally weighted in a
+      // live game, per the "no type should feel unfinished" consistency bar.
+      const tol    = q.tolerance ?? 1;
+      const target = q.correct ?? 5;
+      setQuestionHistory(h => [...h, { qIdx, q: q?.q, options: [], correct: target, distribution: [], correctCount: 0, totalAnswers: Object.values(chAnswers).length, avgTimeMs: 0 }]);
+      let baseScores;
+      if (scores.length > 0) { baseScores = scores; }
+      else if (chPlayers.length > 0) { baseScores = chPlayers.map(p => ({ ...p, score: 0 })); }
+      else { baseScores = Object.entries(chAnswers).map(([pid, ans], i) => ({ id: pid, name: ans.name ?? pid, emoji: PLAYER_EMOJIS[i % PLAYER_EMOJIS.length], color: PLAYER_COLORS[i % PLAYER_COLORS.length], score: 0 })); }
+      const newScores = baseScores.map(p => {
+        const ans = chAnswers[p.id];
+        if (ans?.sliderValue == null) return { ...p, delta: 0, wasCorrect: false };
+        const diff    = Math.abs(ans.sliderValue - target);
+        const correct = diff <= tol;
+        const speedBonus = correct && ans.timeMs ? Math.max(0, Math.round((1 - ans.timeMs / (q.timeLimit * 1000)) * 50)) : 0;
+        const delta = correct ? 100 + speedBonus : 0;
+        return { ...p, score: p.score + delta, delta, wasCorrect: correct };
+      });
+      newScores.sort((a, b) => b.score - a.score);
+      setScores(newScores);
+      setPhase("reveal");
+      persistPhase("reveal", qIdx, false);
+      broadcast({ type: GM.REVEAL, correctIdx: null, scores: newScores, sliderTarget: target, sliderTolerance: tol });
+      if (sessionDbId) {
+        const scoreMap = Object.fromEntries(newScores.map(p => [p.id, p]));
+        const answerRows = Object.entries(chAnswers).map(([pid, ans]) => {
+          const sp   = scoreMap[pid];
+          const diff = ans.sliderValue != null ? Math.abs(ans.sliderValue - target) : Infinity;
+          return { playerId: pid, playerName: ans.name ?? sp?.name ?? pid, questionIdx: qIdx, optionIdx: null, text: null, timeMs: ans.timeMs ?? null, isCorrect: diff <= tol, points: sp?.delta ?? 0, tenantId, numericValue: ans.sliderValue ?? null };
+        });
+        saveGameAnswers(sessionDbId, answerRows).then(({ error }) => { if (error) console.error("[ralli:host] saveGameAnswers (slider) failed:", error); });
+      }
+      return;
+    }
+    if (q.type === "match") {
+      // Correctness: a pair is right when the shuffled-right entry the player
+      // picked has the same `.right` text as the canonical pair for that
+      // leftIdx — identical rule to self-paced (isAnswerCorrect / MatchCard
+      // grading), just resolved against the host's shuffledRight instead of
+      // each player's own local shuffle. wasCorrect (all pairs correct) drives
+      // the binary +100/+0 delta, matching this component's scoring
+      // convention for every other type — see the slider branch above for why
+      // this diverges from self-paced's partial-credit point scale.
+      const pairs = q.pairs ?? [];
+      setQuestionHistory(h => [...h, { qIdx, q: q?.q, options: [], correct: null, distribution: [], correctCount: 0, totalAnswers: Object.values(chAnswers).length, avgTimeMs: 0 }]);
+      let baseScores;
+      if (scores.length > 0) { baseScores = scores; }
+      else if (chPlayers.length > 0) { baseScores = chPlayers.map(p => ({ ...p, score: 0 })); }
+      else { baseScores = Object.entries(chAnswers).map(([pid, ans], i) => ({ id: pid, name: ans.name ?? pid, emoji: PLAYER_EMOJIS[i % PLAYER_EMOJIS.length], color: PLAYER_COLORS[i % PLAYER_COLORS.length], score: 0 })); }
+      const scoreMatch = (mps) => {
+        if (!Array.isArray(mps) || mps.length === 0) return 0;
+        return mps.filter(mp => shuffledRight[mp.rightIdx]?.right === pairs[mp.leftIdx]?.right).length;
+      };
+      const newScores = baseScores.map(p => {
+        const ans = chAnswers[p.id];
+        if (!ans?.matchPairs?.length) return { ...p, delta: 0, wasCorrect: false };
+        const correctCount = scoreMatch(ans.matchPairs);
+        const correct = pairs.length > 0 && correctCount === pairs.length;
+        const speedBonus = correct && ans.timeMs ? Math.max(0, Math.round((1 - ans.timeMs / (q.timeLimit * 1000)) * 50)) : 0;
+        const delta = correct ? 100 + speedBonus : 0;
+        return { ...p, score: p.score + delta, delta, wasCorrect: correct, matchCorrectCount: correctCount };
+      });
+      newScores.sort((a, b) => b.score - a.score);
+      setScores(newScores);
+      setPhase("reveal");
+      persistPhase("reveal", qIdx, false);
+      broadcast({ type: GM.REVEAL, correctIdx: null, scores: newScores, matchPairsCorrect: pairs, shuffledRight });
+      if (sessionDbId) {
+        const scoreMap = Object.fromEntries(newScores.map(p => [p.id, p]));
+        const answerRows = Object.entries(chAnswers).map(([pid, ans]) => {
+          const sp = scoreMap[pid];
+          return { playerId: pid, playerName: ans.name ?? sp?.name ?? pid, questionIdx: qIdx, optionIdx: null, text: null, timeMs: ans.timeMs ?? null, isCorrect: !!sp?.wasCorrect, points: sp?.delta ?? 0, tenantId, answerJson: ans.matchPairs ?? null };
+        });
+        saveGameAnswers(sessionDbId, answerRows).then(({ error }) => { if (error) console.error("[ralli:host] saveGameAnswers (match) failed:", error); });
       }
       return;
     }
@@ -2158,6 +2269,17 @@ function KahootHostView({ onNav, sessionName, pin, sessionDbId, tenantId, questi
     if (onGameEnd) onGameEnd({ scores, questions, questionHistory });
     persistPhase("ended", qIdx, false);
     onNav("rankd-results");
+  };
+
+  // Skip Question — abandons the current question with no scoring at all
+  // (doNext() never touches scores itself; scoring only happens inside
+  // doReveal()/doOpenGradeDone(), which Skip deliberately bypasses). Reuses
+  // doNext()'s existing safe-advance logic, including "final question → end
+  // game and show results" — so Skip and the normal Next-Question flow can't
+  // diverge in how they handle the last question.
+  const doSkip = () => {
+    setShowSkipConfirm(false);
+    doNext();
   };
 
   const dist = (q?.options ?? []).map((_, i) => Object.values(chAnswers).filter(a => a.optionIdx === i).length);
@@ -2353,11 +2475,18 @@ function KahootHostView({ onNav, sessionName, pin, sessionDbId, tenantId, questi
           <button onClick={doTogglePause} title={paused ? "Resume" : "Pause"} style={{ width: 36, height: 36, borderRadius: "50%", border: `1px solid ${C.border}`, background: paused ? C.orange : "rgba(255,255,255,0.9)", color: paused ? "#fff" : C.dark, fontSize: 14, cursor: "pointer", display: "flex", alignItems: "center", justifyContent: "center" }}>
             {paused ? "▶" : "⏸"}
           </button>
+          {phase === "question" && (
+            <button onClick={doReveal} title="Reveal now — locks submissions and scores existing answers" style={{ width: 36, height: 36, borderRadius: "50%", border: `1px solid ${C.border}`, background: "rgba(255,255,255,0.9)", color: C.dark, fontSize: 14, cursor: "pointer", display: "flex", alignItems: "center", justifyContent: "center" }}>
+              👁
+            </button>
+          )}
+          {phase === "question" && (
+            <button onClick={() => setShowSkipConfirm(true)} title="Skip question — no points awarded" style={{ width: 36, height: 36, borderRadius: "50%", border: `1px solid ${C.border}`, background: "rgba(255,255,255,0.9)", color: C.dark, fontSize: 14, cursor: "pointer", display: "flex", alignItems: "center", justifyContent: "center" }}>
+              ⏭
+            </button>
+          )}
           <button onClick={() => setShowEndConfirm(true)} title="End game early" style={{ width: 36, height: 36, borderRadius: "50%", border: "1px solid rgba(239,68,68,0.5)", background: "rgba(239,68,68,0.08)", color: "#ef4444", fontSize: 14, cursor: "pointer", display: "flex", alignItems: "center", justifyContent: "center" }}>
             ■
-          </button>
-          <button onClick={() => setShowEndConfirm(true)} title="End and exit" style={{ width: 36, height: 36, borderRadius: "50%", border: `1px solid ${C.border}`, background: "rgba(255,255,255,0.9)", color: C.textSub, fontSize: 16, cursor: "pointer", display: "flex", alignItems: "center", justifyContent: "center" }}>
-            ✕
           </button>
         </div>
       </div>
@@ -2371,6 +2500,20 @@ function KahootHostView({ onNav, sessionName, pin, sessionDbId, tenantId, questi
             <div style={{ display: "flex", gap: 12 }}>
               <button onClick={() => setShowEndConfirm(false)} style={{ flex: 1, padding: "12px", borderRadius: 12, border: `1px solid ${C.border}`, background: "transparent", color: C.text, fontSize: 14, fontWeight: 700, cursor: "pointer" }}>Cancel</button>
               <button onClick={doForceEnd} style={{ flex: 1, padding: "12px", borderRadius: 12, border: "none", background: "#ef4444", color: "#fff", fontSize: 14, fontWeight: 900, cursor: "pointer" }}>End Game</button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* Skip confirm modal */}
+      {showSkipConfirm && (
+        <div style={{ position: "fixed", inset: 0, background: "rgba(0,0,0,0.7)", display: "flex", alignItems: "center", justifyContent: "center", zIndex: 9999 }}>
+          <div style={{ background: C.cardBg, border: `1px solid ${C.border}`, borderRadius: 20, padding: "32px 40px", textAlign: "center", maxWidth: 360 }}>
+            <h2 style={{ margin: "0 0 8px", color: C.text, fontWeight: 900, fontSize: 20 }}>Skip this question?</h2>
+            <p style={{ margin: "0 0 24px", color: C.textSub, fontSize: 14 }}>No one will be scored for it and no streaks will change. {isFinalQ ? "This ends the game and shows final results." : "Play moves straight to the next question."}</p>
+            <div style={{ display: "flex", gap: 12 }}>
+              <button onClick={() => setShowSkipConfirm(false)} style={{ flex: 1, padding: "12px", borderRadius: 12, border: `1px solid ${C.border}`, background: "transparent", color: C.text, fontSize: 14, fontWeight: 700, cursor: "pointer" }}>Cancel</button>
+              <button onClick={doSkip} style={{ flex: 1, padding: "12px", borderRadius: 12, border: "none", background: C.orange, color: "#fff", fontSize: 14, fontWeight: 900, cursor: "pointer" }}>Skip</button>
             </div>
           </div>
         </div>
@@ -2439,7 +2582,97 @@ function KahootHostView({ onNav, sessionName, pin, sessionDbId, tenantId, questi
           )}
         </div>
       )}
-      <div style={{ flex: q.type === "type" ? 0 : 1, padding: "0 40px 20px", display: q.type === "type" ? "none" : "flex", flexDirection: "column", gap: 10 }}>
+
+      {/* Slider — target/tolerance panel + per-player submitted values.
+          q.options is undefined for this type, so this previously rendered
+          nothing at all (empty answer area, no way for the host to see values
+          or the target). Mirrors the "type" question's layout above. */}
+      {q.type === "slider" && (
+        <div style={{ flex: 1, padding: "0 40px 20px", display: "flex", flexDirection: "column", gap: 12 }}>
+          <div style={{ padding: "18px 22px", borderRadius: 14, background: "#fff", border: `1px solid ${C.border}` }}>
+            <div style={{ fontSize: 11, fontWeight: 700, color: C.textMuted, letterSpacing: "0.08em", marginBottom: 8 }}>TARGET</div>
+            <span style={{ fontSize: 20, fontWeight: 800, color: C.text }}>{q.correct ?? 5}</span>
+            <span style={{ fontSize: 13, color: C.textMuted, marginLeft: 8 }}>± {q.tolerance ?? 1} · range {q.min ?? 0}–{q.max ?? 10}</span>
+          </div>
+          {phase === "reveal" ? (
+            <div style={{ padding: "14px 18px", borderRadius: 14, background: C.white, border: `1px solid ${C.border}` }}>
+              <div style={{ fontSize: 11, fontWeight: 700, color: C.textMuted, letterSpacing: "0.08em", marginBottom: 10 }}>PLAYER RESPONSES</div>
+              <div style={{ display: "flex", flexDirection: "column", gap: 6, maxHeight: 220, overflowY: "auto" }}>
+                {scores.map(p => {
+                  const ans = chAnswers[p.id];
+                  const hasVal = ans?.sliderValue != null;
+                  return (
+                    <div key={p.id} style={{ display: "flex", alignItems: "center", gap: 10, padding: "8px 12px", borderRadius: 10, background: p.wasCorrect ? "#D1FAE5" : hasVal ? "#FEF2F2" : C.muted }}>
+                      <span style={{ fontSize: 13, fontWeight: 700, color: p.wasCorrect ? "#059669" : hasVal ? C.red : C.textMuted, width: 16, flexShrink: 0 }}>{hasVal ? (p.wasCorrect ? "✓" : "✗") : "—"}</span>
+                      <span style={{ fontSize: 16, flexShrink: 0 }}>{p.emoji}</span>
+                      <span style={{ fontSize: 13, fontWeight: 600, color: C.text, flex: 1, minWidth: 0, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{p.name}</span>
+                      <span style={{ fontSize: 13, color: C.textSub, flexShrink: 0 }}>{hasVal ? ans.sliderValue : <em style={{ color: C.textMuted }}>No answer</em>}</span>
+                    </div>
+                  );
+                })}
+                {scores.length === 0 && <span style={{ fontSize: 13, color: C.textMuted, fontStyle: "italic" }}>No players.</span>}
+              </div>
+            </div>
+          ) : (
+            <div style={{ padding: "12px 18px", borderRadius: 12, background: C.muted, display: "flex", alignItems: "center", gap: 8 }}>
+              <span style={{ fontSize: 13, fontWeight: 700, color: C.text }}>{answeredCount}</span>
+              <span style={{ fontSize: 13, color: C.textSub }}>of {playerCount} answered</span>
+            </div>
+          )}
+        </div>
+      )}
+
+      {/* Matching — target pairs + per-player correct-count breakdown. Like
+          slider/mc/tf above, this previously rendered nothing (q.options is
+          undefined for match). Shows a fraction ("3/4 pairs correct") as the
+          submitted-answer summary rather than every individual pair the
+          player chose — enough for the host to see who needs help without a
+          dense per-pair grid mid-game; the full pair-by-pair breakdown is
+          already available in the self-paced review flow. */}
+      {q.type === "match" && (
+        <div style={{ flex: 1, padding: "0 40px 20px", display: "flex", flexDirection: "column", gap: 12 }}>
+          <div style={{ padding: "18px 22px", borderRadius: 14, background: "#fff", border: `1px solid ${C.border}` }}>
+            <div style={{ fontSize: 11, fontWeight: 700, color: C.textMuted, letterSpacing: "0.08em", marginBottom: 10 }}>MATCH THESE PAIRS</div>
+            <div style={{ display: "flex", flexDirection: "column", gap: 6 }}>
+              {(q.pairs ?? []).map((pair, i) => (
+                <div key={i} style={{ display: "flex", alignItems: "center", gap: 10, fontSize: 14, color: C.text }}>
+                  <span style={{ fontWeight: 700 }}>{pair.left}</span>
+                  <span style={{ color: C.textMuted }}>→</span>
+                  <span>{pair.right}</span>
+                </div>
+              ))}
+              {(q.pairs ?? []).length === 0 && <span style={{ fontSize: 13, color: C.textMuted, fontStyle: "italic" }}>No pairs configured.</span>}
+            </div>
+          </div>
+          {phase === "reveal" ? (
+            <div style={{ padding: "14px 18px", borderRadius: 14, background: C.white, border: `1px solid ${C.border}` }}>
+              <div style={{ fontSize: 11, fontWeight: 700, color: C.textMuted, letterSpacing: "0.08em", marginBottom: 10 }}>PLAYER RESPONSES</div>
+              <div style={{ display: "flex", flexDirection: "column", gap: 6, maxHeight: 220, overflowY: "auto" }}>
+                {scores.map(p => {
+                  const ans = chAnswers[p.id];
+                  const attempted = !!ans?.matchPairs?.length;
+                  const total = q.pairs?.length ?? 0;
+                  return (
+                    <div key={p.id} style={{ display: "flex", alignItems: "center", gap: 10, padding: "8px 12px", borderRadius: 10, background: p.wasCorrect ? "#D1FAE5" : attempted ? "#FEF2F2" : C.muted }}>
+                      <span style={{ fontSize: 13, fontWeight: 700, color: p.wasCorrect ? "#059669" : attempted ? C.red : C.textMuted, width: 16, flexShrink: 0 }}>{attempted ? (p.wasCorrect ? "✓" : "✗") : "—"}</span>
+                      <span style={{ fontSize: 16, flexShrink: 0 }}>{p.emoji}</span>
+                      <span style={{ fontSize: 13, fontWeight: 600, color: C.text, flex: 1, minWidth: 0, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{p.name}</span>
+                      <span style={{ fontSize: 13, color: C.textSub, flexShrink: 0 }}>{attempted ? `${p.matchCorrectCount ?? 0}/${total} correct` : <em style={{ color: C.textMuted }}>No answer</em>}</span>
+                    </div>
+                  );
+                })}
+                {scores.length === 0 && <span style={{ fontSize: 13, color: C.textMuted, fontStyle: "italic" }}>No players.</span>}
+              </div>
+            </div>
+          ) : (
+            <div style={{ padding: "12px 18px", borderRadius: 12, background: C.muted, display: "flex", alignItems: "center", gap: 8 }}>
+              <span style={{ fontSize: 13, fontWeight: 700, color: C.text }}>{answeredCount}</span>
+              <span style={{ fontSize: 13, color: C.textSub }}>of {playerCount} answered</span>
+            </div>
+          )}
+        </div>
+      )}
+      <div style={{ flex: (q.type === "type" || q.type === "slider" || q.type === "match") ? 0 : 1, padding: "0 40px 20px", display: (q.type === "type" || q.type === "slider" || q.type === "match") ? "none" : "flex", flexDirection: "column", gap: 10 }}>
         {(q.options ?? []).map((opt, i) => {
           const OPTION_COLORS = ["#EF4444", "#3B82F6", "#F59E0B", "#22C55E"];
           const optColor = OPTION_COLORS[i % OPTION_COLORS.length];
@@ -2473,6 +2706,41 @@ function KahootHostView({ onNav, sessionName, pin, sessionDbId, tenantId, questi
           );
         })}
       </div>
+
+      {/* Reveal: per-player answer breakdown — MC/TF previously only showed an
+          aggregate vote-distribution bar per option; the host had no way to
+          see which specific player got a question wrong, what they actually
+          picked, or match it to their emoji. Mirrors the "type" question's
+          PLAYER RESPONSES panel above, using `scores` (already updated with
+          this question's wasCorrect/delta/emoji by the time phase flips to
+          "reveal" — see doReveal()) so correctness and emoji come straight
+          from the same computation the leaderboard uses, not a re-derivation.
+          Scoped to mc/tf only — "type" already has its own PLAYER RESPONSES
+          panel above, "open" is host-graded with its own review UI, and
+          slider/match get their own dedicated reveal panels (not option-index
+          based, so they'd render misleading "No answer" rows here). */}
+      {phase === "reveal" && (q.type === "mc" || q.type === "tf") && (
+        <div style={{ padding: "0 40px 14px" }}>
+          <div style={{ padding: "14px 18px", borderRadius: 14, background: C.white, border: `1px solid ${C.border}` }}>
+            <div style={{ fontSize: 11, fontWeight: 700, color: C.textMuted, letterSpacing: "0.08em", marginBottom: 10 }}>PLAYER RESPONSES</div>
+            <div style={{ display: "flex", flexDirection: "column", gap: 6, maxHeight: 220, overflowY: "auto" }}>
+              {scores.map(p => {
+                const ans = chAnswers[p.id];
+                const submittedLabel = ans && ans.optionIdx != null ? (q.options?.[ans.optionIdx] ?? `Option ${ans.optionIdx + 1}`) : null;
+                return (
+                  <div key={p.id} style={{ display: "flex", alignItems: "center", gap: 10, padding: "8px 12px", borderRadius: 10, background: p.wasCorrect ? "#D1FAE5" : ans ? "#FEF2F2" : C.muted }}>
+                    <span style={{ fontSize: 13, fontWeight: 700, color: p.wasCorrect ? "#059669" : ans ? C.red : C.textMuted, width: 16, flexShrink: 0 }}>{ans ? (p.wasCorrect ? "✓" : "✗") : "—"}</span>
+                    <span style={{ fontSize: 16, flexShrink: 0 }}>{p.emoji}</span>
+                    <span style={{ fontSize: 13, fontWeight: 600, color: C.text, flex: 1, minWidth: 0, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{p.name}</span>
+                    <span style={{ fontSize: 13, color: C.textSub, flexShrink: 0 }}>{submittedLabel ?? <em style={{ color: C.textMuted }}>No answer</em>}</span>
+                  </div>
+                );
+              })}
+              {scores.length === 0 && <span style={{ fontSize: 13, color: C.textMuted, fontStyle: "italic" }}>No players.</span>}
+            </div>
+          </div>
+        </div>
+      )}
 
       {/* Reveal: mini leaderboard + next CTA */}
       {phase === "reveal" && (
@@ -2516,6 +2784,59 @@ function KahootPlayerView({ onNav, playerName, playerId, pin, sessionDbId, broad
   const [finalScores,   setFinalScores]   = useState(null);
   const [gamePaused,    setGamePaused]    = useState(false);
   const [showLeaveConfirm, setShowLeaveConfirm] = useState(false);
+  const [sliderValue,     setSliderValue]     = useState(null); // Slider questions
+  const [sliderSubmitted, setSliderSubmitted] = useState(false);
+  const [shuffledRight,   setShuffledRight]   = useState([]);   // Matching — shared shuffle from host's SHOW_QUESTION
+  const [matchPairs,      setMatchPairs]      = useState([]);   // [{leftIdx, rightIdx}]
+  const [matchSelLeft,    setMatchSelLeft]    = useState(null); // tap-to-pair: currently selected left prompt
+  const [matchSubmitted,  setMatchSubmitted]  = useState(false);
+
+  // ── Reconnect: restore score and land on a safe screen after a refresh ──────
+  // Previously a refreshing player had NO restoration at all — this component
+  // always mounted at phase "waiting" with myScore 0, so a mid-game refresh
+  // silently lost their running score and left them sitting on the wrong
+  // screen until the next broadcast happened to arrive. This restores what
+  // the DB can tell us (session phase and cumulative score from saved
+  // game_answers) via the same getSessionRestoreData() the host already uses.
+  // What this does NOT do: resume a genuinely in-flight question with the
+  // correct time remaining — game_sessions doesn't persist the question's
+  // start timestamp or the full question payload, only its index, so there's
+  // nothing reliable to rebuild that exact moment from. Landing on "waiting"
+  // for phase "question"/"reveal" is a deliberate, disclosed compromise: the
+  // player isn't stuck, and the very next broadcast (which the host sends on
+  // every phase transition) resyncs them within one question.
+  useEffect(() => {
+    if (!sessionDbId || !playerId) return;
+    let cancelled = false;
+    (async () => {
+      try {
+        const { session, answers } = await getSessionRestoreData(sessionDbId);
+        if (cancelled || session.error || !session.data) return;
+        const sess = session.data;
+        if (sess.phase === "waiting") return; // still in lobby — normal join flow handles this
+
+        if (answers.data?.length) {
+          const myScore = answers.data
+            .filter(r => r.player_id === playerId)
+            .reduce((sum, r) => sum + (r.points ?? 0), 0);
+          setMyScore(myScore);
+        }
+        setGamePaused(!!sess.paused);
+        if (sess.phase === "question" || sess.phase === "reveal") {
+          setPhase("waiting"); // see comment above — safe holding screen, not stuck
+        } else if (sess.phase === "scoreboard") {
+          setPhase("scoreboard");
+        } else if (sess.phase === "ended") {
+          setPhase("ended");
+        } else {
+          setPhase("countdown");
+        }
+      } catch (e) {
+        console.error("[ralli:player] restore failed:", e);
+      }
+    })();
+    return () => { cancelled = true; };
+  }, [sessionDbId, playerId]);
 
   // Heartbeat: keep last_seen_at fresh while in-game so host can detect stale connections
   useEffect(() => {
@@ -2536,6 +2857,8 @@ function KahootPlayerView({ onNav, playerName, playerId, pin, sessionDbId, broad
       const elapsed = chMsg.questionStartedAt ? Math.floor((Date.now() - chMsg.questionStartedAt) / 1000) : 0;
       setQuestion(chMsg.question); setTimeLeft(Math.max(1, timeLimit - elapsed));
       setSelectedIdx(null); setOpenText(""); setOpenSubmitted(false);
+      setSliderValue(null); setSliderSubmitted(false);
+      setShuffledRight(chMsg.shuffledRight ?? []); setMatchPairs([]); setMatchSelLeft(null); setMatchSubmitted(false);
       setQStartMs(Date.now()); setPhase("question");
     }
     if (chMsg.type === GM.OPEN_REVIEW) { setPhase("open-waiting"); }
@@ -2548,6 +2871,18 @@ function KahootPlayerView({ onNav, playerName, playerId, pin, sessionDbId, broad
         // Type-answer: check typed text against accepted answers
         const acc = chMsg.acceptedAnswers.map(a => a.toLowerCase().trim());
         revealCorrect = acc.length > 0 && acc.some(a => openText.toLowerCase().trim() === a);
+      } else if (chMsg.sliderTarget != null) {
+        // Slider: within tolerance of the target, same rule the host used to score it
+        revealCorrect = sliderValue != null && Math.abs(sliderValue - chMsg.sliderTarget) <= (chMsg.sliderTolerance ?? 1);
+      } else if (Array.isArray(chMsg.matchPairsCorrect)) {
+        // Matching: all pairs must match — same all-or-nothing rule the host
+        // used to score it, checked against the SAME shuffledRight the host
+        // broadcast (chMsg.shuffledRight), not the local `shuffledRight`
+        // state, in case a message is processed before state settles.
+        const sr = chMsg.shuffledRight ?? shuffledRight;
+        revealCorrect = matchPairs.length > 0
+          && matchPairs.length === chMsg.matchPairsCorrect.length
+          && matchPairs.every(mp => sr[mp.rightIdx]?.right === chMsg.matchPairsCorrect[mp.leftIdx]?.right);
       } else {
         revealCorrect = selectedIdx === chMsg.correctIdx;
       }
@@ -2582,6 +2917,37 @@ function KahootPlayerView({ onNav, playerName, playerId, pin, sessionDbId, broad
     const timeMs = Date.now() - (qStartMs ?? Date.now());
     setSelectedIdx(idx); setPhase("answered");
     broadcast({ type: GM.ANSWER, playerId, name: playerName, optionIdx: idx, timeMs });
+  };
+
+  const handleSliderSubmit = () => {
+    if (phase !== "question" || sliderSubmitted) return;
+    const timeMs = Date.now() - (qStartMs ?? Date.now());
+    setSliderSubmitted(true); setPhase("answered");
+    broadcast({ type: GM.ANSWER, playerId, name: playerName, sliderValue, timeMs });
+  };
+
+  // Matching — tap-to-pair (chosen over drag-and-drop for the live, timed,
+  // mobile-first context: no window-level drag listeners to get right under
+  // a countdown, and it works identically on touch and mouse). Tapping a left
+  // prompt selects it; tapping a right option pairs it with the selected left
+  // (replacing any existing pair for that left); tapping an already-paired
+  // left re-selects it so its pair can be changed before submitting.
+  const pickMatchLeft = (li) => {
+    if (phase !== "question" || matchSubmitted) return;
+    setMatchSelLeft(li);
+  };
+  const pickMatchRight = (ri) => {
+    if (phase !== "question" || matchSubmitted || matchSelLeft == null) return;
+    if (matchPairs.some(mp => mp.rightIdx === ri)) return; // already claimed by another left
+    setMatchPairs(prev => [...prev.filter(mp => mp.leftIdx !== matchSelLeft), { leftIdx: matchSelLeft, rightIdx: ri }]);
+    setMatchSelLeft(null);
+  };
+  const handleMatchSubmit = () => {
+    const total = question?.pairs?.length ?? 0;
+    if (phase !== "question" || matchSubmitted || matchPairs.length < total) return;
+    const timeMs = Date.now() - (qStartMs ?? Date.now());
+    setMatchSubmitted(true); setPhase("answered");
+    broadcast({ type: GM.ANSWER, playerId, name: playerName, matchPairs, timeMs });
   };
 
   const timerPct   = question ? (timeLeft / question.timeLimit) * 100 : 0;
@@ -2702,13 +3068,21 @@ function KahootPlayerView({ onNav, playerName, playerId, pin, sessionDbId, broad
 
   if (phase === "answered" || phase === "reveal") {
     const showResult  = phase === "reveal";
-    const hasAnswer   = selectedIdx !== null || openSubmitted;
+    const hasAnswer   = selectedIdx !== null || openSubmitted || sliderSubmitted || matchSubmitted;
     const answerLabel = selectedIdx !== null
       ? question?.options?.[selectedIdx]
-      : openText || "—";
+      : sliderSubmitted
+        ? String(sliderValue)
+        : matchSubmitted
+          ? `${matchPairs.length}/${question?.pairs?.length ?? 0} pairs matched`
+          : openText || "—";
     const answerBadge = selectedIdx !== null
       ? String.fromCharCode(65 + selectedIdx)
-      : "✎";
+      : sliderSubmitted
+        ? "🎚"
+        : matchSubmitted
+          ? "🔗"
+          : "✎";
     return (
       <div style={{ minHeight: "100%", background: C.cream, display: "flex", flexDirection: "column", alignItems: "center", justifyContent: "center", gap: 20, padding: mobile ? 16 : 32 }}>
         {hasAnswer ? (
@@ -2717,7 +3091,7 @@ function KahootPlayerView({ onNav, playerName, playerId, pin, sessionDbId, broad
               <div style={{ fontSize: 11, fontWeight: 700, letterSpacing: "0.1em", color: C.textMuted, textTransform: "uppercase", marginBottom: 8 }}>Your answer</div>
               <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
                 <div style={{ width: 32, height: 32, borderRadius: 8, background: showResult ? (isCorrect ? C.trueGreenBg : isCorrect === false ? "#FEF2F2" : C.cream) : C.cream, display: "flex", alignItems: "center", justifyContent: "center", fontSize: 13, fontWeight: 900, color: showResult ? (isCorrect ? C.trueGreen : isCorrect === false ? C.red : C.orange) : C.orange, flexShrink: 0 }}>
-                  {showResult && selectedIdx !== null ? (isCorrect ? "✓" : "✗") : answerBadge}
+                  {showResult && (selectedIdx !== null || sliderSubmitted || matchSubmitted) ? (isCorrect ? "✓" : "✗") : answerBadge}
                 </div>
                 <span style={{ fontSize: 15, fontWeight: 700, color: C.text, textAlign: "left" }}>{answerLabel}</span>
               </div>
@@ -2877,6 +3251,100 @@ function KahootPlayerView({ onNav, playerName, playerId, pin, sessionDbId, broad
           ) : (
             <div style={{ display: "flex", alignItems: "center", gap: 10, padding: "12px 16px", borderRadius: 12, background: "#F5F3FF", border: `1px solid ${PURPLE}44` }}>
               <p style={{ margin: 0, fontSize: 14, color: PURPLE, fontWeight: 700 }}>✓ Submitted — waiting for host</p>
+            </div>
+          )}
+        </div>
+      ) : question?.type === "slider" ? (
+        /* Slider — range input, reuses the same min/max/tolerance fields and
+           tolerance-based correctness rule as the self-paced QuizTakingView
+           slider (see isAnswerCorrect / KahootHostView.doReveal's slider
+           branch); the UI itself is simplified for a fast-moving live round
+           (single drag, one submit) rather than self-paced's free-form nudge. */
+        <div style={{ flex: 1, padding: "0 16px 24px", display: "flex", flexDirection: "column", justifyContent: "center", gap: 20 }}>
+          <div style={{ textAlign: "center" }}>
+            <span style={{ fontSize: 48, fontWeight: 900, color: sliderSubmitted ? PURPLE : C.orange }}>
+              {sliderValue ?? Math.round(((question.min ?? 0) + (question.max ?? 10)) / 2)}
+            </span>
+          </div>
+          <input
+            type="range"
+            min={question.min ?? 0}
+            max={question.max ?? 10}
+            step={1}
+            value={sliderValue ?? Math.round(((question.min ?? 0) + (question.max ?? 10)) / 2)}
+            disabled={sliderSubmitted}
+            onChange={e => setSliderValue(Number(e.target.value))}
+            style={{ width: "100%", accentColor: C.orange }}
+          />
+          <div style={{ display: "flex", justifyContent: "space-between", fontSize: 12, color: C.textMuted, fontWeight: 600 }}>
+            <span>{question.minLabel || (question.min ?? 0)}</span>
+            <span>{question.maxLabel || (question.max ?? 10)}</span>
+          </div>
+          {!sliderSubmitted ? (
+            <button onClick={handleSliderSubmit} style={{ padding: "14px", borderRadius: 14, border: "none", background: C.orange, color: "#fff", fontWeight: 900, fontSize: 15, cursor: "pointer" }}>
+              Submit Answer →
+            </button>
+          ) : (
+            <div style={{ display: "flex", alignItems: "center", gap: 10, padding: "12px 16px", borderRadius: 12, background: "#F5F3FF", border: `1px solid ${PURPLE}44` }}>
+              <p style={{ margin: 0, fontSize: 14, color: PURPLE, fontWeight: 700 }}>✓ Submitted — waiting for others</p>
+            </div>
+          )}
+        </div>
+      ) : question?.type === "match" ? (
+        /* Matching — tap-to-pair. Left prompts in original order; right
+           options in the shared shuffle the host broadcast (shuffledRight),
+           so every player sees the same right-column order the host will
+           score against. */
+        <div style={{ flex: 1, padding: "0 16px 24px", display: "flex", flexDirection: "column", gap: 14, overflowY: "auto" }}>
+          <p style={{ margin: 0, fontSize: 12, color: C.textMuted, textAlign: "center" }}>
+            {matchSelLeft != null ? "Now tap its match on the right" : "Tap a prompt, then tap its match"}
+          </p>
+          <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
+            {(question.pairs ?? []).map((pair, li) => {
+              const mp = matchPairs.find(m => m.leftIdx === li);
+              const isSelected = matchSelLeft === li;
+              const matchedLabel = mp ? shuffledRight[mp.rightIdx]?.right : null;
+              return (
+                <button key={li} disabled={matchSubmitted} onClick={() => pickMatchLeft(li)} style={{
+                  width: "100%", padding: "12px 16px", borderRadius: 12, textAlign: "left",
+                  border: `2px solid ${isSelected ? C.orange : mp ? "#A7F3D0" : C.border}`,
+                  background: isSelected ? C.orangeLight : mp ? "#ECFDF5" : "#fff",
+                  cursor: matchSubmitted ? "default" : "pointer",
+                }}>
+                  <div style={{ fontSize: 14, fontWeight: 700, color: C.text }}>{pair.left}</div>
+                  <div style={{ fontSize: 12, color: mp ? "#059669" : C.textMuted, marginTop: 2 }}>{matchedLabel ?? "Tap to match"}</div>
+                </button>
+              );
+            })}
+          </div>
+          <div style={{ height: 1, background: C.border }} />
+          <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
+            {shuffledRight.map((pair, ri) => {
+              const takenByLeft = matchPairs.find(m => m.rightIdx === ri);
+              return (
+                <button key={ri} disabled={matchSubmitted || matchSelLeft == null || !!takenByLeft} onClick={() => pickMatchRight(ri)} style={{
+                  width: "100%", padding: "12px 16px", borderRadius: 12, textAlign: "left",
+                  border: `2px solid ${takenByLeft ? "#A7F3D0" : C.border}`,
+                  background: takenByLeft ? "#ECFDF5" : "#fff",
+                  opacity: matchSelLeft == null && !takenByLeft ? 0.6 : 1,
+                  cursor: (matchSubmitted || matchSelLeft == null || takenByLeft) ? "default" : "pointer",
+                  fontSize: 14, fontWeight: 600, color: C.text,
+                }}>{pair.right}</button>
+              );
+            })}
+          </div>
+          {!matchSubmitted ? (
+            <button onClick={handleMatchSubmit} disabled={matchPairs.length < (question.pairs?.length ?? 0)} style={{
+              padding: "14px", borderRadius: 14, border: "none",
+              background: matchPairs.length >= (question.pairs?.length ?? 0) ? C.orange : C.muted,
+              color: matchPairs.length >= (question.pairs?.length ?? 0) ? "#fff" : C.textMuted,
+              fontWeight: 900, fontSize: 15, cursor: matchPairs.length >= (question.pairs?.length ?? 0) ? "pointer" : "not-allowed",
+            }}>
+              {matchPairs.length >= (question.pairs?.length ?? 0) ? "Submit Matches →" : `Match all pairs (${matchPairs.length}/${question.pairs?.length ?? 0})`}
+            </button>
+          ) : (
+            <div style={{ display: "flex", alignItems: "center", gap: 10, padding: "12px 16px", borderRadius: 12, background: "#F5F3FF", border: `1px solid ${PURPLE}44` }}>
+              <p style={{ margin: 0, fontSize: 14, color: PURPLE, fontWeight: 700 }}>✓ Submitted — waiting for others</p>
             </div>
           )}
         </div>
@@ -20025,8 +20493,26 @@ export default function App() {
     } catch { return DEFAULT_NOTIF_PREFS; }
   });
 
-  // Stable player ID for this session
-  const [playerId] = useState(() => Math.random().toString(36).slice(2));
+  // Stable player ID for this session. Persisted to localStorage so a fully
+  // anonymous/demo session (no currentUser) keeps the same identity across a
+  // refresh — previously regenerated every mount, which silently changed the
+  // hash-derived emoji fallback (see gamePlayerId below) on every reload.
+  const [playerId] = useState(() => {
+    try {
+      const existing = localStorage.getItem("ralli_anon_player_id");
+      if (existing) return existing;
+      const fresh = Math.random().toString(36).slice(2);
+      localStorage.setItem("ralli_anon_player_id", fresh);
+      return fresh;
+    } catch { return Math.random().toString(36).slice(2); }
+  });
+  // Canonical identity for Ralli Live (emoji hash seed, presence tracking,
+  // game_session_participants.player_id): always the authenticated user's
+  // stable id when logged in. `playerId` above is only a fallback for a
+  // genuinely anonymous session. Using this everywhere (instead of the raw
+  // `playerId` state) is what keeps a player's emoji identical across lobby,
+  // gameplay, reveal, scoreboard, reconnect, and final results.
+  const gamePlayerId = currentUser?.id ?? playerId;
 
   // Quizzes — demo users: persist to localStorage; real users: Supabase only
   const [quizzes, setQuizzes] = useState(() => {
@@ -21060,7 +21546,9 @@ export default function App() {
   const handleEnterName = async (name, emoji) => {
     setLobbyPlayerName(name);
     // Always compute the same emoji used in DB/presence so My card matches manager view.
-    const pidx       = Math.abs(playerId.charCodeAt(0) + (playerId.charCodeAt(1) || 0)) % PLAYER_EMOJIS.length;
+    // Seeded from gamePlayerId (currentUser.id when logged in) — not the raw
+    // per-mount playerId — so this hash is stable across refresh/reconnect.
+    const pidx       = Math.abs(gamePlayerId.charCodeAt(0) + (gamePlayerId.charCodeAt(1) || 0)) % PLAYER_EMOJIS.length;
     const finalEmoji = emoji ?? PLAYER_EMOJIS[pidx];
     setLobbyPlayerEmoji(finalEmoji);
 
@@ -21079,7 +21567,7 @@ export default function App() {
       const pColor = PLAYER_COLORS[pidx % PLAYER_COLORS.length];
       try {
         const { data: jData, error: jErr } = await joinGameSession(sessionDbId, {
-          playerId: currentUser.id ?? playerId,
+          playerId: gamePlayerId,
           name,
           emoji:    finalEmoji,
           color:    pColor,
@@ -21108,11 +21596,13 @@ export default function App() {
   //
   // waiting  → lobby: players join, host clicks Start when ready
   // started / live / active / paused → game screen directly
-  //   Note: KahootHostView always initialises phase/qIdx/scores from React state (no DB read-back
-  //   on mount). Running scores and question index are NOT restored after a refresh or re-entry.
-  //   The host reconnects to the BroadcastChannel and can continue broadcasting new questions,
-  //   but prior-question scores are lost in memory. Full restoration requires a future migration
-  //   to read game_sessions.phase / current_question_index and re-aggregate game_answers on mount.
+  //   Note: KahootHostView restores phase/qIdx/paused/scores from the DB on
+  //   mount (getSessionRestoreData — reads game_sessions.phase/
+  //   current_question_index and re-aggregates game_answers), so a host
+  //   refresh or re-entry mid-game no longer loses running scores.
+  //   KahootPlayerView restores its own score and lands on a safe screen the
+  //   same way, but can't resume a genuinely in-flight question with the
+  //   correct time remaining — see the comment on its restoration effect.
   const LOBBY_STATUSES = new Set(["waiting"]);
   const handleLaunch = (session) => {
     const quiz = quizzes.find(q => q.id === session.quizId);
@@ -21221,8 +21711,8 @@ export default function App() {
       case "rankd-new":         return <NewSessionScreen onNav={navigate} quizzes={quizzes} onCreateSession={handleCreateSession} />;
       case "rankd-quiz-builder":return <QuizBuilderScreen onNav={navigate} onSave={handleSaveQuiz} initialQuiz={editingQuiz} onEditQuiz={handleEditQuiz} />;
       case "rankd-name-entry":  return <RankdNameEntryScreen onNav={navigate} pin={lobbyPin} sessionName={lobbySessionName} onConfirm={handleEnterName} defaultName={userProfile.nickname?.trim() || user?.name || ""} defaultAvatar={userProfile.avatarEmoji} />;
-      case "rankd-lobby":       return <RankdLobbyScreen onNav={navigate} pin={lobbyPin} playerName={lobbyPlayerName} playerEmoji={lobbyPlayerEmoji} sessionName={lobbySessionName} role={gameRole} sessions={sessions} currentUser={currentUser} onGameStart={handleGameStart} chPlayers={chPlayers} broadcast={broadcast} playerId={playerId} chMsg={chMsg} onHostEnd={async () => { await endGameSession(lobbyPin, { tenantId: currentOrg?.id ?? null }); navigate("rankd"); }} />;
-      case "rankd-game":        return <RankdGameScreen onNav={navigate} sessionName={lobbySessionName} role={gameRole} playerName={lobbyPlayerName ?? user.name} questions={gameQuestions ?? GAME_QUESTIONS} demoMode={gameRole === "admin" && sessions.find(s => s.code === lobbyPin)?.demoMode !== false} pin={lobbyPin} sessionDbId={sessions.find(s => s.code === lobbyPin)?.dbId ?? null} tenantId={currentOrg?.id ?? user?.orgId ?? null} broadcast={broadcast} chMsg={chMsg} chAnswers={chAnswers} chPlayers={chPlayers} playerId={playerId} onGameEnd={handleGameEnd} setChAnswers={setChAnswers} />;
+      case "rankd-lobby":       return <RankdLobbyScreen onNav={navigate} pin={lobbyPin} playerName={lobbyPlayerName} playerEmoji={lobbyPlayerEmoji} sessionName={lobbySessionName} role={gameRole} sessions={sessions} currentUser={currentUser} onGameStart={handleGameStart} chPlayers={chPlayers} broadcast={broadcast} playerId={gamePlayerId} chMsg={chMsg} onHostEnd={async () => { await endGameSession(lobbyPin, { tenantId: currentOrg?.id ?? null }); navigate("rankd"); }} />;
+      case "rankd-game":        return <RankdGameScreen onNav={navigate} sessionName={lobbySessionName} role={gameRole} playerName={lobbyPlayerName ?? user.name} questions={gameQuestions ?? GAME_QUESTIONS} demoMode={gameRole === "admin" && sessions.find(s => s.code === lobbyPin)?.demoMode !== false} pin={lobbyPin} sessionDbId={sessions.find(s => s.code === lobbyPin)?.dbId ?? null} tenantId={currentOrg?.id ?? user?.orgId ?? null} broadcast={broadcast} chMsg={chMsg} chAnswers={chAnswers} chPlayers={chPlayers} playerId={gamePlayerId} onGameEnd={handleGameEnd} setChAnswers={setChAnswers} />;
       case "rankd-results":     return <RankdResultsScreen onNav={navigate} sessionCode={viewResultsCode} sessions={sessions} gameData={gameResultsData} />;
       case "learn":             return <LearnScreen role={gameRole} user={user} orgUsers={orgUsers} orgs={orgs} onNav={navigate} onAwardXp={handleAwardXp} pendingLessonId={pendingLessonId} onClearPendingLesson={() => setPendingLessonId(null)} pendingCourseId={pendingCourseId} onClearPendingCourse={() => setPendingCourseId(null)} canCreate={perm("actions","create")} canEdit={perm("actions","edit")} canDelete={perm("actions","delete")} canAssign={perm("actions","assign")} tenantId={currentOrg?.id ?? null} isReal={!!user?._isReal} quizzes={quizzes} sharedAssignmentData={sharedAssignmentData} />;
       case "quizzes":           return <QuizzesScreen role={gameRole} onNav={navigate} quizzes={quizzes} onEditQuiz={handleEditQuiz} onDeleteQuiz={handleDeleteQuiz} onToggleFavorite={handleToggleFavorite} onToggleActive={handleToggleActive} pendingQuizId={pendingQuizId} onClearPendingQuiz={() => setPendingQuizId(null)} canCreate={perm("actions","create")} canEdit={perm("actions","edit")} canDelete={perm("actions","delete")} canLaunch={perm("actions","launch")} canAssign={perm("actions","assign")} onAssignQuiz={handleAssignQuiz} onLaunchQuiz={handleCreateSession} orgUsers={orgUsers} orgs={orgs} currentUser={currentUser} tenantId={currentOrg?.id ?? null} isReal={!!user?._isReal} quizzesReady={quizzesReady} sharedAssignmentData={sharedAssignmentData} />;
