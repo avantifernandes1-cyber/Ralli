@@ -10456,6 +10456,15 @@ function QuizResultsView({ quiz, attempt, onRetake, onBack, showRetake = true, s
     quiz.questions[i].type !== "open" && isAnswerCorrect(quiz.questions[i], a.selected)
   ).length;
   const passed  = attempt.passed;
+  // Effective passing score for display — must mirror the exact fallback rule
+  // QuizTakingView.next() already uses when computing attempt.passed
+  // (quiz.passingScore ?? 90), so the copy shown here can never disagree with
+  // the rule that actually decided pass/fail. Legacy quizzes saved before the
+  // passingScore column existed have passingScore === null/undefined and
+  // correctly keep showing the old 90% fallback; quizzes with a saved value
+  // (new quizzes default to 100, existing quizzes keep whatever was set) show
+  // that value instead.
+  const effectivePassingScore = typeof quiz.passingScore === "number" ? quiz.passingScore : 90;
 
   return (
     <div style={{ maxWidth: 640, margin: "0 auto", display: "flex", flexDirection: "column", gap: 20 }}>
@@ -10473,7 +10482,7 @@ function QuizResultsView({ quiz, attempt, onRetake, onBack, showRetake = true, s
         <div style={{ display: "inline-flex", alignItems: "center", gap: 8, padding: "6px 16px", borderRadius: 99, background: passed ? "#DCFCE7" : "#FEE2E2", border: `1px solid ${passed ? "#86EFAC" : "#FCA5A5"}` }}>
           <span style={{ fontSize: 13, fontWeight: 800, color: passed ? "#166534" : "#991B1B" }}>{passed ? "Passed" : "Retry"}</span>
         </div>
-        {!passed && showRetake && <p style={{ margin: "12px 0 0", fontSize: 12, color: C.textMuted }}>Score 90% or higher to pass. You've got this.</p>}
+        {!passed && showRetake && <p style={{ margin: "12px 0 0", fontSize: 12, color: C.textMuted }}>Score {effectivePassingScore}% or higher to pass. You've got this.</p>}
         {showRetake && onRetake && (
           <button onClick={onRetake} style={{ marginTop: 20, padding: "10px 24px", borderRadius: 10, border: `1px solid ${C.orange}`, background: C.orangeLight, color: C.orange, fontSize: 13, fontWeight: 700, cursor: "pointer" }}>
             Retake Quiz
