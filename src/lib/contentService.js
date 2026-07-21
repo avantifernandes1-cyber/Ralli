@@ -410,6 +410,66 @@ export async function getTenantAssignments(tenantId) {
 }
 
 /**
+ * Subscribe to tenant_assignments changes (INSERT/UPDATE/DELETE) for one
+ * tenant, so a manager creating/editing/removing an assignment shows up for
+ * everyone watching without a manual refresh (Task 12).
+ *
+ * Tenant-scoped two ways: the Postgres `filter` below narrows which change
+ * events even reach this channel, and — the real security boundary —
+ * Realtime respects the table's RLS `tenant_assignments_select` policy
+ * (017_tenant_assignments.sql), so a client can never receive a row for a
+ * tenant it isn't allowed to SELECT, filter or no filter. A cross-tenant
+ * `ralli_admin` caller (who can SELECT every tenant per that same policy)
+ * intentionally only gets this one tenant's events, matching every other
+ * tenant-scoped read in this file.
+ *
+ * `scope` disambiguates the channel name per caller (e.g. "home", "learn",
+ * "quizzes-user", "quizzes-tracking") so multiple screens can each hold
+ * their own independent subscription for the same tenant without colliding
+ * on one shared channel topic.
+ *
+ * `onChange` is debounced (400ms of quiet) rather than called once per raw
+ * event — a single manager action can fan out to many rows at once (team/org
+ * assignment, Task 10's createAssignments()), which would otherwise fire the
+ * caller's refetch once per inserted row instead of once for the whole
+ * change.
+ *
+ * Returns a plain cleanup function (not the raw channel) — call it on
+ * unmount/dependency-change. It cancels any pending debounced refetch and
+ * removes the channel, so a component that unmounts mid-debounce can never
+ * fire a refetch (and any resulting setState) after it's gone.
+ *
+ * @param {string} tenantId
+ * @param {string} scope - short, unique-per-caller label for the channel name
+ * @param {() => void} onChange - called (no payload — callers just refetch) after a burst of INSERT/UPDATE/DELETE events settles
+ * @returns {() => void} cleanup — call on unmount
+ */
+export function subscribeToTenantAssignments(tenantId, scope, onChange) {
+  let debounceTimer = null;
+  const debouncedOnChange = () => {
+    clearTimeout(debounceTimer);
+    debounceTimer = setTimeout(onChange, 400);
+  };
+  const channel = supabase
+    .channel(`tenant_assignments:${scope}:${tenantId}`)
+    .on(
+      "postgres_changes",
+      {
+        event:  "*",
+        schema: "public",
+        table:  "tenant_assignments",
+        filter: `tenant_id=eq.${tenantId}`,
+      },
+      debouncedOnChange
+    )
+    .subscribe();
+  return () => {
+    clearTimeout(debounceTimer);
+    supabase.removeChannel(channel);
+  };
+}
+
+/**
  * Resolve a target (individual/team/group) into the candidate { userId, userName }
  * pairs it fans out to. Queried fresh from Supabase so it always reflects
  * current team/org membership at assign time (or at eligibility-check time).

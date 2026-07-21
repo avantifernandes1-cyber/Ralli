@@ -64,6 +64,7 @@ import {
   deleteBattleCard as dbDeleteBattleCard,
   updateUserProfile as dbUpdateUserProfile,
   updateLastSeenAssignmentsAt,
+  subscribeToTenantAssignments,
 } from "./src/lib/contentService.js";
 import { resolveAssignmentStatus, isQualifyingEvent } from "./src/lib/assignmentEngine.js";
 import { getProfile, createMissingProfile, getTenantProfiles } from "./src/lib/profileService.js";
@@ -578,6 +579,18 @@ function HomeScreen({ user, onNav, quizAssignments = [], onResumeLesson, onStart
   }, [isReal, tenantId, user?.id]);
 
   useEffect(() => { loadHomeData(); }, [loadHomeData]);
+
+  // Task 12 — live updates. A manager assigning/editing/removing content
+  // shows up here without the rep navigating away and back: re-runs the
+  // exact same retryable loadHomeData() used on mount, so loading/error
+  // handling and the "mark seen" rule stay identical for both paths — no
+  // separate partial-refetch code to keep in sync. Tenant-scoped (see
+  // subscribeToTenantAssignments's docstring); torn down on unmount/tenant
+  // change so navigating away never leaves a stale subscription running.
+  useEffect(() => {
+    if (!isReal || !tenantId) return;
+    return subscribeToTenantAssignments(tenantId, "home", () => loadHomeData());
+  }, [isReal, tenantId, loadHomeData]);
 
   // Report new-assignment count to App so the "Learn" nav badge stays in sync.
   // "new" = assigned after lastSeenAt (only meaningful when lastSeenAt is set).
@@ -6304,6 +6317,17 @@ function LearnScreen({ role, user, orgUsers = [], orgs = [], onNav, onAwardXp, p
 
   useEffect(() => { loadLearnData(); }, [loadLearnData]);
 
+  // Task 12 — live updates for both the rep-facing "My Learning" tab and the
+  // manager Assignments tracking tab (same component, same underlying
+  // `assignments` state). Re-runs the existing retryable loadLearnData() so
+  // Task 11's tracking columns and Task 10's engine both see fresh data —
+  // no separate partial-refetch path. Tenant-scoped; cleaned up on
+  // unmount/tenant change.
+  useEffect(() => {
+    if (!isReal || !tenantId) return;
+    return subscribeToTenantAssignments(tenantId, "learn", () => loadLearnData());
+  }, [isReal, tenantId, loadLearnData]);
+
   const handleCompleteLesson = (id) => {
     if (completedLessons.has(id)) return;
     const completedAtNow = new Date().toISOString();
@@ -10493,6 +10517,17 @@ function QuizTrackingPanel({ quizzes, orgUsers, tenantId, isReal, refreshKey, on
 
   useEffect(() => { loadTracking(); }, [loadTracking, refreshKey]);
 
+  // Task 12 — live updates. Managers watching this tracking panel see a
+  // teammate's assignment appear/change/disappear without a manual refresh,
+  // whether it came from this browser tab (already covered by the
+  // refreshKey bump after AssignContentModal submits) or from someone else
+  // entirely. Re-runs the same retryable loadTracking(). Tenant-scoped;
+  // cleaned up on unmount/tenant change.
+  useEffect(() => {
+    if (!isReal || !tenantId) return;
+    return subscribeToTenantAssignments(tenantId, "quizzes-tracking", () => loadTracking());
+  }, [isReal, tenantId, loadTracking]);
+
   const allRows = buildQuizAssignmentRows(assignments, attempts, quizzes, orgUsers);
   const draftQuizzes = quizzes.filter(q => !assignments.some(a => a.contentId === q.id));
 
@@ -10730,6 +10765,16 @@ function QuizzesScreen({ role, onNav, quizzes, onEditQuiz, onDeleteQuiz, onToggl
     }, [tenantId, isReal, currentUser?.id, currentUser?.teamId, currentUser?.orgId, quizzesReady, quizzes]);
 
     useEffect(() => { loadUserQuizData(); }, [loadUserQuizData]);
+
+    // Task 12 — live updates. Re-runs the existing retryable
+    // loadUserQuizData() so a newly assigned/reassigned/removed quiz shows
+    // up without navigating away and back, using the same merge logic and
+    // error handling as the mount-time load. Tenant-scoped; cleaned up on
+    // unmount/tenant change.
+    useEffect(() => {
+      if (!isReal || !tenantId) return;
+      return subscribeToTenantAssignments(tenantId, "quizzes-user", () => loadUserQuizData());
+    }, [isReal, tenantId, loadUserQuizData]);
 
     // view: "list" | "taking" | "results"
     const [view,         setView]         = useState("list");
