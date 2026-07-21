@@ -17312,49 +17312,14 @@ function UserSettingsScreen({ user, profile, notifPrefs, onSaveProfile, onSaveNo
         </button>
       </Card>
 
-      {/* ── NOTIFICATIONS ── */}
-      <Card style={{ marginBottom: 20 }}>
-        <SectionHeader title="Notifications" subtitle="Choose which emails you receive from ralli." />
-        <div style={{ display: "flex", flexDirection: "column", gap: 0 }}>
-          {NOTIF_ITEMS.map(({ key, label }, i) => (
-            <div key={key} style={{
-              display: "flex", alignItems: "center", justifyContent: "space-between",
-              padding: "14px 0",
-              borderBottom: i < NOTIF_ITEMS.length - 1 ? `1px solid ${C.creamBorder}` : "none",
-            }}>
-              <span style={{ fontSize: 14, color: C.text }}>{label}</span>
-              {/* Toggle */}
-              <button onClick={() => toggle(key)} style={{
-                width: 44, height: 24, borderRadius: 99, border: "none",
-                background: notifs[key] ? C.orange : C.muted,
-                cursor: "pointer", position: "relative", flexShrink: 0,
-                transition: "background 0.2s",
-              }}>
-                <div style={{
-                  position: "absolute", top: 3,
-                  left: notifs[key] ? 23 : 3,
-                  width: 18, height: 18, borderRadius: "50%", background: "#fff",
-                  transition: "left 0.2s",
-                  boxShadow: "0 1px 3px rgba(0,0,0,0.2)",
-                }} />
-              </button>
-            </div>
-          ))}
-        </div>
-        <button
-          onClick={saveNotifs}
-          disabled={!notifsDirty}
-          style={{
-            marginTop: 20, padding: "10px 20px", borderRadius: 10, border: "none",
-            background: saved === "notifs" ? C.trueGreen : notifsDirty ? C.orange : C.muted,
-            color: notifsDirty || saved === "notifs" ? "#fff" : C.textMuted,
-            fontSize: 13, fontWeight: 700, cursor: notifsDirty ? "pointer" : "not-allowed",
-            transition: "all 0.15s",
-          }}
-        >
-          {saved === "notifs" ? "Saved" : "Save Preferences"}
-        </button>
-      </Card>
+      {/* ── NOTIFICATIONS ──
+          Hidden: no delivery system (email/push/in-app) exists yet for any of
+          quizAssigned/courseAssigned/lessonAssigned/gameResults/dueSoon/overdue —
+          nothing in the codebase reads notif_prefs at send time, so a visible
+          toggle here would let users believe they've configured notifications
+          that will never arrive. Sprint 1 Task 4 (2026-07-20): UI trust fix only.
+          notif_prefs stays in the DB, still loads into state below untouched —
+          restore this Card once real delivery ships. */}
 
       {/* ── ACCOUNT ── */}
       <Card>
