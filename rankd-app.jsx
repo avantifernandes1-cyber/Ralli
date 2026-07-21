@@ -838,7 +838,12 @@ function PersonalDashboardScreen({
       getRepTopicScores(tenantId, user.id),
       supabase
         .from("user_point_events")
-        .select("source_type, source_id, points, created_at")
+        // Task 18 — quiz_attempt_id (added 041_quiz_attempt_id_on_point_events.sql)
+        // lets findAttemptForEvent() open the exact attempt an event was
+        // earned from, instead of guessing via nearest timestamp. NULL for
+        // lesson/course/game rows and for quiz rows written before that
+        // migration — those still fall back to the old timestamp match.
+        .select("source_type, source_id, points, created_at, quiz_attempt_id")
         .eq("tenant_id", tenantId)
         .eq("user_id", user.id)
         .order("created_at", { ascending: false })
@@ -1030,16 +1035,31 @@ function PersonalDashboardScreen({
 
   // Find the specific quiz attempt (with per-question answers) tied to a point event,
   // so the review modal opens the exact prior attempt rather than just "the latest".
+  //
+  // Task 18 — events written by submit_quiz_attempt_atomic() (since
+  // 041_quiz_attempt_id_on_point_events.sql) carry a stable quiz_attempt_id,
+  // so we match on that exact id first: no ambiguity from rapid retakes,
+  // multiple tabs, or timestamp precision. Older events written before that
+  // migration have quiz_attempt_id = NULL and fall back to the original
+  // nearest-created_at heuristic — kept only for that legacy case.
   const findAttemptForEvent = (e, quiz) => {
     if (isReal) {
-      const candidates = quizAttemptsFull.filter(a => a.quiz_id === e.source_id);
-      if (!candidates.length) return null;
-      const targetMs = new Date(e.created_at).getTime();
-      const closest = candidates.reduce((best, a) => {
-        const diff = Math.abs(new Date(a.created_at).getTime() - targetMs);
-        return (!best || diff < best.diff) ? { attempt: a, diff } : best;
-      }, null);
-      const raw = closest?.attempt;
+      let raw = null;
+      if (e.quiz_attempt_id) {
+        raw = quizAttemptsFull.find(a => a.id === e.quiz_attempt_id) ?? null;
+      }
+      if (!raw) {
+        // Legacy fallback — pre-Task-18 events only.
+        const candidates = quizAttemptsFull.filter(a => a.quiz_id === e.source_id);
+        if (candidates.length) {
+          const targetMs = new Date(e.created_at).getTime();
+          const closest = candidates.reduce((best, a) => {
+            const diff = Math.abs(new Date(a.created_at).getTime() - targetMs);
+            return (!best || diff < best.diff) ? { attempt: a, diff } : best;
+          }, null);
+          raw = closest?.attempt ?? null;
+        }
+      }
       if (!raw) return null;
       return {
         score:   raw.score,
