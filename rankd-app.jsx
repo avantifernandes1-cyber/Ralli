@@ -41,6 +41,7 @@ import {
   upsertQuiz,
   deleteQuiz as dbDeleteQuiz,
   getLessonCompletions,
+  getLessonCompletionsWithDates,
   markLessonComplete,
   getTenantAssignments,
   createAssignments as dbCreateAssignments,
@@ -504,6 +505,41 @@ function InfoTooltip({ text }) {
   );
 }
 
+// ── resolveQuizAssignmentInstantMs ──────────────────────────────────────────
+// Resolves the reliable assignment-instance timestamp for a HomeScreen quiz
+// assignment enrichment check, in ms since epoch — or null if no valid
+// timestamp is available. Used ONLY to decide whether a passing attempt
+// resolves that *specific* assignment; never to guess based on assignment
+// age or attempt history.
+//
+// A missing, null, or malformed assignedAtRaw must never fall back to "any
+// historical pass counts" — that's the exact bug already fixed for the
+// normal path (see the quiz branch below, and 036/037's server-side
+// equivalents): an old pass silently resolving a brand-new reassignment,
+// making it disappear from Assigned Learning. So this function has exactly
+// one non-null return path — a successfully-parsed assignedAtRaw — and the
+// caller must treat a null result as "unresolved / still active", never as
+// "resolved by anything".
+//
+// Investigated whether a verified legacy timestamp exists to fall back to:
+// tenant_assignments has exactly one timestamp column, assigned_at
+// (TIMESTAMPTZ NOT NULL — see 017_tenant_assignments.sql); there is no
+// separate created_at or other per-row instant. dbToAssignment()
+// (contentService.js) also exposes a formatted `assignedAt` display string
+// (e.g. "Jul 20") — that's deliberately NOT used here: it drops the year, so
+// two assignments a year apart would compare as equal/ambiguous, which is
+// an unrelated, unreliable timestamp for this purpose, not a legitimate
+// legacy equivalent. If a genuine legacy timestamp field is ever added to
+// this schema, it belongs as an additional, explicitly-verified fallback
+// step here — not folded into the "no timestamp" case.
+function resolveQuizAssignmentInstantMs(a) {
+  if (a?.assignedAtRaw) {
+    const ms = new Date(a.assignedAtRaw).getTime();
+    if (!Number.isNaN(ms)) return ms;
+  }
+  return null; // no reliable assignment-instance timestamp — caller must treat as unresolved
+}
+
 function HomeScreen({ user, onNav, quizAssignments = [], onResumeLesson, onStartQuiz, onStartCourse, orgUsers = [], isReal = false, tenantId = null, quizzes = [], lastSeenAt = null, onNewAssignments = null }) {
   const mobile = useMobile();
   const firstName = user.name.split(" ")[0];
@@ -520,7 +556,7 @@ function HomeScreen({ user, onNav, quizAssignments = [], onResumeLesson, onStart
   const [homeCourses,     setHomeCourses]     = useState([]);
   const [homeLessons,     setHomeLessons]     = useState([]);
   const [homeAssignments, setHomeAssignments] = useState([]);
-  const [homeCompleted,   setHomeCompleted]   = useState(new Set());
+  const [homeCompletedAt, setHomeCompletedAt] = useState(new Map()); // lesson_id → completed_at (ISO), assignment-instance-aware
   const [homeQuizAttempts,setHomeQuizAttempts]= useState([]); // raw quiz_attempts rows, newest first — single source for both
                                                                  // "is this assigned quiz done" and the Recent Quizzes list below,
                                                                  // so they can never disagree with each other.
@@ -541,7 +577,7 @@ function HomeScreen({ user, onNav, quizAssignments = [], onResumeLesson, onStart
       getTenantCourses(tenantId),
       getTenantLessons(tenantId),
       getTenantAssignments(tenantId),
-      getLessonCompletions(user.id),
+      getLessonCompletionsWithDates(user.id),
       getUserQuizAttempts(tenantId, user.id), // needed to know which assigned quizzes are already passed
     ]).then(([{ data: c }, { data: l }, { data: a }, { data: done }, { data: attempts }]) => {
       if (c) setHomeCourses(c);
@@ -553,7 +589,7 @@ function HomeScreen({ user, onNav, quizAssignments = [], onResumeLesson, onStart
         // so the user still sees "NEW" badges on the next visit / login.
         updateLastSeenAssignmentsAt(user.id);
       }
-      if (done) setHomeCompleted(done);
+      if (done) setHomeCompletedAt(done);
       if (attempts) setHomeQuizAttempts(attempts); // already ordered newest-first by getUserQuizAttempts
       setHomeLoading(false);
     });
@@ -593,12 +629,27 @@ function HomeScreen({ user, onNav, quizAssignments = [], onResumeLesson, onStart
         if (!content) return null;
         let pct = 0, isComplete = false;
         if (isCourse) {
+          // Course — complete once EVERY lesson in the course has a completion
+          // recorded at or after THIS course assignment's assigned_at. Mirrors
+          // the quiz pattern below: an old completion from a previous course
+          // assignment must not resolve a brand-new reassignment. See
+          // _course_assignment_active_user_ids()
+          // (037_assignment_aware_lesson_course_eligibility.sql) for the
+          // server-side equivalent this display logic must agree with.
           const cls = (content.lessonIds ?? []).map(id => homeLessons.find(l => l.id === id)).filter(Boolean);
-          const done = cls.filter(l => homeCompleted.has(l.id)).length;
+          const done = cls.filter(l => {
+            const completedAt = homeCompletedAt.get(l.id);
+            return !!completedAt && (!a.assignedAtRaw || new Date(completedAt) >= new Date(a.assignedAtRaw));
+          }).length;
           pct = cls.length ? Math.round((done / cls.length) * 100) : 0;
           isComplete = cls.length > 0 && pct === 100;
         } else if (isLesson) {
-          isComplete = homeCompleted.has(content.id);
+          // Lesson — complete once there's a completion recorded at or after
+          // this assignment's assigned_at. Same reasoning as course/quiz: an
+          // old completion from a previous assignment must not resolve a
+          // brand-new reassignment. See _lesson_assignment_active_user_ids().
+          const completedAt = homeCompletedAt.get(content.id);
+          isComplete = !!completedAt && (!a.assignedAtRaw || new Date(completedAt) >= new Date(a.assignedAtRaw));
           pct = isComplete ? 100 : 0;
         } else {
           // Quiz — complete once there's a PASSED attempt *created at or after this
@@ -609,11 +660,24 @@ function HomeScreen({ user, onNav, quizAssignments = [], onResumeLesson, onStart
           // real, RLS-readable row — but this check would immediately mark that brand
           // new row `isComplete: true` off the stale old pass and drop it straight out
           // of pendingAssignments, so the "successful" reassignment never appeared
-          // under Assigned Learning. Falls back to "any pass" only if assignedAtRaw is
-          // somehow missing (assigned_at is NOT NULL in the schema, so this is
-          // defensive, not an expected path).
-          isComplete = homeQuizAttempts.some(at => at.quiz_id === content.id && at.passed &&
-            (!a.assignedAtRaw || !at.created_at || new Date(at.created_at) >= new Date(a.assignedAtRaw)));
+          // under Assigned Learning.
+          //
+          // If assignedAtRaw can't be reliably resolved (missing, null, or malformed),
+          // resolveQuizAssignmentInstantMs() returns null and the assignment is treated
+          // as UNRESOLVED — it stays visible in Assigned Learning rather than falling
+          // back to "any historical pass counts". A false negative here (a genuinely
+          // resolved quiz staying visible a little longer than strictly necessary) is
+          // far less harmful than a false positive (a brand-new reassignment silently
+          // vanishing because of a stale pass) — see resolveQuizAssignmentInstantMs().
+          // Same reasoning requires the attempt's own created_at to be present and
+          // parseable too — an attempt with no reliable timestamp can't prove it
+          // happened after the assignment, so it doesn't count either.
+          const assignedAtMs = resolveQuizAssignmentInstantMs(a);
+          isComplete = assignedAtMs != null && homeQuizAttempts.some(at => {
+            if (at.quiz_id !== content.id || !at.passed || !at.created_at) return false;
+            const attemptMs = new Date(at.created_at).getTime();
+            return !Number.isNaN(attemptMs) && attemptMs >= assignedAtMs;
+          });
           pct = isComplete ? 100 : 0;
         }
         const dueStatus = (a.dueAt && a.dueAt !== "Open") ? getDueStatus(a.dueAt) : null;
@@ -6176,6 +6240,12 @@ function LearnScreen({ role, user, orgUsers = [], orgs = [], onNav, onAwardXp, p
       return saved ? new Set(JSON.parse(saved)) : new Set();
     } catch { return new Set(); }
   });
+  // lesson_id → completed_at (ISO), used only for assignment-instance-aware
+  // Due/Complete classification in the ASSIGNED tab below — every other use of
+  // `completedLessons` above (lesson viewer checkmarks, "next up" lesson,
+  // course browse progress, XP tally) is intentionally left as plain
+  // ever-completed membership, since assignment timing doesn't apply there.
+  const [completedLessonsAt, setCompletedLessonsAt] = useState(new Map());
   const [userTab,    setUserTab]    = useState("assigned");
   const [learnFilter, setLearnFilter] = useState("due"); // "due" | "complete" | "all"
   const [search,     setSearch]     = useState("");
@@ -6221,10 +6291,15 @@ function LearnScreen({ role, user, orgUsers = [], orgs = [], onNav, onAwardXp, p
       // Replace entirely — do not merge with any prior localStorage state.
       setCompletedLessons(new Set(dbCompleted));
     });
+    getLessonCompletionsWithDates(user.id).then(({ data: dbCompletedAt }) => {
+      if (!dbCompletedAt) return;
+      setCompletedLessonsAt(dbCompletedAt);
+    });
   }, [user?.id, isReal]); // eslint-disable-line react-hooks/exhaustive-deps
 
   const handleCompleteLesson = (id) => {
     if (completedLessons.has(id)) return;
+    const completedAtNow = new Date().toISOString();
     setCompletedLessons(prev => {
       const next = new Set([...prev, id]);
       // Real users: Supabase is source of truth — skip localStorage to avoid stale data accumulation.
@@ -6233,6 +6308,10 @@ function LearnScreen({ role, user, orgUsers = [], orgs = [], onNav, onAwardXp, p
       }
       return next;
     });
+    // Keep the timestamped map in sync so the ASSIGNED tab reclassifies this
+    // lesson as complete immediately, without waiting for a refetch — same
+    // immediacy the plain completedLessons Set already gets above.
+    setCompletedLessonsAt(prev => new Map(prev).set(id, completedAtNow));
     const lessonXp = lessons.find(l => l.id === id)?.xp ?? 0;
     if (lessonXp) onAwardXp?.(lessonXp);
     // Persist to Supabase for real users (fire-and-forget)
@@ -6586,15 +6665,29 @@ function LearnScreen({ role, user, orgUsers = [], orgs = [], onNav, onAwardXp, p
 
           // ── Enrich each assignment with completion + availability ──────────────
           const todayMsForFilter = new Date().setHours(0, 0, 0, 0);
+          // Assignment-instance-aware: only a completion recorded at/after THIS
+          // assignment's assigned_at counts toward resolving it. An old
+          // completion from a previous assignment must not resolve a brand-new
+          // reassignment — mirrors _lesson_assignment_active_user_ids() /
+          // _course_assignment_active_user_ids()
+          // (037_assignment_aware_lesson_course_eligibility.sql), which is what
+          // create_assignments_atomic() actually enforces server-side. Scoped to
+          // this ASSIGNED tab only — the plain `completedLessons` Set above is
+          // still used everywhere else in LearnScreen (lesson viewer, "next up",
+          // course browsing progress) where assignment timing doesn't apply.
+          const isQualifyingCompletion = (lessonId, assignedAtRaw) => {
+            const completedAt = completedLessonsAt.get(lessonId);
+            return !!completedAt && (!assignedAtRaw || new Date(completedAt) >= new Date(assignedAtRaw));
+          };
           const enrichedAssigned = dedupedAssignments.map(a => {
             const isCourse = a.contentType === "course";
             const content  = isCourse ? courses.find(c => c.id === a.contentId) : lessons.find(l => l.id === a.contentId);
             if (!content) return null;
             const courseLessons = isCourse ? content.lessonIds.map(id => lessons.find(l => l.id === id)).filter(Boolean) : [];
-            const doneCount = isCourse ? courseLessons.filter(l => completedLessons.has(l.id)).length : 0;
+            const doneCount = isCourse ? courseLessons.filter(l => isQualifyingCompletion(l.id, a.assignedAtRaw)).length : 0;
             const pct = isCourse
               ? Math.round((doneCount / Math.max(courseLessons.length, 1)) * 100)
-              : (completedLessons.has(content.id) ? 100 : 0);
+              : (isQualifyingCompletion(content.id, a.assignedAtRaw) ? 100 : 0);
             const isComplete = pct === 100;
             // Availability: does the user have at least one lesson they can act on now?
             // Locked-only courses are excluded from Due but still shown in All.
@@ -6609,7 +6702,7 @@ function LearnScreen({ role, user, orgUsers = [], orgs = [], onNav, onAwardXp, p
                 const base = new Date(assignedDate); base.setHours(0, 0, 0, 0);
                 return todayMsForFilter < base.getTime() + days * 86400000;
               };
-              isAvailable = courseLessons.some(l => !completedLessons.has(l.id) && !isLockedForFilter(l.id));
+              isAvailable = courseLessons.some(l => !isQualifyingCompletion(l.id, a.assignedAtRaw) && !isLockedForFilter(l.id));
             }
             return { a, content, isCourse, courseLessons, doneCount, pct, isComplete, isAvailable };
           }).filter(Boolean);
@@ -6676,7 +6769,7 @@ function LearnScreen({ role, user, orgUsers = [], orgs = [], onNav, onAwardXp, p
                             const base = new Date(assignedDate); base.setHours(0, 0, 0, 0);
                             return todayMs < base.getTime() + days * 86400000;
                           };
-                          const next = courseLessons.find(l => !completedLessons.has(l.id) && !isLockedLesson(l.id));
+                          const next = courseLessons.find(l => !isQualifyingCompletion(l.id, a.assignedAtRaw) && !isLockedLesson(l.id));
                           if (next) openLesson(next, content);
                           else setActiveCourse(content); // all next lessons are still locked — show course detail
                         }
@@ -6871,13 +6964,17 @@ function LearnScreen({ role, user, orgUsers = [], orgs = [], onNav, onAwardXp, p
     }
     if (!users.length) return true;
     if (a.contentType === "quiz") return true;
+    // Assignment-instance-aware, same rule as the per-rep status table above:
+    // a completion recorded before THIS assignment's assignedAt doesn't count
+    // toward resolving it (see 037_assignment_aware_lesson_course_eligibility.sql).
+    const isQualifyingComp = (comp) => !!comp?.completedAt && (!a.assignedAtRaw || new Date(comp.completedAt) >= new Date(a.assignedAtRaw));
     return users.some(u => {
       const comps = tenantCompletions.filter(c => c.profileId === u.id);
-      if (a.contentType === "lesson") return !comps.some(c => c.lessonId === a.contentId);
+      if (a.contentType === "lesson") return !isQualifyingComp(comps.find(c => c.lessonId === a.contentId));
       const course = courses.find(c => c.id === a.contentId);
       if (!course) return true;
       const cls = (course.lessonIds ?? []).map(id => lessons.find(l => l.id === id)).filter(Boolean);
-      return cls.some(l => !comps.some(c => c.lessonId === l.id));
+      return cls.some(l => !isQualifyingComp(comps.find(c => c.lessonId === l.id)));
     });
   }).length;
 
@@ -7069,12 +7166,20 @@ function LearnScreen({ role, user, orgUsers = [], orgs = [], onNav, onAwardXp, p
 
           return users.map(u => {
             const userComps = tenantCompletions.filter(c => c.profileId === u.id);
+            // Assignment-instance-aware: a completion recorded BEFORE this
+            // assignment's assignedAt belongs to a previous, already-resolved
+            // assignment and must not make a brand-new reassignment read as
+            // "Completed" to the manager. Mirrors
+            // _lesson_assignment_active_user_ids() /
+            // _course_assignment_active_user_ids()
+            // (037_assignment_aware_lesson_course_eligibility.sql).
+            const isQualifying = (comp) => !!comp?.completedAt && (!a.assignedAtRaw || new Date(comp.completedAt) >= new Date(a.assignedAtRaw));
             let progress = 0, completedAt = null, status = "not_started";
 
             if (!u._isAggregate) {
               if (isCourse) {
                 const cls = (content.lessonIds ?? []).map(id => lessons.find(l => l.id === id)).filter(Boolean);
-                const done = cls.filter(l => userComps.some(c => c.lessonId === l.id));
+                const done = cls.filter(l => isQualifying(userComps.find(c => c.lessonId === l.id)));
                 progress = cls.length ? Math.round((done.length / cls.length) * 100) : 0;
                 if (progress === 100) {
                   status = "completed";
@@ -7084,7 +7189,7 @@ function LearnScreen({ role, user, orgUsers = [], orgs = [], onNav, onAwardXp, p
               } else if (!isQuiz) {
                 // Lesson
                 const comp = userComps.find(c => c.lessonId === a.contentId);
-                if (comp) { progress = 100; status = "completed"; completedAt = comp.completedAt; }
+                if (isQualifying(comp)) { progress = 100; status = "completed"; completedAt = comp.completedAt; }
               }
               // Quiz: no completion table yet — shows as not_started (overdue check still applies)
               if (status !== "completed" && a.dueAt && a.dueAt !== "Open") {
@@ -12139,7 +12244,7 @@ function RepDrillDownModal({ rep, tenantId, onClose, isReal = false }) {
       // Fix 8: fetch assignments + completions for this rep
       supabase
         .from("tenant_assignments")
-        .select("id, content_type, content_id, assigned_to, due_at, required")
+        .select("id, content_type, content_id, assigned_to, assigned_at, due_at, required")
         .eq("tenant_id", tenantId),
       supabase
         .from("lesson_completions")
@@ -12167,7 +12272,15 @@ function RepDrillDownModal({ rep, tenantId, onClose, isReal = false }) {
       (courses ?? []).forEach(c => { courseNames[c.id] = c.name; });
       const lessonNames = {};
       (lessons ?? []).forEach(l => { lessonNames[l.id] = l.name; });
-      const completedLessons = new Set((completions ?? []).map(c => c.lesson_id));
+      // lesson_id → completed_at, not just a membership Set — a completion
+      // recorded before THIS assignment's assigned_at must not show it as
+      // "Complete" (same assignment-instance-aware rule as
+      // _lesson_assignment_active_user_ids(),
+      // 037_assignment_aware_lesson_course_eligibility.sql). An old
+      // completion from a previous, already-resolved assignment would
+      // otherwise make a brand-new reassignment look done to the manager
+      // the moment it's created.
+      const completedAtByLesson = new Map((completions ?? []).map(c => [c.lesson_id, c.completed_at]));
       const passedQuizzes   = new Set((attempts  ?? []).filter(a => a.passed).map(a => a.quiz_id));
 
       const enriched = repAssignments.map(a => {
@@ -12175,9 +12288,11 @@ function RepDrillDownModal({ rep, tenantId, onClose, isReal = false }) {
           a.content_type === "course" ? (courseNames[a.content_id] || "Course") :
           a.content_type === "lesson" ? (lessonNames[a.content_id] || "Lesson") :
           a.content_type === "quiz"   ? (names[a.content_id]       || "Quiz")   : "Content";
+        const lessonCompletedAt = a.content_type === "lesson" ? completedAtByLesson.get(a.content_id) : null;
+        const lessonResolved = !!lessonCompletedAt && (!a.assigned_at || new Date(lessonCompletedAt) >= new Date(a.assigned_at));
         const status =
-          a.content_type === "quiz"   ? (passedQuizzes.has(a.content_id)    ? "Passed"   : "Pending") :
-          a.content_type === "lesson" ? (completedLessons.has(a.content_id) ? "Complete" : "Pending") :
+          a.content_type === "quiz"   ? (passedQuizzes.has(a.content_id) ? "Passed"   : "Pending") :
+          a.content_type === "lesson" ? (lessonResolved                  ? "Complete" : "Pending") :
           "Assigned";
         return { ...a, title, status };
       });

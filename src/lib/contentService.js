@@ -460,22 +460,18 @@ async function resolveTargetCandidates(tenantId, assignedTo) {
 }
 
 /**
- * Which candidate users have already resolved this piece of content —
- * i.e. no longer have an assignment "awaiting completion" — and therefore
- * remain eligible for reassignment.
+ * Which candidate users have EVER resolved this piece of content, at any
+ * point in time — content-level, with no reference to which assignment
+ * instance is being evaluated. Mirrors _content_completed_user_ids() in SQL.
  *
- * Quiz: ANY recorded attempt (passed or failed), not just passed = true.
- * quiz_attempts rows are only written on full submission (QuizTakingView's
- * onComplete → saveQuizAttempt) — there's no partial/in-progress attempt row
- * and no attempt-count cap in the schema, so "has an attempt" already means
- * "no longer assigned/open/in-progress" for a quiz. Previously this only
- * counted passed = true, which left every failed user permanently blocked
- * from reassignment (see migration 035's header for the full story) — fixed
- * here and in the SQL mirror, _content_completed_user_ids()
- * (034_atomic_assignment_engine.sql, replaced by 035), which is what
- * create_assignments_atomic() actually enforces. This JS function isn't on
- * that live enforcement path today (see getActiveAssignmentsByUser's docstring)
- * but is kept in sync so it never silently diverges from the RPC.
+ * Not used for assignment eligibility by any content type anymore — quiz
+ * (migration 036), lesson, and course (migration 037) all use their
+ * assignment-instance-aware counterpart instead (getQuizAssignmentActiveUserIds
+ * / getLessonAssignmentActiveUserIds / getCourseAssignmentActiveUserIds),
+ * because "completed ever" incorrectly treats a stale, pre-reassignment
+ * completion as resolving a brand-new assignment. Kept as a correct,
+ * tenant-safe read-only utility for "has this user ever finished X at all"
+ * style reporting, where assignment timing genuinely doesn't matter.
  * @returns {Promise<Set<string>>} profile IDs
  */
 async function getCompletedUserIds(tenantId, contentType, contentId) {
@@ -583,15 +579,117 @@ async function getQuizAssignmentActiveUserIds(tenantId, contentId) {
 }
 
 /**
+ * Assignment-instance-aware version of "who currently blocks a new lesson
+ * assignment" — mirrors _lesson_assignment_active_user_ids() in
+ * 037_assignment_aware_lesson_course_eligibility.sql exactly, field for
+ * field, so this JS path and the live RPC enforcement never silently
+ * diverge. Lesson counterpart to getQuizAssignmentActiveUserIds() above —
+ * see that function's docstring for the full "why" (same bug, same fix
+ * shape, just lesson_completions.completed_at in place of
+ * quiz_attempts.created_at).
+ * @returns {Promise<Set<string>>} profile IDs still active (unresolved) for this lesson
+ */
+async function getLessonAssignmentActiveUserIds(tenantId, contentId) {
+  const { data: rows } = await supabase
+    .from("tenant_assignments")
+    .select("assigned_to, assigned_at")
+    .eq("tenant_id", tenantId)
+    .eq("content_type", "lesson")
+    .eq("content_id", contentId);
+
+  const latestAssignedAtByUser = new Map();
+  for (const row of rows ?? []) {
+    const candidates = await resolveTargetCandidates(tenantId, row.assigned_to);
+    for (const c of candidates) {
+      const prev = latestAssignedAtByUser.get(c.userId);
+      if (!prev || new Date(row.assigned_at) > new Date(prev)) latestAssignedAtByUser.set(c.userId, row.assigned_at);
+    }
+  }
+  if (latestAssignedAtByUser.size === 0) return new Set();
+
+  const { data: completions } = await supabase
+    .from("lesson_completions")
+    .select("profile_id, completed_at")
+    .eq("tenant_id", tenantId)
+    .eq("lesson_id", contentId)
+    .in("profile_id", [...latestAssignedAtByUser.keys()]);
+
+  const active = new Set();
+  for (const [userId, latestAssignedAt] of latestAssignedAtByUser) {
+    const resolved = (completions ?? []).some(c => c.profile_id === userId && new Date(c.completed_at) >= new Date(latestAssignedAt));
+    if (!resolved) active.add(userId);
+  }
+  return active;
+}
+
+/**
+ * Assignment-instance-aware version of "who currently blocks a new course
+ * assignment" — mirrors _course_assignment_active_user_ids() in
+ * 037_assignment_aware_lesson_course_eligibility.sql exactly. A user is
+ * still active unless EVERY one of the course's lessons has a completion
+ * dated at/after their most recent course assignment's assigned_at — an old
+ * completion from before that assignment does not count toward resolving it.
+ * @returns {Promise<Set<string>>} profile IDs still active (unresolved) for this course
+ */
+async function getCourseAssignmentActiveUserIds(tenantId, contentId) {
+  const { data: course } = await supabase
+    .from("tenant_courses")
+    .select("lesson_ids")
+    .eq("id", contentId)
+    .eq("tenant_id", tenantId)
+    .maybeSingle();
+  const lessonIds = course?.lesson_ids ?? [];
+  if (lessonIds.length === 0) return new Set(); // missing/cross-tenant/empty course — nobody is "active"
+
+  const { data: rows } = await supabase
+    .from("tenant_assignments")
+    .select("assigned_to, assigned_at")
+    .eq("tenant_id", tenantId)
+    .eq("content_type", "course")
+    .eq("content_id", contentId);
+
+  const latestAssignedAtByUser = new Map();
+  for (const row of rows ?? []) {
+    const candidates = await resolveTargetCandidates(tenantId, row.assigned_to);
+    for (const c of candidates) {
+      const prev = latestAssignedAtByUser.get(c.userId);
+      if (!prev || new Date(row.assigned_at) > new Date(prev)) latestAssignedAtByUser.set(c.userId, row.assigned_at);
+    }
+  }
+  if (latestAssignedAtByUser.size === 0) return new Set();
+
+  const { data: completions } = await supabase
+    .from("lesson_completions")
+    .select("profile_id, lesson_id, completed_at")
+    .eq("tenant_id", tenantId)
+    .in("lesson_id", lessonIds)
+    .in("profile_id", [...latestAssignedAtByUser.keys()]);
+
+  const active = new Set();
+  for (const [userId, latestAssignedAt] of latestAssignedAtByUser) {
+    const qualifyingLessons = new Set(
+      (completions ?? [])
+        .filter(c => c.profile_id === userId && new Date(c.completed_at) >= new Date(latestAssignedAt))
+        .map(c => c.lesson_id)
+    );
+    const resolved = qualifyingLessons.size >= lessonIds.length;
+    if (!resolved) active.add(userId);
+  }
+  return active;
+}
+
+/**
  * Which candidate users currently hold an ACTIVE assignment (assigned /
  * in_progress / overdue) for this content. Covers both new-style per-user
  * rows and legacy team/group aggregate rows, so duplicate prevention is
  * correct regardless of when the existing assignment was created.
  *
- * Quiz content uses getQuizAssignmentActiveUserIds() (assignment-instance-
- * aware); lesson/course content uses getCompletedUserIds() (content-level —
- * unchanged, since lesson_completions carries no timestamp to compare
- * against an assignment's assigned_at today).
+ * All three content types are assignment-instance-aware: quiz via
+ * getQuizAssignmentActiveUserIds(), lesson via
+ * getLessonAssignmentActiveUserIds(), course via
+ * getCourseAssignmentActiveUserIds(). An old completion from before the
+ * user's current assignment never resolves it, matching the equivalent SQL
+ * enforced by create_assignments_atomic().
  *
  * NOT used by createAssignments() anymore — a read-then-act check here is
  * inherently racy under concurrent calls (see 034_atomic_assignment_engine.sql).
@@ -609,15 +707,16 @@ async function getActiveAssignmentsByUser(tenantId, contentType, contentId) {
     .eq("content_type", contentType)
     .eq("content_id", contentId);
 
-  const activeQuizIds = contentType === "quiz" ? await getQuizAssignmentActiveUserIds(tenantId, contentId) : null;
-  const completed = contentType === "quiz" ? null : await getCompletedUserIds(tenantId, contentType, contentId);
+  const activeIds =
+    contentType === "quiz"   ? await getQuizAssignmentActiveUserIds(tenantId, contentId)
+  : contentType === "lesson" ? await getLessonAssignmentActiveUserIds(tenantId, contentId)
+  :                             await getCourseAssignmentActiveUserIds(tenantId, contentId);
   const activeByUser = new Map();
 
   for (const row of rows ?? []) {
     const candidates = await resolveTargetCandidates(tenantId, row.assigned_to);
     for (const c of candidates) {
-      const isActive = contentType === "quiz" ? activeQuizIds.has(c.userId) : !completed.has(c.userId);
-      if (!isActive) continue; // resolved — doesn't block reassignment
+      if (!activeIds.has(c.userId)) continue; // resolved — doesn't block reassignment
       if (!activeByUser.has(c.userId)) {
         activeByUser.set(c.userId, { assignmentId: row.id, dueAt: row.due_at, required: row.required });
       }
@@ -869,7 +968,18 @@ export async function getLessonCompletions(profileId) {
 
 /**
  * Mark a lesson as complete for the current user.
- * Uses upsert — safe to call multiple times.
+ * Uses upsert — safe to call multiple times. completed_at is set explicitly
+ * on every call (not left to the column default) because Supabase's upsert
+ * only issues `DO UPDATE SET <columns in the payload>` — omitting completed_at
+ * meant a RE-completion (e.g. after being reassigned the lesson) silently kept
+ * the original completed_at from the user's very first completion, since
+ * (profile_id, lesson_id) is UNIQUE and the row is updated in place, not
+ * inserted again. That stale timestamp would then always read as "before" any
+ * later reassignment's assigned_at, permanently hiding the new assignment as
+ * unresolved even after the user genuinely redid it. See
+ * _lesson_assignment_active_user_ids() (037_assignment_aware_lesson_course_eligibility.sql)
+ * and getLessonAssignmentActiveUserIds() below, which both depend on
+ * completed_at accurately reflecting the MOST RECENT completion.
  * @param {string} profileId
  * @param {string} lessonId
  * @param {string} [tenantId]
@@ -879,10 +989,30 @@ export async function markLessonComplete(profileId, lessonId, tenantId = null) {
   const { error } = await supabase
     .from("lesson_completions")
     .upsert(
-      { profile_id: profileId, lesson_id: lessonId, tenant_id: tenantId },
+      { profile_id: profileId, lesson_id: lessonId, tenant_id: tenantId, completed_at: new Date().toISOString() },
       { onConflict: "profile_id,lesson_id" }
     );
   return { error };
+}
+
+/**
+ * Fetch lesson completions for a single user, WITH timestamps — used wherever
+ * completion needs to be compared against a specific assignment's assigned_at
+ * (assignment-instance-aware eligibility/display). For plain "has this lesson
+ * ever been completed" membership checks with no timing concern, use the
+ * simpler getLessonCompletions() above instead.
+ * @param {string} profileId
+ * @returns {Promise<{ data: Map<string, string>|null, error: Object|null }>} lesson_id → completed_at (ISO string)
+ */
+export async function getLessonCompletionsWithDates(profileId) {
+  const { data, error } = await supabase
+    .from("lesson_completions")
+    .select("lesson_id, completed_at")
+    .eq("profile_id", profileId);
+  return {
+    data: data ? new Map(data.map(r => [r.lesson_id, r.completed_at])) : null,
+    error,
+  };
 }
 
 
