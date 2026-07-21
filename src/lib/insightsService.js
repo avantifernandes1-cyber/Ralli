@@ -191,7 +191,20 @@ export async function getUserPerformance(tenantId, userId, { windowDays = 30 } =
  */
 export async function computeAndSaveReadinessScore(tenantId, userId, opts = {}) {
   const { data: perf, error: perfError } = await getUserPerformance(tenantId, userId, opts);
-  if (perfError || !perf) return { data: null, error: perfError };
+  if (perfError || !perf) {
+    // Blocking Fix 2 — this function resolves { data, error } instead of
+    // rejecting (by design — see computeAndSaveReadinessScore's callers,
+    // which expect a result object, not a throw). That means a caller using
+    // only `.catch()` (triggerReadinessUpdate, below) never sees this
+    // failure. Root cause of readiness_scores staying empty for weeks
+    // despite real quiz/lesson activity: the upsert below was failing with
+    // Postgres 42P10 (missing UNIQUE(tenant_id,user_id) constraint — fixed
+    // in migration 024/readiness_scores_upsert_constraint) on every single
+    // call, completely silently. Logging directly here means a future
+    // regression is loud regardless of how the caller handles the result.
+    console.error("[ralli] computeAndSaveReadinessScore: getUserPerformance failed", { tenantId, userId, perfError });
+    return { data: null, error: perfError };
+  }
 
   const { error: upsertError } = await supabase.from("readiness_scores").upsert({
     tenant_id:         tenantId,
@@ -208,6 +221,12 @@ export async function computeAndSaveReadinessScore(tenantId, userId, opts = {}) 
     window_days:       opts.windowDays ?? 30,
     computed_at:       new Date().toISOString(),
   }, { onConflict: "tenant_id,user_id" });
+
+  if (upsertError) {
+    // Blocking Fix 2 — same rationale as above: log unconditionally here,
+    // don't rely on every call site's error handling to notice.
+    console.error("[ralli] computeAndSaveReadinessScore: readiness_scores upsert failed", { tenantId, userId, upsertError });
+  }
 
   return { data: perf, error: upsertError };
 }
