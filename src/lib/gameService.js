@@ -24,11 +24,19 @@ import { supabase } from "./supabase.js";
  * Create a new game session in the database.
  * Called in handleCreateSession immediately after the host clicks "Create Session".
  *
- * @param {{ pin: string, name: string, quizId: string, questionCount: number, demoMode: boolean, tenantId?: string|null, hostId?: string }} params
+ * Routes through the create_game_session_atomic RPC (migration 046) instead
+ * of a raw insert: the RPC generates the 6-digit code server-side and
+ * retries on a same-tenant collision, so code allocation is atomic and never
+ * races on the client. It also re-derives the caller's real tenant_id from
+ * their Supabase session when authenticated — the `tenantId` passed here is
+ * only actually used as a fallback for the anon/demo-mode path, where there
+ * is no stronger signal available. The `pin` param is intentionally no
+ * longer accepted — the caller doesn't get to choose the code.
+ *
+ * @param {{ name: string, quizId: string, questionCount: number, demoMode: boolean, tenantId?: string|null, hostId?: string }} params
  * @returns {Promise<{ data: Object|null, error: Object|null }>}
  */
 export async function createGameSession({
-  pin,
   name,
   quizId,
   questionCount,
@@ -36,37 +44,39 @@ export async function createGameSession({
   tenantId = null,
   hostId = "anonymous",
 }) {
-  const { data, error } = await supabase
-    .from("game_sessions")
-    .insert({
-      pin,
-      name,
-      quiz_id:        quizId,
-      question_count: questionCount,
-      demo_mode:      demoMode,
-      tenant_id:      tenantId,
-      host_id:        hostId,
-      status:         "waiting",
-    })
-    .select()
-    .single();
+  const { data, error } = await supabase.rpc("create_game_session_atomic", {
+    p_tenant_id:      tenantId,
+    p_host_id:        hostId,
+    p_quiz_id:        quizId,
+    p_name:           name,
+    p_question_count: questionCount,
+    p_demo_mode:      demoMode,
+  });
   return { data, error };
 }
 
 /**
- * Find a game session by PIN.
- * Called in handleEnterPin for cross-device joins (player's device has no local sessions state).
+ * Find a game session to join, scoped to the caller's tenant + the entered
+ * code (migration 046's find_joinable_session RPC) — never a code-only
+ * lookup. A pin that belongs to a different tenant returns exactly the same
+ * "not found" shape as a pin that doesn't exist at all, so callers can never
+ * distinguish "wrong organization" from "doesn't exist" (no existence leak).
+ * `tenantId` is only actually used for the anon/demo-mode path — an
+ * authenticated caller's real tenant (from their Supabase session) always
+ * wins server-side.
  *
+ * @param {string|null} tenantId - the current user's tenant/org id, or null for anon/demo
  * @param {string} pin
  * @returns {Promise<{ data: Object|null, error: Object|null }>}
  */
-export async function findSessionByPin(pin) {
-  const { data, error } = await supabase
-    .from("game_sessions")
-    .select("*")
-    .eq("pin", pin)
-    .single();
-  return { data, error };
+export async function findJoinableSession(tenantId, pin) {
+  const { data, error } = await supabase.rpc("find_joinable_session", {
+    p_tenant_id: tenantId,
+    p_pin:       pin,
+  });
+  // A no-match call returns a null composite, not an error — normalize to
+  // `data: null` either way so callers have one shape to check.
+  return { data: data?.id ? data : null, error };
 }
 
 /**
@@ -76,16 +86,19 @@ export async function findSessionByPin(pin) {
  * @param {string} pin
  * @returns {Promise<{ data: Object|null, error: Object|null }>}
  */
-export async function startGameSession(pin) {
-  const { data, error } = await supabase
+export async function startGameSession(pin, tenantId = null) {
+  // Scoped by tenant_id whenever the caller has one — see endGameSession's
+  // comment above for why pin alone is no longer a safe match (migration
+  // 046: pins are only unique within a tenant).
+  let query = supabase
     .from("game_sessions")
     .update({
       status:     "started",
       started_at: new Date().toISOString(),
     })
-    .eq("pin", pin)
-    .select()
-    .single();
+    .eq("pin", pin);
+  if (tenantId) query = query.eq("tenant_id", tenantId);
+  const { data, error } = await query.select().single();
   return { data, error };
 }
 
@@ -99,16 +112,19 @@ export async function startGameSession(pin) {
  * @returns {Promise<{ data: Object|null, error: Object|null }>}
  */
 export async function endGameSession(pin, { scores = [], tenantId = null } = {}) {
-  // 1. Update session status
-  const { data: session, error: sessionError } = await supabase
+  // 1. Update session status. Scoped by tenant_id whenever the caller has
+  // one, not just pin — pins are only unique WITHIN a tenant (migration
+  // 046), so a code-only match here could otherwise end a different
+  // tenant's session that happens to share the same visible pin.
+  let query = supabase
     .from("game_sessions")
     .update({
       status:   "completed",
       ended_at: new Date().toISOString(),
     })
-    .eq("pin", pin)
-    .select()
-    .single();
+    .eq("pin", pin);
+  if (tenantId) query = query.eq("tenant_id", tenantId);
+  const { data: session, error: sessionError } = await query.select().single();
 
   if (sessionError) {
     console.error("[gameService] endGameSession: failed to update session", sessionError);

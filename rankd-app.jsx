@@ -17,7 +17,7 @@ import {
 import { supabase } from "./src/lib/supabase.js";
 import {
   createGameSession,
-  findSessionByPin,
+  findJoinableSession,
   startGameSession,
   endGameSession,
   getActiveSessions,
@@ -21378,9 +21378,19 @@ export default function App() {
     return () => clearInterval(interval);
   }, [screen, currentUser?.id]); // eslint-disable-line react-hooks/exhaustive-deps
 
-  // BroadcastChannel — only active when a game is running
+  // BroadcastChannel — only active when a game is running.
+  // Keyed on the session's DB id, not the bare pin: pins are now only
+  // unique WITHIN a tenant (migration 046 — tenant-scoped game codes), so
+  // two different tenants' games can legitimately share the same visible
+  // pin. Keying the realtime channel on the pin would put both tenants'
+  // presence/broadcasts (answers, reveals, scores) on the SAME Supabase
+  // Realtime channel — a live cross-tenant leak, not just a lookup one.
+  // sessionDbId is a real UUID with no such collision risk. Falls back to
+  // the pin only if no DB row exists yet (e.g. a pure demo-mode session).
   const isInGame = ["rankd-lobby", "rankd-game"].includes(screen);
-  const { chPlayers, chAnswers, setChAnswers, chMsg, broadcast } = useGameChannel(isInGame ? lobbyPin : null, gameRole);
+  const lobbySessionDbId = sessions.find(s => s.code === lobbyPin)?.dbId ?? null;
+  const gameChannelKey = isInGame ? (lobbySessionDbId ?? lobbyPin) : null;
+  const { chPlayers, chAnswers, setChAnswers, chMsg, broadcast } = useGameChannel(gameChannelKey, gameRole);
 
   // Recovery mode takes priority over normal routing — show the reset form regardless
   // of whether a session exists. This prevents the app from routing past the form if
@@ -21893,10 +21903,15 @@ export default function App() {
   };
 
   const handleCreateSession = async (session) => {
-    // Persist to Supabase first — enables cross-device joins by PIN
+    // Persist to Supabase first — enables cross-device joins by PIN.
+    // The 6-digit code is no longer chosen client-side (session.code is
+    // ignored): create_game_session_atomic (migration 046) generates and
+    // reserves it server-side, scoped + unique within the host's tenant, and
+    // retries automatically on a same-tenant collision. Two different
+    // tenants can legitimately end up with the same visible code now — that
+    // is no longer a bug, it's the point.
     const tenantId = currentOrg?.id ?? user?.orgId ?? null;
     const { data, error } = await createGameSession({
-      pin:           session.code,
       name:          session.name,
       quizId:        session.quizId,
       questionCount: session.questionCount,
@@ -21904,16 +21919,19 @@ export default function App() {
       tenantId,
       hostId:        user?.id ?? "anonymous",
     });
-    if (error) {
-      console.error("[ralli:game] createGameSession FAILED — RLS or network issue:", error);
+    if (error || !data?.pin) {
+      console.error("[ralli:game] createGameSession FAILED:", error);
+      toast.error("Couldn't create the game session. Please try again.");
+      return;
     }
-    // Keep local state (screens still read from sessions array)
-    const newSession = { ...session, dbId: data?.id };
+    // Keep local state (screens still read from sessions array) — code comes
+    // from the DB response, not from the caller.
+    const newSession = { ...session, code: data.pin, dbId: data.id };
     setSessions(prev => [newSession, ...prev]);
     // Route directly to the lobby so host doesn't have to click Launch again
     const quiz = quizzes.find(q => q.id === session.quizId);
     setGameQuestions(quiz?.questions ?? GAME_QUESTIONS);
-    setLobbyPin(session.code);
+    setLobbyPin(data.pin);
     setLobbySessionName(session.name);
     setScreen("rankd-lobby");
   };
@@ -21926,14 +21944,17 @@ export default function App() {
     let quizId      = session?.quizId;
 
     if (!session) {
-      // Player is on a different device — fetch session metadata from Supabase
-      const { data: remote, error: pinErr } = await findSessionByPin(pin);
+      // Player is on a different device — resolve via the tenant-scoped
+      // find_joinable_session RPC (migration 046). Never a code-only lookup:
+      // the query is always scoped to (the caller's tenant, the entered
+      // pin). A pin belonging to a different tenant and a pin that doesn't
+      // exist at all now come back through the exact same "not found"
+      // branch below — that's intentional, not a gap: this app can no
+      // longer distinguish "wrong organization" from "doesn't exist",
+      // which is what prevents leaking whether a code exists elsewhere.
+      const tenantId = currentUser?.orgId ?? null;
+      const { data: remote, error: pinErr } = await findJoinableSession(tenantId, pin);
       if (remote) {
-        // Cross-tenant protection: real users can only join their own org's sessions
-        if (currentUser?._isReal && remote.tenant_id && remote.tenant_id !== currentUser.orgId) {
-          console.warn("[ralli:game] handleEnterPin: cross-tenant join BLOCKED — session.tenantId:", remote.tenant_id, "user.orgId:", currentUser.orgId);
-          return "This game belongs to a different organization.";
-        }
         // Only allow joining sessions that are actively waiting for players
         if (remote.status && remote.status !== "waiting") {
           console.warn("[ralli:game] handleEnterPin: session not accepting players, status:", remote.status);
@@ -21956,11 +21977,10 @@ export default function App() {
         sessionName = remote.name;
         quizId      = remote.quiz_id;
       } else if (pinErr) {
-        console.error("[ralli:game] findSessionByPin FAILED — likely RLS blocking authenticated read:", pinErr);
+        console.error("[ralli:game] findJoinableSession FAILED:", pinErr);
         return "Couldn't verify that PIN. Check your connection and try again.";
       } else {
-        console.warn("[ralli:game] findSessionByPin: no session found for PIN", pin, "— check if session was created in DB");
-        return "No active game found for that PIN.";
+        return "Game not found or no longer available.";
       }
     }
 
@@ -22069,7 +22089,7 @@ export default function App() {
       broadcast({ type: GM.GAME_START, questions: qs, totalQ: qs.length });
     }
     // Persist status update to Supabase (fire-and-forget)
-    startGameSession(lobbyPin).catch(e => console.error("[ralli] startGameSession failed:", e));
+    startGameSession(lobbyPin, currentOrg?.id ?? user?.orgId ?? null).catch(e => console.error("[ralli] startGameSession failed:", e));
     setScreen("rankd-game");
   };
 
