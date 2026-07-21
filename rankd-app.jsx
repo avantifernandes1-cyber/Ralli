@@ -6476,9 +6476,20 @@ function LearnScreen({ role, user, orgUsers = [], orgs = [], onNav, onAwardXp, p
                   (a.assignedTo.type === "team"       && userTeamId && a.assignedTo.teamId === userTeamId)
                 )
               );
+              // Task 16 — course completion/XP is a FORMAL event and must
+              // only fire for an actual course assignment. A user who freely
+              // browses into a course and completes every lesson on their
+              // own still keeps full lesson XP and lesson-completion history
+              // (both persisted above, unaffected) — they just don't trigger
+              // a course-completion XP event or a readiness recalculation
+              // for a course nobody assigned them. If this course is later
+              // actually assigned, resolution still goes through the
+              // instance-aware shared engine (assignmentEngine.js), which is
+              // untouched by this gate.
+              if (!courseAssignment) return;
               // Award course XP, then trigger a second readiness update so the
               // final score includes both lesson and course XP.
-              awardCoursePoints(tid, uid, course.id, { dueAt: courseAssignment?.dueAt })
+              awardCoursePoints(tid, uid, course.id, { dueAt: courseAssignment.dueAt })
                 .then(() => triggerReadinessUpdate(tid, uid))
                 .catch(e => console.error("[ralli] awardCoursePoints failed:", e));
             });
@@ -6668,6 +6679,16 @@ function LearnScreen({ role, user, orgUsers = [], orgs = [], onNav, onAwardXp, p
         const availMs = base.getTime() + days * 86400000;
         return { locked: todayMs < availMs, availableDate: new Date(availMs) };
       };
+      // Task 16 — this pct/isComplete is ORGANIC browse progress (lessons
+      // done ÷ lessons total), shown for any course a user opens whether or
+      // not `courseAssignment` above resolved to a real row. That's
+      // intentional — free browsing/completing lessons always stays visible
+      // (Sprint 3 Task 16's explicit rule) — it is NOT the formal,
+      // XP-bearing course completion, which only fires from
+      // handleCompleteLesson's cascade when a real course assignment exists.
+      // Assigned-course status elsewhere (Home, manager tracking) is always
+      // computed separately via the shared engine (resolveAssignmentStatus),
+      // never from this local pct.
       const pct = Math.round((doneCount / Math.max(cls.length, 1)) * 100);
       const totalXp = cls.reduce((s, l) => s + (l.xp || 0), 0);
       const bonusXp = Math.round(totalXp * 0.2);
