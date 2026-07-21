@@ -11182,7 +11182,12 @@ function QuizTrackingPanel({ quizzes, orgUsers, tenantId, isReal, refreshKey, on
               const completedLabel = row.completedAt
                 ? (() => { try { return new Date(row.completedAt).toLocaleDateString("en-US", { month: "short", day: "numeric" }); } catch { return "—"; } })()
                 : "—";
-              const isClickable = row.status === "completed";
+              // Drilldown is available whenever a rep has at least one
+              // attempt on record — not gated to "completed" status, since a
+              // failed-but-attempted quiz is exactly where a manager most
+              // needs to see the question-by-question breakdown (Self-Paced
+              // Quiz audit: Manager Review — no ambiguity).
+              const isClickable = row.attemptCount > 0;
               return (
                 <div key={row.key} style={{ minWidth: 980, display: "grid", gridTemplateColumns: "1.8fr 1.2fr 0.75fr 0.75fr 0.85fr 0.8fr 1fr 0.6fr 0.85fr", gap: 10, padding: "13px 16px", background: C.white, borderTop: `1px solid ${C.border}`, alignItems: "center" }}>
                   <div style={{ minWidth: 0 }}>
