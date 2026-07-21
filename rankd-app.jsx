@@ -6236,6 +6236,7 @@ function LearnScreen({ role, user, orgUsers = [], orgs = [], onNav, onAwardXp, p
   const [tenantCompletions, setTenantCompletions] = useState([]); // manager/admin only
   const [tenantQuizAttempts, setTenantQuizAttempts] = useState([]); // manager/admin only — real quiz_attempts rows, powers Assignments tab quiz status
   const [selectedAssignmentId, setSelectedAssignmentId] = useState(null); // manager click-through
+  const [selectedRowKey, setSelectedRowKey] = useState(null); // manager per-rep drill-down (Task 11)
   const [assignTimeframe,  setAssignTimeframe]  = useState("all"); // "all" | "week" | "month" | "custom"
   const [assignDateRange,  setAssignDateRange]  = useState({ start: "", end: "" }); // ISO date strings for custom range
 
@@ -7190,6 +7191,10 @@ function LearnScreen({ role, user, orgUsers = [], orgs = [], onNav, onAwardXp, p
           return users.map(u => {
             const userComps = tenantCompletions.filter(c => c.profileId === u.id);
             let progress = 0, completedAt = null, status = "not_started";
+            // Extra, content-type-specific data carried alongside the row for
+            // the drill-down view only (Task 11) — never re-derives status;
+            // that stays exclusively the engine's job.
+            let courseLessons = [], completedAtByLesson = null, userAttempts = [];
 
             // Resolution now comes from the shared Resolved Assignment engine
             // (src/lib/assignmentEngine.js) — see its header for why this used
@@ -7201,14 +7206,14 @@ function LearnScreen({ role, user, orgUsers = [], orgs = [], onNav, onAwardXp, p
             if (!u._isAggregate) {
               let engineResult;
               if (isCourse) {
-                const cls = (content.lessonIds ?? []).map(id => lessons.find(l => l.id === id)).filter(Boolean);
-                const completedAtByLesson = new Map(userComps.map(c => [c.lessonId, c.completedAt]));
-                engineResult = resolveAssignmentStatus("course", a, { lessonIds: cls.map(l => l.id), completedAtByLesson });
+                courseLessons = (content.lessonIds ?? []).map(id => lessons.find(l => l.id === id)).filter(Boolean);
+                completedAtByLesson = new Map(userComps.map(c => [c.lessonId, c.completedAt]));
+                engineResult = resolveAssignmentStatus("course", a, { lessonIds: courseLessons.map(l => l.id), completedAtByLesson });
               } else if (!isQuiz) {
                 const comp = userComps.find(c => c.lessonId === a.contentId);
                 engineResult = resolveAssignmentStatus("lesson", a, { completedAt: comp?.completedAt ?? null });
               } else {
-                const userAttempts = tenantQuizAttempts.filter(at => at.quiz_id === a.contentId && at.user_id === u.id);
+                userAttempts = tenantQuizAttempts.filter(at => at.quiz_id === a.contentId && at.user_id === u.id);
                 engineResult = resolveAssignmentStatus("quiz", a, { attempts: userAttempts });
               }
               progress = engineResult.progress;
@@ -7216,7 +7221,7 @@ function LearnScreen({ role, user, orgUsers = [], orgs = [], onNav, onAwardXp, p
               completedAt = engineResult.completedAt;
             }
 
-            return { a, content, isCourse, isQuiz, u, progress, status, completedAt };
+            return { a, content, isCourse, isQuiz, u, progress, status, completedAt, courseLessons, completedAtByLesson, userAttempts };
           });
         });
 
@@ -7278,24 +7283,56 @@ function LearnScreen({ role, user, orgUsers = [], orgs = [], onNav, onAwardXp, p
           ? filteredRows.filter(r => r.a.id === selectedAssignmentId)
           : searchedRows;
 
+        // Per-rep drill-down (Task 11) — reuses QuizAttemptDrilldown for
+        // quizzes (same component QuizzesScreen's tracking panel uses) and
+        // the new ContentAssignmentDrilldown for lessons/courses, so every
+        // content type gets an "open a row, see the details" experience
+        // without a second analytics system.
+        const selectedRow = selectedRowKey ? allRows.find(r => `${r.a.id}-${r.u.id}` === selectedRowKey) : null;
+        if (selectedRow) {
+          const onBackFromRow = () => setSelectedRowKey(null);
+          return selectedRow.isQuiz
+            ? <QuizAttemptDrilldown row={{ quiz: selectedRow.content, user: selectedRow.u, attempts: selectedRow.userAttempts }} onBack={onBackFromRow} />
+            : <ContentAssignmentDrilldown row={selectedRow} onBack={onBackFromRow} />;
+        }
+
+        // Shared column grid — CONTENT / REP / ASSIGNED / DUE / STATUS /
+        // PROGRESS / SCORE / DONE — identical for every content type (Task
+        // 11 baseline). SCORE is quiz-only; lesson/course rows show "—"
+        // rather than a fabricated score or attempt count.
+        const TRACKING_GRID = "1.7fr 1.1fr 0.75fr 0.75fr 0.85fr 0.95fr 1fr 0.75fr";
+        const fmtShort = (iso) => { try { return new Date(iso).toLocaleDateString("en-US", { month: "short", day: "numeric" }); } catch { return "—"; } };
+
         const renderTable = (rows) => (
           <div style={{ borderRadius: 12, overflow: "hidden", border: `1px solid ${C.border}` }}>
             <div style={{ overflowX: "auto", WebkitOverflowScrolling: "touch" }}>
-            <div style={{ minWidth: 620, display: "grid", gridTemplateColumns: "2fr 1.2fr 0.8fr 1fr 0.8fr 80px", gap: 10, padding: "10px 16px", background: C.pageBg, fontSize: 11, fontWeight: 700, color: C.textMuted, letterSpacing: "0.05em" }}>
-              <span>CONTENT</span><span>REP</span><span>DUE DATE</span><span>STATUS</span><span>PROGRESS</span><span>DONE</span>
+            <div style={{ minWidth: 860, display: "grid", gridTemplateColumns: TRACKING_GRID, gap: 10, padding: "10px 16px", background: C.pageBg, fontSize: 11, fontWeight: 700, color: C.textMuted, letterSpacing: "0.05em" }}>
+              <span>CONTENT</span><span>REP</span><span>ASSIGNED</span><span>DUE DATE</span><span>STATUS</span><span>PROGRESS</span><span>SCORE</span><span>DONE</span>
             </div>
-            {rows.map(({ a, content, isCourse, isQuiz, u, progress, status, completedAt }, i) => {
+            {rows.map((row, i) => {
+              const { a, content, isCourse, isQuiz, u, progress, status, completedAt, userAttempts } = row;
               const sc     = STATUS_CONFIG[status] ?? STATUS_CONFIG.not_started;
               const tColor = isCourse ? (content.color ?? C.orange) : isQuiz ? C.purple : (LESSON_TYPE_COLORS[content.type] ?? C.orange);
               const contentLabel = isCourse ? "Course" : isQuiz ? "Quiz" : "Lesson";
               const contentIcon  = isCourse ? content.emoji : isQuiz ? "📋" : LESSON_TYPE_ICONS[content.type];
               const contentTitle = content.title ?? content.name ?? "Untitled";
-              const dueLabel = a.dueAt && a.dueAt !== "Open"
-                ? (() => { try { return new Date(a.dueAt).toLocaleDateString("en-US", { month: "short", day: "numeric" }); } catch { return a.dueAt; } })()
-                : "Open";
+              const dueLabel = a.dueAt && a.dueAt !== "Open" ? fmtShort(a.dueAt) : "Open";
+              const assignedLabel = a.assignedAt ?? "—";
+              // Quiz-only score summary — latest attempt's score, best score
+              // across all attempts, and attempt count. Never shown for
+              // lesson/course (no fake score/attempt data — Task 11).
+              const sortedAttempts = isQuiz ? [...userAttempts].sort((x, y) => new Date(y.created_at) - new Date(x.created_at)) : [];
+              const latestAttempt  = sortedAttempts[0] ?? null;
+              const bestScore      = sortedAttempts.length ? Math.max(...sortedAttempts.map(at => at.score ?? 0)) : null;
+              const canDrilldown   = !u._isAggregate;
+              const rowKey = `${a.id}-${u.id}`;
               return (
-                <div key={`${a.id}-${u.id}-${i}`} style={{ minWidth: 620, display: "grid", gridTemplateColumns: "2fr 1.2fr 0.8fr 1fr 0.8fr 80px", gap: 10, padding: "13px 16px", background: C.white, borderTop: `1px solid ${C.border}`, alignItems: "center" }}>
-                  {/* Content — clickable to drill into this assignment */}
+                <div
+                  key={`${rowKey}-${i}`}
+                  onClick={canDrilldown ? () => setSelectedRowKey(rowKey) : undefined}
+                  style={{ minWidth: 860, display: "grid", gridTemplateColumns: TRACKING_GRID, gap: 10, padding: "13px 16px", background: C.white, borderTop: `1px solid ${C.border}`, alignItems: "center", cursor: canDrilldown ? "pointer" : "default" }}
+                >
+                  {/* Content — also independently clickable to drill into this assignment across all reps */}
                   <div style={{ display: "flex", alignItems: "center", gap: 10, minWidth: 0 }}>
                     {contentIcon && (
                       <div style={{ width: 30, height: 30, borderRadius: 7, background: tColor + "20", flexShrink: 0, display: "flex", alignItems: "center", justifyContent: "center", fontSize: 13 }}>
@@ -7304,12 +7341,12 @@ function LearnScreen({ role, user, orgUsers = [], orgs = [], onNav, onAwardXp, p
                     )}
                     <div style={{ minWidth: 0 }}>
                       <button
-                        onClick={() => setSelectedAssignmentId(selectedAssignmentId === a.id ? null : a.id)}
+                        onClick={(e) => { e.stopPropagation(); setSelectedAssignmentId(selectedAssignmentId === a.id ? null : a.id); }}
                         style={{ background: "none", border: "none", padding: 0, cursor: "pointer", textAlign: "left" }}
                       >
                         <div style={{ fontSize: 13, fontWeight: 700, color: C.text, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap", textDecoration: "underline", textDecorationColor: C.border }}>{contentTitle}</div>
                       </button>
-                      <div style={{ fontSize: 11, color: C.textSub }}>{contentLabel}{a.required ? " · Required" : ""}</div>
+                      <div style={{ fontSize: 11, color: C.textSub }}>{contentLabel}{a.required ? " · Required" : " · Recommended"}</div>
                     </div>
                   </div>
                   {/* Rep */}
@@ -7319,6 +7356,8 @@ function LearnScreen({ role, user, orgUsers = [], orgs = [], onNav, onAwardXp, p
                     </div>
                     <span style={{ fontSize: 13, fontWeight: 600, color: C.text, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{u.name}</span>
                   </div>
+                  {/* Assigned */}
+                  <span style={{ fontSize: 13, color: C.textSub }}>{assignedLabel}</span>
                   {/* Due */}
                   <span style={{ fontSize: 13, color: status === "overdue" ? C.red : C.textSub, fontWeight: status === "overdue" ? 700 : 400 }}>{dueLabel}</span>
                   {/* Status badge */}
@@ -7330,10 +7369,17 @@ function LearnScreen({ role, user, orgUsers = [], orgs = [], onNav, onAwardXp, p
                     </div>
                     <span style={{ fontSize: 11, fontWeight: 700, color: C.textSub, flexShrink: 0 }}>{progress}%</span>
                   </div>
+                  {/* Score — quiz only */}
+                  <div style={{ fontSize: 11, color: C.textSub, lineHeight: 1.4 }}>
+                    {isQuiz && latestAttempt ? (
+                      <>
+                        <div style={{ fontSize: 12, fontWeight: 700, color: latestAttempt.passed ? C.trueGreen ?? C.green : C.red }}>{latestAttempt.score}% {latestAttempt.passed ? "Pass" : "Fail"}</div>
+                        <div>Best {bestScore}% · {sortedAttempts.length} attempt{sortedAttempts.length !== 1 ? "s" : ""}</div>
+                      </>
+                    ) : "—"}
+                  </div>
                   {/* Completed at */}
-                  <span style={{ fontSize: 12, color: C.textSub }}>
-                    {completedAt ? (() => { try { return new Date(completedAt).toLocaleDateString("en-US", { month: "short", day: "numeric" }); } catch { return "—"; } })() : "—"}
-                  </span>
+                  <span style={{ fontSize: 12, color: C.textSub }}>{completedAt ? fmtShort(completedAt) : "—"}</span>
                 </div>
               );
             })}
@@ -10244,9 +10290,10 @@ function buildQuizAssignmentRows(assignments, attempts, quizzes, orgUsers) {
         .sort((x, y) => new Date(y.created_at) - new Date(x.created_at)); // newest first
       const attemptCount = userAttempts.length;
       const latestScore  = userAttempts[0]?.score ?? null;
+      const bestScore    = userAttempts.length ? Math.max(...userAttempts.map(at => at.score ?? 0)) : null;
 
       const engineResult = u._isAggregate
-        ? { status: "not_started", completedAt: null }
+        ? { status: "not_started", progress: 0, completedAt: null }
         : resolveAssignmentStatus("quiz", a, { attempts: userAttempts });
       // QUIZ_STATUS_CONFIG uses "assigned" for the not-yet-started state;
       // the engine's vocabulary is "not_started" — translate so the existing
@@ -10256,7 +10303,8 @@ function buildQuizAssignmentRows(assignments, attempts, quizzes, orgUsers) {
       return {
         key: `${a.id}-${u.id}`,
         assignment: a, quiz, user: u,
-        attempts: userAttempts, attemptCount, latestScore, status, completedAt: engineResult.completedAt,
+        attempts: userAttempts, attemptCount, latestScore, bestScore,
+        status, progress: engineResult.progress, completedAt: engineResult.completedAt,
       };
     });
   });
@@ -10320,6 +10368,88 @@ function QuizAttemptDrilldown({ row, onBack }) {
               </div>
             );
           })}
+        </div>
+      )}
+    </div>
+  );
+}
+
+// Read-only detail view for one rep's lesson or course assignment — the
+// lesson/course counterpart to QuizAttemptDrilldown above, giving managers
+// the same "open a row, see the relevant history" experience for every
+// content type (Task 11). Lessons/courses have no per-attempt history the
+// way quizzes do (lesson_completions is a single upsert row, not a log), so
+// there's no fake attempt list here — just the assignment's own metadata
+// plus, for courses, a per-lesson completion breakdown (reusing the same
+// engine-computed data the tracking table already has).
+function ContentAssignmentDrilldown({ row, onBack }) {
+  const { a, content, isCourse, u: user, status, progress, completedAt, courseLessons = [], completedAtByLesson } = row;
+  const STATUS_CONFIG = {
+    not_started: { label: "Not Started", bg: C.muted,   text: C.textSub },
+    in_progress: { label: "In Progress", bg: C.blueBg,  text: C.blue    },
+    completed:   { label: "Completed",   bg: C.greenBg, text: C.green   },
+    overdue:     { label: "Overdue",     bg: C.redBg,   text: C.red     },
+  };
+  const sc = STATUS_CONFIG[status] ?? STATUS_CONFIG.not_started;
+  const fmt = (iso) => { try { return new Date(iso).toLocaleDateString("en-US", { month: "short", day: "numeric", year: "numeric" }); } catch { return "—"; } };
+
+  return (
+    <div style={{ display: "flex", flexDirection: "column", gap: 16 }}>
+      <div style={{ display: "flex", alignItems: "center", gap: 12 }}>
+        <button onClick={onBack} style={{ background: "none", border: "none", cursor: "pointer", color: C.textSub, fontSize: 13, fontWeight: 700, padding: 0 }}>← All Assignments</button>
+      </div>
+      <div style={{ padding: "14px 18px", borderRadius: 12, background: C.white, border: `1px solid ${C.border}`, display: "flex", alignItems: "center", gap: 12 }}>
+        <div style={{ width: 34, height: 34, borderRadius: "50%", background: user.color ?? C.orange, display: "flex", alignItems: "center", justifyContent: "center", fontSize: 13, fontWeight: 700, color: "#fff", flexShrink: 0 }}>
+          {(user.initials ?? user.name?.[0] ?? "?").toUpperCase()}
+        </div>
+        <div style={{ flex: 1, minWidth: 0 }}>
+          <div style={{ fontSize: 14, fontWeight: 700, color: C.text }}>{user.name}</div>
+          <div style={{ fontSize: 12, color: C.textSub }}>{content.title ?? content.name}{isCourse ? ` · ${courseLessons.length} lesson${courseLessons.length !== 1 ? "s" : ""}` : ""}</div>
+        </div>
+        <span style={{ fontSize: 11, fontWeight: 700, padding: "3px 8px", borderRadius: 6, background: sc.bg, color: sc.text, flexShrink: 0 }}>{sc.label}</span>
+      </div>
+
+      {/* Assignment metadata — same fields every content type shows in the tracking table */}
+      <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(120px, 1fr))", gap: 10 }}>
+        {[
+          { label: "Assigned",  value: a.assignedAt ?? "—" },
+          { label: "Due",       value: a.dueAt && a.dueAt !== "Open" ? fmt(a.dueAt) : "Open" },
+          { label: "Required",  value: a.required ? "Required" : "Recommended" },
+          { label: "Completed", value: completedAt ? fmt(completedAt) : "—" },
+        ].map(({ label, value }) => (
+          <div key={label} style={{ padding: "10px 14px", background: C.pageBg, borderRadius: 10 }}>
+            <div style={{ fontSize: 10, fontWeight: 700, color: C.textMuted, letterSpacing: "0.05em", marginBottom: 3 }}>{label.toUpperCase()}</div>
+            <div style={{ fontSize: 13, fontWeight: 700, color: C.text }}>{value}</div>
+          </div>
+        ))}
+      </div>
+
+      {!isCourse ? (
+        // Lesson — nothing more to drill into beyond its own completion state,
+        // already shown above. No attempt/score fields: lessons don't have them.
+        <div style={{ padding: "12px 14px", background: C.pageBg, borderRadius: 10, fontSize: 13, color: C.textSub }}>
+          {status === "completed" ? "This lesson is complete." : "This lesson has not been completed yet."}
+        </div>
+      ) : (
+        // Course — per-lesson breakdown, so a manager can see exactly which
+        // lessons are blocking completion, same "progress" data the table's
+        // percentage is built from.
+        <div>
+          <div style={{ fontWeight: 700, fontSize: 13, color: C.text, marginBottom: 10 }}>Lesson Breakdown ({progress}% complete)</div>
+          <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
+            {courseLessons.map(l => {
+              const lc = completedAtByLesson?.get(l.id);
+              const done = !!lc && (!a.assignedAtRaw || new Date(lc) >= new Date(a.assignedAtRaw));
+              return (
+                <div key={l.id} style={{ display: "flex", alignItems: "center", justifyContent: "space-between", padding: "10px 14px", background: C.pageBg, borderRadius: 10 }}>
+                  <div style={{ fontSize: 13, fontWeight: 600, color: C.text }}>{l.title}</div>
+                  <span style={{ fontSize: 11, fontWeight: 700, padding: "2px 8px", borderRadius: 99, background: done ? C.greenBg : C.muted, color: done ? C.green : C.textSub }}>
+                    {done ? `Complete · ${fmt(lc)}` : "Incomplete"}
+                  </span>
+                </div>
+              );
+            })}
+          </div>
         </div>
       )}
     </div>
@@ -10441,8 +10571,11 @@ function QuizTrackingPanel({ quizzes, orgUsers, tenantId, isReal, refreshKey, on
       {rowsForStatusTab.length > 0 && (
         <div style={{ borderRadius: 12, overflow: "hidden", border: `1px solid ${C.border}` }}>
           <div style={{ overflowX: "auto", WebkitOverflowScrolling: "touch" }}>
-            <div style={{ minWidth: 780, display: "grid", gridTemplateColumns: "2fr 1.3fr 0.9fr 0.9fr 1fr 0.9fr 0.8fr", gap: 10, padding: "10px 16px", background: C.pageBg, fontSize: 11, fontWeight: 700, color: C.textMuted, letterSpacing: "0.05em" }}>
-              <span>QUIZ</span><span>REP / TEAM</span><span>ASSIGNED</span><span>DUE</span><span>STATUS</span><span>LATEST SCORE</span><span>ATTEMPTS</span>
+            {/* Column set matches the shared tracking baseline (Task 11): user,
+                content, status, assigned/due, required, progress, completion
+                date — plus quiz-only latest/best score and attempts. */}
+            <div style={{ minWidth: 980, display: "grid", gridTemplateColumns: "1.8fr 1.2fr 0.75fr 0.75fr 0.85fr 0.8fr 1fr 0.6fr 0.85fr", gap: 10, padding: "10px 16px", background: C.pageBg, fontSize: 11, fontWeight: 700, color: C.textMuted, letterSpacing: "0.05em" }}>
+              <span>QUIZ</span><span>REP / TEAM</span><span>ASSIGNED</span><span>DUE</span><span>STATUS</span><span>PROGRESS</span><span>SCORE</span><span>ATTEMPTS</span><span>DONE</span>
             </div>
             {rowsForStatusTab.map(row => {
               const sc = QUIZ_STATUS_CONFIG[row.status];
@@ -10450,9 +10583,12 @@ function QuizTrackingPanel({ quizzes, orgUsers, tenantId, isReal, refreshKey, on
               const dueLabel = row.assignment.dueAt && row.assignment.dueAt !== "Open"
                 ? (() => { try { return new Date(row.assignment.dueAt).toLocaleDateString("en-US", { month: "short", day: "numeric" }); } catch { return row.assignment.dueAt; } })()
                 : "Open";
+              const completedLabel = row.completedAt
+                ? (() => { try { return new Date(row.completedAt).toLocaleDateString("en-US", { month: "short", day: "numeric" }); } catch { return "—"; } })()
+                : "—";
               const isClickable = row.status === "completed";
               return (
-                <div key={row.key} style={{ minWidth: 780, display: "grid", gridTemplateColumns: "2fr 1.3fr 0.9fr 0.9fr 1fr 0.9fr 0.8fr", gap: 10, padding: "13px 16px", background: C.white, borderTop: `1px solid ${C.border}`, alignItems: "center" }}>
+                <div key={row.key} style={{ minWidth: 980, display: "grid", gridTemplateColumns: "1.8fr 1.2fr 0.75fr 0.75fr 0.85fr 0.8fr 1fr 0.6fr 0.85fr", gap: 10, padding: "13px 16px", background: C.white, borderTop: `1px solid ${C.border}`, alignItems: "center" }}>
                   <div style={{ minWidth: 0 }}>
                     {isClickable ? (
                       <button onClick={() => setSelectedKey(row.key)} style={{ background: "none", border: "none", padding: 0, cursor: "pointer", textAlign: "left" }}>
@@ -10461,7 +10597,7 @@ function QuizTrackingPanel({ quizzes, orgUsers, tenantId, isReal, refreshKey, on
                     ) : (
                       <span style={{ fontSize: 13, fontWeight: 700, color: C.text }}>{row.quiz.title ?? row.quiz.name}</span>
                     )}
-                    {row.assignment.required && <div style={{ fontSize: 11, color: C.textSub }}>Required</div>}
+                    <div style={{ fontSize: 11, color: C.textSub }}>{row.assignment.required ? "Required" : "Recommended"}</div>
                   </div>
                   <div style={{ display: "flex", alignItems: "center", gap: 7, minWidth: 0 }}>
                     <div style={{ width: 22, height: 22, borderRadius: "50%", background: row.user.color ?? C.orange, display: "flex", alignItems: "center", justifyContent: "center", fontSize: 10, fontWeight: 700, color: "#fff", flexShrink: 0 }}>
@@ -10472,8 +10608,17 @@ function QuizTrackingPanel({ quizzes, orgUsers, tenantId, isReal, refreshKey, on
                   <span style={{ fontSize: 12, color: C.textSub }}>{assignedLabel}</span>
                   <span style={{ fontSize: 12, color: row.status === "overdue" ? C.red : C.textSub, fontWeight: row.status === "overdue" ? 700 : 400 }}>{dueLabel}</span>
                   <div><span style={{ fontSize: 11, fontWeight: 700, padding: "3px 8px", borderRadius: 6, background: sc.bg, color: sc.text }}>{sc.label}</span></div>
-                  <span style={{ fontSize: 12, color: C.textSub }}>{row.latestScore != null ? `${row.latestScore}%` : "—"}</span>
+                  <span style={{ fontSize: 12, color: C.textSub }}>{row.progress}%</span>
+                  <div style={{ fontSize: 11, color: C.textSub, lineHeight: 1.4 }}>
+                    {row.latestScore != null ? (
+                      <>
+                        <div style={{ fontSize: 12, fontWeight: 700, color: C.text }}>Latest {row.latestScore}%</div>
+                        <div>Best {row.bestScore}%</div>
+                      </>
+                    ) : "—"}
+                  </div>
                   <span style={{ fontSize: 12, color: C.textSub }}>{row.attemptCount}</span>
+                  <span style={{ fontSize: 12, color: C.textSub }}>{completedLabel}</span>
                 </div>
               );
             })}
