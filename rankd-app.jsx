@@ -1829,7 +1829,7 @@ const Q_TYPE_ICONS  = { mc: "", tf: "", type: "", open: "", slider: "", match: "
 // ── REAL GAME HOST VIEW ──────────────────────────────────────
 const PURPLE = "#8B5CF6";
 
-function KahootHostView({ onNav, sessionName, pin, sessionDbId, demoMode, tenantId, questions, broadcast, chAnswers, chPlayers, onGameEnd, setChAnswers }) {
+function KahootHostView({ onNav, sessionName, pin, sessionDbId, demoMode, tenantId, questions, broadcast, chAnswers, chPlayers, chStatus, onGameEnd, setChAnswers }) {
   const mobile       = useMobile();
   const [phase,      setPhase]      = useState("countdown");
   const [qIdx,       setQIdx]       = useState(0);
@@ -1864,6 +1864,13 @@ function KahootHostView({ onNav, sessionName, pin, sessionDbId, demoMode, tenant
   const [questionHistory, setQuestionHistory] = useState([]);
   // DB-backed participant count for countdown — presence may lag behind actual joins
   const [dbParticipantCount, setDbParticipantCount] = useState(chPlayers.length);
+  // Stricter DB-active count used ONLY as the halt fallback when the host
+  // realtime channel is not SUBSCRIBED: requires a FRESH, NON-NULL heartbeat, so
+  // a just-inserted row with last_seen_at = null is never treated as active
+  // indefinitely during gameplay. When the channel IS subscribed, Presence
+  // (chPlayers, deduped by playerId) is the connected-now truth and this is
+  // ignored (see the halt watchdog).
+  const [dbActiveForHalt, setDbActiveForHalt] = useState(0);
   // DB-backed participant roster (id, name, emoji, color, status) — the
   // authoritative source for a player's stored emoji. Presence (chPlayers)
   // can lag on join, and if doReveal() ever needs to build a player row from
@@ -2020,7 +2027,17 @@ function KahootHostView({ onNav, sessionName, pin, sessionDbId, demoMode, tenant
           if (!p.last_seen_at) return true;
           return (now - new Date(p.last_seen_at).getTime()) < HEARTBEAT_FRESH_MS;
         }).length;
+        // Halt fallback count: same status rule, but a null heartbeat does NOT
+        // count as active — a stale/heartbeat-less durable row must not keep a
+        // game alive when the host has lost Presence.
+        const activeForHalt = data.filter(p => {
+          const statusOk = !p.status || p.status === "joined" || p.status === "active";
+          if (!statusOk) return false;
+          if (!p.last_seen_at) return false;
+          return (now - new Date(p.last_seen_at).getTime()) < HEARTBEAT_FRESH_MS;
+        }).length;
         setDbParticipantCount(active);
+        setDbActiveForHalt(activeForHalt);
         setDbParticipants(data);
       });
     };
@@ -2048,39 +2065,89 @@ function KahootHostView({ onNav, sessionName, pin, sessionDbId, demoMode, tenant
   }, [dbParticipants]);
 
   // ── Zero-active-players halt ──────────────────────────────────────────────
-  // If every connected player leaves mid-game, freeze the timer and block
-  // automatic progression instead of letting the game run unattended and
-  // silently mark people wrong. "Active" reuses the same connected-count
-  // definition already computed above (max of Presence chPlayers and the
-  // DB-active participant count). A short debounce absorbs brief Presence
-  // blips (a reconnect, a backgrounded tab) so those don't falsely trigger a
-  // halt. Once triggered, `halted` only clears when the host explicitly
-  // resumes — reconnecting players never auto-resume the game.
+  // If every CONNECTED player leaves mid-game, pause the game instead of letting
+  // it run unattended and silently mark people wrong. Connected-now truth is
+  // Presence (chPlayers, deduped by playerId) whenever the host channel is
+  // SUBSCRIBED — we do NOT max() with the DB heartbeat count, because a durable
+  // participant row lingers (heartbeat freshness window) after the player is
+  // already gone from Presence. Only when the host channel is NOT subscribed do
+  // we fall back to the fresh, non-null DB heartbeat count. A short grace period
+  // absorbs a reconnect blip before halting. Once halted, the game only resumes
+  // when the host explicitly does so — reconnecting players never auto-resume.
   const [halted, setHalted] = useState(false);
+  const [resumeBlocked, setResumeBlocked] = useState(false); // tried to resume with nobody connected
   const zeroSinceRef = useRef(null);
-  // Refs mirror the latest counts into the watchdog interval below without
-  // forcing the interval to be torn down and recreated on every presence tick.
+  const haltArmedRef = useRef(true);     // one auto-halt per empty episode; re-arms when a player is present
+  const haltActionedRef = useRef(false); // idempotent guard for the pause side effects (persist + broadcast)
+  // Refs mirror the latest values into the watchdog interval below without
+  // forcing the interval to be torn down and recreated on every tick.
   const chPlayersLenRef = useRef(chPlayers.length);
   chPlayersLenRef.current = chPlayers.length;
-  const dbParticipantCountRef = useRef(dbParticipantCount);
-  dbParticipantCountRef.current = dbParticipantCount;
+  const chStatusRef = useRef(chStatus);
+  chStatusRef.current = chStatus;
+  const dbActiveForHaltRef = useRef(dbActiveForHalt);
+  dbActiveForHaltRef.current = dbActiveForHalt;
+
+  // Connected-now count: Presence when subscribed, fresh DB heartbeats otherwise.
+  const connectedNow = () => (chStatus === "SUBSCRIBED" ? chPlayers.length : dbActiveForHalt);
 
   useEffect(() => {
     if (!sessionDbId || restoreState !== "done") return;
-    const HALT_DEBOUNCE_MS = 5000;
+    const HALT_GRACE_MS = 5000; // reconnect grace before halting
     const interval = setInterval(() => {
-      const activeCount = Math.max(chPlayersLenRef.current, dbParticipantCountRef.current);
-      if (activeCount === 0) {
-        if (zeroSinceRef.current == null) zeroSinceRef.current = Date.now();
-        else if (Date.now() - zeroSinceRef.current >= HALT_DEBOUNCE_MS) setHalted(true);
-      } else {
-        zeroSinceRef.current = null; // a player is back — but stay halted until the host resumes
+      const subscribed = chStatusRef.current === "SUBSCRIBED";
+      const active = subscribed ? chPlayersLenRef.current : dbActiveForHaltRef.current;
+      if (active > 0) {
+        zeroSinceRef.current = null;
+        haltArmedRef.current = true; // players present again → re-arm for a future empty episode
+        return;
+      }
+      // active === 0
+      if (!haltArmedRef.current) return;       // already handled this empty episode (host chose Stay Paused / End)
+      if (zeroSinceRef.current == null) { zeroSinceRef.current = Date.now(); return; }
+      if (Date.now() - zeroSinceRef.current >= HALT_GRACE_MS) {
+        haltArmedRef.current = false;          // disarm — exactly one halt per empty episode
+        setHalted(true);
       }
     }, 1000);
     return () => clearInterval(interval);
   }, [sessionDbId, restoreState]);
 
-  const resumeFromHalt = () => setHalted(false);
+  // Halt transition → pause the game exactly once (idempotent). Stops the timer/
+  // countdown/progression (the `halted` guards below already freeze those),
+  // persists paused=true with the CURRENT phase/index, and broadcasts the
+  // existing GM.PAUSE. Runs only when `halted` flips true; the ref guard blocks
+  // any duplicate PAUSE write/broadcast from repeated syncs or watchdog ticks.
+  useEffect(() => {
+    if (!halted) return;
+    if (haltActionedRef.current) return;
+    haltActionedRef.current = true;
+    setPaused(true);
+    persistPhase(phase, qIdx, true);
+    broadcast({ type: GM.PAUSE });
+  }, [halted]); // eslint-disable-line react-hooks/exhaustive-deps
+
+  // Host chose "Stay Paused": dismiss the halt notice but KEEP the game paused.
+  // haltArmedRef stays false so the watchdog won't re-raise the notice while the
+  // game is still empty; the normal paused overlay (with Resume) remains.
+  const stayPaused = () => setHalted(false);
+
+  // Manual resume (from the halt notice or the paused overlay). Requires at
+  // least one CURRENTLY connected player; persists paused=false, broadcasts the
+  // existing GM.RESUME, and continues the PRESERVED phase/timer (never restarts
+  // the full question timer — timeLeft was frozen, not reset). Re-arms the halt
+  // watchdog for the next empty episode.
+  const resumeGame = () => {
+    if (connectedNow() < 1) { setResumeBlocked(true); return; }
+    setResumeBlocked(false);
+    haltActionedRef.current = false;
+    haltArmedRef.current = true;
+    zeroSinceRef.current = null;
+    setHalted(false);
+    setPaused(false);
+    persistPhase(phase, qIdx, false);
+    broadcast({ type: GM.RESUME });
+  };
 
   // Single fixed (non-index) placeholder for the rare case a player row has
   // no discoverable identity anywhere (not in scores, presence, or the DB
@@ -2459,12 +2526,15 @@ function KahootHostView({ onNav, sessionName, pin, sessionDbId, demoMode, tenant
     broadcast({ type: GM.NEXT_QUESTION, qIdx: next });
   };
 
-  const doTogglePause = () => {
-    const next = !paused;
-    setPaused(next);
-    persistPhase(phase, qIdx, next);
-    broadcast({ type: next ? GM.PAUSE : GM.RESUME });
+  // Manual pause (host control). Resume is routed through resumeGame so it
+  // enforces the "at least one connected player" rule and clears any halt.
+  const doPause = () => {
+    if (paused) return;
+    setPaused(true);
+    persistPhase(phase, qIdx, true);
+    broadcast({ type: GM.PAUSE });
   };
+  const doTogglePause = () => { if (paused) resumeGame(); else doPause(); };
 
   const doForceEnd = () => {
     setShowEndConfirm(false);
@@ -2766,27 +2836,39 @@ function KahootHostView({ onNav, sessionName, pin, sessionDbId, demoMode, tenant
         </div>
       )}
 
-      {/* Halted overlay — every connected player left mid-game. Timer/
-          progression are frozen (see the debounced watchdog effect above);
-          this only clears when the host explicitly resumes, never on its
-          own even after someone reconnects. Takes precedence over the
+      {/* Halted notice — every ACTIVE player has left mid-game. The game is
+          already paused (persisted + GM.PAUSE broadcast, once); timer/countdown/
+          progression are frozen. The host chooses: End Game (the existing
+          accepted completion path) or Stay Paused (keep it paused; the normal
+          paused overlay with Resume remains). The game never auto-ends and never
+          auto-resumes when a player reconnects. Takes precedence over the
           ordinary pause overlay below. */}
       {halted && (
         <div style={{ position: "fixed", inset: 0, background: "rgba(0,0,0,0.75)", display: "flex", flexDirection: "column", alignItems: "center", justifyContent: "center", gap: 20, zIndex: 101, backdropFilter: "blur(4px)" }}>
           <div style={{ fontSize: 56 }}>⚠️</div>
-          <p style={{ margin: 0, fontSize: 22, fontWeight: 900, color: "#fff" }}>All players have left.</p>
-          <p style={{ margin: "-12px 0 0", fontSize: 14, color: "rgba(255,255,255,0.7)" }}>The game is paused. No points are being awarded.</p>
-          <button onClick={resumeFromHalt} style={{ marginTop: 4, padding: "14px 36px", borderRadius: 14, border: "none", background: C.orange, color: "#fff", fontSize: 17, fontWeight: 900, cursor: "pointer", display: "flex", alignItems: "center", gap: 10 }}>
-            ▶ Resume Game
-          </button>
+          <p style={{ margin: 0, fontSize: 22, fontWeight: 900, color: "#fff" }}>All active players have left. The game has been paused.</p>
+          <p style={{ margin: "-12px 0 0", fontSize: 14, color: "rgba(255,255,255,0.7)" }}>No points are being awarded while paused.</p>
+          <div style={{ display: "flex", gap: 12, marginTop: 4 }}>
+            <button onClick={() => setShowEndConfirm(true)} style={{ padding: "14px 28px", borderRadius: 14, border: `1px solid rgba(255,255,255,0.35)`, background: "transparent", color: "#fff", fontSize: 16, fontWeight: 900, cursor: "pointer" }}>
+              End Game
+            </button>
+            <button onClick={stayPaused} style={{ padding: "14px 28px", borderRadius: 14, border: "none", background: C.orange, color: "#fff", fontSize: 16, fontWeight: 900, cursor: "pointer" }}>
+              Stay Paused
+            </button>
+          </div>
         </div>
       )}
 
-      {/* Paused overlay */}
+      {/* Paused overlay — also the resting state after "Stay Paused". Resume is
+          routed through resumeGame, which requires at least one currently
+          connected player and continues the preserved timer (never restarts it). */}
       {paused && !halted && (
         <div style={{ position: "fixed", inset: 0, background: "rgba(0,0,0,0.65)", display: "flex", flexDirection: "column", alignItems: "center", justifyContent: "center", gap: 20, zIndex: 100, backdropFilter: "blur(4px)" }}>
           <div style={{ fontSize: 56 }}>⏸</div>
           <p style={{ margin: 0, fontSize: 22, fontWeight: 900, color: "#fff" }}>Game Paused</p>
+          {resumeBlocked && (
+            <p style={{ margin: "-12px 0 0", fontSize: 14, color: "#FCA5A5", fontWeight: 700 }}>Waiting for a player to reconnect before you can resume.</p>
+          )}
           <button onClick={doTogglePause} style={{ marginTop: 4, padding: "14px 36px", borderRadius: 14, border: "none", background: C.orange, color: "#fff", fontSize: 17, fontWeight: 900, cursor: "pointer", display: "flex", alignItems: "center", gap: 10 }}>
             ▶ Resume
           </button>
@@ -3855,7 +3937,7 @@ function KahootPlayerView({ onNav, playerName, playerId, pin, sessionDbId, tenan
 function RankdGameScreen({ onNav, sessionName, role, playerName, questions = GAME_QUESTIONS, demoMode = true, pin, sessionDbId, tenantId, broadcast, chMsg, chStatus, chAnswers, chPlayers, playerId, onGameEnd, setChAnswers }) {
   // Real multiplayer mode — route to Kahoot views
   if (!demoMode && role === "admin") {
-    return <KahootHostView onNav={onNav} sessionName={sessionName} pin={pin} sessionDbId={sessionDbId} demoMode={demoMode} tenantId={tenantId} questions={questions} broadcast={broadcast} chAnswers={chAnswers} chPlayers={chPlayers} onGameEnd={onGameEnd} setChAnswers={setChAnswers} />;
+    return <KahootHostView onNav={onNav} sessionName={sessionName} pin={pin} sessionDbId={sessionDbId} demoMode={demoMode} tenantId={tenantId} questions={questions} broadcast={broadcast} chAnswers={chAnswers} chPlayers={chPlayers} chStatus={chStatus} onGameEnd={onGameEnd} setChAnswers={setChAnswers} />;
   }
   if (!demoMode && role !== "admin") {
     return <KahootPlayerView onNav={onNav} playerName={playerName} playerId={playerId} pin={pin} sessionDbId={sessionDbId} tenantId={tenantId} broadcast={broadcast} chMsg={chMsg} chStatus={chStatus} />;
@@ -22672,12 +22754,22 @@ export default function App() {
     const finalEmoji = emoji ?? null;
     setLobbyPlayerEmoji(finalEmoji);
 
-    // Update local session state (keeps existing local-state consumers working)
-    setSessions(prev => prev.map(s =>
-      s.code === lobbyPin
-        ? { ...s, players: [...(s.players ?? []).filter(p => p.id !== currentUser?.id), { id: currentUser?.id ?? name, name, joinedAt: Date.now() }], playerCount: (s.playerCount ?? 0) + 1 }
-        : s
-    ));
+    // NOTE: local session/player-count state is intentionally NOT updated here.
+    // It is applied only AFTER the join is accepted (see commitLocalJoin below),
+    // so a failed exact-id check or a failed joinGameSession never counts a
+    // player who didn't actually join. The update is idempotent by player id, so
+    // a retry or a rejoin adds the player exactly once.
+    const commitLocalJoin = () => {
+      const pid = currentUser?.id ?? name;
+      setSessions(prev => prev.map(s => {
+        if (s.code !== lobbyPin) return s;
+        const already = (s.players ?? []).some(p => p.id === pid);
+        const players = [...(s.players ?? []).filter(p => p.id !== pid), { id: pid, name, joinedAt: Date.now() }];
+        // Only increment the count for a genuinely new player; a rejoin/replace
+        // keeps the existing count (no inflation).
+        return { ...s, players, playerCount: already ? (s.playerCount ?? 0) : (s.playerCount ?? 0) + 1 };
+      }));
+    };
 
     // Persist participant to Supabase so manager sees them cross-device.
     // Identity comes from App state established at handleEnterPin (the exact
@@ -22704,17 +22796,20 @@ export default function App() {
         });
         if (jErr) {
           console.error("[ralli:game] joinGameSession FAILED — RLS or schema issue:", jErr);
-          return jErr.message ?? "Failed to join the game. Please try again.";
+          return jErr.message ?? "Failed to join the game. Please try again."; // no local count change
         }
       } catch (e) {
         console.error("[ralli:game] joinGameSession exception:", e);
-        return e?.message ?? "Couldn't connect to the game. Check your connection and try again.";
+        return e?.message ?? "Couldn't connect to the game. Check your connection and try again."; // no local count change
       }
     } else {
       // Demo mode or no DB session — skip write, proceed directly.
       console.warn("[ralli:game] handleEnterName: skipping joinGameSession —", !sessionDbId ? "sessionDbId is null (demo or session not found in DB)" : "currentUser is null (anonymous)");
     }
 
+    // Join accepted (DB write succeeded, or intentionally skipped for demo/anon)
+    // → NOW reflect the player locally, exactly once.
+    commitLocalJoin();
     setScreen("rankd-lobby");
     return null;
   };
