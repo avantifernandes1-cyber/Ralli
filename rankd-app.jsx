@@ -159,10 +159,10 @@ function useGameChannel(pin, role) {
       // player counts twice, which (a) duplicated them in the roster and
       // (b) kept the active-player count above zero so the zero-player halt
       // never fired. Keep the last entry seen for each id.
+      const rawUserEntries = Object.values(state).flat().filter((p) => p.presenceRole === "user" && p.playerId != null);
       const byId = new Map();
-      Object.values(state).flat()
-        .filter((p) => p.presenceRole === "user" && p.playerId != null)
-        .forEach((p) => byId.set(p.playerId, p));
+      rawUserEntries.forEach((p) => byId.set(p.playerId, p));
+      if (role === "admin") console.log("[RALLI_PRESENCE_TRACE] presence sync", { rawCount: rawUserEntries.length, rawIds: rawUserEntries.map(p => p.playerId), dedupedCount: byId.size, dedupedIds: [...byId.keys()] });
       // emoji/color stay null when the player chose no avatar — never a
       // placeholder. Identity is the id; avatar is purely cosmetic.
       const players = Array.from(byId.values()).map((p) => ({
@@ -5978,10 +5978,13 @@ function RankdLobbyScreen({ onNav, pin, playerName, playerEmoji, sessionName, ro
     // Optimistic self-entry: show player count ≥ 1 immediately without waiting
     // for joinGameSession() (fire-and-forget) or presence subscription to complete.
     const pidx = Math.abs((playerId ?? "").charCodeAt(0) + ((playerId ?? "").charCodeAt(1) || 0)) % PLAYER_EMOJIS.length;
+    // No-avatar players stay null here too — this optimistic self-entry was the
+    // last remaining placeholder source (playerEmoji ?? PLAYER_EMOJIS[pidx]).
+    console.log("[RALLI_AVATAR_TRACE] lobby self-entry", { playerId, playerEmojiProp: playerEmoji ?? null, storedEmoji: playerEmoji ?? null });
     const selfEntry = normParticipant({
       player_id: currentUser?.id ?? playerId,
       name:      playerName,
-      emoji:     playerEmoji ?? PLAYER_EMOJIS[pidx],
+      emoji:     playerEmoji ?? null,
       color:     PLAYER_COLORS[pidx % PLAYER_COLORS.length],
       status:    "active",
     });
@@ -6043,15 +6046,36 @@ function RankdLobbyScreen({ onNav, pin, playerName, playerEmoji, sessionName, ro
 
   const demoAllPlayers = [basePlayer, ...LOBBY_PLAYERS.filter(p => p.name !== basePlayer.name)];
 
-  // Real mode: merge DB participants (source of truth) with Presence players (belt-and-suspenders).
-  // Deduplicate by id. Exclude DB players with status='left' or 'disconnected'.
+  // CANONICAL roster: Presence is the connected-now truth for lobby VISIBILITY
+  // (chPlayers is already deduped by playerId in the presence sync). A player
+  // who closes the tab or leaves drops from presence and therefore from the
+  // roster after the presence grace window. DB participant status is NOT used
+  // for visibility — it stays "active" after a socket leaves and would keep a
+  // departed player shown (the reported bug). DB rows ONLY enrich identity
+  // (name / emoji / color); emoji stays null for no-avatar players.
   const combinedRealPlayers = (() => {
     if (isDemoMode) return [];
+    const dbById = new Map(dbPlayers.map(p => [p.id, p]));
     const map = new Map();
-    // DB players first (includes status); only keep active ones
-    dbPlayers.filter(p => p.status !== "left" && p.status !== "disconnected").forEach(p => { if (p.id) map.set(p.id, p); });
-    // Presence players add any not yet in DB (belt-and-suspenders)
-    chPlayers.forEach(p => { if (p.id && !map.has(p.id)) map.set(p.id, p); });
+    chPlayers.forEach(p => {
+      if (!p.id) return;
+      const db = dbById.get(p.id);
+      map.set(p.id, {
+        id:    p.id,
+        name:  db?.name  ?? p.name,
+        emoji: db?.emoji ?? p.emoji ?? null,   // null stays null — name only
+        color: db?.color ?? p.color ?? null,
+        score: 0,
+      });
+    });
+    // Player's own view only: show self immediately from the optimistic DB
+    // self-entry until this client's presence syncs. Never add self for the
+    // host, so a departed player is never re-introduced by identity data.
+    if (role !== "admin" && playerId && !map.has(playerId)) {
+      const db = dbById.get(playerId);
+      map.set(playerId, { id: playerId, name: db?.name ?? playerName, emoji: db?.emoji ?? playerEmoji ?? null, color: db?.color ?? PLAYER_COLORS[0], score: 0 });
+    }
+    console.log("[RALLI_PRESENCE_TRACE] lobby roster", { role, sessionDbId, presence: chPlayers.map(p => ({ id: p.id, emoji: p.emoji })), db: dbPlayers.map(p => ({ id: p.id, status: p.status, emoji: p.emoji })), visible: Array.from(map.values()).map(p => ({ id: p.id, emoji: p.emoji })) });
     return Array.from(map.values());
   })();
 
