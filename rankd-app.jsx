@@ -22611,16 +22611,30 @@ export default function App() {
       case "rankd-name-entry":  return <RankdNameEntryScreen onNav={navigate} pin={lobbyPin} sessionName={lobbySessionName} onConfirm={handleEnterName} defaultName={userProfile.nickname?.trim() || user?.name || ""} defaultAvatar={userProfile.avatarEmoji} />;
       case "rankd-lobby":       return <RankdLobbyScreen onNav={navigate} pin={lobbyPin} playerName={lobbyPlayerName} playerEmoji={lobbyPlayerEmoji} sessionName={lobbySessionName} role={gameRole} sessions={sessions} currentUser={currentUser} onGameStart={handleGameStart} chPlayers={chPlayers} broadcast={broadcast} playerId={gamePlayerId} chMsg={chMsg} onHostEnd={async () => {
         // Ending from the LOBBY (before gameplay) is a CANCELLATION, not a
-        // completed game: notify players immediately, then cancel (not
-        // complete) the session so it stays non-joinable, awards nothing, and
-        // never appears under Past Sessions. Broadcast first (immediate UX),
-        // then the DB write (its await lets the broadcast flush before the
-        // channel tears down on navigate). Durable status="canceled" is the
-        // recovery source if a player misses the broadcast.
-        broadcast({ type: GM.FORCE_END, cancelled: true });
+        // completed game. Durable cancellation is the source of truth and MUST
+        // succeed before we tell anyone the game ended: cancel the DB row and
+        // confirm error === null FIRST, THEN broadcast the terminal event
+        // (fast notification path) and navigate. If the session id is missing
+        // or the cancel fails, do NOT navigate and do NOT broadcast — leave the
+        // host in the lobby with the players still connected, and surface a
+        // retryable error, so we never abandon a stale "waiting" joinable
+        // session that the host believes was cancelled.
         const dbId = sessions.find(s => s.code === lobbyPin)?.dbId ?? null;
+        if (!dbId) {
+          toast.error("Couldn't end the game — session not found. Please try again.");
+          return; // stay in lobby; players remain connected
+        }
         const tid = currentOrg?.id ?? user?.orgId ?? null;
-        if (dbId) await cancelGameSession(dbId, tid);
+        const { error: cancelErr } = await cancelGameSession(dbId, tid);
+        if (cancelErr) {
+          console.error("[ralli:game] cancelGameSession (lobby end) failed:", cancelErr);
+          toast.error("Couldn't end the game. Please try again.");
+          return; // durable cancel failed — no broadcast, no navigate, state preserved
+        }
+        // Durable status="canceled" confirmed — now notify players (best-effort;
+        // the player lobby's status poll recovers it if this event is missed)
+        // and leave the lobby.
+        broadcast({ type: GM.FORCE_END, cancelled: true });
         navigate("rankd");
       }} />;
       case "rankd-game":        return <RankdGameScreen onNav={navigate} sessionName={lobbySessionName} role={gameRole} playerName={lobbyPlayerName ?? user.name} questions={gameQuestions ?? GAME_QUESTIONS} demoMode={gameRole === "admin" && sessions.find(s => s.code === lobbyPin)?.demoMode !== false} pin={lobbyPin} sessionDbId={sessions.find(s => s.code === lobbyPin)?.dbId ?? null} tenantId={currentOrg?.id ?? user?.orgId ?? null} broadcast={broadcast} chMsg={chMsg} chStatus={chStatus} chAnswers={chAnswers} chPlayers={chPlayers} playerId={gamePlayerId} onGameEnd={handleGameEnd} setChAnswers={setChAnswers} />;
