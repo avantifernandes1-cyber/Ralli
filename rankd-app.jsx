@@ -5653,7 +5653,7 @@ function RankdAdminPanel({ onNav, sessions, pastSessions = [], onLaunch, onViewR
         <div style={{ display: "flex", gap: 8 }}>
           {isPast ? (
             <>
-              <button onClick={() => onViewResults(s.code)} style={{ padding: "8px 16px", borderRadius: 10, fontSize: 12, fontWeight: 700, cursor: "pointer", background: C.white, color: C.textSub, border: `1px solid ${C.border}` }}>View Results</button>
+              <button onClick={() => onViewResults(s)} style={{ padding: "8px 16px", borderRadius: 10, fontSize: 12, fontWeight: 700, cursor: "pointer", background: C.white, color: C.textSub, border: `1px solid ${C.border}` }}>View Results</button>
               <button onClick={() => onRelaunch(s)} style={{ display: "flex", alignItems: "center", gap: 6, padding: "8px 16px", borderRadius: 10, fontSize: 12, fontWeight: 700, cursor: "pointer", background: C.dark, color: "#fff", border: "none" }}>▶ Re-launch</button>
             </>
           ) : (
@@ -6325,9 +6325,22 @@ function RankdLobbyScreen({ onNav, pin, playerName, playerEmoji, sessionName, ro
 
 // ── RANKD RESULTS SCREEN ─────────────────────────────────────
 
-function RankdResultsScreen({ onNav, sessionCode, sessions, gameData }) {
+function RankdResultsScreen({ onNav, sessionDbId, sessionCode, sessions, gameData }) {
   const mobile    = useMobile();
-  const session   = sessions.find(s => s.code === sessionCode);
+  // Resolve the EXACT session by game_sessions.id (dbId) — the permanent
+  // historical primary key. A code-only lookup is used ONLY for demo sessions
+  // that have no dbId (a PIN is a reusable join code, not an identity, and can
+  // collide across historical/active sessions).
+  const session   = sessionDbId != null
+    ? sessions.find(s => s.dbId === sessionDbId)
+    : sessions.find(s => s.code === sessionCode);
+  // In-memory (just-played) results are trusted ONLY when their tagged session
+  // identity matches the session being displayed — never "the latest game".
+  const inMemoryForThisSession = !!gameData && (
+    sessionDbId != null
+      ? gameData.sessionDbId === sessionDbId                                   // persisted: exact id match
+      : (gameData.sessionDbId == null && gameData.sessionCode === sessionCode) // demo: code match, no dbId
+  );
   const [tab, setTab] = useState("summary");
   const [dbScores, setDbScores] = useState(null);
   // Explicit per-source load state so a query FAILURE is never mistaken for
@@ -6342,7 +6355,7 @@ function RankdResultsScreen({ onNav, sessionCode, sessions, gameData }) {
   // Load player scores from DB when not in memory (host refreshed after end, or
   // opening from history). A failed query must never look like "no players".
   useEffect(() => {
-    if (gameData?.scores) { setPlayersStatus("ok"); return; } // in-memory scores present
+    if (inMemoryForThisSession && gameData?.scores) { setPlayersStatus("ok"); return; } // matched in-memory scores
     if (!session?.dbId)   { setPlayersStatus("ok"); return; } // demo / non-persisted
     let cancelled = false;
     setPlayersStatus("loading"); setDbScores(null); // clear prior session's data
@@ -6414,13 +6427,16 @@ function RankdResultsScreen({ onNav, sessionCode, sessions, gameData }) {
     return () => { cancelled = true; };
   }, [session?.dbId, reloadKey]); // eslint-disable-line react-hooks/exhaustive-deps
 
-  const realScores    = gameData?.scores ?? dbScores ?? null;
+  // Scores: identity-matched in-memory results (immediate) → durable game_players.
+  const realScores = (inMemoryForThisSession ? gameData?.scores : null) ?? dbScores ?? null;
   // Canonical question-source precedence:
   //  • Real persisted session (session.dbId): the immutable snapshot ONLY (null
-  //    → unavailable). gameData.questions is NOT preferred, so immediate results
-  //    read the same historical truth as a reopened session.
-  //  • Demo / non-persisted session (no dbId): in-memory gameData.questions.
-  const realQuestions = session?.dbId ? detailQuestions : (gameData?.questions ?? null);
+  //    → unavailable). gameData.questions is NOT used — immediate results read
+  //    the same historical truth as a reopened session.
+  //  • Demo / non-persisted session (no dbId): identity-matched in-memory questions.
+  const realQuestions = session?.dbId
+    ? detailQuestions
+    : (inMemoryForThisSession ? (gameData?.questions ?? null) : null);
 
   // Snapshot-present and answer-rows-present are SEPARATE concerns: a valid
   // snapshot can exist with zero answers (nobody submitted before the game
@@ -21475,6 +21491,9 @@ export default function App() {
   const [lobbyPlayerName,  setLobbyPlayerName]  = useState(null);
   const [lobbyPlayerEmoji, setLobbyPlayerEmoji] = useState(null);
   const [viewResultsCode,  setViewResultsCode]  = useState(null);
+  // Exact historical identity for the results screen — game_sessions.id (dbId),
+  // NOT the PIN (a reusable join code). Null for demo/non-persisted sessions.
+  const [viewResultsDbId,  setViewResultsDbId]  = useState(null);
   const [gameResultsData,  setGameResultsData]  = useState(null);
   const [gameQuestions,    setGameQuestions]    = useState(null);
   const [editingQuiz,      setEditingQuiz]      = useState(null);
@@ -22703,7 +22722,11 @@ export default function App() {
 
   // Admin: game over — navigate to results + persist final scores
   const handleGameEnd = (data) => {
-    setGameResultsData(data);
+    // Tag the in-memory results with the EXACT session identity so the results
+    // screen only trusts them for this specific session (never "the latest game").
+    const endedDbId = sessions.find(s => s.code === lobbyPin)?.dbId ?? null;
+    setGameResultsData({ ...data, sessionDbId: endedDbId, sessionCode: lobbyPin });
+    setViewResultsDbId(endedDbId);
     setViewResultsCode(lobbyPin);
     navigate("rankd-results");
     // Immediately mark session as completed in local state so it moves to
@@ -22743,7 +22766,15 @@ export default function App() {
     }
   };
 
-  const handleViewResults = (code) => {
+  // Opening a historical session: select it by exact game_sessions.id (dbId),
+  // and CLEAR any unrelated in-memory results so Game A's scores can never flash
+  // while Game B loads. Falls back to code only for demo sessions without a dbId.
+  const handleViewResults = (sessionOrCode) => {
+    const s = typeof sessionOrCode === "object" && sessionOrCode !== null ? sessionOrCode : null;
+    const dbId = s?.dbId ?? null;
+    const code = s?.code ?? (typeof sessionOrCode === "string" ? sessionOrCode : null);
+    setGameResultsData(null);      // drop stale immediate results from a prior game
+    setViewResultsDbId(dbId);
     setViewResultsCode(code);
     setScreen("rankd-results");
   };
@@ -22816,7 +22847,7 @@ export default function App() {
         navigate("rankd");
       }} />;
       case "rankd-game":        return <RankdGameScreen onNav={navigate} sessionName={lobbySessionName} role={gameRole} playerName={lobbyPlayerName ?? user.name} questions={gameQuestions ?? GAME_QUESTIONS} demoMode={gameRole === "admin" && sessions.find(s => s.code === lobbyPin)?.demoMode !== false} pin={lobbyPin} sessionDbId={sessions.find(s => s.code === lobbyPin)?.dbId ?? null} tenantId={currentOrg?.id ?? user?.orgId ?? null} broadcast={broadcast} chMsg={chMsg} chStatus={chStatus} chAnswers={chAnswers} chPlayers={chPlayers} playerId={gamePlayerId} onGameEnd={handleGameEnd} setChAnswers={setChAnswers} />;
-      case "rankd-results":     return <RankdResultsScreen onNav={navigate} sessionCode={viewResultsCode} sessions={[...sessions, ...pastSessions]} gameData={gameResultsData} />;
+      case "rankd-results":     return <RankdResultsScreen onNav={navigate} sessionDbId={viewResultsDbId} sessionCode={viewResultsCode} sessions={[...sessions, ...pastSessions]} gameData={gameResultsData} />;
       case "learn":             return <LearnScreen role={gameRole} user={user} orgUsers={orgUsers} orgs={orgs} onNav={navigate} onAwardXp={handleAwardXp} pendingLessonId={pendingLessonId} onClearPendingLesson={() => setPendingLessonId(null)} pendingCourseId={pendingCourseId} onClearPendingCourse={() => setPendingCourseId(null)} canCreate={perm("actions","create")} canEdit={perm("actions","edit")} canDelete={perm("actions","delete")} canAssign={perm("actions","assign")} tenantId={currentOrg?.id ?? null} isReal={!!user?._isReal} quizzes={quizzes} sharedAssignmentData={sharedAssignmentData} />;
       case "quizzes":           return <QuizzesScreen role={gameRole} onNav={navigate} quizzes={quizzes} onEditQuiz={handleEditQuiz} onDeleteQuiz={handleDeleteQuiz} onToggleFavorite={handleToggleFavorite} onToggleActive={handleToggleActive} pendingQuizId={pendingQuizId} onClearPendingQuiz={() => setPendingQuizId(null)} canCreate={perm("actions","create")} canEdit={perm("actions","edit")} canDelete={perm("actions","delete")} canLaunch={perm("actions","launch")} canAssign={perm("actions","assign")} onAssignQuiz={handleAssignQuiz} onLaunchQuiz={handleCreateSession} orgUsers={orgUsers} orgs={orgs} currentUser={currentUser} tenantId={currentOrg?.id ?? null} isReal={!!user?._isReal} quizzesReady={quizzesReady} sharedAssignmentData={sharedAssignmentData} />;
       case "battlecards":       return (isAdminType && perm("actions","edit"))
