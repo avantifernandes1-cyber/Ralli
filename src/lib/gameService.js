@@ -411,13 +411,61 @@ export async function updateParticipantHeartbeat(sessionId, playerId) {
  * @returns {Promise<{ data: Array|null, error: Object|null }>}
  */
 export async function getPlayerGameHistory(playerId, limit = 20) {
+  // ORDER BY joined_at — game_players has NO created_at column, so the previous
+  // .order("created_at") made PostgREST return a 42703 error for EVERY call.
+  // The caller swallowed that error into [] and always showed "No games yet",
+  // even though the player's rows existed. joined_at is the real timestamp
+  // column; callers may additionally sort by the joined session's ended_at.
   const { data, error } = await supabase
     .from("game_players")
-    .select("*, game_sessions(name, question_count, ended_at, pin)")
+    .select("*, game_sessions(name, question_count, ended_at, pin, status)")
     .eq("player_id", playerId)
-    .order("created_at", { ascending: false })
+    .order("joined_at", { ascending: false })
     .limit(limit);
   return { data, error };
+}
+
+/**
+ * Fetch ONE player's own answer rows for ONE session — the player-scoped source
+ * for the "My Scores" detail view. Scoped by BOTH exact session_id AND the exact
+ * authenticated player_id so a player can never read another player's
+ * submissions (RLS additionally confines it to the caller's tenant). Ordered by
+ * question_idx for stable rendering.
+ *
+ * @param {string} sessionId - game_sessions.id (UUID)
+ * @param {string} playerId  - the authenticated user's id
+ * @returns {Promise<{ data: Object[]|null, error: Object|null }>}
+ */
+export async function getPlayerAnswersForSession(sessionId, playerId) {
+  const { data, error } = await supabase
+    .from("game_answers")
+    .select("question_idx, option_idx, answer_text, numeric_value, answer_json, is_correct, points, time_ms, was_skipped, answered_at, id")
+    .eq("session_id", sessionId)
+    .eq("player_id", playerId)
+    .order("question_idx", { ascending: true });
+  return { data, error };
+}
+
+/**
+ * Exact participant count for each of the given sessions, as { [sessionId]: n }.
+ * Reads only the session_id column of game_players (never scores/answers/names),
+ * so the player UI can show "#N of M" without pulling other players' data. RLS
+ * confines the read to the caller's tenant.
+ *
+ * @param {string[]} sessionIds
+ * @returns {Promise<{ data: Object<string,number>|null, error: Object|null }>}
+ */
+export async function getSessionPlayerCounts(sessionIds) {
+  const ids = (sessionIds ?? []).filter(Boolean);
+  if (ids.length === 0) return { data: {}, error: null };
+  const { data, error } = await supabase
+    .from("game_players")
+    .select("session_id")
+    .in("session_id", ids);
+  if (error) return { data: null, error };
+  const counts = {};
+  for (const r of data ?? []) counts[r.session_id] = (counts[r.session_id] ?? 0) + 1;
+  return { data: counts, error: null };
 }
 
 /**

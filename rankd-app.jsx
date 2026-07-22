@@ -29,6 +29,8 @@ import {
   markParticipantLeft,
   updateParticipantHeartbeat,
   getPlayerGameHistory,
+  getPlayerAnswersForSession,
+  getSessionPlayerCounts,
   getGameHistory,
   getSessionPlayers,
   getSessionRestoreData,
@@ -5312,6 +5314,96 @@ const TOPIC_QUIZ_MAP = {
   "Forecasting":        ["Pipeline","Forecasting"],
 };
 
+// ── Canonical answer-detail helpers (shared by manager results + player scores)
+// ONE implementation of "what did this player submit on this question" so the
+// manager drill-down (RankdResultsScreen) and the player "My Scores" detail can
+// never disagree. Pure functions of a raw game_answers row + its snapshot
+// question definition — no fabricated topics/accuracy/recommendations.
+
+// A row is a real submission (vs an explicit "unanswered" placeholder).
+const answerRowHasSubmission = (r) => r.option_idx != null || (r.answer_text != null && r.answer_text !== "")
+  || r.numeric_value != null || (Array.isArray(r.answer_json) && r.answer_json.length > 0);
+
+// Dedupe by (player_id, question_idx): keep the latest by answered_at, then a
+// stable id tiebreak. Never double-count a duplicate submission.
+const dedupeAnswerRowsByPlayerQ = (rows) => {
+  const byKey = new Map();
+  for (const r of (rows ?? [])) {
+    const key = `${r.player_id ?? ""}::${r.question_idx}`;
+    const prev = byKey.get(key);
+    if (!prev) { byKey.set(key, r); continue; }
+    const rt = r.answered_at ? Date.parse(r.answered_at) : 0;
+    const pt = prev.answered_at ? Date.parse(prev.answered_at) : 0;
+    if (rt > pt || (rt === pt && String(r.id ?? "") > String(prev.id ?? ""))) byKey.set(key, r);
+  }
+  return [...byKey.values()];
+};
+
+// Resolve a raw game_answers row + canonical question → display-ready detail.
+// Handles MC/TF/Type/Slider(incl. 0)/Matching/Open + skipped/unanswered/
+// unavailable. Never invents a right answer, points, or response time.
+const resolveAnswerDetail = (row, question) => {
+  if (!question) return { status: "unavailable" };
+  if (row?.was_skipped) return { status: "skipped", points: 0, timeMs: null };
+  if (!row) return { status: "unavailable" };
+  const type = question.type;
+  const hasSubmission = row.option_idx != null || (row.answer_text != null && row.answer_text !== "")
+    || row.numeric_value != null || (Array.isArray(row.answer_json) && row.answer_json.length > 0);
+  if (!hasSubmission) {
+    let correctLabel = null;
+    if (type === "mc" || type === "tf") correctLabel = question.options?.[question.correct] ?? null;
+    else if (type === "type") correctLabel = (question.acceptedAnswers ?? []).join(" / ") || null;
+    else if (type === "slider") correctLabel = `${question.correct ?? 5} ± ${question.tolerance ?? 1}`;
+    else if (type === "match") correctLabel = (question.pairs ?? []).map(p => `${p.left} → ${p.right}`).join(", ") || null;
+    return { status: "unanswered", correctLabel, points: 0, timeMs: null };
+  }
+  const base = { points: row.points ?? 0, timeMs: row.time_ms ?? null, status: row.is_correct ? "correct" : "incorrect" };
+  if (type === "mc" || type === "tf") {
+    return { ...base,
+      submittedLabel: row.option_idx != null ? (question.options?.[row.option_idx] ?? `Option ${row.option_idx + 1}`) : null,
+      correctLabel:   question.options?.[question.correct] ?? null,
+    };
+  }
+  if (type === "type") {
+    return { ...base,
+      submittedLabel: row.answer_text,
+      correctLabel:   (question.acceptedAnswers ?? []).join(" / ") || null,
+    };
+  }
+  if (type === "slider") {
+    if (row.numeric_value == null) return { ...base, status: "unavailable", points: row.points ?? 0 };
+    return { ...base,
+      submittedLabel: String(row.numeric_value),   // String(0) === "0" — zero is preserved
+      correctLabel:   `${question.correct ?? 5} ± ${question.tolerance ?? 1}`,
+    };
+  }
+  if (type === "match") {
+    if (!Array.isArray(row.answer_json) || row.answer_json.length === 0 || row.answer_json[0]?.rightText === undefined) {
+      return { ...base, status: "unavailable", points: row.points ?? 0 }; // legacy shuffle-dependent shape
+    }
+    const pairs = question.pairs ?? [];
+    const detail = row.answer_json.map(mp => {
+      const canonical = pairs[mp.leftIdx];
+      const isMatch    = canonical && mp.rightText === canonical.right;
+      return { left: canonical?.left ?? `#${mp.leftIdx + 1}`, submitted: mp.rightText, correct: canonical?.right ?? null, isMatch };
+    });
+    return { ...base,
+      matchDetail:    detail,
+      submittedLabel: detail.map(d => `${d.left} → ${d.submitted}`).join(", "),
+      correctLabel:   pairs.map(p => `${p.left} → ${p.right}`).join(", "),
+    };
+  }
+  return { ...base, submittedLabel: row.answer_text ?? null, correctLabel: null };
+};
+
+const ANSWER_STATUS_STYLES = {
+  correct:     { label: "Correct",     bg: "#D1FAE5", text: "#059669",   icon: "✓" },
+  incorrect:   { label: "Incorrect",   bg: "#FEF2F2", text: C.red,       icon: "✗" },
+  unanswered:  { label: "Unanswered",  bg: C.muted,   text: C.textMuted, icon: "—" },
+  skipped:     { label: "Skipped",     bg: "#FEF3C7", text: "#B45309",   icon: "⏭" },
+  unavailable: { label: "Unavailable", bg: C.muted,   text: C.textMuted, icon: "?" },
+};
+
 function SessionDetailView({ session, onBack }) {
   const [tab, setTab] = useState("overview");
 
@@ -5655,6 +5747,162 @@ function SessionDetailView({ session, onBack }) {
   );
 }
 
+// ── PLAYER "MY SCORES" SESSION DETAIL (real Ralli Live history) ──────────────
+// Focused, real-data-only detail for one completed session. Uses ONLY the
+// canonical sources: game_players (final score/rank via the passed `session`),
+// game_sessions.question_snapshot (exact questions + order), and this player's
+// OWN game_answers (getPlayerAnswersForSession — scoped by exact session_id AND
+// authenticated player_id, never another player's rows). Renders every answer
+// through the shared resolveAnswerDetail helper. Never loads the mutable quiz,
+// never fabricates accuracy/topics/recommendations/right answers.
+function PlayerSessionDetail({ session, playerId, onBack }) {
+  const [snapStatus,    setSnapStatus]    = useState("loading"); // loading | ok | empty | failed
+  const [answersStatus, setAnswersStatus] = useState("loading"); // loading | ok | failed
+  const [snapshot,      setSnapshot]      = useState(null);
+  const [answers,       setAnswers]       = useState([]);
+  const [totalPlayers,  setTotalPlayers]  = useState(null);
+  const [reloadKey,     setReloadKey]     = useState(0);
+
+  useEffect(() => {
+    if (!session?.dbId || !playerId) { setSnapStatus("failed"); setAnswersStatus("failed"); return; }
+    let cancelled = false;               // stale guard: a newer selected session cancels this one
+    const dbId = session.dbId;
+    setSnapStatus("loading"); setAnswersStatus("loading");
+    setSnapshot(null); setAnswers([]); setTotalPlayers(null);
+    (async () => {
+      const [snapRes, ansRes, cntRes] = await Promise.all([
+        getSessionQuestionSnapshot(dbId),
+        getPlayerAnswersForSession(dbId, playerId),
+        getSessionPlayerCounts([dbId]),
+      ]);
+      if (cancelled) return;             // a delayed response must not overwrite a newer session
+      if (snapRes.error)                       setSnapStatus("failed");
+      else if (!snapRes.data || snapRes.data.length === 0) setSnapStatus("empty"); // legacy: no snapshot
+      else { setSnapshot(snapRes.data);        setSnapStatus("ok"); }
+      if (ansRes.error) setAnswersStatus("failed");
+      else { setAnswers(ansRes.data ?? []); setAnswersStatus("ok"); }
+      if (!cntRes.error && cntRes.data) setTotalPlayers(cntRes.data[dbId] ?? null); // else hidden
+    })();
+    return () => { cancelled = true; };
+  }, [session?.dbId, playerId, reloadKey]);
+
+  const retry = () => setReloadKey(k => k + 1);
+  const mobile = useMobile();
+
+  const backBtn = (
+    <button onClick={onBack} style={{ display: "flex", alignItems: "center", gap: 6, background: "none", border: "none", cursor: "pointer", color: C.textSub, fontSize: 13, fontWeight: 700, padding: 0, marginBottom: 18 }}>
+      ← Back to My Scores
+    </button>
+  );
+
+  const rankLabel = session?.rank != null
+    ? (totalPlayers != null ? `#${session.rank} of ${totalPlayers}` : `#${session.rank}`)
+    : "—";
+
+  const header = (
+    <div style={{ marginBottom: 20 }}>
+      <h2 style={{ margin: "0 0 6px", fontSize: 22, fontWeight: 900, color: C.text }}>{session?.sessionName ?? "Game"}</h2>
+      <div style={{ display: "flex", flexWrap: "wrap", gap: 16, fontSize: 13, color: C.textSub }}>
+        <span>{session?.date ?? "—"}</span>
+        <span>Final score: <strong style={{ color: C.orange }}>{(session?.score ?? 0).toLocaleString()} pts</strong></span>
+        <span>Placement: <strong style={{ color: C.text }}>{rankLabel}</strong></span>
+      </div>
+    </div>
+  );
+
+  const errorBox = (msg) => (
+    <div style={{ textAlign: "center", padding: "40px 0", color: C.textSub }}>
+      <p style={{ fontSize: 22, margin: "0 0 8px" }}>⚠️</p>
+      <p style={{ margin: 0, fontSize: 14, fontWeight: 600 }}>{msg}</p>
+      <button onClick={retry} style={{ marginTop: 14, padding: "8px 20px", borderRadius: 10, border: `1px solid ${C.border}`, background: C.white, color: C.text, fontSize: 13, fontWeight: 700, cursor: "pointer" }}>Retry</button>
+    </div>
+  );
+
+  let body;
+  if (snapStatus === "loading" || answersStatus === "loading") {
+    body = <p style={{ fontSize: 13, color: C.textSub, padding: "20px 0" }}>Loading session details…</p>;
+  } else if (snapStatus === "failed") {
+    body = errorBox("Session questions could not be loaded.");
+  } else if (answersStatus === "failed") {
+    body = errorBox("Your answers could not be loaded.");
+  } else if (snapStatus === "empty") {
+    // Legacy session created before the immutable snapshot existed — degrade
+    // honestly, never substitute the current (mutable) quiz.
+    body = (
+      <div style={{ textAlign: "center", padding: "40px 0", color: C.textSub }}>
+        <p style={{ fontSize: 22, margin: "0 0 8px" }}>🕰️</p>
+        <p style={{ margin: 0, fontSize: 14, fontWeight: 600 }}>Exact question detail unavailable for this historical session.</p>
+      </div>
+    );
+  } else {
+    // ok — resolve each snapshot question against this player's own answer row.
+    const byQ = new Map();
+    for (const r of dedupeAnswerRowsByPlayerQ(answers)) byQ.set(r.question_idx, r);
+    body = (
+      <div style={{ display: "flex", flexDirection: "column", gap: 12 }}>
+        {snapshot.map((q, i) => {
+          const row    = byQ.get(i) ?? null;
+          const detail = resolveAnswerDetail(row, q);
+          const st     = ANSWER_STATUS_STYLES[detail.status] ?? ANSWER_STATUS_STYLES.unavailable;
+          const showCorrect = (detail.status === "incorrect" || detail.status === "unanswered") && detail.correctLabel;
+          const validTime = detail.timeMs != null && detail.timeMs >= 0;
+          return (
+            <div key={q.id ?? i} style={{ borderRadius: 14, border: `1px solid ${C.border}`, background: C.white, padding: mobile ? 14 : 18 }}>
+              <div style={{ display: "flex", alignItems: "flex-start", justifyContent: "space-between", gap: 12 }}>
+                <div style={{ flex: 1, minWidth: 0 }}>
+                  <p style={{ margin: "0 0 2px", fontSize: 10, fontWeight: 700, letterSpacing: "0.08em", textTransform: "uppercase", color: C.textMuted }}>
+                    Q{i + 1} · {Q_TYPE_LABELS[q.type] ?? "Question"}
+                  </p>
+                  <p style={{ margin: 0, fontSize: 14, fontWeight: 700, color: C.text }}>{q.q ?? q.text ?? `Question ${i + 1}`}</p>
+                </div>
+                <span style={{ flexShrink: 0, padding: "4px 10px", borderRadius: 8, background: st.bg, color: st.text, fontSize: 12, fontWeight: 800 }}>{st.icon} {st.label}</span>
+              </div>
+
+              {/* Matching detail (per-pair), else the submitted label */}
+              {detail.matchDetail ? (
+                <div style={{ marginTop: 10, display: "flex", flexDirection: "column", gap: 4 }}>
+                  {detail.matchDetail.map((d, k) => (
+                    <div key={k} style={{ fontSize: 12, color: C.textSub }}>
+                      <span style={{ color: C.text }}>{d.left}</span> → <span style={{ color: d.isMatch ? "#059669" : C.red, fontWeight: 700 }}>{d.submitted}</span>
+                      {!d.isMatch && d.correct != null && <span style={{ color: C.textMuted }}> (correct: {d.correct})</span>}
+                    </div>
+                  ))}
+                </div>
+              ) : detail.status !== "skipped" && detail.status !== "unavailable" ? (
+                <p style={{ margin: "10px 0 0", fontSize: 13, color: C.textSub }}>
+                  Your answer: <strong style={{ color: C.text }}>{detail.submittedLabel != null && detail.submittedLabel !== "" ? detail.submittedLabel : "—"}</strong>
+                </p>
+              ) : null}
+
+              {showCorrect && (
+                <p style={{ margin: "4px 0 0", fontSize: 13, color: C.textSub }}>
+                  Correct answer: <strong style={{ color: "#059669" }}>{detail.correctLabel}</strong>
+                </p>
+              )}
+
+              <div style={{ marginTop: 8, display: "flex", gap: 16, fontSize: 11, color: C.textMuted }}>
+                <span>{(detail.points ?? 0).toLocaleString()} pts</span>
+                {validTime && <span>{(detail.timeMs / 1000).toFixed(1)}s</span>}
+              </div>
+            </div>
+          );
+        })}
+        {answers.length === 0 && (
+          <p style={{ fontSize: 12, color: C.textMuted, textAlign: "center", padding: "8px 0" }}>You have no recorded answers for this session.</p>
+        )}
+      </div>
+    );
+  }
+
+  return (
+    <div style={{ maxWidth: 720 }}>
+      {backBtn}
+      {header}
+      {body}
+    </div>
+  );
+}
+
 // ── RANKD JOIN PANEL (user view) ────────────────────────────
 
 function RankdJoinPanel({ onJoin, sessions, currentUser }) {
@@ -5663,15 +5911,32 @@ function RankdJoinPanel({ onJoin, sessions, currentUser }) {
   const [joining, setJoining]               = useState(false);
   const [tab, setTab]                       = useState("join");
   const [activeHistorySession, setActiveHistorySession] = useState(null);
-  const [dbHistory, setDbHistory]           = useState(null); // null = not yet loaded
+  const [dbHistory, setDbHistory]           = useState([]);      // loaded rows
+  const [historyStatus, setHistoryStatus]   = useState("idle");  // idle | loading | ok | failed
+  const [historyCounts, setHistoryCounts]   = useState({});      // sessionId -> participant count
+  const [historyReloadKey, setHistoryReloadKey] = useState(0);
 
-  // Load real game history when My Scores tab is opened
+  // Load real game history when My Scores tab is opened. The previous version
+  // did `setDbHistory(data ?? [])` and ignored `error`, so a FAILED query (the
+  // getPlayerGameHistory bug ordered by a non-existent column) looked identical
+  // to "no games". Now the error is surfaced with Retry, and only a genuinely
+  // empty successful load shows "No games yet".
   useEffect(() => {
-    if (tab !== "scores" || dbHistory !== null || !currentUser?.id) return;
-    getPlayerGameHistory(currentUser.id).then(({ data }) => {
-      setDbHistory(data ?? []);
+    if (tab !== "scores" || !currentUser?._isReal || !currentUser?.id) return;
+    let cancelled = false;
+    setHistoryStatus("loading");
+    getPlayerGameHistory(currentUser.id).then(({ data, error }) => {
+      if (cancelled) return;
+      if (error) { console.error("[ralli:player] getPlayerGameHistory failed:", error); setHistoryStatus("failed"); return; }
+      const rows = data ?? [];
+      setDbHistory(rows);
+      setHistoryStatus("ok");
+      // Exact participant counts (session_id only — no other players' data).
+      const ids = rows.map(r => r.session_id).filter(Boolean);
+      getSessionPlayerCounts(ids).then(({ data: counts }) => { if (!cancelled && counts) setHistoryCounts(counts); });
     });
-  }, [tab, currentUser?.id]); // eslint-disable-line react-hooks/exhaustive-deps
+    return () => { cancelled = true; };
+  }, [tab, currentUser?.id, currentUser?._isReal, historyReloadKey]); // eslint-disable-line react-hooks/exhaustive-deps
 
   const handleJoin = async (overridePin) => {
     const p = overridePin ?? pin;
@@ -5768,17 +6033,28 @@ function RankdJoinPanel({ onJoin, sessions, currentUser }) {
 
       {tab === "scores" && (
         activeHistorySession ? (
-          <SessionDetailView session={activeHistorySession} onBack={() => setActiveHistorySession(null)} />
+          // Real sessions (carry a dbId = game_sessions.id) open the real-data
+          // player detail; demo seed rows keep the legacy demo detail view.
+          activeHistorySession.dbId
+            ? <PlayerSessionDetail session={activeHistorySession} playerId={currentUser?.id} onBack={() => setActiveHistorySession(null)} />
+            : <SessionDetailView session={activeHistorySession} onBack={() => setActiveHistorySession(null)} />
         ) : (() => {
-          // Real users: use DB history if loaded; demo users: use seed data
-          const useDb       = currentUser?._isReal && dbHistory !== null;
-          const isLoading   = currentUser?._isReal && dbHistory === null;
-          const historyData = useDb ? dbHistory : USER_GAME_HISTORY;
+          const useDb = !!currentUser?._isReal; // real users always use the DB path
 
-          if (isLoading) {
+          if (useDb && historyStatus === "loading") {
             return <p style={{ fontSize: 13, color: C.textSub, padding: "20px 0" }}>Loading your game history…</p>;
           }
-          if (useDb && historyData.length === 0) {
+          if (useDb && historyStatus === "failed") {
+            // A failed query must NOT masquerade as "No games yet".
+            return (
+              <div style={{ textAlign: "center", padding: "48px 0", color: C.textSub }}>
+                <p style={{ fontSize: 22, margin: "0 0 8px" }}>⚠️</p>
+                <p style={{ margin: 0, fontSize: 14, fontWeight: 600 }}>Your game history could not be loaded.</p>
+                <button onClick={() => setHistoryReloadKey(k => k + 1)} style={{ marginTop: 14, padding: "8px 20px", borderRadius: 10, border: `1px solid ${C.border}`, background: C.white, color: C.text, fontSize: 13, fontWeight: 700, cursor: "pointer" }}>Retry</button>
+              </div>
+            );
+          }
+          if (useDb && historyStatus === "ok" && dbHistory.length === 0) {
             return (
               <div style={{ textAlign: "center", padding: "48px 0", color: C.textSub }}>
                 <p style={{ fontSize: 22, margin: "0 0 8px" }}>🎮</p>
@@ -5788,22 +6064,23 @@ function RankdJoinPanel({ onJoin, sessions, currentUser }) {
             );
           }
 
-          // Map DB rows to display shape (mirrors USER_GAME_HISTORY shape)
+          // Map game_players rows → display shape. Canonical: final_score/rank
+          // from game_players, name/date/pin/questionCount from the joined
+          // session, exact participant count from historyCounts. Each row carries
+          // dbId = session_id so the detail loads the exact historical session.
           const displayHistory = useDb
-            ? historyData.map((row, i) => ({
-                id:          row.id,
-                sessionName: row.game_sessions?.name ?? "Game",
-                date:        row.game_sessions?.ended_at ? new Date(row.game_sessions.ended_at).toLocaleDateString("en-US", { month: "short", day: "numeric" }) : "—",
-                rank:        row.final_rank ?? i + 1,
-                totalPlayers: null,
-                score:       row.final_score ?? 0,
-                scorePercent: null, // not stored in game_players
-                accuracy:    null,
-                pin:         row.game_sessions?.pin ?? "—",
+            ? dbHistory.map((row, i) => ({
+                id:            row.id,
+                dbId:          row.session_id,
+                sessionName:   row.game_sessions?.name ?? "Game",
+                date:          row.game_sessions?.ended_at ? new Date(row.game_sessions.ended_at).toLocaleDateString("en-US", { month: "short", day: "numeric" }) : "—",
+                rank:          row.final_rank ?? i + 1,
+                totalPlayers:  historyCounts[row.session_id] ?? null,
+                score:         row.final_score ?? 0,
+                pin:           row.game_sessions?.pin ?? "—",
                 questionCount: row.game_sessions?.question_count ?? "—",
-                questions:   [],
               }))
-            : historyData;
+            : USER_GAME_HISTORY;
 
           if (!useDb) {
             // Legacy demo path — unchanged
@@ -5887,21 +6164,30 @@ function RankdJoinPanel({ onJoin, sessions, currentUser }) {
                   <h3 style={{ margin: 0, fontSize: 13, fontWeight: 700, color: C.text }}>Session History</h3>
                 </div>
                 {displayHistory.map((s, idx) => (
-                  <div key={s.id} style={{
-                    padding: "16px 20px", display: "flex", alignItems: "center", gap: 16,
+                  // Clickable — opens the exact historical detail for THIS player.
+                  <button key={s.id} onClick={() => setActiveHistorySession(s)} style={{
+                    width: "100%", padding: "16px 20px", display: "flex", alignItems: "center", gap: 16,
                     borderBottom: idx < displayHistory.length - 1 ? `1px solid ${C.border}` : "none",
-                  }}>
+                    background: "transparent", border: "none", cursor: "pointer", textAlign: "left",
+                  }}
+                  onMouseEnter={e => e.currentTarget.style.background = C.pageBg}
+                  onMouseLeave={e => e.currentTarget.style.background = "transparent"}>
                     <div style={{ width: 36, height: 36, borderRadius: 10, flexShrink: 0, display: "flex", alignItems: "center", justifyContent: "center", fontSize: 12, fontWeight: 800, background: s.rank === 1 ? C.orange : C.muted, color: s.rank === 1 ? "#fff" : C.textSub }}>
                       #{s.rank}
                     </div>
                     <div style={{ flex: 1, minWidth: 0 }}>
                       <p style={{ margin: 0, fontSize: 13, fontWeight: 700, color: C.text }}>{s.sessionName}</p>
-                      <p style={{ margin: "2px 0 0", fontSize: 11, color: C.textSub }}>{s.date} · PIN: {s.pin}</p>
+                      <p style={{ margin: "2px 0 0", fontSize: 11, color: C.textSub }}>
+                        {s.date}
+                        {s.totalPlayers != null ? ` · #${s.rank} of ${s.totalPlayers}` : ` · #${s.rank}`}
+                        {s.questionCount != null && s.questionCount !== "—" ? ` · ${s.questionCount} questions` : ""}
+                      </p>
                     </div>
                     <div style={{ textAlign: "right", flexShrink: 0 }}>
                       <p style={{ margin: 0, fontSize: 18, fontWeight: 900, color: C.orange }}>{(s.score ?? 0).toLocaleString()} pts</p>
                     </div>
-                  </div>
+                    <span style={{ fontSize: 14, color: C.textMuted, flexShrink: 0 }}>›</span>
+                  </button>
                 ))}
               </div>
             </div>
@@ -6795,24 +7081,12 @@ function RankdResultsScreen({ onNav, sessionDbId, sessionCode, sessions, gameDat
   // question_idx). All answerRows are already scoped to this session, so dedupe
   // by (player_id, question_idx), keeping the latest row by answered_at (then a
   // stable id fallback). Analytics must never double-count a duplicate row.
-  const dedupedAnswerRows = (() => {
-    const byKey = new Map();
-    for (const r of (answerRows ?? [])) {
-      const key = `${r.player_id}::${r.question_idx}`;
-      const prev = byKey.get(key);
-      if (!prev) { byKey.set(key, r); continue; }
-      const rt = r.answered_at ? Date.parse(r.answered_at) : 0;
-      const pt = prev.answered_at ? Date.parse(prev.answered_at) : 0;
-      if (rt > pt || (rt === pt && String(r.id ?? "") > String(prev.id ?? ""))) byKey.set(key, r);
-    }
-    return [...byKey.values()];
-  })();
+  const dedupedAnswerRows = dedupeAnswerRowsByPlayerQ(answerRows);
 
   // A row counts as a real submission (vs an explicit "unanswered" placeholder)
-  // — same contract getAnswerDetail uses, so every metric agrees with Player
-  // Breakdown.
-  const rowHasSubmission = (r) => r.option_idx != null || (r.answer_text != null && r.answer_text !== "")
-    || r.numeric_value != null || (Array.isArray(r.answer_json) && r.answer_json.length > 0);
+  // — same shared contract resolveAnswerDetail uses, so every metric agrees with
+  // Player Breakdown AND the player "My Scores" detail.
+  const rowHasSubmission = answerRowHasSubmission;
 
   // ONE canonical answer lookup keyed by player_id + question_idx, built from
   // the SAME deduplicated (latest answered_at, then id) rows the aggregation
@@ -6875,74 +7149,11 @@ function RankdResultsScreen({ onNav, sessionDbId, sessionCode, sessions, gameDat
     eligible: q.eligible, accuracy: q.accuracy, avgMs: q.avgValidTimeMs, skipped: q.skipped,
   }));
 
-  // ── Canonical answer-detail renderer/data contract ─────────────────────────
-  // Single source of truth for "what did this player submit on this
-  // question" — used by both the Player Breakdown and Questions drill-downs
-  // so the two views can never disagree. Resolves a raw game_answers row +
-  // its canonical question definition into a display-ready shape.
-  const getAnswerDetail = (row, question) => {
-    if (!question) return { status: "unavailable" };
-    if (row?.was_skipped) return { status: "skipped", points: 0, timeMs: null };
-    if (!row) return { status: "unavailable" };
-    const type = question.type;
-    const hasSubmission = row.option_idx != null || (row.answer_text != null && row.answer_text !== "")
-      || row.numeric_value != null || (Array.isArray(row.answer_json) && row.answer_json.length > 0);
-    if (!hasSubmission) {
-      let correctLabel = null;
-      if (type === "mc" || type === "tf") correctLabel = question.options?.[question.correct] ?? null;
-      else if (type === "type") correctLabel = (question.acceptedAnswers ?? []).join(" / ") || null;
-      else if (type === "slider") correctLabel = `${question.correct ?? 5} ± ${question.tolerance ?? 1}`;
-      else if (type === "match") correctLabel = (question.pairs ?? []).map(p => `${p.left} → ${p.right}`).join(", ") || null;
-      return { status: "unanswered", correctLabel, points: 0, timeMs: null };
-    }
-    const base = { points: row.points ?? 0, timeMs: row.time_ms ?? null, status: row.is_correct ? "correct" : "incorrect" };
-    if (type === "mc" || type === "tf") {
-      return { ...base,
-        submittedLabel: row.option_idx != null ? (question.options?.[row.option_idx] ?? `Option ${row.option_idx + 1}`) : null,
-        correctLabel:   question.options?.[question.correct] ?? null,
-      };
-    }
-    if (type === "type") {
-      return { ...base,
-        submittedLabel: row.answer_text,
-        correctLabel:   (question.acceptedAnswers ?? []).join(" / ") || null,
-      };
-    }
-    if (type === "slider") {
-      if (row.numeric_value == null) return { ...base, status: "unavailable", points: row.points ?? 0 };
-      return { ...base,
-        submittedLabel: String(row.numeric_value),
-        correctLabel:   `${question.correct ?? 5} ± ${question.tolerance ?? 1}`,
-      };
-    }
-    if (type === "match") {
-      if (!Array.isArray(row.answer_json) || row.answer_json.length === 0 || row.answer_json[0]?.rightText === undefined) {
-        // Legacy shape (raw shuffle-dependent rightIdx, pre-migration-045) or
-        // no data — the shuffle order is gone, so exact pairs can't be shown.
-        return { ...base, status: "unavailable", points: row.points ?? 0 };
-      }
-      const pairs = question.pairs ?? [];
-      const detail = row.answer_json.map(mp => {
-        const canonical = pairs[mp.leftIdx];
-        const isMatch    = canonical && mp.rightText === canonical.right;
-        return { left: canonical?.left ?? `#${mp.leftIdx + 1}`, submitted: mp.rightText, correct: canonical?.right ?? null, isMatch };
-      });
-      return { ...base,
-        matchDetail:    detail,
-        submittedLabel: detail.map(d => `${d.left} → ${d.submitted}`).join(", "),
-        correctLabel:   pairs.map(p => `${p.left} → ${p.right}`).join(", "),
-      };
-    }
-    return { ...base, submittedLabel: row.answer_text ?? null, correctLabel: null };
-  };
+  // Canonical answer-detail contract — the SHARED module-level helper, so the
+  // manager drill-downs and the player "My Scores" detail can never disagree.
+  const getAnswerDetail = resolveAnswerDetail;
 
-  const STATUS_STYLES = {
-    correct:     { label: "Correct",     bg: "#D1FAE5", text: "#059669", icon: "✓" },
-    incorrect:   { label: "Incorrect",   bg: "#FEF2F2", text: C.red,     icon: "✗" },
-    unanswered:  { label: "Unanswered",  bg: C.muted,   text: C.textMuted, icon: "—" },
-    skipped:     { label: "Skipped",     bg: "#FEF3C7", text: "#B45309", icon: "⏭" },
-    unavailable: { label: "Unavailable", bg: C.muted,   text: C.textMuted, icon: "?" },
-  };
+  const STATUS_STYLES = ANSWER_STATUS_STYLES;
 
   // Shared answer-detail body — used inside both the Player Breakdown
   // question card (below) and the Questions-tab player row so submitted/
