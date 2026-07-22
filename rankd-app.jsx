@@ -162,9 +162,14 @@ const liveQuestionTimingSeq = (lq) => (lq?.timingUpdatedAt ?? lq?.questionStarte
 
 function useGameChannel(pin, role) {
   const channelRef       = useRef(null);
-  // Buffer for the player's track payload — flushed once the channel is SUBSCRIBED.
-  // Fixes the race where ch.track() is called before the WebSocket handshake completes.
-  const pendingTrackRef  = useRef(null);
+  // The player's Presence identity for THIS channel connection. Persistent (not
+  // cleared after the first flush) so every SUBSCRIBED — the initial subscribe
+  // AND every websocket reconnect — re-tracks the same player. Set via
+  // trackPlayerPresence(); the subscribe callback re-emits it. Cleared only when
+  // the channel itself is torn down (pin/role change), so a new game starts
+  // fresh. This is what keeps a player who reconnects/rejoins directly into the
+  // game present in the host's Presence roster.
+  const presenceRef      = useRef(null);
   const [chPlayers, setChPlayers] = useState([]);
   const [chAnswers, setChAnswers] = useState({});   // { playerId: { optionIdx, timeMs, name, text } }
   const [chMsg,     setChMsg]     = useState(null); // latest inbound broadcast for player side
@@ -241,22 +246,43 @@ function useGameChannel(pin, role) {
     setChStatus("init");
     channel.subscribe((status) => {
       setChStatus(status);
-      // Once subscribed, flush any track that was queued before the WebSocket was ready.
-      if (status === 'SUBSCRIBED' && pendingTrackRef.current) {
-        channel.track(pendingTrackRef.current);
-        pendingTrackRef.current = null;
+      // (Re)track the player's Presence on EVERY SUBSCRIBED — initial subscribe
+      // and every reconnect — so presence survives a dropped websocket. Not
+      // cleared here, so the identity persists across reconnects.
+      if (status === 'SUBSCRIBED' && presenceRef.current) {
+        channel.track(presenceRef.current);
       }
     });
 
     return () => {
       supabase.removeChannel(channel);
       channelRef.current = null;
-      pendingTrackRef.current = null;
+      presenceRef.current = null; // channel torn down (pin/role change) → next game starts fresh
       setChPlayers([]);
       setChAnswers({});
       setChMsg(null);
     };
   }, [pin, role]);
+
+  // ── Shared player-Presence registration ─────────────────────────────────────
+  // The ONE path that registers a player in Presence for the whole connection
+  // lifecycle (lobby join, entering the game, refresh/reconnect directly into
+  // the game). Stores the identity so the subscribe callback re-tracks it on
+  // every (re)SUBSCRIBED, and also tracks immediately if already subscribed.
+  // Identity is caller-provided (id/name/nullable emoji/color) — never a new one.
+  const trackPlayerPresence = useCallback((player) => {
+    if (!player?.id) return;
+    const trackData = {
+      presenceRole: "user",
+      playerId:     player.id,
+      name:         player.name,
+      emoji:        player.emoji ?? null,
+      color:        player.color ?? null,
+    };
+    presenceRef.current = trackData;
+    const ch = channelRef.current;
+    if (ch) ch.track(trackData); // no-op until SUBSCRIBED; the callback re-tracks then
+  }, []);
 
   // ── broadcast ─────────────────────────────────────────────────────────────
   // Intercepts PLAYER_JOIN → tracks player in Presence instead of sending a message.
@@ -268,18 +294,9 @@ function useGameChannel(pin, role) {
     const { type, ...payload } = msg;
 
     if (type === GM.PLAYER_JOIN) {
-      // Buffer the track payload so the subscribe callback can flush it if the
-      // WebSocket isn't ready yet (race condition on lobby mount).
-      const trackData = {
-        presenceRole: "user",
-        playerId:     payload.player.id,
-        name:         payload.player.name,
-        emoji:        payload.player.emoji,
-        color:        payload.player.color,
-      };
-      pendingTrackRef.current = trackData;
-      // Also attempt immediately — succeeds if already SUBSCRIBED, is a no-op otherwise.
-      ch.track(trackData);
+      // Backward-compatible alias — routes to the SAME shared registration path
+      // (single implementation) so no divergent presence logic exists.
+      trackPlayerPresence(payload.player);
       return;
     }
 
@@ -291,9 +308,9 @@ function useGameChannel(pin, role) {
 
     // All other messages: send via Broadcast
     ch.send({ type: "broadcast", event: type, payload });
-  }, []);
+  }, [trackPlayerPresence]);
 
-  return { chPlayers, setChPlayers, chAnswers, setChAnswers, chMsg, broadcast, chStatus };
+  return { chPlayers, setChPlayers, chAnswers, setChAnswers, chMsg, broadcast, chStatus, trackPlayerPresence };
 }
 
 // ── DESIGN TOKENS (exact Figma theme.css values) ────────────
@@ -3325,7 +3342,7 @@ function KahootHostView({ onNav, sessionName, pin, sessionDbId, demoMode, tenant
 }
 
 // ── REAL GAME PLAYER VIEW ────────────────────────────────────
-function KahootPlayerView({ onNav, playerName, playerId, pin, sessionDbId, tenantId, broadcast, chMsg, chStatus }) {
+function KahootPlayerView({ onNav, playerName, playerEmoji, playerId, pin, sessionDbId, tenantId, broadcast, trackPlayerPresence, chMsg, chStatus }) {
   const mobile          = useMobile();
   const [phase,         setPhase]         = useState("waiting");
   const [cdNum,         setCdNum]         = useState(3);
@@ -3468,6 +3485,26 @@ function KahootPlayerView({ onNav, playerName, playerId, pin, sessionDbId, tenan
       console.error("[ralli:player] reconcile failed:", e);
     }
   }, [sessionDbId, playerId, applyShowQuestion]); // eslint-disable-line react-hooks/exhaustive-deps
+
+  // ── Player Presence registration (gameplay connection lifecycle) ────────────
+  // Presence must belong to the player's CONNECTION, not just the lobby screen.
+  // A player who reconnects/rejoins directly into the game never remounts the
+  // lobby, so without this the host's Presence roster (its connected-now truth)
+  // stays empty and Resume is wrongly blocked. Register on every SUBSCRIBED
+  // (initial + every reconnect) via the ONE shared path. Identity is the exact
+  // retained gamePlayerId + name + nullable avatar + stable cosmetic color —
+  // never a new identity. trackPlayerPresence stores it so the channel re-tracks
+  // on reconnect too; the host dedups by playerId as a safety net.
+  useEffect(() => {
+    if (chStatus !== "SUBSCRIBED" || !playerId || !trackPlayerPresence) return;
+    const pidx = Math.abs(playerId.charCodeAt(0) + (playerId.charCodeAt(1) || 0)) % PLAYER_EMOJIS.length;
+    trackPlayerPresence({
+      id:    playerId,
+      name:  playerName,
+      emoji: playerEmoji ?? null,                          // no-avatar stays null (name-only)
+      color: PLAYER_COLORS[pidx % PLAYER_COLORS.length],   // stable cosmetic tint (host patches from DB)
+    });
+  }, [chStatus, playerId, playerName, playerEmoji]); // eslint-disable-line react-hooks/exhaustive-deps
 
   // Reconcile on: initial load / identity change …
   useEffect(() => { reconcile(); }, [sessionDbId, playerId]); // eslint-disable-line react-hooks/exhaustive-deps
@@ -4174,13 +4211,13 @@ function KahootPlayerView({ onNav, playerName, playerId, pin, sessionDbId, tenan
 
 // ── RANKD GAME SCREEN ────────────────────────────────────────
 
-function RankdGameScreen({ onNav, sessionName, role, playerName, questions = GAME_QUESTIONS, demoMode = true, pin, sessionDbId, tenantId, broadcast, chMsg, chStatus, chAnswers, chPlayers, playerId, onGameEnd, setChAnswers }) {
+function RankdGameScreen({ onNav, sessionName, role, playerName, playerEmoji, questions = GAME_QUESTIONS, demoMode = true, pin, sessionDbId, tenantId, broadcast, trackPlayerPresence, chMsg, chStatus, chAnswers, chPlayers, playerId, onGameEnd, setChAnswers }) {
   // Real multiplayer mode — route to Kahoot views
   if (!demoMode && role === "admin") {
     return <KahootHostView onNav={onNav} sessionName={sessionName} pin={pin} sessionDbId={sessionDbId} demoMode={demoMode} tenantId={tenantId} questions={questions} broadcast={broadcast} chAnswers={chAnswers} chPlayers={chPlayers} chStatus={chStatus} onGameEnd={onGameEnd} setChAnswers={setChAnswers} />;
   }
   if (!demoMode && role !== "admin") {
-    return <KahootPlayerView onNav={onNav} playerName={playerName} playerId={playerId} pin={pin} sessionDbId={sessionDbId} tenantId={tenantId} broadcast={broadcast} chMsg={chMsg} chStatus={chStatus} />;
+    return <KahootPlayerView onNav={onNav} playerName={playerName} playerEmoji={playerEmoji} playerId={playerId} pin={pin} sessionDbId={sessionDbId} tenantId={tenantId} broadcast={broadcast} trackPlayerPresence={trackPlayerPresence} chMsg={chMsg} chStatus={chStatus} />;
   }
 
   const mobile = useMobile();
@@ -6521,7 +6558,7 @@ function RankdNameEntryScreen({ onNav, pin, sessionName, onConfirm, defaultName,
 
 // ── RANKD LOBBY SCREEN ───────────────────────────────────────
 
-function RankdLobbyScreen({ onNav, pin, playerName, playerEmoji, sessionName, role, sessions = [], currentUser, onGameStart, chPlayers, broadcast, playerId, chMsg, onHostEnd }) {
+function RankdLobbyScreen({ onNav, pin, playerName, playerEmoji, sessionName, role, sessions = [], currentUser, onGameStart, chPlayers, broadcast, trackPlayerPresence, playerId, chMsg, onHostEnd }) {
   const mobile = useMobile();
   const session     = sessions.find(s => s.code === pin);
   const sessionDbId = session?.dbId ?? null;
@@ -6717,7 +6754,8 @@ function RankdLobbyScreen({ onNav, pin, playerName, playerEmoji, sessionName, ro
     // cosmetic tint. Identity is `id`; gameplay never reads emoji.
     const resolvedEmoji = dbSelf?.emoji ?? playerEmoji ?? null;
     const resolvedColor = dbSelf?.color ?? PLAYER_COLORS[pidx % PLAYER_COLORS.length];
-    broadcast({ type: GM.PLAYER_JOIN, player: { id: playerId, name: playerName, emoji: resolvedEmoji, color: resolvedColor } });
+    // Same shared registration path the game view uses (no divergent logic).
+    trackPlayerPresence?.({ id: playerId, name: playerName, emoji: resolvedEmoji, color: resolvedColor });
   }, [isDemoMode, pin, playerId, role, playerEmoji, dbPlayers]); // eslint-disable-line react-hooks/exhaustive-deps
 
   // Player side: watch for GAME_START or first SHOW_QUESTION → navigate to game;
@@ -22550,7 +22588,7 @@ export default function App() {
   // only for a pure demo session with no DB row. Never a PIN re-lookup.
   const lobbySessionDbId = activeGameSessionDbId;
   const gameChannelKey = isInGame ? (lobbySessionDbId ?? lobbyPin) : null;
-  const { chPlayers, chAnswers, setChAnswers, chMsg, broadcast, chStatus } = useGameChannel(gameChannelKey, gameRole);
+  const { chPlayers, chAnswers, setChAnswers, chMsg, broadcast, chStatus, trackPlayerPresence } = useGameChannel(gameChannelKey, gameRole);
 
   // Recovery mode takes priority over normal routing — show the reset form regardless
   // of whether a session exists. This prevents the app from routing past the form if
@@ -23458,7 +23496,7 @@ export default function App() {
       case "rankd-new":         return <NewSessionScreen onNav={navigate} quizzes={quizzes} onCreateSession={handleCreateSession} />;
       case "rankd-quiz-builder":return <QuizBuilderScreen onNav={navigate} onSave={handleSaveQuiz} initialQuiz={editingQuiz} onEditQuiz={handleEditQuiz} />;
       case "rankd-name-entry":  return <RankdNameEntryScreen onNav={navigate} pin={lobbyPin} sessionName={lobbySessionName} onConfirm={handleEnterName} defaultName={userProfile.nickname?.trim() || user?.name || ""} defaultAvatar={userProfile.avatarEmoji} />;
-      case "rankd-lobby":       return <RankdLobbyScreen onNav={navigate} pin={lobbyPin} playerName={lobbyPlayerName} playerEmoji={lobbyPlayerEmoji} sessionName={lobbySessionName} role={gameRole} sessions={sessions} currentUser={currentUser} onGameStart={handleGameStart} chPlayers={chPlayers} broadcast={broadcast} playerId={gamePlayerId} chMsg={chMsg} onHostEnd={async () => {
+      case "rankd-lobby":       return <RankdLobbyScreen onNav={navigate} pin={lobbyPin} playerName={lobbyPlayerName} playerEmoji={lobbyPlayerEmoji} sessionName={lobbySessionName} role={gameRole} sessions={sessions} currentUser={currentUser} onGameStart={handleGameStart} chPlayers={chPlayers} broadcast={broadcast} trackPlayerPresence={trackPlayerPresence} playerId={gamePlayerId} chMsg={chMsg} onHostEnd={async () => {
         // Ending from the LOBBY (before gameplay) is a CANCELLATION, not a
         // completed game. Durable cancellation is the source of truth and MUST
         // succeed before we tell anyone the game ended: cancel the DB row and
@@ -23486,7 +23524,7 @@ export default function App() {
         broadcast({ type: GM.FORCE_END, cancelled: true });
         navigate("rankd");
       }} />;
-      case "rankd-game":        return <RankdGameScreen onNav={navigate} sessionName={lobbySessionName} role={gameRole} playerName={lobbyPlayerName ?? user.name} questions={gameQuestions ?? GAME_QUESTIONS} demoMode={gameRole === "admin" && activeGameIsDemo} pin={lobbyPin} sessionDbId={activeGameSessionDbId} tenantId={currentOrg?.id ?? user?.orgId ?? null} broadcast={broadcast} chMsg={chMsg} chStatus={chStatus} chAnswers={chAnswers} chPlayers={chPlayers} playerId={gamePlayerId} onGameEnd={handleGameEnd} setChAnswers={setChAnswers} />;
+      case "rankd-game":        return <RankdGameScreen onNav={navigate} sessionName={lobbySessionName} role={gameRole} playerName={lobbyPlayerName ?? user.name} playerEmoji={lobbyPlayerEmoji} questions={gameQuestions ?? GAME_QUESTIONS} demoMode={gameRole === "admin" && activeGameIsDemo} pin={lobbyPin} sessionDbId={activeGameSessionDbId} tenantId={currentOrg?.id ?? user?.orgId ?? null} broadcast={broadcast} trackPlayerPresence={trackPlayerPresence} chMsg={chMsg} chStatus={chStatus} chAnswers={chAnswers} chPlayers={chPlayers} playerId={gamePlayerId} onGameEnd={handleGameEnd} setChAnswers={setChAnswers} />;
       case "rankd-results":     return <RankdResultsScreen onNav={navigate} sessionDbId={viewResultsDbId} sessionCode={viewResultsCode} sessions={[...sessions, ...pastSessions]} gameData={gameResultsData} />;
       case "learn":             return <LearnScreen role={gameRole} user={user} orgUsers={orgUsers} orgs={orgs} onNav={navigate} onAwardXp={handleAwardXp} pendingLessonId={pendingLessonId} onClearPendingLesson={() => setPendingLessonId(null)} pendingCourseId={pendingCourseId} onClearPendingCourse={() => setPendingCourseId(null)} canCreate={perm("actions","create")} canEdit={perm("actions","edit")} canDelete={perm("actions","delete")} canAssign={perm("actions","assign")} tenantId={currentOrg?.id ?? null} isReal={!!user?._isReal} quizzes={quizzes} sharedAssignmentData={sharedAssignmentData} />;
       case "quizzes":           return <QuizzesScreen role={gameRole} onNav={navigate} quizzes={quizzes} onEditQuiz={handleEditQuiz} onDeleteQuiz={handleDeleteQuiz} onToggleFavorite={handleToggleFavorite} onToggleActive={handleToggleActive} pendingQuizId={pendingQuizId} onClearPendingQuiz={() => setPendingQuizId(null)} canCreate={perm("actions","create")} canEdit={perm("actions","edit")} canDelete={perm("actions","delete")} canLaunch={perm("actions","launch")} canAssign={perm("actions","assign")} onAssignQuiz={handleAssignQuiz} onLaunchQuiz={handleCreateSession} orgUsers={orgUsers} orgs={orgs} currentUser={currentUser} tenantId={currentOrg?.id ?? null} isReal={!!user?._isReal} quizzesReady={quizzesReady} sharedAssignmentData={sharedAssignmentData} />;
