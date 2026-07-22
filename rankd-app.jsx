@@ -120,6 +120,44 @@ const GM = {
 const PLAYER_EMOJIS = ["🦊","🐯","🦁","🐺","🦅","🐬","🦄","🐉","🦋","🐙","🦖","🦈","🐸","🐼","🦝"];
 const PLAYER_COLORS = ["#F97316","#3B82F6","#10B981","#8B5CF6","#F43F5E","#EAB308","#0EA5E9","#EC4899","#84CC16","#6366F1","#F59E0B","#14B8A6","#EF4444","#A855F7","#22C55E"];
 
+// ── Canonical question-timing helper ─────────────────────────────────────────
+// The ONE place pause / resume / refresh / reconnect timer math lives — shared
+// by host restoration, host pause/resume, and player recovery, so those paths
+// can never diverge. Given a `live_question` payload and the paused flag, it
+// returns the remaining time in ms, clamped to [0, timeLimit*1000].
+//
+// live_question timing fields:
+//   timeLimit           seconds (question limit)
+//   questionStartedAt   ms epoch — EFFECTIVE start; while running,
+//                       remaining = limit − (now − questionStartedAt). It is
+//                       unchanged by pausing and advanced forward by exactly the
+//                       paused duration on resume, so a resumed clock continues
+//                       from the frozen value (never restarts).
+//   pausedAt            ms epoch when paused (null when running)
+//   remainingTimeMs     frozen remaining while paused — AUTHORITATIVE when
+//                       paused, so paused wall-clock is never consumed
+//   timingUpdatedAt     ms epoch of the last timing change (start/pause/resume);
+//                       a monotonic version used to reject stale reconciles
+function liveQuestionRemainingMs(lq, paused, now = Date.now()) {
+  if (!lq) return 0;
+  const limitMs = Math.max(0, (lq.timeLimit ?? 0) * 1000);
+  if (paused) {
+    const frozen = lq.remainingTimeMs != null
+      ? lq.remainingTimeMs
+      : (lq.questionStartedAt != null && lq.pausedAt != null
+          ? limitMs - (lq.pausedAt - lq.questionStartedAt)
+          : limitMs);
+    return Math.min(limitMs, Math.max(0, frozen));
+  }
+  const startedAt = lq.questionStartedAt ?? now;
+  return Math.min(limitMs, Math.max(0, limitMs - (now - startedAt)));
+}
+// ms → whole seconds for the countdown display (round so ~11.5s reads 12).
+const liveQuestionRemainingSecs = (lq, paused, now = Date.now()) =>
+  Math.max(0, Math.round(liveQuestionRemainingMs(lq, paused, now) / 1000));
+// Monotonic timing version of a live_question (start/pause/resume moment).
+const liveQuestionTimingSeq = (lq) => (lq?.timingUpdatedAt ?? lq?.questionStartedAt ?? 0);
+
 function useGameChannel(pin, role) {
   const channelRef       = useRef(null);
   // Buffer for the player's track payload — flushed once the channel is SUBSCRIBED.
@@ -1917,8 +1955,20 @@ function KahootHostView({ onNav, sessionName, pin, sessionDbId, demoMode, tenant
         const safePhase = (sess.phase === "ended") ? "reveal" : (sess.phase ?? "countdown");
         if (safePhase === "countdown") setCdNum(3);
         if (safePhase === "question") {
-          const rq = questions[restoredQIdx];
-          if (rq?.timeLimit) setTimeLeft(rq.timeLimit);
+          // Timing truth is the durable live_question, NOT questions[qIdx].timeLimit
+          // (which would restart the full clock). The canonical helper returns the
+          // real remaining time — the frozen value if paused, or limit − elapsed
+          // from the effective start if running — clamped to zero. Only if the row
+          // has no live_question at all (legacy/edge) do we fall back to the limit.
+          const lqR = sess.live_question;
+          const restoredPaused = sess.paused ?? false;
+          if (lqR) {
+            setTimeLeft(liveQuestionRemainingSecs(lqR, restoredPaused));
+            if (lqR.shuffledRight) setShuffledRight(lqR.shuffledRight); // keep matching column in sync on refresh
+          } else {
+            const rq = questions[restoredQIdx];
+            if (rq?.timeLimit) setTimeLeft(rq.timeLimit);
+          }
         }
         // Set phase after other state so countdown/question effects don't fire prematurely
         setPhase(safePhase);
@@ -2076,6 +2126,8 @@ function KahootHostView({ onNav, sessionName, pin, sessionDbId, demoMode, tenant
   // when the host explicitly does so — reconnecting players never auto-resume.
   const [halted, setHalted] = useState(false);
   const [resumeBlocked, setResumeBlocked] = useState(false); // tried to resume with nobody connected
+  const [pauseError, setPauseError]   = useState(false);     // pause timing failed to persist (retryable)
+  const [resumeError, setResumeError] = useState(false);     // resume timing failed to persist (retryable)
   const zeroSinceRef = useRef(null);
   const haltArmedRef = useRef(true);     // one auto-halt per empty episode; re-arms when a player is present
   const haltActionedRef = useRef(false); // idempotent guard for the pause side effects (persist + broadcast)
@@ -2113,18 +2165,58 @@ function KahootHostView({ onNav, sessionName, pin, sessionDbId, demoMode, tenant
     return () => clearInterval(interval);
   }, [sessionDbId, restoreState]);
 
-  // Halt transition → pause the game exactly once (idempotent). Stops the timer/
-  // countdown/progression (the `halted` guards below already freeze those),
-  // persists paused=true with the CURRENT phase/index, and broadcasts the
-  // existing GM.PAUSE. Runs only when `halted` flips true; the ref guard blocks
-  // any duplicate PAUSE write/broadcast from repeated syncs or watchdog ticks.
+  // ── Canonical pause ───────────────────────────────────────────────────────
+  // The ONE pause path (manual pause AND automatic zero-player halt). During a
+  // question it captures the host's canonical remaining time (timeLeft, the
+  // authoritative frozen value), clamps it, and writes it into live_question as
+  // remainingTimeMs + pausedAt + a bumped timingUpdatedAt. Freezes locally FIRST
+  // for safety, then persists and CONFIRMS the durable write before broadcasting
+  // GM.PAUSE — so a recoverable pause state is never announced unless it was
+  // durably saved. On persist failure the host stays locally paused, no PAUSE is
+  // broadcast, and a retryable error is shown (no auto-resume/advance).
+  // Returns true if the pause was durably persisted (and broadcast), else false.
+  const pauseGame = async () => {
+    if (paused) return true; // already paused — idempotent
+    const nowTs = Date.now();
+    const cur = questions[qIdx];
+    let liveQuestion; // only rewrite timing during a live question
+    if (phase === "question" && cur) {
+      const limitMs = Math.max(0, (cur.timeLimit ?? 0) * 1000);
+      const remainingTimeMs = Math.max(0, Math.min(limitMs, timeLeft * 1000));
+      liveQuestion = {
+        qIdx, question: cur, timeLimit: cur.timeLimit, shuffledRight,
+        // Effective start is preserved (pausing does not consume time), pausedAt
+        // marks the freeze, remainingTimeMs is authoritative while paused.
+        questionStartedAt: nowTs - (limitMs - remainingTimeMs),
+        pausedAt: nowTs, remainingTimeMs, timingUpdatedAt: nowTs,
+      };
+    }
+    setPaused(true); // freeze local timer immediately (safety)
+    if (sessionDbId) {
+      const { error } = await updateSessionPhase(sessionDbId, {
+        phase, currentQuestionIndex: qIdx, paused: true,
+        liveQuestion: liveQuestion ?? undefined, // leave timing untouched outside a question
+      });
+      if (error) {
+        console.error("[ralli:host] pause persist failed — not broadcasting:", error);
+        setPauseError(true); // stays locally paused; host can retry
+        return false;
+      }
+    }
+    setPauseError(false);
+    broadcast({ type: GM.PAUSE, qIdx, remainingTimeMs: liveQuestion?.remainingTimeMs ?? null, timingUpdatedAt: liveQuestion?.timingUpdatedAt ?? nowTs });
+    return true;
+  };
+
+  // Halt transition → pause the game exactly once (idempotent). The `halted`
+  // guards below already freeze the timer/countdown/progression; this performs
+  // the durable pause + GM.PAUSE via the canonical pauseGame helper. The ref
+  // guard blocks any duplicate PAUSE write/broadcast from repeated syncs/ticks.
   useEffect(() => {
     if (!halted) return;
     if (haltActionedRef.current) return;
     haltActionedRef.current = true;
-    setPaused(true);
-    persistPhase(phase, qIdx, true);
-    broadcast({ type: GM.PAUSE });
+    pauseGame(); // confirm-before-broadcast + idempotent inside
   }, [halted]); // eslint-disable-line react-hooks/exhaustive-deps
 
   // Host chose "Stay Paused": dismiss the halt notice but KEEP the game paused.
@@ -2132,21 +2224,48 @@ function KahootHostView({ onNav, sessionName, pin, sessionDbId, demoMode, tenant
   // game is still empty; the normal paused overlay (with Resume) remains.
   const stayPaused = () => setHalted(false);
 
-  // Manual resume (from the halt notice or the paused overlay). Requires at
-  // least one CURRENTLY connected player; persists paused=false, broadcasts the
-  // existing GM.RESUME, and continues the PRESERVED phase/timer (never restarts
-  // the full question timer — timeLeft was frozen, not reset). Re-arms the halt
-  // watchdog for the next empty episode.
-  const resumeGame = () => {
+  // ── Canonical resume ──────────────────────────────────────────────────────
+  // Requires ≥1 currently connected player. During a question it derives a NEW
+  // effective questionStartedAt from the frozen remaining time (so the resumed
+  // clock continues from exactly that value — the paused wall-clock is never
+  // subtracted and the full timer is never restarted), clears pausedAt/
+  // remainingTimeMs, and bumps timingUpdatedAt. Persists paused=false and the
+  // updated live_question and CONFIRMS the write before broadcasting GM.RESUME.
+  // On persist failure it remains paused, does not broadcast RESUME, and shows a
+  // retryable error.
+  const resumeGame = async () => {
     if (connectedNow() < 1) { setResumeBlocked(true); return; }
     setResumeBlocked(false);
+    const nowTs = Date.now();
+    const cur = questions[qIdx];
+    let liveQuestion, resumedRemainingMs = null;
+    if (phase === "question" && cur) {
+      const limitMs = Math.max(0, (cur.timeLimit ?? 0) * 1000);
+      resumedRemainingMs = Math.max(0, Math.min(limitMs, timeLeft * 1000)); // frozen host value
+      liveQuestion = {
+        qIdx, question: cur, timeLimit: cur.timeLimit, shuffledRight,
+        questionStartedAt: nowTs - (limitMs - resumedRemainingMs), // new effective start
+        pausedAt: null, remainingTimeMs: null, timingUpdatedAt: nowTs,
+      };
+    }
+    if (sessionDbId) {
+      const { error } = await updateSessionPhase(sessionDbId, {
+        phase, currentQuestionIndex: qIdx, paused: false,
+        liveQuestion: liveQuestion ?? undefined,
+      });
+      if (error) {
+        console.error("[ralli:host] resume persist failed — not broadcasting:", error);
+        setResumeError(true); // stays paused; host can retry
+        return;
+      }
+    }
+    setResumeError(false);
     haltActionedRef.current = false;
     haltArmedRef.current = true;
     zeroSinceRef.current = null;
     setHalted(false);
-    setPaused(false);
-    persistPhase(phase, qIdx, false);
-    broadcast({ type: GM.RESUME });
+    setPaused(false); // local timer continues from the frozen timeLeft (never reset)
+    broadcast({ type: GM.RESUME, qIdx, questionStartedAt: liveQuestion?.questionStartedAt ?? null, remainingTimeMs: resumedRemainingMs, timingUpdatedAt: liveQuestion?.timingUpdatedAt ?? nowTs });
   };
 
   // Single fixed (non-index) placeholder for the rare case a player row has
@@ -2220,7 +2339,7 @@ function KahootHostView({ onNav, sessionName, pin, sessionDbId, demoMode, tenant
     const shuffled = q.type === "match" && q.pairs?.length
       ? [...q.pairs].sort(() => Math.random() - 0.5)
       : [];
-    const liveQuestion = { qIdx, question: q, timeLimit: q.timeLimit, questionStartedAt: startedAt, shuffledRight: shuffled };
+    const liveQuestion = { qIdx, question: q, timeLimit: q.timeLimit, questionStartedAt: startedAt, shuffledRight: shuffled, pausedAt: null, remainingTimeMs: null, timingUpdatedAt: startedAt };
 
     if (sessionDbId) {
       const { error } = await updateSessionPhase(sessionDbId, {
@@ -2242,7 +2361,7 @@ function KahootHostView({ onNav, sessionName, pin, sessionDbId, demoMode, tenant
 
   useEffect(() => {
     if (restoreState !== "done") return; // block until restoration finishes
-    if (halted) return; // all players left — freeze progression until host resumes
+    if (halted || paused) return; // no automatic progression while paused/halted
     if (phase !== "countdown") return;
     if (cdNum <= 0) {
       // Guard: startQuestion() is async, so cdNum stays 0 / phase stays
@@ -2255,7 +2374,7 @@ function KahootHostView({ onNav, sessionName, pin, sessionDbId, demoMode, tenant
     }
     const t = setTimeout(() => setCdNum(n => n - 1), 1000);
     return () => clearTimeout(t);
-  }, [phase, cdNum, restoreState, halted]); // eslint-disable-line react-hooks/exhaustive-deps
+  }, [phase, cdNum, restoreState, halted, paused]); // eslint-disable-line react-hooks/exhaustive-deps
 
   useEffect(() => {
     if (restoreState !== "done") return; // block until restoration finishes
@@ -2268,10 +2387,10 @@ function KahootHostView({ onNav, sessionName, pin, sessionDbId, demoMode, tenant
 
   useEffect(() => {
     if (restoreState !== "done") return; // block until restoration finishes
-    if (halted) return; // all players left — freeze progression until host resumes
+    if (halted || paused) return; // no automatic reveal while paused/halted
     if (phase !== "question" || answeredCount < playerCount || answeredCount === 0) return;
     doReveal();
-  }, [answeredCount, phase, restoreState, halted]); // eslint-disable-line react-hooks/exhaustive-deps
+  }, [answeredCount, phase, restoreState, halted, paused]); // eslint-disable-line react-hooks/exhaustive-deps
 
   const doReveal = () => {
     // Reentrancy guard — see hasRevealedRef declaration above. Must be the
@@ -2526,15 +2645,10 @@ function KahootHostView({ onNav, sessionName, pin, sessionDbId, demoMode, tenant
     broadcast({ type: GM.NEXT_QUESTION, qIdx: next });
   };
 
-  // Manual pause (host control). Resume is routed through resumeGame so it
-  // enforces the "at least one connected player" rule and clears any halt.
-  const doPause = () => {
-    if (paused) return;
-    setPaused(true);
-    persistPhase(phase, qIdx, true);
-    broadcast({ type: GM.PAUSE });
-  };
-  const doTogglePause = () => { if (paused) resumeGame(); else doPause(); };
+  // Manual pause/resume (host control) reuse the SAME canonical helpers as the
+  // zero-player halt — one pause implementation, one resume implementation, so
+  // the durable timing can never diverge between manual and automatic paths.
+  const doTogglePause = () => { if (paused) resumeGame(); else pauseGame(); };
 
   const doForceEnd = () => {
     setShowEndConfirm(false);
@@ -2869,9 +2983,22 @@ function KahootHostView({ onNav, sessionName, pin, sessionDbId, demoMode, tenant
           {resumeBlocked && (
             <p style={{ margin: "-12px 0 0", fontSize: 14, color: "#FCA5A5", fontWeight: 700 }}>Waiting for a player to reconnect before you can resume.</p>
           )}
-          <button onClick={doTogglePause} style={{ marginTop: 4, padding: "14px 36px", borderRadius: 14, border: "none", background: C.orange, color: "#fff", fontSize: 17, fontWeight: 900, cursor: "pointer", display: "flex", alignItems: "center", gap: 10 }}>
-            ▶ Resume
-          </button>
+          {pauseError && (
+            <p style={{ margin: "-12px 0 0", fontSize: 14, color: "#FCA5A5", fontWeight: 700 }}>Couldn't save the paused state. It's paused on your screen — tap Retry to sync players.</p>
+          )}
+          {resumeError && (
+            <p style={{ margin: "-12px 0 0", fontSize: 14, color: "#FCA5A5", fontWeight: 700 }}>Couldn't resume — please try again.</p>
+          )}
+          <div style={{ display: "flex", gap: 12, marginTop: 4 }}>
+            {pauseError && (
+              <button onClick={pauseGame} style={{ padding: "14px 28px", borderRadius: 14, border: `1px solid rgba(255,255,255,0.35)`, background: "transparent", color: "#fff", fontSize: 16, fontWeight: 900, cursor: "pointer" }}>
+                Retry save
+              </button>
+            )}
+            <button onClick={doTogglePause} style={{ padding: "14px 36px", borderRadius: 14, border: "none", background: C.orange, color: "#fff", fontSize: 17, fontWeight: 900, cursor: "pointer", display: "flex", alignItems: "center", gap: 10 }}>
+              ▶ Resume
+            </button>
+          </div>
         </div>
       )}
 
@@ -3154,29 +3281,30 @@ function KahootPlayerView({ onNav, playerName, playerId, pin, sessionDbId, tenan
   // for durable recovery: a delayed DB reconcile must never overwrite a newer
   // realtime question, nor reset the question the player is already on.
   const appliedQIdxRef = useRef(-1);
+  // Monotonic timing version last applied (live_question.timingUpdatedAt). A
+  // delayed DB reconcile or a stale broadcast whose version is OLDER than this
+  // is ignored, so timing can never roll backward.
+  const timingSeqRef = useRef(0);
 
   // ── Single source of truth for applying a SHOW_QUESTION payload ─────────────
   // Used by ALL four entry points — realtime SHOW_QUESTION, initial restore,
   // channel reconnect, and window focus — so question setup, matching shuffle,
-  // and timer math can never diverge between the fast path and recovery.
-  // Timer is reconstructed from the SERVER-persisted questionStartedAt (not
-  // reset to the full limit) and clamped to zero, so a recovering player gets
-  // the real remaining time, never a fresh clock.
-  const applyShowQuestion = useCallback((payload) => {
+  // and timer math can never diverge between the fast path and recovery. Timer
+  // is reconstructed via the canonical helper: the frozen remaining if paused
+  // (paused wall-clock is never consumed), else limit − elapsed from the
+  // effective start, clamped to zero — never a fresh full clock on recovery.
+  const applyShowQuestion = useCallback((payload, paused = false) => {
     if (!payload?.question) return;
-    const timeLimit = payload.timeLimit ?? payload.question?.timeLimit ?? 20;
-    const startedAt = payload.questionStartedAt ?? Date.now();
-    const elapsed   = Math.floor((Date.now() - startedAt) / 1000);
-    // Clamp to [0, timeLimit]: never restart the full clock on recovery (lower
-    // bound), and never exceed it if the player's clock lags the host's (upper).
-    const remaining = Math.min(timeLimit, Math.max(0, timeLimit - elapsed));
+    const remaining = liveQuestionRemainingSecs(payload, paused);
     setQuestion(payload.question);
     setTimeLeft(remaining);
+    setGamePaused(!!paused); // a recovered paused question stays visibly paused, no countdown
     setSelectedIdx(null); setOpenText(""); setOpenSubmitted(false);
     setSliderValue(null); setSliderSubmitted(false);
     setShuffledRight(payload.shuffledRight ?? []); setMatchPairs([]); setMatchSelLeft(null); setMatchSubmitted(false);
-    setQStartMs(startedAt);
+    setQStartMs(payload.questionStartedAt ?? Date.now());
     appliedQIdxRef.current = payload.qIdx ?? appliedQIdxRef.current;
+    timingSeqRef.current = liveQuestionTimingSeq(payload);
     setPhase("question");
   }, []);
 
@@ -3209,15 +3337,32 @@ function KahootPlayerView({ onNav, playerName, playerId, pin, sessionDbId, tenan
           .reduce((sum, r) => sum + (r.points ?? 0), 0);
         setMyScore(sc);
       }
-      setGamePaused(!!s.paused);
+      // Adopt the read's paused flag only if its timing version is NOT older
+      // than what we've already applied — a delayed DB response must never roll
+      // a resumed player back into a paused state (or vice-versa).
+      const readSeq = liveQuestionTimingSeq(lq);
+      const timingFresh = !lq || readSeq >= timingSeqRef.current;
+      if (timingFresh) setGamePaused(!!s.paused);
 
       if (s.phase === "waiting")    return;                       // still in lobby
       if (s.phase === "scoreboard") { setPhase("scoreboard"); return; }
       if (s.phase === "ended")      { setPhase("ended");      return; }
 
-      // Core fix: recover the current question the player never received.
+      // Core fix: recover the current question the player never received. Pass
+      // the paused flag so a question recovered mid-pause restores its FROZEN
+      // remaining time and stays visibly paused (no countdown).
       if (s.phase === "question" && idxMatch && lq.qIdx > appliedQIdxRef.current) {
-        applyShowQuestion(lq);
+        applyShowQuestion(lq, !!s.paused);
+        return;
+      }
+
+      // Same question the player is already on: sync ONLY the pause state (and,
+      // while paused, the frozen remaining time) from a FRESH read. Never
+      // override a running clock here — that would let a delayed response roll
+      // the timer backward; the local countdown owns the running value.
+      if (s.phase === "question" && idxMatch && lq.qIdx === appliedQIdxRef.current && timingFresh) {
+        timingSeqRef.current = readSeq;
+        if (s.paused) setTimeLeft(liveQuestionRemainingSecs(lq, true));
         return;
       }
 
@@ -3322,8 +3467,31 @@ function KahootPlayerView({ onNav, playerName, playerId, pin, sessionDbId, tenan
     }
     if (chMsg.type === GM.NEXT_QUESTION) { setCdNum(3); setIsCorrect(null); setGamePaused(false); setPhase("countdown"); }
     if (chMsg.type === GM.GAME_END) { setFinalScores(chMsg.scores); setPhase("ended"); }
-    if (chMsg.type === GM.PAUSE) { setGamePaused(true); }
-    if (chMsg.type === GM.RESUME) { setGamePaused(false); }
+    if (chMsg.type === GM.PAUSE) {
+      // Fast pause path — accept only if not older than the last applied timing
+      // version, then freeze at the host's exact remaining time for this question.
+      const seq = chMsg.timingUpdatedAt ?? 0;
+      if (seq >= timingSeqRef.current) {
+        setGamePaused(true);
+        if (chMsg.remainingTimeMs != null && (chMsg.qIdx == null || chMsg.qIdx === appliedQIdxRef.current)) {
+          setTimeLeft(Math.max(0, Math.round(chMsg.remainingTimeMs / 1000)));
+        }
+        timingSeqRef.current = seq;
+      }
+    }
+    if (chMsg.type === GM.RESUME) {
+      // Fast resume path — continue from the host's new effective start; never
+      // restart the full timer; ignore a stale RESUME.
+      const seq = chMsg.timingUpdatedAt ?? 0;
+      if (seq >= timingSeqRef.current) {
+        setGamePaused(false);
+        if (chMsg.qIdx == null || chMsg.qIdx === appliedQIdxRef.current) {
+          if (chMsg.questionStartedAt != null) setQStartMs(chMsg.questionStartedAt);
+          if (chMsg.remainingTimeMs != null) setTimeLeft(Math.max(0, Math.round(chMsg.remainingTimeMs / 1000)));
+        }
+        timingSeqRef.current = seq;
+      }
+    }
     if (chMsg.type === GM.FORCE_END) { setFinalScores(chMsg.scores); setPhase("ended"); }
     if (chMsg.type === GM.SCOREBOARD) { if (chMsg.scores) setFinalScores(chMsg.scores); setPhase("scoreboard"); }
   }, [chMsg]);
