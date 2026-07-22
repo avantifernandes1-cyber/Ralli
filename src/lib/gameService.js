@@ -198,11 +198,13 @@ export async function cancelGameSession(sessionId, tenantId = null) {
  * @returns {Promise<{ data: Object|null, error: Object|null }>}
  */
 export async function joinGameSession(sessionId, { playerId, name, emoji = null, color = null, tenantId = null }) {
-  // Emoji identity must be stored once and never silently change on a
-  // rejoin/reconnect (e.g. landing back on name-entry with a different
-  // default avatar). If a participant row already exists for this
-  // (session, player), its stored emoji/color win over whatever the caller
-  // just computed — only a brand-new row gets the freshly computed values.
+  // The caller's avatar choice is AUTHORITATIVE — including null, which means
+  // "no avatar / clear any previously stored one". The previous logic
+  // (existing?.emoji ?? emoji) preserved a prior stored avatar over the
+  // caller's value, so a player who once had an avatar and later chose "None"
+  // had the old avatar silently restored on rejoin. Emoji no longer drifts on
+  // reconnect (name-entry passes the actual selection or null, never a
+  // recomputed hash), so preservation is obsolete and was the bug.
   const { data: existing } = await supabase
     .from("game_session_participants")
     .select("emoji, color")
@@ -210,8 +212,9 @@ export async function joinGameSession(sessionId, { playerId, name, emoji = null,
     .eq("player_id", playerId)
     .maybeSingle();
 
-  const finalEmoji = existing?.emoji ?? emoji;
-  const finalColor = existing?.color ?? color;
+  const finalEmoji = emoji;   // caller-authoritative — null clears any prior avatar
+  const finalColor = color;
+  console.log("[RALLI_AVATAR_TRACE] joinGameSession", { playerId, callerEmoji: emoji, existingEmoji: existing?.emoji ?? null, storedEmoji: finalEmoji, oldBehaviorWouldStore: existing?.emoji ?? emoji });
 
   const { data, error } = await supabase
     .from("game_session_participants")

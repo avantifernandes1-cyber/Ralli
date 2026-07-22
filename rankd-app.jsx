@@ -172,6 +172,7 @@ function useGameChannel(pin, role) {
         color: p.color ?? null,
         score: 0,
       }));
+      if (role === "admin") console.log("[RALLI_AVATAR_TRACE] host chPlayers (presence)", players.map(p => ({ id: p.id, emoji: p.emoji })));
       setChPlayers(players);
     });
 
@@ -6073,6 +6074,7 @@ function RankdLobbyScreen({ onNav, pin, playerName, playerEmoji, sessionName, ro
     // cosmetic tint. Identity is `id`; gameplay never reads emoji.
     const resolvedEmoji = dbSelf?.emoji ?? playerEmoji ?? null;
     const resolvedColor = dbSelf?.color ?? PLAYER_COLORS[pidx % PLAYER_COLORS.length];
+    console.log("[RALLI_AVATAR_TRACE] lobby PLAYER_JOIN broadcast", { playerId, dbSelfEmoji: dbSelf?.emoji ?? null, playerEmojiProp: playerEmoji ?? null, resolvedEmoji, source: dbSelf?.emoji != null ? "db" : playerEmoji != null ? "selection" : "none(null)" });
     broadcast({ type: GM.PLAYER_JOIN, player: { id: playerId, name: playerName, emoji: resolvedEmoji, color: resolvedColor } });
   }, [isDemoMode, pin, playerId, role, playerEmoji, dbPlayers]); // eslint-disable-line react-hooks/exhaustive-deps
 
@@ -22383,6 +22385,7 @@ export default function App() {
     // renders fall back to name-only. Color still gets a stable cosmetic tint.
     const pidx       = Math.abs(gamePlayerId.charCodeAt(0) + (gamePlayerId.charCodeAt(1) || 0)) % PLAYER_EMOJIS.length;
     const finalEmoji = emoji ?? null;
+    console.log("[RALLI_AVATAR_TRACE] handleEnterName (avatar selection)", { playerId: gamePlayerId, selectedEmoji: emoji, joinPayloadEmoji: finalEmoji });
     setLobbyPlayerEmoji(finalEmoji);
 
     // Update local session state (keeps existing local-state consumers working)
