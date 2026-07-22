@@ -1,0 +1,36 @@
+-- ─────────────────────────────────────────────────────────────────────────────
+-- Ralli Live — durable recovery source for in-question state
+--
+-- Problem this addresses: a player's transition INTO a live question depends
+-- solely on the transient, unacknowledged SHOW_QUESTION realtime broadcast. If
+-- that frame is missed (WebSocket hiccup, the player's channel reaching
+-- SUBSCRIBED after the host sent it, or the tab being briefly throttled), the
+-- player has no way to recover the current question and is stranded on the
+-- holding screen until the host's next phase transition.
+--
+-- game_sessions already durably stores `phase` and `current_question_index`
+-- (via updateSessionPhase). This adds the one missing piece — the question
+-- CONTENT + its timing — so a player can reconcile the exact current question
+-- from the database on load / reconnect / focus. Broadcasts remain the fast
+-- realtime path; this column is only the recovery source.
+--
+-- Stored as the exact SHOW_QUESTION payload:
+--   { qIdx, question, timeLimit, questionStartedAt, shuffledRight }
+-- questionStartedAt lets a reconciling player reconstruct the *remaining* time
+-- from the server timestamp instead of restarting the full timer.
+--
+-- `phase` + `current_question_index` remain the authoritative guard: a client
+-- only applies live_question when phase = 'question'/'reveal' AND
+-- live_question.qIdx = current_question_index. The host clears this column
+-- (sets it null) whenever it moves off the question (advance into countdown,
+-- skip, end, cancel), so a reconnecting player can never restore a stale
+-- question after the host has moved on.
+--
+-- Additive and nullable — no backfill. In-flight sessions populate it on their
+-- next SHOW_QUESTION; completed/legacy rows never need it. No RLS change: the
+-- existing game_sessions SELECT policies already scope who can read the row
+-- (authenticated → own tenant; anon → tenant_id IS NULL demo sessions), so a
+-- player can read exactly the session they are already authorised to see.
+-- ─────────────────────────────────────────────────────────────────────────────
+
+ALTER TABLE game_sessions ADD COLUMN IF NOT EXISTS live_question jsonb;

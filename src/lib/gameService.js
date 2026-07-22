@@ -166,6 +166,27 @@ export async function endGameSession(pin, { scores = [], tenantId = null } = {})
   return { data: session, error: null };
 }
 
+/**
+ * Cancel a session — a terminal status that is NOT joinable (findable joins
+ * require status "waiting") and is NOT surfaced in Past Sessions (getGameHistory
+ * only queries status "completed"). Used to roll back a session whose question
+ * snapshot failed to persist, so it never becomes an orphaned joinable session
+ * without a snapshot.
+ *
+ * @param {string} sessionId - game_sessions.id (UUID)
+ * @param {string|null} tenantId
+ * @returns {Promise<{ error: Object|null }>}
+ */
+export async function cancelGameSession(sessionId, tenantId = null) {
+  let query = supabase
+    .from("game_sessions")
+    .update({ status: "canceled", ended_at: new Date().toISOString() })
+    .eq("id", sessionId);
+  if (tenantId) query = query.eq("tenant_id", tenantId);
+  const { error } = await query;
+  return { error };
+}
+
 // ── LOBBY PARTICIPANTS ────────────────────────────────────────────────────────
 
 /**
@@ -177,11 +198,13 @@ export async function endGameSession(pin, { scores = [], tenantId = null } = {})
  * @returns {Promise<{ data: Object|null, error: Object|null }>}
  */
 export async function joinGameSession(sessionId, { playerId, name, emoji = null, color = null, tenantId = null }) {
-  // Emoji identity must be stored once and never silently change on a
-  // rejoin/reconnect (e.g. landing back on name-entry with a different
-  // default avatar). If a participant row already exists for this
-  // (session, player), its stored emoji/color win over whatever the caller
-  // just computed — only a brand-new row gets the freshly computed values.
+  // The caller's avatar choice is AUTHORITATIVE — including null, which means
+  // "no avatar / clear any previously stored one". The previous logic
+  // (existing?.emoji ?? emoji) preserved a prior stored avatar over the
+  // caller's value, so a player who once had an avatar and later chose "None"
+  // had the old avatar silently restored on rejoin. Emoji no longer drifts on
+  // reconnect (name-entry passes the actual selection or null, never a
+  // recomputed hash), so preservation is obsolete and was the bug.
   const { data: existing } = await supabase
     .from("game_session_participants")
     .select("emoji, color")
@@ -189,8 +212,8 @@ export async function joinGameSession(sessionId, { playerId, name, emoji = null,
     .eq("player_id", playerId)
     .maybeSingle();
 
-  const finalEmoji = existing?.emoji ?? emoji;
-  const finalColor = existing?.color ?? color;
+  const finalEmoji = emoji;   // caller-authoritative — null clears any prior avatar
+  const finalColor = color;
 
   const { data, error } = await supabase
     .from("game_session_participants")
@@ -270,10 +293,14 @@ export function subscribeToLobbyParticipants(sessionId, onInsert) {
  * @param {{ phase: string, currentQuestionIndex?: number, paused?: boolean }} params
  * @returns {Promise<{ error: Object|null }>}
  */
-export async function updateSessionPhase(sessionId, { phase, currentQuestionIndex, paused } = {}) {
+export async function updateSessionPhase(sessionId, { phase, currentQuestionIndex, paused, liveQuestion } = {}) {
   const patch = { phase };
   if (currentQuestionIndex !== undefined) patch.current_question_index = currentQuestionIndex;
   if (paused !== undefined) patch.paused = paused;
+  // live_question is the durable recovery source (migration 048). Passing an
+  // object stores the current SHOW_QUESTION payload; passing null clears it
+  // (host moved off the question); passing undefined leaves it untouched.
+  if (liveQuestion !== undefined) patch.live_question = liveQuestion;
   const { error } = await supabase
     .from("game_sessions")
     .update(patch)
@@ -384,13 +411,61 @@ export async function updateParticipantHeartbeat(sessionId, playerId) {
  * @returns {Promise<{ data: Array|null, error: Object|null }>}
  */
 export async function getPlayerGameHistory(playerId, limit = 20) {
+  // ORDER BY joined_at — game_players has NO created_at column, so the previous
+  // .order("created_at") made PostgREST return a 42703 error for EVERY call.
+  // The caller swallowed that error into [] and always showed "No games yet",
+  // even though the player's rows existed. joined_at is the real timestamp
+  // column; callers may additionally sort by the joined session's ended_at.
   const { data, error } = await supabase
     .from("game_players")
-    .select("*, game_sessions(name, question_count, ended_at, pin)")
+    .select("*, game_sessions(name, question_count, ended_at, pin, status)")
     .eq("player_id", playerId)
-    .order("created_at", { ascending: false })
+    .order("joined_at", { ascending: false })
     .limit(limit);
   return { data, error };
+}
+
+/**
+ * Fetch ONE player's own answer rows for ONE session — the player-scoped source
+ * for the "My Scores" detail view. Scoped by BOTH exact session_id AND the exact
+ * authenticated player_id so a player can never read another player's
+ * submissions (RLS additionally confines it to the caller's tenant). Ordered by
+ * question_idx for stable rendering.
+ *
+ * @param {string} sessionId - game_sessions.id (UUID)
+ * @param {string} playerId  - the authenticated user's id
+ * @returns {Promise<{ data: Object[]|null, error: Object|null }>}
+ */
+export async function getPlayerAnswersForSession(sessionId, playerId) {
+  const { data, error } = await supabase
+    .from("game_answers")
+    .select("question_idx, option_idx, answer_text, numeric_value, answer_json, is_correct, points, time_ms, was_skipped, answered_at, id")
+    .eq("session_id", sessionId)
+    .eq("player_id", playerId)
+    .order("question_idx", { ascending: true });
+  return { data, error };
+}
+
+/**
+ * Exact participant count for each of the given sessions, as { [sessionId]: n }.
+ * Reads only the session_id column of game_players (never scores/answers/names),
+ * so the player UI can show "#N of M" without pulling other players' data. RLS
+ * confines the read to the caller's tenant.
+ *
+ * @param {string[]} sessionIds
+ * @returns {Promise<{ data: Object<string,number>|null, error: Object|null }>}
+ */
+export async function getSessionPlayerCounts(sessionIds) {
+  const ids = (sessionIds ?? []).filter(Boolean);
+  if (ids.length === 0) return { data: {}, error: null };
+  const { data, error } = await supabase
+    .from("game_players")
+    .select("session_id")
+    .in("session_id", ids);
+  if (error) return { data: null, error };
+  const counts = {};
+  for (const r of data ?? []) counts[r.session_id] = (counts[r.session_id] ?? 0) + 1;
+  return { data: counts, error: null };
 }
 
 /**
@@ -407,6 +482,42 @@ export async function getSessionPlayers(sessionId) {
     .eq("session_id", sessionId)
     .order("final_rank", { ascending: true });
   return { data, error };
+}
+
+/**
+ * Persist the exact question set + order a session will play, written ONCE at
+ * session creation. This is the authoritative source for post-game analytics
+ * (migration 049) — game_answers.question_idx indexes INTO this array. Stores
+ * question DEFINITIONS only (never scoring state or player answers).
+ *
+ * @param {string} sessionId - game_sessions.id (UUID)
+ * @param {Array} questions - the normalized questions array, in play order
+ * @returns {Promise<{ error: Object|null }>}
+ */
+export async function saveSessionQuestionSnapshot(sessionId, questions) {
+  if (!sessionId || !Array.isArray(questions) || questions.length === 0) return { error: null };
+  const { error } = await supabase
+    .from("game_sessions")
+    .update({ question_snapshot: questions })
+    .eq("id", sessionId);
+  return { error };
+}
+
+/**
+ * Fetch the durable question snapshot for a session. Returns null (not an
+ * error) for legacy sessions created before the snapshot existed — callers
+ * must degrade honestly rather than fall back to the mutable current quiz.
+ *
+ * @param {string} sessionId - game_sessions.id (UUID)
+ * @returns {Promise<{ data: Array|null, error: Object|null }>}
+ */
+export async function getSessionQuestionSnapshot(sessionId) {
+  const { data, error } = await supabase
+    .from("game_sessions")
+    .select("question_snapshot")
+    .eq("id", sessionId)
+    .single();
+  return { data: data?.question_snapshot ?? null, error };
 }
 
 // ── ANALYTICS ─────────────────────────────────────────────────────────────────
@@ -541,7 +652,7 @@ export async function getSessionRestoreData(sessionId) {
   const [sessionResult, answersResult] = await Promise.all([
     supabase
       .from("game_sessions")
-      .select("id, phase, current_question_index, paused, status, pin, name, quiz_id, question_count, player_count, tenant_id")
+      .select("id, phase, current_question_index, paused, status, pin, name, quiz_id, question_count, player_count, tenant_id, live_question")
       .eq("id", sessionId)
       .single(),
     supabase
