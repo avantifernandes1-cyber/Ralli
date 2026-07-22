@@ -166,6 +166,27 @@ export async function endGameSession(pin, { scores = [], tenantId = null } = {})
   return { data: session, error: null };
 }
 
+/**
+ * Cancel a session — a terminal status that is NOT joinable (findable joins
+ * require status "waiting") and is NOT surfaced in Past Sessions (getGameHistory
+ * only queries status "completed"). Used to roll back a session whose question
+ * snapshot failed to persist, so it never becomes an orphaned joinable session
+ * without a snapshot.
+ *
+ * @param {string} sessionId - game_sessions.id (UUID)
+ * @param {string|null} tenantId
+ * @returns {Promise<{ error: Object|null }>}
+ */
+export async function cancelGameSession(sessionId, tenantId = null) {
+  let query = supabase
+    .from("game_sessions")
+    .update({ status: "canceled", ended_at: new Date().toISOString() })
+    .eq("id", sessionId);
+  if (tenantId) query = query.eq("tenant_id", tenantId);
+  const { error } = await query;
+  return { error };
+}
+
 // ── LOBBY PARTICIPANTS ────────────────────────────────────────────────────────
 
 /**
@@ -270,10 +291,14 @@ export function subscribeToLobbyParticipants(sessionId, onInsert) {
  * @param {{ phase: string, currentQuestionIndex?: number, paused?: boolean }} params
  * @returns {Promise<{ error: Object|null }>}
  */
-export async function updateSessionPhase(sessionId, { phase, currentQuestionIndex, paused } = {}) {
+export async function updateSessionPhase(sessionId, { phase, currentQuestionIndex, paused, liveQuestion } = {}) {
   const patch = { phase };
   if (currentQuestionIndex !== undefined) patch.current_question_index = currentQuestionIndex;
   if (paused !== undefined) patch.paused = paused;
+  // live_question is the durable recovery source (migration 048). Passing an
+  // object stores the current SHOW_QUESTION payload; passing null clears it
+  // (host moved off the question); passing undefined leaves it untouched.
+  if (liveQuestion !== undefined) patch.live_question = liveQuestion;
   const { error } = await supabase
     .from("game_sessions")
     .update(patch)
@@ -409,6 +434,42 @@ export async function getSessionPlayers(sessionId) {
   return { data, error };
 }
 
+/**
+ * Persist the exact question set + order a session will play, written ONCE at
+ * session creation. This is the authoritative source for post-game analytics
+ * (migration 049) — game_answers.question_idx indexes INTO this array. Stores
+ * question DEFINITIONS only (never scoring state or player answers).
+ *
+ * @param {string} sessionId - game_sessions.id (UUID)
+ * @param {Array} questions - the normalized questions array, in play order
+ * @returns {Promise<{ error: Object|null }>}
+ */
+export async function saveSessionQuestionSnapshot(sessionId, questions) {
+  if (!sessionId || !Array.isArray(questions) || questions.length === 0) return { error: null };
+  const { error } = await supabase
+    .from("game_sessions")
+    .update({ question_snapshot: questions })
+    .eq("id", sessionId);
+  return { error };
+}
+
+/**
+ * Fetch the durable question snapshot for a session. Returns null (not an
+ * error) for legacy sessions created before the snapshot existed — callers
+ * must degrade honestly rather than fall back to the mutable current quiz.
+ *
+ * @param {string} sessionId - game_sessions.id (UUID)
+ * @returns {Promise<{ data: Array|null, error: Object|null }>}
+ */
+export async function getSessionQuestionSnapshot(sessionId) {
+  const { data, error } = await supabase
+    .from("game_sessions")
+    .select("question_snapshot")
+    .eq("id", sessionId)
+    .single();
+  return { data: data?.question_snapshot ?? null, error };
+}
+
 // ── ANALYTICS ─────────────────────────────────────────────────────────────────
 
 /**
@@ -541,7 +602,7 @@ export async function getSessionRestoreData(sessionId) {
   const [sessionResult, answersResult] = await Promise.all([
     supabase
       .from("game_sessions")
-      .select("id, phase, current_question_index, paused, status, pin, name, quiz_id, question_count, player_count, tenant_id")
+      .select("id, phase, current_question_index, paused, status, pin, name, quiz_id, question_count, player_count, tenant_id, live_question")
       .eq("id", sessionId)
       .single(),
     supabase

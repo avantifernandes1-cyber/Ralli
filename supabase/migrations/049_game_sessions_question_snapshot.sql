@@ -1,0 +1,33 @@
+-- ─────────────────────────────────────────────────────────────────────────────
+-- Ralli Live — durable per-session question snapshot for trustworthy analytics
+--
+-- Problem this fixes: post-game analytics (Overview / Player Breakdown /
+-- Questions) reconstructed each answer's question by indexing game_answers.
+-- question_idx into the quiz's CURRENT questions, reloaded via getQuizById().
+-- game_answers stores only a positional index (no question id/content), so any
+-- edit/reorder/insert/delete to the source quiz AFTER the game made those
+-- indices point at different questions — the summary showed questions that were
+-- never asked.
+--
+-- Fix: snapshot the exact question set + order used by a session, written once
+-- at session creation. Analytics reads this snapshot as the authoritative
+-- source; game_answers.question_idx is a stable index INTO this snapshot (play
+-- order is never shuffled — only Matching pairs shuffle within a question, and
+-- that shuffle is not part of question identity). Where the quiz assigns a
+-- stable question id, it travels inside the snapshot too.
+--
+-- Contains ONLY question DEFINITIONS (prompt, type, options, correct answer,
+-- acceptedAnswers, pairs, tolerance, min/max, timeLimit, id) in play order.
+-- It deliberately does NOT contain scoring state or player answers — those live
+-- in game_answers / game_players.
+--
+-- Legacy sessions created before this column stay NULL and are shown honestly
+-- ("exact question detail unavailable for this historical session") rather than
+-- reconstructed from the mutable quiz.
+--
+-- Additive, nullable, no backfill. No RLS change: the existing game_sessions
+-- SELECT policies already scope who can read the row (authenticated → own
+-- tenant; anon → tenant_id IS NULL demo), so tenant isolation is preserved.
+-- ─────────────────────────────────────────────────────────────────────────────
+
+ALTER TABLE game_sessions ADD COLUMN IF NOT EXISTS question_snapshot jsonb;
