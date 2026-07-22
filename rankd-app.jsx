@@ -6330,23 +6330,37 @@ function RankdResultsScreen({ onNav, sessionCode, sessions, gameData }) {
   const session   = sessions.find(s => s.code === sessionCode);
   const [tab, setTab] = useState("summary");
   const [dbScores, setDbScores] = useState(null);
+  // Explicit per-source load state so a query FAILURE is never mistaken for
+  // "no data". Each: "loading" | "ok" | "error". reloadKey drives a shared
+  // retry that re-runs all durable loaders for the current session.
+  const [answerStatus,   setAnswerStatus]   = useState("loading");
+  const [snapshotStatus, setSnapshotStatus] = useState("loading");
+  const [playersStatus,  setPlayersStatus]  = useState("loading");
+  const [reloadKey,      setReloadKey]      = useState(0);
+  const retryLoad = () => setReloadKey(k => k + 1);
 
-  // Load from DB if gameData not in memory (e.g. host refreshed after game ended)
+  // Load player scores from DB when not in memory (host refreshed after end, or
+  // opening from history). A failed query must never look like "no players".
   useEffect(() => {
-    if (gameData?.scores || !session?.dbId) return;
-    getSessionPlayers(session.dbId).then(({ data }) => {
-      if (data?.length) {
-        setDbScores(data.map((p) => ({
-          id:    p.player_id,
-          name:  p.name,
-          emoji: p.emoji ?? null,   // no-avatar players stay null — name only, no placeholder
-          color: p.color ?? C.orange,
-          score: p.final_score ?? 0,
-          delta: 0,
-        })));
-      }
-    });
-  }, [session?.dbId]); // eslint-disable-line react-hooks/exhaustive-deps
+    if (gameData?.scores) { setPlayersStatus("ok"); return; } // in-memory scores present
+    if (!session?.dbId)   { setPlayersStatus("ok"); return; } // demo / non-persisted
+    let cancelled = false;
+    setPlayersStatus("loading"); setDbScores(null); // clear prior session's data
+    getSessionPlayers(session.dbId).then(({ data, error }) => {
+      if (cancelled) return;
+      if (error) { setPlayersStatus("error"); setDbScores(null); return; }
+      setPlayersStatus("ok");
+      setDbScores((data ?? []).map((p) => ({
+        id:    p.player_id,
+        name:  p.name,
+        emoji: p.emoji ?? null,   // no-avatar players stay null — name only, no placeholder
+        color: p.color ?? C.orange,
+        score: p.final_score ?? 0,
+        delta: 0,
+      })));
+    }).catch(() => { if (!cancelled) { setPlayersStatus("error"); setDbScores(null); } });
+    return () => { cancelled = true; };
+  }, [session?.dbId, reloadKey]); // eslint-disable-line react-hooks/exhaustive-deps
 
   // ── Answer-detail drill-down (Player Breakdown / Questions tabs) ───────────
   // Canonical historical question source is game_sessions.question_snapshot
@@ -6362,23 +6376,43 @@ function RankdResultsScreen({ onNav, sessionCode, sessions, gameData }) {
   const [selectedPlayerId, setSelectedPlayerId] = useState(null);
   const [selectedQIdx,     setSelectedQIdx]     = useState(null);
 
+  // One retryable loader for the answer/snapshot pair. A failed query is
+  // surfaced as "error" (retryable) — NOT silently coerced to []/null, which
+  // would falsely read as "no responses" / "legacy session". `cancelled` +
+  // `reloadKey` in the deps prevent a stale/prior-session response from
+  // overwriting a newer retry or a newly selected session; state is cleared up
+  // front so another session's results can never flash or persist.
   useEffect(() => {
-    if (!session?.dbId) { setDetailLoaded(true); return; }
+    if (!session?.dbId) {
+      // Demo / non-persisted: no durable sources to load.
+      setDetailLoaded(true); setAnswerStatus("ok"); setSnapshotStatus("ok");
+      setAnswerRows([]); setDetailQuestions(null);
+      return;
+    }
     let cancelled = false;
+    setDetailLoaded(false);
+    setAnswerStatus("loading"); setSnapshotStatus("loading");
+    setAnswerRows(null); setDetailQuestions(null);
     Promise.all([
       getGameAnswersForSession(session.dbId),
       getSessionQuestionSnapshot(session.dbId),
     ]).then(([answersRes, snapRes]) => {
       if (cancelled) return;
-      setAnswerRows(answersRes.data ?? []);
+      if (answersRes.error) { setAnswerStatus("error"); setAnswerRows(null); }
+      else                  { setAnswerStatus("ok");    setAnswerRows(answersRes.data ?? []); }
       // Persisted session: the immutable snapshot is the ONLY canonical source.
-      // No fallback to gameData or the mutable quiz — a missing snapshot is an
-      // honest "unavailable", never silently substituted.
-      setDetailQuestions(snapRes.data ?? null);
+      // A query error is retryable ("error"); a successful null is legacy. No
+      // fallback to gameData or the mutable quiz.
+      if (snapRes.error)    { setSnapshotStatus("error"); setDetailQuestions(null); }
+      else                  { setSnapshotStatus("ok");    setDetailQuestions(snapRes.data ?? null); }
       setDetailLoaded(true);
-    }).catch(() => { if (!cancelled) setDetailLoaded(true); });
+    }).catch(() => {
+      if (cancelled) return;
+      setAnswerStatus("error"); setSnapshotStatus("error");
+      setAnswerRows(null); setDetailQuestions(null); setDetailLoaded(true);
+    });
     return () => { cancelled = true; };
-  }, [session?.dbId]); // eslint-disable-line react-hooks/exhaustive-deps
+  }, [session?.dbId, reloadKey]); // eslint-disable-line react-hooks/exhaustive-deps
 
   const realScores    = gameData?.scores ?? dbScores ?? null;
   // Canonical question-source precedence:
@@ -6390,14 +6424,24 @@ function RankdResultsScreen({ onNav, sessionCode, sessions, gameData }) {
 
   // Snapshot-present and answer-rows-present are SEPARATE concerns: a valid
   // snapshot can exist with zero answers (nobody submitted before the game
-  // ended) — the questions are still historically known.
+  // ended) — the questions are still historically known. Answer presence is
+  // expressed as answersFailed / answersEmpty below (distinguishing failure
+  // from a genuine empty result).
   const questionDetailAvailable = detailLoaded && (realQuestions?.length > 0);
-  const answerDataAvailable     = detailLoaded && (answerRows?.length > 0);
 
-  // "Exact question detail unavailable" applies ONLY to a real persisted session
-  // whose immutable snapshot is genuinely missing (pre-049) — never to a
-  // snapshot that simply has no answers.
-  const isLegacyDetail = detailLoaded && !!session?.dbId && !(realQuestions?.length > 0);
+  // Distinct honest states for the durable sources (a FAILURE is never
+  // "no data"): legacy = snapshot query SUCCEEDED but returned null; the
+  // *Failed booleans = query error (retryable); answersEmpty = answers query
+  // succeeded with zero rows.
+  const isPersisted    = detailLoaded && !!session?.dbId;
+  const snapshotFailed = isPersisted && snapshotStatus === "error";
+  const answersFailed  = isPersisted && answerStatus   === "error";
+  const answersEmpty   = detailLoaded && answerStatus === "ok" && (answerRows?.length ?? 0) === 0;
+  const playersFailed  = playersStatus === "error";
+  // "Exact question detail unavailable" ONLY when the snapshot query SUCCEEDED
+  // but returned null for a real session (pre-049) — never on a query error and
+  // never on a snapshot that merely has no answers.
+  const isLegacyDetail = isPersisted && snapshotStatus === "ok" && !(realQuestions?.length > 0);
 
   const leaderboard = realScores
     ? realScores.map((p, i) => ({ rank: i+1, id: p.id, name: p.name, emoji: p.emoji ?? null, score: p.score }))
@@ -6662,6 +6706,22 @@ function RankdResultsScreen({ onNav, sessionCode, sessions, gameData }) {
   })();
   const totalPlayers  = leaderboard.length;
 
+  // Honest, retryable load-error UI (shared for all three durable sources).
+  const renderLoadError = (message) => (
+    <Card>
+      <div style={{ textAlign: "center", padding: 20 }}>
+        <p style={{ margin: "0 0 12px", fontSize: 13, color: C.textMuted, fontStyle: "italic" }}>{message}</p>
+        <button onClick={retryLoad} style={{ padding: "8px 20px", borderRadius: 10, border: "none", background: C.orange, color: "#fff", fontSize: 13, fontWeight: 700, cursor: "pointer" }}>Retry</button>
+      </div>
+    </Card>
+  );
+  const inlineLoadError = (message) => (
+    <div style={{ marginBottom: 12, textAlign: "center" }}>
+      <p style={{ margin: "0 0 8px", fontSize: 12, color: C.red, fontStyle: "italic" }}>{message}</p>
+      <button onClick={retryLoad} style={{ padding: "6px 16px", borderRadius: 8, border: "none", background: C.orange, color: "#fff", fontSize: 12, fontWeight: 700, cursor: "pointer" }}>Retry</button>
+    </div>
+  );
+
   const typeColors = {
     "Multiple Choice": { bg: C.blueBg,     text: "#0284C7" },
     "True / False":    { bg: C.limeBg,     text: "#059669" },
@@ -6762,15 +6822,19 @@ function RankdResultsScreen({ onNav, sessionCode, sessions, gameData }) {
             {/* Question accuracy breakdown */}
             <Card>
               <p style={{ margin: "0 0 14px", fontSize: 10, fontWeight: 700, color: C.textSub, textTransform: "uppercase", letterSpacing: "0.08em" }}>Question Accuracy</p>
-              {questionDetailAvailable && !answerDataAvailable && (
-                <p style={{ margin: "0 0 12px", fontSize: 12, color: C.textMuted, fontStyle: "italic" }}>No responses were recorded for this session — questions shown for reference.</p>
-              )}
+              {/* answer load failed → retryable error (never "No responses");
+                  succeeded-empty → honest no-responses note. */}
+              {answersFailed
+                ? inlineLoadError("Session responses could not be loaded.")
+                : (questionDetailAvailable && answersEmpty && (
+                    <p style={{ margin: "0 0 12px", fontSize: 12, color: C.textMuted, fontStyle: "italic" }}>No responses were recorded for this session — questions shown for reference.</p>
+                  ))}
               {questionBreakdown.map((q, i) => {
-                // Honest: skipped and no-eligible-data questions never show a
-                // fake 0% — they render "Skipped" / "No responses" and an empty bar.
+                // Never a fake 0%. On answer-load FAILURE metrics are unknown →
+                // "—" (not "No responses"); skipped → "Skipped"; no eligible data → "No responses".
                 const pct   = q.accuracy == null ? null : Math.round(q.accuracy * 100);
-                const label = q.skipped ? "Skipped" : pct == null ? "No responses" : `${pct}%`;
-                const color = pct == null ? C.textMuted : pct >= 80 ? "#059669" : pct >= 60 ? C.orange : C.red;
+                const label = answersFailed ? "—" : q.skipped ? "Skipped" : pct == null ? "No responses" : `${pct}%`;
+                const color = (answersFailed || pct == null) ? C.textMuted : pct >= 80 ? "#059669" : pct >= 60 ? C.orange : C.red;
                 return (
                   <div key={i} style={{ marginBottom: 10 }}>
                     <div style={{ display: "flex", justifyContent: "space-between", marginBottom: 4 }}>
@@ -6778,15 +6842,19 @@ function RankdResultsScreen({ onNav, sessionCode, sessions, gameData }) {
                       <span style={{ fontSize: 12, fontWeight: 700, color, flexShrink: 0 }}>{label}</span>
                     </div>
                     <div style={{ height: 6, borderRadius: 99, background: C.muted }}>
-                      <div style={{ height: "100%", borderRadius: 99, width: `${pct ?? 0}%`, background: color, transition: "width 0.5s" }} />
+                      <div style={{ height: "100%", borderRadius: 99, width: `${answersFailed ? 0 : (pct ?? 0)}%`, background: color, transition: "width 0.5s" }} />
                     </div>
                   </div>
                 );
               })}
               {questionBreakdown.length === 0 && (
-                <p style={{ margin: 0, fontSize: 12, color: C.textMuted, fontStyle: "italic" }}>
-                  {isLegacyDetail ? "Exact question detail unavailable for this historical session." : "No question data available for this session."}
-                </p>
+                snapshotFailed
+                  ? inlineLoadError("Session question details could not be loaded.")
+                  : (
+                    <p style={{ margin: 0, fontSize: 12, color: C.textMuted, fontStyle: "italic" }}>
+                      {isLegacyDetail ? "Exact question detail unavailable for this historical session." : "No question data available for this session."}
+                    </p>
+                  )
               )}
             </Card>
           </div>
@@ -6808,9 +6876,11 @@ function RankdResultsScreen({ onNav, sessionCode, sessions, gameData }) {
                     </div>
                   </div>
                 </Card>
-                {!questionDetailAvailable ? (
-                  <Card><p style={{ margin: 0, fontSize: 13, color: C.textMuted, fontStyle: "italic", textAlign: "center", padding: 20 }}>{isLegacyDetail ? "Exact question detail unavailable for this historical session." : "Answer detail unavailable for this session."}</p></Card>
-                ) : (
+                {answersFailed ? renderLoadError("Session responses could not be loaded.")
+                 : snapshotFailed ? renderLoadError("Session question details could not be loaded.")
+                 : !questionDetailAvailable ? (
+                    <Card><p style={{ margin: 0, fontSize: 13, color: C.textMuted, fontStyle: "italic", textAlign: "center", padding: 20 }}>{isLegacyDetail ? "Exact question detail unavailable for this historical session." : "Answer detail unavailable for this session."}</p></Card>
+                 ) : (
                   <div style={{ display: "flex", flexDirection: "column", gap: 10 }}>
                     {realQuestions.map((question, i) => {
                       const row = getAnswerRow(player.id, i);
@@ -6822,8 +6892,10 @@ function RankdResultsScreen({ onNav, sessionCode, sessions, gameData }) {
               </div>
             );
           })() : (
-            leaderboard.length === 0
-              ? <div style={{ textAlign: "center", padding: 60, color: C.textMuted, fontSize: 14 }}>No player data available</div>
+            playersFailed
+              ? renderLoadError("Session player results could not be loaded.")
+              : leaderboard.length === 0
+              ? <div style={{ textAlign: "center", padding: 60, color: C.textMuted, fontSize: 14 }}>No player results for this session.</div>
               : <Card style={{ padding: 0, overflow: "hidden" }}>
                   <div style={{ display: "grid", gridTemplateColumns: "40px 1fr 80px 80px", padding: "10px 20px", borderBottom: `1px solid ${C.border}`, fontSize: 10, fontWeight: 700, color: C.textMuted, letterSpacing: "0.06em", textTransform: "uppercase", background: C.muted }}>
                     <div>#</div><div>Player</div><div style={{ textAlign: "right" }}>Score</div><div style={{ textAlign: "right" }}>Rank</div>
@@ -6843,7 +6915,8 @@ function RankdResultsScreen({ onNav, sessionCode, sessions, gameData }) {
           )
         )}
 
-        {tab === "leaderboard" && (
+        {tab === "leaderboard" && playersFailed && renderLoadError("Session player results could not be loaded.")}
+        {tab === "leaderboard" && !playersFailed && (
           <div style={{ display: "grid", gridTemplateColumns: mobile ? "1fr" : "7fr 5fr", gap: 24 }}>
             {/* Left: stats + podium + table */}
             <div>
@@ -7037,13 +7110,18 @@ function RankdResultsScreen({ onNav, sessionCode, sessions, gameData }) {
             );
           })() : (
             <div style={{ display: "flex", flexDirection: "column", gap: 12 }}>
-              {questionBreakdown.length === 0 && <div style={{ textAlign: "center", padding: 60, color: C.textMuted, fontSize: 14 }}>{isLegacyDetail ? "Exact question detail unavailable for this historical session." : "No question data available"}</div>}
+              {answersFailed && inlineLoadError("Session responses could not be loaded.")}
+              {questionBreakdown.length === 0 && (
+                snapshotFailed
+                  ? inlineLoadError("Session question details could not be loaded.")
+                  : <div style={{ textAlign: "center", padding: 60, color: C.textMuted, fontSize: 14 }}>{isLegacyDetail ? "Exact question detail unavailable for this historical session." : "No question data available"}</div>
+              )}
               {questionBreakdown.map((q, i) => {
                 const pct   = q.accuracy == null ? null : Math.round(q.accuracy * 100);
-                const label = q.skipped ? "Skipped" : pct == null ? "No responses" : `${pct}%`;
-                const color = pct == null ? C.textMuted : pct >= 80 ? "#059669" : pct >= 60 ? C.orange : C.red;
+                const label = answersFailed ? "—" : q.skipped ? "Skipped" : pct == null ? "No responses" : `${pct}%`;
+                const color = (answersFailed || pct == null) ? C.textMuted : pct >= 80 ? "#059669" : pct >= 60 ? C.orange : C.red;
                 const tc    = typeColors[q.type] ?? { bg: C.muted, text: C.textSub };
-                const clickable = questionDetailAvailable && !q.skipped;
+                const clickable = questionDetailAvailable && !q.skipped && !answersFailed;
                 return (
                   <Card key={i} onClick={clickable ? () => setSelectedQIdx(i) : undefined} style={clickable ? { cursor: "pointer" } : undefined}>
                     <div style={{ display: "flex", alignItems: "flex-start", gap: 16 }}>
