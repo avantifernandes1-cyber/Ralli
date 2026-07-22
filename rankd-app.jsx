@@ -2442,9 +2442,11 @@ function KahootHostView({ onNav, sessionName, pin, sessionDbId, demoMode, tenant
   const doNext = () => {
     if (isFinalQ) {
       broadcast({ type: GM.GAME_END, scores });
-      if (onGameEnd) onGameEnd({ scores, questions, questionHistory, sessionDbId, demoMode });
+      // Parent (handleGameEnd) authorizes navigation via its return value:
+      // false = completion rejected (unresolved identity) → do NOT navigate.
+      const ok = onGameEnd ? onGameEnd({ scores, questions, questionHistory, sessionDbId, demoMode }) : true;
       persistPhase("ended", qIdx, false);
-      onNav("rankd-results");
+      if (ok !== false) onNav("rankd-results");
       return;
     }
     const next = qIdx + 1;
@@ -2464,9 +2466,10 @@ function KahootHostView({ onNav, sessionName, pin, sessionDbId, demoMode, tenant
   const doForceEnd = () => {
     setShowEndConfirm(false);
     broadcast({ type: GM.FORCE_END, scores });
-    if (onGameEnd) onGameEnd({ scores, questions, questionHistory, sessionDbId, demoMode });
+    // Parent authorizes navigation via its return value (false = rejected).
+    const ok = onGameEnd ? onGameEnd({ scores, questions, questionHistory, sessionDbId, demoMode }) : true;
     persistPhase("ended", qIdx, false);
-    onNav("rankd-results");
+    if (ok !== false) onNav("rankd-results");
   };
 
   // Skip Question — abandons the current question with no scoring at all
@@ -4018,8 +4021,9 @@ function RankdGameScreen({ onNav, sessionName, role, playerName, questions = GAM
 
   const handleNext = () => {
     if (isFinalQ) {
-      if (onGameEnd) onGameEnd({ scores, questions, questionHistory: [], sessionDbId, demoMode });
-      onNav("rankd-results");
+      // Parent authorizes navigation via its return value (false = rejected).
+      const ok = onGameEnd ? onGameEnd({ scores, questions, questionHistory: [], sessionDbId, demoMode }) : true;
+      if (ok !== false) onNav("rankd-results");
       return;
     } else {
       setQIdx(n => n + 1);
@@ -4052,8 +4056,8 @@ function RankdGameScreen({ onNav, sessionName, role, playerName, questions = GAM
     broadcast({ type: GM.FORCE_END, scores });
     setShowEndConfirm(false);
     if (onGameEnd) {
-      // onGameEnd sets gameResultsData and navigates to rankd-results
-      onGameEnd({ scores, questions, questionHistory: [], sessionDbId, demoMode });
+      // Parent authorizes navigation via its return value (false = rejected).
+      if (onGameEnd({ scores, questions, questionHistory: [], sessionDbId, demoMode }) !== false) onNav("rankd-results");
     } else {
       onNav("rankd-results");
     }
@@ -21487,6 +21491,17 @@ export default function App() {
   // source instead of filtering an array that structurally excludes it.
   const [pastSessions,     setPastSessions]     = useState([]);
   const [lobbyPin,         setLobbyPin]         = useState(null);
+  // Exact identity of the session currently being hosted/joined — established
+  // at the MOMENT the session is created, launched, or joined, straight from the
+  // exact session object / creation response, and NEVER re-derived later from
+  // lobbyPin (a reusable join code whose local lookup can be stale or ambiguous
+  // when a PIN is reused). game_sessions.id (dbId) is the permanent key;
+  // activeGameIsDemo mirrors the session's demo flag (demoMode !== false, i.e.
+  // demo unless explicitly false). These flow lobby → game → completion →
+  // results, so a reused/stale/reordered PIN can never select another session.
+  // Null dbId + demo=true is a legitimate non-persisted demo session.
+  const [activeGameSessionDbId, setActiveGameSessionDbId] = useState(null);
+  const [activeGameIsDemo,      setActiveGameIsDemo]      = useState(false);
   const [lobbySessionName, setLobbySessionName] = useState(null);
   const [lobbyPlayerName,  setLobbyPlayerName]  = useState(null);
   const [lobbyPlayerEmoji, setLobbyPlayerEmoji] = useState(null);
@@ -21997,7 +22012,9 @@ export default function App() {
   // sessionDbId is a real UUID with no such collision risk. Falls back to
   // the pin only if no DB row exists yet (e.g. a pure demo-mode session).
   const isInGame = ["rankd-lobby", "rankd-game"].includes(screen);
-  const lobbySessionDbId = sessions.find(s => s.code === lobbyPin)?.dbId ?? null;
+  // Exact active-session id (set at create/launch/join). Falls back to the pin
+  // only for a pure demo session with no DB row. Never a PIN re-lookup.
+  const lobbySessionDbId = activeGameSessionDbId;
   const gameChannelKey = isInGame ? (lobbySessionDbId ?? lobbyPin) : null;
   const { chPlayers, chAnswers, setChAnswers, chMsg, broadcast, chStatus } = useGameChannel(gameChannelKey, gameRole);
 
@@ -22556,6 +22573,11 @@ export default function App() {
     // Snapshot confirmed — now it's safe to make the session live for the host.
     const newSession = { ...session, code: data.pin, dbId: data.id };
     setSessions(prev => [newSession, ...prev]);
+    // Establish the exact active-session identity from the creation response
+    // (data.id is the freshly-minted game_sessions.id) — this, not lobbyPin, is
+    // what the lobby, game, completion, and results all key off from here on.
+    setActiveGameSessionDbId(data.id ?? null);
+    setActiveGameIsDemo(session.demoMode !== false);
     setGameQuestions(playedQuestions);
     setLobbyPin(data.pin);
     setLobbySessionName(session.name);
@@ -22646,6 +22668,11 @@ export default function App() {
     // Persist participant to Supabase so manager sees them cross-device.
     const joiningSession = sessions.find(s => s.code === lobbyPin);
     const sessionDbId    = joiningSession?.dbId ?? null;
+    // Establish the exact active-session identity for this player from the
+    // resolved session object (its dbId + demo flag). The realtime channel keys
+    // off this; it is never re-derived from the pin once set.
+    setActiveGameSessionDbId(sessionDbId);
+    setActiveGameIsDemo(joiningSession?.demoMode !== false);
 
     if (sessionDbId && currentUser) {
       const pColor = PLAYER_COLORS[pidx % PLAYER_COLORS.length];
@@ -22689,12 +22716,28 @@ export default function App() {
   //   correct time remaining — see the comment on its restoration effect.
   const LOBBY_STATUSES = new Set(["waiting"]);
   const handleLaunch = (session) => {
+    const isLobby = LOBBY_STATUSES.has(session.status);
+    const isDemo  = session.demoMode !== false;
+    const dbId    = session.dbId ?? null;
+    // A real (persisted) session must carry its exact id to be opened at all —
+    // every durable op (restore mid-game, persist phase, save answers, complete)
+    // keys on it. Refuse rather than enter/relaunch with an unresolved identity.
+    // (Real sessions always come from the DB with a dbId; this is a guard against
+    // a corrupt/stale local row, not a normal path.)
+    if (!isDemo && dbId == null) {
+      console.error("[ralli:game] handleLaunch blocked: real session has no dbId", session?.code);
+      toast.error("Couldn't open this game — its session id is unavailable. Please refresh and try again.");
+      return;
+    }
     const quiz = quizzes.find(q => q.id === session.quizId);
     setGameQuestions(quiz?.questions ?? GAME_QUESTIONS);
+    // Store the exact identity from the clicked session object.
+    setActiveGameSessionDbId(dbId);
+    setActiveGameIsDemo(isDemo);
     setLobbyPin(session.code);
     setLobbySessionName(session.name);
     // Do NOT overwrite session status — preserve the canonical value from Supabase / local state.
-    if (LOBBY_STATUSES.has(session.status)) {
+    if (isLobby) {
       setScreen("rankd-lobby");
     } else {
       // started / live / active / paused — re-enter the game screen directly.
@@ -22705,54 +22748,66 @@ export default function App() {
 
   // Admin: start real game from lobby
   const handleGameStart = () => {
+    // EARLIEST safe boundary for a real game: it must never enter gameplay
+    // without its exact session id — that id is required to persist phase, save
+    // answers, and complete durably. Blocking here makes the completion-time
+    // missing-id branch unreachable in normal operation. Nothing is broadcast
+    // and the host stays in the lobby with players still connected.
+    if (!activeGameIsDemo && activeGameSessionDbId == null) {
+      console.error("[ralli:game] handleGameStart blocked: real session has no dbId");
+      toast.error("Couldn't start the game — its session id is unavailable. Please refresh and try again.");
+      return;
+    }
+    // Mark the exact active session started locally (keyed by its dbId when
+    // known, so a reused pin can't flip another local row).
     setSessions(prev => prev.map(s =>
-      s.code === lobbyPin ? { ...s, status: "started" } : s
+      (activeGameSessionDbId != null ? s.dbId === activeGameSessionDbId : s.code === lobbyPin)
+        ? { ...s, status: "started" } : s
     ));
-    // For real mode, broadcast GAME_START so all players navigate to game
-    const curSession = sessions.find(s => s.code === lobbyPin);
-    if (curSession?.demoMode === false) {
-      const quiz = quizzes.find(q => q.id === curSession.quizId);
-      const qs = quiz?.questions ?? GAME_QUESTIONS;
+    // For real mode, broadcast GAME_START so all players navigate to game.
+    if (!activeGameIsDemo) {
+      const qs = gameQuestions ?? GAME_QUESTIONS;
       broadcast({ type: GM.GAME_START, questions: qs, totalQ: qs.length });
     }
-    // Persist status update to Supabase (fire-and-forget)
+    // Persist status update to Supabase (fire-and-forget). startGameSession's
+    // established API takes the pin (tenant-scoped join code) — a legitimate
+    // helper-API use of the pin, not an identity derivation.
     startGameSession(lobbyPin, currentOrg?.id ?? user?.orgId ?? null).catch(e => console.error("[ralli] startGameSession failed:", e));
     setScreen("rankd-game");
   };
 
-  // Admin: game over — navigate to results + persist final scores
+  // Admin: game over. Returns true when completion is accepted (caller may
+  // navigate to results) and false when it is REJECTED (caller must NOT
+  // navigate). Exact identity comes from App state established at
+  // create/launch/join — never re-derived from lobbyPin. The value carried on
+  // `data` is expected to equal it; App state is authoritative.
   const handleGameEnd = (data) => {
-    // Use the EXACT session id carried through onGameEnd from the game component
-    // (KahootHostView / RankdGameScreen already hold it) — NEVER re-derived from
-    // lobbyPin, a reusable join code whose local lookup can be stale/ambiguous.
-    const endedDbId = data?.sessionDbId ?? null;
-    const isDemoGame = !!data?.demoMode;
-    // A real (non-demo) game that reaches completion without a session id is a
-    // genuine error — do NOT demote it to a demo, do not invent an id, and do
-    // not open results that could resolve (by code) to another session. Keep the
-    // in-memory scores safe in state and surface a clear error instead.
+    const endedDbId  = activeGameSessionDbId;
+    const isDemoGame = activeGameIsDemo;
+    // DEFENSIVE guard: a real game reaching completion without an id should be
+    // impossible — handleGameStart / handleLaunch block it at the start
+    // boundary. If it somehow happens, reject the completion HONESTLY: do NOT
+    // navigate to an unresolvable results screen, do NOT invent an id, do NOT
+    // mark any local session completed by PIN, and do NOT claim durable
+    // completion (no endGameSession / points). Preserve the in-memory scores
+    // under a non-resolvable identity so nothing else is read, and return false
+    // so the caller skips navigation.
     if (!isDemoGame && endedDbId == null) {
-      console.error("[ralli:game] handleGameEnd: persisted game completed without a sessionDbId");
-      toast.error("Couldn't open results — the session id was unavailable. Your game data is safe; please try again from Past Sessions.");
-      // Preserve the completed scores in state, but with a NON-resolvable
-      // identity (null id + null code) so the results screen can't resolve or
-      // match another session — it degrades to an honest empty state, never a
-      // wrong session, and no id is invented.
+      console.error("[ralli:game] handleGameEnd REJECTED: persisted game completed without a sessionDbId");
+      toast.error("Couldn't finalize the game — the session id was unavailable. Your scores are safe; please reopen it from Past Sessions.");
       setGameResultsData({ ...data, sessionDbId: null, sessionCode: null });
-      setViewResultsDbId(null); setViewResultsCode(null);
-      setSessions(prev => prev.map(s => s.code === lobbyPin ? { ...s, status: "completed" } : s));
-      return;
+      return false;
     }
     // Persisted → tag with exact dbId; demo → dbId null with code identity.
     setGameResultsData({ ...data, sessionDbId: endedDbId, sessionCode: lobbyPin });
     setViewResultsDbId(endedDbId);
     setViewResultsCode(lobbyPin);
-    navigate("rankd-results");
-    // Immediately mark session as completed in local state so it moves to
-    // Past Sessions and is excluded from the active lobby without waiting
-    // for the next getActiveSessions poll.
+    // Immediately mark the EXACT session completed in local state (keyed by its
+    // dbId when known, so a reused pin can't flip another local row) so it moves
+    // to Past Sessions and leaves the active lobby without waiting for the poll.
     setSessions(prev => prev.map(s =>
-      s.code === lobbyPin ? { ...s, status: "completed" } : s
+      (endedDbId != null ? s.dbId === endedDbId : s.code === lobbyPin)
+        ? { ...s, status: "completed" } : s
     ));
     const gameTenantId = currentOrg?.id ?? user?.orgId ?? null;
     // Persist results + mark participants completed in Supabase (fire-and-forget)
@@ -22783,6 +22838,7 @@ export default function App() {
         })
         .catch(e => { console.error("[ralli] awardGamePointsForSession failed:", e); toast.warning("Points could not be recorded for this session. Game results have been saved."); });
     }
+    return true; // completion accepted — caller may navigate to results
   };
 
   // Opening a historical session: select it by exact game_sessions.id (dbId),
@@ -22847,7 +22903,7 @@ export default function App() {
         // host in the lobby with the players still connected, and surface a
         // retryable error, so we never abandon a stale "waiting" joinable
         // session that the host believes was cancelled.
-        const dbId = sessions.find(s => s.code === lobbyPin)?.dbId ?? null;
+        const dbId = activeGameSessionDbId;
         if (!dbId) {
           toast.error("Couldn't end the game — session not found. Please try again.");
           return; // stay in lobby; players remain connected
@@ -22865,7 +22921,7 @@ export default function App() {
         broadcast({ type: GM.FORCE_END, cancelled: true });
         navigate("rankd");
       }} />;
-      case "rankd-game":        return <RankdGameScreen onNav={navigate} sessionName={lobbySessionName} role={gameRole} playerName={lobbyPlayerName ?? user.name} questions={gameQuestions ?? GAME_QUESTIONS} demoMode={gameRole === "admin" && sessions.find(s => s.code === lobbyPin)?.demoMode !== false} pin={lobbyPin} sessionDbId={sessions.find(s => s.code === lobbyPin)?.dbId ?? null} tenantId={currentOrg?.id ?? user?.orgId ?? null} broadcast={broadcast} chMsg={chMsg} chStatus={chStatus} chAnswers={chAnswers} chPlayers={chPlayers} playerId={gamePlayerId} onGameEnd={handleGameEnd} setChAnswers={setChAnswers} />;
+      case "rankd-game":        return <RankdGameScreen onNav={navigate} sessionName={lobbySessionName} role={gameRole} playerName={lobbyPlayerName ?? user.name} questions={gameQuestions ?? GAME_QUESTIONS} demoMode={gameRole === "admin" && activeGameIsDemo} pin={lobbyPin} sessionDbId={activeGameSessionDbId} tenantId={currentOrg?.id ?? user?.orgId ?? null} broadcast={broadcast} chMsg={chMsg} chStatus={chStatus} chAnswers={chAnswers} chPlayers={chPlayers} playerId={gamePlayerId} onGameEnd={handleGameEnd} setChAnswers={setChAnswers} />;
       case "rankd-results":     return <RankdResultsScreen onNav={navigate} sessionDbId={viewResultsDbId} sessionCode={viewResultsCode} sessions={[...sessions, ...pastSessions]} gameData={gameResultsData} />;
       case "learn":             return <LearnScreen role={gameRole} user={user} orgUsers={orgUsers} orgs={orgs} onNav={navigate} onAwardXp={handleAwardXp} pendingLessonId={pendingLessonId} onClearPendingLesson={() => setPendingLessonId(null)} pendingCourseId={pendingCourseId} onClearPendingCourse={() => setPendingCourseId(null)} canCreate={perm("actions","create")} canEdit={perm("actions","edit")} canDelete={perm("actions","delete")} canAssign={perm("actions","assign")} tenantId={currentOrg?.id ?? null} isReal={!!user?._isReal} quizzes={quizzes} sharedAssignmentData={sharedAssignmentData} />;
       case "quizzes":           return <QuizzesScreen role={gameRole} onNav={navigate} quizzes={quizzes} onEditQuiz={handleEditQuiz} onDeleteQuiz={handleDeleteQuiz} onToggleFavorite={handleToggleFavorite} onToggleActive={handleToggleActive} pendingQuizId={pendingQuizId} onClearPendingQuiz={() => setPendingQuizId(null)} canCreate={perm("actions","create")} canEdit={perm("actions","edit")} canDelete={perm("actions","delete")} canLaunch={perm("actions","launch")} canAssign={perm("actions","assign")} onAssignQuiz={handleAssignQuiz} onLaunchQuiz={handleCreateSession} orgUsers={orgUsers} orgs={orgs} currentUser={currentUser} tenantId={currentOrg?.id ?? null} isReal={!!user?._isReal} quizzesReady={quizzesReady} sharedAssignmentData={sharedAssignmentData} />;
