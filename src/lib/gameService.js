@@ -270,10 +270,14 @@ export function subscribeToLobbyParticipants(sessionId, onInsert) {
  * @param {{ phase: string, currentQuestionIndex?: number, paused?: boolean }} params
  * @returns {Promise<{ error: Object|null }>}
  */
-export async function updateSessionPhase(sessionId, { phase, currentQuestionIndex, paused } = {}) {
+export async function updateSessionPhase(sessionId, { phase, currentQuestionIndex, paused, liveQuestion } = {}) {
   const patch = { phase };
   if (currentQuestionIndex !== undefined) patch.current_question_index = currentQuestionIndex;
   if (paused !== undefined) patch.paused = paused;
+  // live_question is the durable recovery source (migration 048). Passing an
+  // object stores the current SHOW_QUESTION payload; passing null clears it
+  // (host moved off the question); passing undefined leaves it untouched.
+  if (liveQuestion !== undefined) patch.live_question = liveQuestion;
   const { error } = await supabase
     .from("game_sessions")
     .update(patch)
@@ -319,7 +323,10 @@ export async function saveGameAnswers(sessionId, answers = []) {
     numeric_value: a.numericValue ?? null,
     was_skipped:   a.wasSkipped ?? false,
   }));
+  // [RALLI_SLIDER_TRACE] boundary 12 — mapped numeric_value going into game_answers (temporary)
+  console.log("[RALLI_SLIDER_TRACE] 12 game_answers insert rows", JSON.stringify(rows.map(r => ({ player_id: r.player_id, numeric_value: r.numeric_value, is_correct: r.is_correct }))));
   const { error } = await supabase.from("game_answers").insert(rows);
+  console.log("[RALLI_SLIDER_TRACE] 12b game_answers insert error", error);
   return { error };
 }
 
@@ -541,7 +548,7 @@ export async function getSessionRestoreData(sessionId) {
   const [sessionResult, answersResult] = await Promise.all([
     supabase
       .from("game_sessions")
-      .select("id, phase, current_question_index, paused, status, pin, name, quiz_id, question_count, player_count, tenant_id")
+      .select("id, phase, current_question_index, paused, status, pin, name, quiz_id, question_count, player_count, tenant_id, live_question")
       .eq("id", sessionId)
       .single(),
     supabase

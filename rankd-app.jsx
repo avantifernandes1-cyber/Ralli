@@ -126,6 +126,11 @@ function useGameChannel(pin, role) {
   const [chPlayers, setChPlayers] = useState([]);
   const [chAnswers, setChAnswers] = useState({});   // { playerId: { optionIdx, timeMs, name, text } }
   const [chMsg,     setChMsg]     = useState(null); // latest inbound broadcast for player side
+  // Channel subscribe status — bumped to "SUBSCRIBED" once the WebSocket
+  // handshake completes (and re-fired on a realtime reconnect). Players key a
+  // durable-state reconcile off this so a broadcast missed while the socket
+  // was (re)connecting is recovered from the DB. See KahootPlayerView.reconcile.
+  const [chStatus,  setChStatus]  = useState("init");
 
   useEffect(() => {
     if (!pin) return;
@@ -164,17 +169,22 @@ function useGameChannel(pin, role) {
       if (role === "admin") {
         // Host only cares about ANSWER events from players
         if (event === GM.ANSWER) {
-          setChAnswers((prev) => ({
-            ...prev,
-            [payload.playerId]: {
-              optionIdx:   payload.optionIdx,
-              timeMs:      payload.timeMs,
-              name:        payload.name,
-              text:        payload.text,
-              sliderValue: payload.sliderValue,   // Slider questions
-              matchPairs:  payload.matchPairs,    // Matching questions — [{leftIdx, rightIdx}]
-            },
-          }));
+          console.log("[RALLI_SLIDER_TRACE] 5 host inbound ANSWER", { playerId: payload.playerId, sliderValue: payload.sliderValue, typeofSlider: typeof payload.sliderValue, rawPayload: JSON.stringify(payload) });
+          setChAnswers((prev) => {
+            const next = {
+              ...prev,
+              [payload.playerId]: {
+                optionIdx:   payload.optionIdx,
+                timeMs:      payload.timeMs,
+                name:        payload.name,
+                text:        payload.text,
+                sliderValue: payload.sliderValue,   // Slider questions
+                matchPairs:  payload.matchPairs,    // Matching questions — [{leftIdx, rightIdx}]
+              },
+            };
+            console.log("[RALLI_SLIDER_TRACE] 6 host chAnswers write", { playerId: payload.playerId, storedSliderValue: next[payload.playerId].sliderValue });
+            return next;
+          });
         }
       } else {
         // Players receive all host broadcasts as chMsg (same shape as before)
@@ -183,7 +193,9 @@ function useGameChannel(pin, role) {
     });
 
     channelRef.current = channel;
+    setChStatus("init");
     channel.subscribe((status) => {
+      setChStatus(status);
       // Once subscribed, flush any track that was queued before the WebSocket was ready.
       if (status === 'SUBSCRIBED' && pendingTrackRef.current) {
         channel.track(pendingTrackRef.current);
@@ -236,7 +248,7 @@ function useGameChannel(pin, role) {
     ch.send({ type: "broadcast", event: type, payload });
   }, []);
 
-  return { chPlayers, setChPlayers, chAnswers, setChAnswers, chMsg, broadcast };
+  return { chPlayers, setChPlayers, chAnswers, setChAnswers, chMsg, broadcast, chStatus };
 }
 
 // ── DESIGN TOKENS (exact Figma theme.css values) ────────────
@@ -1836,6 +1848,14 @@ function KahootHostView({ onNav, sessionName, pin, sessionDbId, tenantId, questi
   // call in any tick actually runs — without this, scores/game_answers could
   // be double-applied. Reset to false whenever a fresh question starts.
   const hasRevealedRef = useRef(false);
+  // Guards startQuestion() against double-invocation from the countdown effect
+  // (which can re-run while the async persist is in-flight, before phase flips
+  // off "countdown"). Holds the qIdx we've already begun starting.
+  const startedQIdxRef = useRef(-1);
+  // Set when persisting the durable question state fails: the question is NOT
+  // broadcast or started, current game state is preserved, and the host is
+  // shown a retryable error (see the questionStartError render below).
+  const [questionStartError, setQuestionStartError] = useState(false);
   const [questionHistory, setQuestionHistory] = useState([]);
   // DB-backed participant count for countdown — presence may lag behind actual joins
   const [dbParticipantCount, setDbParticipantCount] = useState(chPlayers.length);
@@ -2057,10 +2077,18 @@ function KahootHostView({ onNav, sessionName, pin, sessionDbId, tenantId, questi
   // Persist phase transitions to DB so host can recover on refresh
   const persistPhase = useCallback((nextPhase, nextQIdx, nextPaused) => {
     if (!sessionDbId) return;
+    const resolvedPhase = nextPhase ?? phase;
+    // Clear the durable question payload the moment the host moves OFF the
+    // question — advancing into the next countdown, or ending. This prevents a
+    // reconnecting player from restoring a question the host has already left.
+    // "reveal" and "paused" deliberately keep it (same question, still shown),
+    // which is what lets reveal recovery reconstruct from live_question.
+    const clearLive = resolvedPhase === "countdown" || resolvedPhase === "ended";
     updateSessionPhase(sessionDbId, {
-      phase:                nextPhase ?? phase,
+      phase:                resolvedPhase,
       currentQuestionIndex: nextQIdx  ?? qIdx,
       paused:               nextPaused ?? paused,
+      liveQuestion:         clearLive ? null : undefined,
     }).catch(e => console.error("[ralli:host] updateSessionPhase failed:", e));
   }, [sessionDbId, phase, qIdx, paused]); // eslint-disable-line react-hooks/exhaustive-deps
 
@@ -2077,21 +2105,56 @@ function KahootHostView({ onNav, sessionName, pin, sessionDbId, tenantId, questi
     if (phase === "countdown" && (qIdx === 0 || scores.length === 0)) setScores(chPlayers.map(p => ({ ...p, score: 0 })));
   }, [chPlayers.length, restoreState]); // eslint-disable-line react-hooks/exhaustive-deps
 
+  // ── Start a question: persist durable state BEFORE broadcasting ─────────────
+  // Ordering matters. The database write (phase + current_question_index +
+  // live_question) is the recovery source a player falls back to when it misses
+  // the transient SHOW_QUESTION broadcast. If we broadcast first and persisted
+  // after, a player reconciling in that window would read STALE session state
+  // (previous question / null live_question) and stay stranded. So:
+  //   1. build the canonical SHOW_QUESTION payload once
+  //   2. persist it and CONFIRM the write succeeded
+  //   3. only then broadcast that exact same payload + start locally
+  // On persist failure: do not broadcast, do not start, keep current game state,
+  // surface a retryable error to the host.
+  const startQuestion = async () => {
+    if (!q) return;
+    const startedAt = Date.now();
+    // Matching: one shuffle for this question, shared with every client via the
+    // same payload (persisted + broadcast) so all render the same right column.
+    const shuffled = q.type === "match" && q.pairs?.length
+      ? [...q.pairs].sort(() => Math.random() - 0.5)
+      : [];
+    const liveQuestion = { qIdx, question: q, timeLimit: q.timeLimit, questionStartedAt: startedAt, shuffledRight: shuffled };
+
+    if (sessionDbId) {
+      const { error } = await updateSessionPhase(sessionDbId, {
+        phase: "question", currentQuestionIndex: qIdx, paused: false, liveQuestion,
+      });
+      if (error) {
+        console.error("[ralli:host] startQuestion: durable persist failed, not broadcasting:", error);
+        setQuestionStartError(true); // game state untouched; host can retry
+        return;
+      }
+    }
+    setQuestionStartError(false);
+    hasRevealedRef.current = false; // fresh question — arm the reveal guard
+    setShuffledRight(shuffled);
+    setTimeLeft(q.timeLimit);
+    setPhase("question");
+    broadcast({ type: GM.SHOW_QUESTION, ...liveQuestion });
+  };
+
   useEffect(() => {
     if (restoreState !== "done") return; // block until restoration finishes
     if (halted) return; // all players left — freeze progression until host resumes
     if (phase !== "countdown") return;
     if (cdNum <= 0) {
-      hasRevealedRef.current = false; // fresh question — arm the reveal guard
-      setPhase("question"); setTimeLeft(q.timeLimit);
-      persistPhase("question", qIdx, false);
-      // Matching: compute one shuffle for this question and send it to every
-      // player in the same broadcast — see shuffledRight declaration above.
-      const shuffled = q.type === "match" && q.pairs?.length
-        ? [...q.pairs].sort(() => Math.random() - 0.5)
-        : [];
-      setShuffledRight(shuffled);
-      broadcast({ type: GM.SHOW_QUESTION, qIdx, question: q, timeLimit: q.timeLimit, questionStartedAt: Date.now(), shuffledRight: shuffled });
+      // Guard: startQuestion() is async, so cdNum stays 0 / phase stays
+      // "countdown" until the persist resolves and setPhase("question") runs.
+      // Without this ref the effect could re-fire and double-persist/broadcast.
+      if (startedQIdxRef.current === qIdx) return;
+      startedQIdxRef.current = qIdx;
+      startQuestion();
       return;
     }
     const t = setTimeout(() => setCdNum(n => n - 1), 1000);
@@ -2184,6 +2247,7 @@ function KahootHostView({ onNav, sessionName, pin, sessionDbId, tenantId, questi
       else { baseScores = Object.entries(chAnswers).map(([pid, ans]) => buildScoreRowFromAnswer(pid, ans)); }
       const newScores = baseScores.map(p => {
         const ans = chAnswers[p.id];
+        console.log("[RALLI_SLIDER_TRACE] 7 host doReveal read", { playerId: p.id, ansSliderValue: ans?.sliderValue, typeofSlider: typeof ans?.sliderValue, target, tol });
         if (ans?.sliderValue == null) return { ...p, delta: 0, wasCorrect: false };
         const diff    = Math.abs(ans.sliderValue - target);
         const correct = diff <= tol;
@@ -2206,7 +2270,8 @@ function KahootHostView({ onNav, sessionName, pin, sessionDbId, tenantId, questi
           const diff = Math.abs(ans.sliderValue - target);
           return { playerId: p.id, playerName: ans.name ?? p.name, questionIdx: qIdx, optionIdx: null, text: null, timeMs: ans.timeMs ?? null, isCorrect: diff <= tol, points: p.delta ?? 0, tenantId, numericValue: ans.sliderValue ?? null };
         });
-        saveGameAnswers(sessionDbId, answerRows).then(({ error }) => { if (error) console.error("[ralli:host] saveGameAnswers (slider) failed:", error); });
+        console.log("[RALLI_SLIDER_TRACE] 8 saveGameAnswers payload (slider)", JSON.stringify(answerRows.map(r => ({ playerId: r.playerId, numericValue: r.numericValue, isCorrect: r.isCorrect })))); // eslint-disable-line
+        saveGameAnswers(sessionDbId, answerRows).then(({ error }) => { console.log("[RALLI_SLIDER_TRACE] 9 saveGameAnswers insert result", { error }); if (error) console.error("[ralli:host] saveGameAnswers (slider) failed:", error); });
       }
       return;
     }
@@ -2433,6 +2498,36 @@ function KahootHostView({ onNav, sessionName, pin, sessionDbId, tenantId, questi
           <div style={{ display: "flex", gap: 10, justifyContent: "center" }}>
             <button
               onClick={() => setRetryCount(c => c + 1)}
+              style={{ padding: "10px 24px", borderRadius: 12, border: "none", background: C.orange, color: "#fff", fontWeight: 700, fontSize: 14, cursor: "pointer" }}
+            >
+              Retry
+            </button>
+            <button
+              onClick={() => onNav("rankd")}
+              style={{ padding: "10px 24px", borderRadius: 12, border: `1.5px solid ${C.border}`, background: "#fff", color: C.text, fontWeight: 700, fontSize: 14, cursor: "pointer" }}
+            >
+              Back to Games
+            </button>
+          </div>
+        </div>
+      </div>
+    );
+  }
+
+  // Durable persist for the current question failed — the question was NOT
+  // broadcast or started (players never saw it), and all game state (qIdx,
+  // scores, phase) is preserved. Host retries the persist-then-broadcast; on
+  // success startQuestion() flips phase to "question" and this screen clears.
+  if (questionStartError) {
+    return (
+      <div style={{ minHeight: "100%", display: "flex", alignItems: "center", justifyContent: "center", background: C.cream }}>
+        <div style={{ textAlign: "center", padding: 40, maxWidth: 380 }}>
+          <div style={{ fontSize: 36, marginBottom: 16 }}>⚠️</div>
+          <p style={{ margin: "0 0 8px", fontSize: 15, fontWeight: 700, color: C.text }}>Couldn’t start the question</p>
+          <p style={{ margin: "0 0 24px", fontSize: 13, color: C.textMuted }}>The question wasn’t sent to players. Your game and scores are safe — retry to continue.</p>
+          <div style={{ display: "flex", gap: 10, justifyContent: "center" }}>
+            <button
+              onClick={() => { setQuestionStartError(false); startQuestion(); }}
               style={{ padding: "10px 24px", borderRadius: 12, border: "none", background: C.orange, color: "#fff", fontWeight: 700, fontSize: 14, cursor: "pointer" }}
             >
               Retry
@@ -2915,7 +3010,7 @@ function KahootHostView({ onNav, sessionName, pin, sessionDbId, tenantId, questi
 }
 
 // ── REAL GAME PLAYER VIEW ────────────────────────────────────
-function KahootPlayerView({ onNav, playerName, playerId, pin, sessionDbId, broadcast, chMsg }) {
+function KahootPlayerView({ onNav, playerName, playerId, pin, sessionDbId, tenantId, broadcast, chMsg, chStatus }) {
   const mobile          = useMobile();
   const [phase,         setPhase]         = useState("waiting");
   const [cdNum,         setCdNum]         = useState(3);
@@ -2939,52 +3034,122 @@ function KahootPlayerView({ onNav, playerName, playerId, pin, sessionDbId, broad
   const [matchSelLeft,    setMatchSelLeft]    = useState(null); // tap-to-pair: currently selected left prompt
   const [matchSubmitted,  setMatchSubmitted]  = useState(false);
 
-  // ── Reconnect: restore score and land on a safe screen after a refresh ──────
-  // Previously a refreshing player had NO restoration at all — this component
-  // always mounted at phase "waiting" with myScore 0, so a mid-game refresh
-  // silently lost their running score and left them sitting on the wrong
-  // screen until the next broadcast happened to arrive. This restores what
-  // the DB can tell us (session phase and cumulative score from saved
-  // game_answers) via the same getSessionRestoreData() the host already uses.
-  // What this does NOT do: resume a genuinely in-flight question with the
-  // correct time remaining — game_sessions doesn't persist the question's
-  // start timestamp or the full question payload, only its index, so there's
-  // nothing reliable to rebuild that exact moment from. Landing on "waiting"
-  // for phase "question"/"reveal" is a deliberate, disclosed compromise: the
-  // player isn't stuck, and the very next broadcast (which the host sends on
-  // every phase transition) resyncs them within one question.
-  useEffect(() => {
-    if (!sessionDbId || !playerId) return;
-    let cancelled = false;
-    (async () => {
-      try {
-        const { session, answers } = await getSessionRestoreData(sessionDbId);
-        if (cancelled || session.error || !session.data) return;
-        const sess = session.data;
-        if (sess.phase === "waiting") return; // still in lobby — normal join flow handles this
+  // Highest question index this client has actually applied. The stale-guard
+  // for durable recovery: a delayed DB reconcile must never overwrite a newer
+  // realtime question, nor reset the question the player is already on.
+  const appliedQIdxRef = useRef(-1);
 
-        if (answers.data?.length) {
-          const myScore = answers.data
-            .filter(r => r.player_id === playerId)
-            .reduce((sum, r) => sum + (r.points ?? 0), 0);
-          setMyScore(myScore);
-        }
-        setGamePaused(!!sess.paused);
-        if (sess.phase === "question" || sess.phase === "reveal") {
-          setPhase("waiting"); // see comment above — safe holding screen, not stuck
-        } else if (sess.phase === "scoreboard") {
-          setPhase("scoreboard");
-        } else if (sess.phase === "ended") {
-          setPhase("ended");
-        } else {
-          setPhase("countdown");
-        }
-      } catch (e) {
-        console.error("[ralli:player] restore failed:", e);
+  // ── Single source of truth for applying a SHOW_QUESTION payload ─────────────
+  // Used by ALL four entry points — realtime SHOW_QUESTION, initial restore,
+  // channel reconnect, and window focus — so question setup, matching shuffle,
+  // and timer math can never diverge between the fast path and recovery.
+  // Timer is reconstructed from the SERVER-persisted questionStartedAt (not
+  // reset to the full limit) and clamped to zero, so a recovering player gets
+  // the real remaining time, never a fresh clock.
+  const applyShowQuestion = useCallback((payload) => {
+    if (!payload?.question) return;
+    const timeLimit = payload.timeLimit ?? payload.question?.timeLimit ?? 20;
+    const startedAt = payload.questionStartedAt ?? Date.now();
+    const elapsed   = Math.floor((Date.now() - startedAt) / 1000);
+    // Clamp to [0, timeLimit]: never restart the full clock on recovery (lower
+    // bound), and never exceed it if the player's clock lags the host's (upper).
+    const remaining = Math.min(timeLimit, Math.max(0, timeLimit - elapsed));
+    setQuestion(payload.question);
+    setTimeLeft(remaining);
+    setSelectedIdx(null); setOpenText(""); setOpenSubmitted(false);
+    setSliderValue(null); setSliderSubmitted(false);
+    setShuffledRight(payload.shuffledRight ?? []); setMatchPairs([]); setMatchSelLeft(null); setMatchSubmitted(false);
+    setQStartMs(startedAt);
+    appliedQIdxRef.current = payload.qIdx ?? appliedQIdxRef.current;
+    setPhase("question");
+  }, []);
+
+  // ── Durable reconcile: recover current state from game_sessions ─────────────
+  // The recovery path for a missed/late SHOW_QUESTION (or REVEAL) broadcast.
+  // Broadcasts remain the fast path; this reads the durable session row the
+  // host persisted BEFORE broadcasting. RLS scopes the read to sessions this
+  // player may see (authenticated → own tenant; anon → tenant_id IS NULL demo),
+  // so tenant isolation is preserved with no policy change.
+  //
+  // Stale guards (never roll a player backward or disrupt their current view):
+  //   • live_question.qIdx must equal current_question_index (row-internal
+  //     consistency — phase + index remain the authoritative guard)
+  //   • question recovery only applies a STRICTLY newer qIdx (never resets the
+  //     question the player is already answering)
+  //   • all state comes from the session row the reconcile actually read
+  const reconcile = useCallback(async () => {
+    if (!sessionDbId || !playerId) return;
+    try {
+      const { session, answers } = await getSessionRestoreData(sessionDbId);
+      if (session.error || !session.data) return;
+      const s  = session.data;
+      const lq = s.live_question;
+      const idxMatch = lq && lq.qIdx === s.current_question_index;
+
+      // Cumulative score — idempotent, always safe to recompute.
+      if (answers.data?.length) {
+        const sc = answers.data
+          .filter(r => r.player_id === playerId)
+          .reduce((sum, r) => sum + (r.points ?? 0), 0);
+        setMyScore(sc);
       }
-    })();
-    return () => { cancelled = true; };
-  }, [sessionDbId, playerId]);
+      setGamePaused(!!s.paused);
+
+      if (s.phase === "waiting")    return;                       // still in lobby
+      if (s.phase === "scoreboard") { setPhase("scoreboard"); return; }
+      if (s.phase === "ended")      { setPhase("ended");      return; }
+
+      // Core fix: recover the current question the player never received.
+      if (s.phase === "question" && idxMatch && lq.qIdx > appliedQIdxRef.current) {
+        applyShowQuestion(lq);
+        return;
+      }
+
+      // Reveal recovery — reconstruct from live_question (correct answer) + the
+      // player's own game_answers row (their correctness + points). Rank is not
+      // durably stored mid-game, so it is left as-is (never fabricated). A
+      // player who was present but missed REVEAL keeps their in-memory answer
+      // selection, so the reveal renders fully; a player who refreshed during
+      // reveal sees the correct answer + their score without their own pick
+      // highlighted — honest, and never stranded.
+      if (s.phase === "reveal" && idxMatch && lq.qIdx >= appliedQIdxRef.current) {
+        const myRow = (answers.data ?? []).find(r => r.player_id === playerId && r.question_idx === lq.qIdx);
+        setQuestion(lq.question);
+        appliedQIdxRef.current = lq.qIdx;
+        if (myRow) { setIsCorrect(!!myRow.is_correct); setMyDelta(myRow.points ?? 0); }
+        setPhase("reveal");
+        return;
+      }
+
+      // Between questions (host cleared live_question on advance) — move to
+      // countdown; the next SHOW_QUESTION (or a later reconcile) takes over.
+      if (s.phase === "countdown" && appliedQIdxRef.current < (s.current_question_index ?? 0)) {
+        setPhase("countdown");
+        return;
+      }
+
+      // Couldn't reconstruct and the player hasn't seen anything yet → safe
+      // holding screen (never worse than the old behaviour).
+      if (appliedQIdxRef.current < 0) setPhase("waiting");
+    } catch (e) {
+      console.error("[ralli:player] reconcile failed:", e);
+    }
+  }, [sessionDbId, playerId, applyShowQuestion]); // eslint-disable-line react-hooks/exhaustive-deps
+
+  // Reconcile on: initial load / identity change …
+  useEffect(() => { reconcile(); }, [sessionDbId, playerId]); // eslint-disable-line react-hooks/exhaustive-deps
+  // … channel (re)subscribe — recovers a broadcast missed while (re)connecting …
+  useEffect(() => { if (chStatus === "SUBSCRIBED") reconcile(); }, [chStatus]); // eslint-disable-line react-hooks/exhaustive-deps
+  // … and tab focus / becoming visible after being backgrounded/throttled.
+  useEffect(() => {
+    const onVisible = () => { if (document.visibilityState === "visible") reconcile(); };
+    window.addEventListener("visibilitychange", onVisible);
+    window.addEventListener("focus", onVisible);
+    return () => {
+      window.removeEventListener("visibilitychange", onVisible);
+      window.removeEventListener("focus", onVisible);
+    };
+  }, [reconcile]);
 
   // Heartbeat: keep last_seen_at fresh while in-game so host can detect stale connections
   useEffect(() => {
@@ -3001,13 +3166,10 @@ function KahootPlayerView({ onNav, playerName, playerId, pin, sessionDbId, broad
     // Game start: host broadcast — show countdown before first question
     if (chMsg.type === GM.GAME_START) { setCdNum(3); setPhase("countdown"); }
     if (chMsg.type === GM.SHOW_QUESTION) {
-      const timeLimit = chMsg.timeLimit ?? chMsg.question?.timeLimit ?? 20;
-      const elapsed = chMsg.questionStartedAt ? Math.floor((Date.now() - chMsg.questionStartedAt) / 1000) : 0;
-      setQuestion(chMsg.question); setTimeLeft(Math.max(1, timeLimit - elapsed));
-      setSelectedIdx(null); setOpenText(""); setOpenSubmitted(false);
-      setSliderValue(null); setSliderSubmitted(false);
-      setShuffledRight(chMsg.shuffledRight ?? []); setMatchPairs([]); setMatchSelLeft(null); setMatchSubmitted(false);
-      setQStartMs(Date.now()); setPhase("question");
+      // Fast realtime path — same helper as durable recovery so setup/shuffle/
+      // timer never diverge. Guarded so a stray older/duplicate frame can't roll
+      // the player back onto a question they've already moved past.
+      if ((chMsg.qIdx ?? 0) >= appliedQIdxRef.current) applyShowQuestion(chMsg);
     }
     if (chMsg.type === GM.OPEN_REVIEW) { setPhase("open-waiting"); }
     if (chMsg.type === GM.REVEAL) {
@@ -3021,6 +3183,7 @@ function KahootPlayerView({ onNav, playerName, playerId, pin, sessionDbId, broad
         revealCorrect = acc.length > 0 && acc.some(a => openText.toLowerCase().trim() === a);
       } else if (chMsg.sliderTarget != null) {
         // Slider: within tolerance of the target, same rule the host used to score it
+        console.log("[RALLI_SLIDER_TRACE] 10/11 player REVEAL", { revealSliderTarget: chMsg.sliderTarget, revealSliderTolerance: chMsg.sliderTolerance, localSliderValue: sliderValue, localSliderSubmitted: sliderSubmitted });
         revealCorrect = sliderValue != null && Math.abs(sliderValue - chMsg.sliderTarget) <= (chMsg.sliderTolerance ?? 1);
       } else if (Array.isArray(chMsg.matchPairsCorrect)) {
         // Matching: all pairs must match — same all-or-nothing rule the host
@@ -3067,11 +3230,31 @@ function KahootPlayerView({ onNav, playerName, playerId, pin, sessionDbId, broad
     broadcast({ type: GM.ANSWER, playerId, name: playerName, optionIdx: idx, timeMs });
   };
 
+  // [RALLI_SLIDER_TRACE] boundary 1 — slider render/state (temporary; remove after diagnosis)
+  useEffect(() => {
+    if (question?.type === "slider" && (phase === "question" || phase === "answered" || phase === "reveal")) {
+      const eff = sliderValue ?? Math.round(((question?.min ?? 0) + (question?.max ?? 10)) / 2);
+      console.log("[RALLI_SLIDER_TRACE] 1 slider render", { phase, sliderValue, displayedEffective: eff, sliderSubmitted, qIdx: appliedQIdxRef.current });
+    }
+  }, [sliderValue, sliderSubmitted, question, phase]);
+
   const handleSliderSubmit = () => {
     if (phase !== "question" || sliderSubmitted) return;
+    // sliderValue is null until the player drags. The input/display show the
+    // midpoint via `?? midpoint`, so a player who accepts the default without
+    // dragging sees a value (e.g. 5) while state is still null — submitting the
+    // raw null erased their answer everywhere downstream. Resolve to the exact
+    // value shown (same expression as the render), lock it into state so the
+    // reveal reads it, and broadcast that. `?? ` preserves a dragged 0.
+    const submitted = sliderValue ?? Math.round(((question?.min ?? 0) + (question?.max ?? 10)) / 2);
     const timeMs = Date.now() - (qStartMs ?? Date.now());
+    console.log("[RALLI_SLIDER_TRACE] 2 handleSliderSubmit entry", { rawSliderValue: sliderValue, computedSubmitted: submitted, qIdx: appliedQIdxRef.current, qMin: question?.min, qMax: question?.max });
+    setSliderValue(submitted);
     setSliderSubmitted(true); setPhase("answered");
-    broadcast({ type: GM.ANSWER, playerId, name: playerName, sliderValue, timeMs });
+    const payload = { type: GM.ANSWER, playerId, name: playerName, sliderValue: submitted, timeMs };
+    console.log("[RALLI_SLIDER_TRACE] 3 outbound ANSWER payload", JSON.stringify(payload), "chStatus:", chStatus);
+    broadcast(payload);
+    console.log("[RALLI_SLIDER_TRACE] 4 broadcast() returned (fire-and-forget)");
   };
 
   // Matching — tap-to-pair (chosen over drag-and-drop for the live, timed,
@@ -3644,13 +3827,13 @@ function KahootPlayerView({ onNav, playerName, playerId, pin, sessionDbId, broad
 
 // ── RANKD GAME SCREEN ────────────────────────────────────────
 
-function RankdGameScreen({ onNav, sessionName, role, playerName, questions = GAME_QUESTIONS, demoMode = true, pin, sessionDbId, tenantId, broadcast, chMsg, chAnswers, chPlayers, playerId, onGameEnd, setChAnswers }) {
+function RankdGameScreen({ onNav, sessionName, role, playerName, questions = GAME_QUESTIONS, demoMode = true, pin, sessionDbId, tenantId, broadcast, chMsg, chStatus, chAnswers, chPlayers, playerId, onGameEnd, setChAnswers }) {
   // Real multiplayer mode — route to Kahoot views
   if (!demoMode && role === "admin") {
     return <KahootHostView onNav={onNav} sessionName={sessionName} pin={pin} sessionDbId={sessionDbId} tenantId={tenantId} questions={questions} broadcast={broadcast} chAnswers={chAnswers} chPlayers={chPlayers} onGameEnd={onGameEnd} setChAnswers={setChAnswers} />;
   }
   if (!demoMode && role !== "admin") {
-    return <KahootPlayerView onNav={onNav} playerName={playerName} playerId={playerId} pin={pin} sessionDbId={sessionDbId} broadcast={broadcast} chMsg={chMsg} />;
+    return <KahootPlayerView onNav={onNav} playerName={playerName} playerId={playerId} pin={pin} sessionDbId={sessionDbId} tenantId={tenantId} broadcast={broadcast} chMsg={chMsg} chStatus={chStatus} />;
   }
 
   const mobile = useMobile();
@@ -21533,7 +21716,7 @@ export default function App() {
   const isInGame = ["rankd-lobby", "rankd-game"].includes(screen);
   const lobbySessionDbId = sessions.find(s => s.code === lobbyPin)?.dbId ?? null;
   const gameChannelKey = isInGame ? (lobbySessionDbId ?? lobbyPin) : null;
-  const { chPlayers, chAnswers, setChAnswers, chMsg, broadcast } = useGameChannel(gameChannelKey, gameRole);
+  const { chPlayers, chAnswers, setChAnswers, chMsg, broadcast, chStatus } = useGameChannel(gameChannelKey, gameRole);
 
   // Recovery mode takes priority over normal routing — show the reset form regardless
   // of whether a session exists. This prevents the app from routing past the form if
@@ -22323,7 +22506,7 @@ export default function App() {
       case "rankd-quiz-builder":return <QuizBuilderScreen onNav={navigate} onSave={handleSaveQuiz} initialQuiz={editingQuiz} onEditQuiz={handleEditQuiz} />;
       case "rankd-name-entry":  return <RankdNameEntryScreen onNav={navigate} pin={lobbyPin} sessionName={lobbySessionName} onConfirm={handleEnterName} defaultName={userProfile.nickname?.trim() || user?.name || ""} defaultAvatar={userProfile.avatarEmoji} />;
       case "rankd-lobby":       return <RankdLobbyScreen onNav={navigate} pin={lobbyPin} playerName={lobbyPlayerName} playerEmoji={lobbyPlayerEmoji} sessionName={lobbySessionName} role={gameRole} sessions={sessions} currentUser={currentUser} onGameStart={handleGameStart} chPlayers={chPlayers} broadcast={broadcast} playerId={gamePlayerId} chMsg={chMsg} onHostEnd={async () => { await endGameSession(lobbyPin, { tenantId: currentOrg?.id ?? null }); navigate("rankd"); }} />;
-      case "rankd-game":        return <RankdGameScreen onNav={navigate} sessionName={lobbySessionName} role={gameRole} playerName={lobbyPlayerName ?? user.name} questions={gameQuestions ?? GAME_QUESTIONS} demoMode={gameRole === "admin" && sessions.find(s => s.code === lobbyPin)?.demoMode !== false} pin={lobbyPin} sessionDbId={sessions.find(s => s.code === lobbyPin)?.dbId ?? null} tenantId={currentOrg?.id ?? user?.orgId ?? null} broadcast={broadcast} chMsg={chMsg} chAnswers={chAnswers} chPlayers={chPlayers} playerId={gamePlayerId} onGameEnd={handleGameEnd} setChAnswers={setChAnswers} />;
+      case "rankd-game":        return <RankdGameScreen onNav={navigate} sessionName={lobbySessionName} role={gameRole} playerName={lobbyPlayerName ?? user.name} questions={gameQuestions ?? GAME_QUESTIONS} demoMode={gameRole === "admin" && sessions.find(s => s.code === lobbyPin)?.demoMode !== false} pin={lobbyPin} sessionDbId={sessions.find(s => s.code === lobbyPin)?.dbId ?? null} tenantId={currentOrg?.id ?? user?.orgId ?? null} broadcast={broadcast} chMsg={chMsg} chStatus={chStatus} chAnswers={chAnswers} chPlayers={chPlayers} playerId={gamePlayerId} onGameEnd={handleGameEnd} setChAnswers={setChAnswers} />;
       case "rankd-results":     return <RankdResultsScreen onNav={navigate} sessionCode={viewResultsCode} sessions={[...sessions, ...pastSessions]} gameData={gameResultsData} />;
       case "learn":             return <LearnScreen role={gameRole} user={user} orgUsers={orgUsers} orgs={orgs} onNav={navigate} onAwardXp={handleAwardXp} pendingLessonId={pendingLessonId} onClearPendingLesson={() => setPendingLessonId(null)} pendingCourseId={pendingCourseId} onClearPendingCourse={() => setPendingCourseId(null)} canCreate={perm("actions","create")} canEdit={perm("actions","edit")} canDelete={perm("actions","delete")} canAssign={perm("actions","assign")} tenantId={currentOrg?.id ?? null} isReal={!!user?._isReal} quizzes={quizzes} sharedAssignmentData={sharedAssignmentData} />;
       case "quizzes":           return <QuizzesScreen role={gameRole} onNav={navigate} quizzes={quizzes} onEditQuiz={handleEditQuiz} onDeleteQuiz={handleDeleteQuiz} onToggleFavorite={handleToggleFavorite} onToggleActive={handleToggleActive} pendingQuizId={pendingQuizId} onClearPendingQuiz={() => setPendingQuizId(null)} canCreate={perm("actions","create")} canEdit={perm("actions","edit")} canDelete={perm("actions","delete")} canLaunch={perm("actions","launch")} canAssign={perm("actions","assign")} onAssignQuiz={handleAssignQuiz} onLaunchQuiz={handleCreateSession} orgUsers={orgUsers} orgs={orgs} currentUser={currentUser} tenantId={currentOrg?.id ?? null} isReal={!!user?._isReal} quizzesReady={quizzesReady} sharedAssignmentData={sharedAssignmentData} />;
