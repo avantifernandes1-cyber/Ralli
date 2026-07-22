@@ -2441,12 +2441,15 @@ function KahootHostView({ onNav, sessionName, pin, sessionDbId, demoMode, tenant
 
   const doNext = () => {
     if (isFinalQ) {
-      broadcast({ type: GM.GAME_END, scores });
-      // Parent (handleGameEnd) authorizes navigation via its return value:
-      // false = completion rejected (unresolved identity) → do NOT navigate.
+      // ACCEPTANCE GATE FIRST. The parent validates identity; only on accept do
+      // we notify players (broadcast), write the terminal phase, and navigate.
+      // On reject: players are NOT told the game ended, phase stays intact, and
+      // the host stays put with the parent's retryable error.
       const ok = onGameEnd ? onGameEnd({ scores, questions, questionHistory, sessionDbId, demoMode }) : true;
+      if (ok === false) return;
+      broadcast({ type: GM.GAME_END, scores });
       persistPhase("ended", qIdx, false);
-      if (ok !== false) onNav("rankd-results");
+      onNav("rankd-results");
       return;
     }
     const next = qIdx + 1;
@@ -2465,11 +2468,12 @@ function KahootHostView({ onNav, sessionName, pin, sessionDbId, demoMode, tenant
 
   const doForceEnd = () => {
     setShowEndConfirm(false);
-    broadcast({ type: GM.FORCE_END, scores });
-    // Parent authorizes navigation via its return value (false = rejected).
+    // ACCEPTANCE GATE FIRST — no terminal broadcast/persist/navigate on reject.
     const ok = onGameEnd ? onGameEnd({ scores, questions, questionHistory, sessionDbId, demoMode }) : true;
+    if (ok === false) return;
+    broadcast({ type: GM.FORCE_END, scores });
     persistPhase("ended", qIdx, false);
-    if (ok !== false) onNav("rankd-results");
+    onNav("rankd-results");
   };
 
   // Skip Question — abandons the current question with no scoring at all
@@ -4021,9 +4025,10 @@ function RankdGameScreen({ onNav, sessionName, role, playerName, questions = GAM
 
   const handleNext = () => {
     if (isFinalQ) {
-      // Parent authorizes navigation via its return value (false = rejected).
+      // Acceptance gate first; navigate only if accepted (demo → always true).
       const ok = onGameEnd ? onGameEnd({ scores, questions, questionHistory: [], sessionDbId, demoMode }) : true;
-      if (ok !== false) onNav("rankd-results");
+      if (ok === false) return;
+      onNav("rankd-results");
       return;
     } else {
       setQIdx(n => n + 1);
@@ -4053,14 +4058,12 @@ function RankdGameScreen({ onNav, sessionName, role, playerName, questions = GAM
     broadcast({ type: next ? GM.PAUSE : GM.RESUME });
   };
   const doForceEnd = () => {
-    broadcast({ type: GM.FORCE_END, scores });
     setShowEndConfirm(false);
-    if (onGameEnd) {
-      // Parent authorizes navigation via its return value (false = rejected).
-      if (onGameEnd({ scores, questions, questionHistory: [], sessionDbId, demoMode }) !== false) onNav("rankd-results");
-    } else {
-      onNav("rankd-results");
-    }
+    // ACCEPTANCE GATE FIRST — no terminal broadcast/navigate on reject.
+    const ok = onGameEnd ? onGameEnd({ scores, questions, questionHistory: [], sessionDbId, demoMode }) : true;
+    if (ok === false) return;
+    broadcast({ type: GM.FORCE_END, scores });
+    onNav("rankd-results");
   };
 
   // ──────────────────────────────────────────────────────────
@@ -22590,6 +22593,12 @@ export default function App() {
     let session    = sessions.find(s => s.code === pin);
     let sessionName = sessionNameHint ?? session?.name ?? "Live Game";
     let quizId      = session?.quizId;
+    // Capture the EXACT joinable-session identity here, from the exact source
+    // (the selected local object, or the findJoinableSession response below),
+    // and retain it in App state. Name confirmation then uses this — it never
+    // re-derives identity by PIN, and never depends on a pending setSessions().
+    let resolvedDbId = session?.dbId ?? null;
+    let resolvedDemo = session ? (session.demoMode !== false) : true;
 
     if (!session) {
       // Player is on a different device — resolve via the tenant-scoped
@@ -22622,8 +22631,10 @@ export default function App() {
           dbId:          remote.id,   // DB primary key — used for lobby participant persistence
         };
         setSessions(prev => [...prev, fetched]);
-        sessionName = remote.name;
-        quizId      = remote.quiz_id;
+        sessionName  = remote.name;
+        quizId       = remote.quiz_id;
+        resolvedDbId = remote.id ?? null;              // exact DB id from the RPC
+        resolvedDemo = remote.demo_mode !== false;
       } else if (pinErr) {
         console.error("[ralli:game] findJoinableSession FAILED:", pinErr);
         return "Couldn't verify that PIN. Check your connection and try again.";
@@ -22639,6 +22650,9 @@ export default function App() {
     } else {
       setGameQuestions(GAME_QUESTIONS);
     }
+    // Retain the exact identity for name entry → lobby → game.
+    setActiveGameSessionDbId(resolvedDbId);
+    setActiveGameIsDemo(resolvedDemo);
     setLobbyPin(pin);
     setLobbySessionName(sessionName);
     setScreen("rankd-name-entry");
@@ -22666,13 +22680,17 @@ export default function App() {
     ));
 
     // Persist participant to Supabase so manager sees them cross-device.
-    const joiningSession = sessions.find(s => s.code === lobbyPin);
-    const sessionDbId    = joiningSession?.dbId ?? null;
-    // Establish the exact active-session identity for this player from the
-    // resolved session object (its dbId + demo flag). The realtime channel keys
-    // off this; it is never re-derived from the pin once set.
-    setActiveGameSessionDbId(sessionDbId);
-    setActiveGameIsDemo(joiningSession?.demoMode !== false);
+    // Identity comes from App state established at handleEnterPin (the exact
+    // local object / findJoinableSession id) — NEVER a PIN find here, and never
+    // dependent on the pending setSessions() flush.
+    const sessionDbId = activeGameSessionDbId;
+    // A persisted (non-demo) join MUST have an exact id. Never silently
+    // downgrade to a demo join — block confirmation with a retryable error and
+    // do not enter the lobby.
+    if (!activeGameIsDemo && sessionDbId == null) {
+      console.error("[ralli:game] handleEnterName: persisted join has no sessionDbId — blocking");
+      return "Couldn't join the game — its session id was unavailable. Please re-enter the PIN and try again.";
+    }
 
     if (sessionDbId && currentUser) {
       const pColor = PLAYER_COLORS[pidx % PLAYER_COLORS.length];
@@ -22776,29 +22794,32 @@ export default function App() {
     setScreen("rankd-game");
   };
 
-  // Admin: game over. Returns true when completion is accepted (caller may
-  // navigate to results) and false when it is REJECTED (caller must NOT
-  // navigate). Exact identity comes from App state established at
-  // create/launch/join — never re-derived from lobbyPin. The value carried on
-  // `data` is expected to equal it; App state is authoritative.
+  // Admin: game over. Called by the game component BEFORE any terminal
+  // broadcast/persist — it is the ACCEPTANCE GATE. Returns true when completion
+  // is accepted (caller may then broadcast, persist "ended", and navigate) and
+  // false when REJECTED (caller must NOT broadcast, persist, or navigate).
+  // Exact identity comes from App state established at create/launch/join. The
+  // id the child carries on `data.sessionDbId` must be non-null AND equal to
+  // App state for a persisted game — otherwise we cannot know which session
+  // this is and must not pick one speculatively.
   const handleGameEnd = (data) => {
-    const endedDbId  = activeGameSessionDbId;
-    const isDemoGame = activeGameIsDemo;
-    // DEFENSIVE guard: a real game reaching completion without an id should be
-    // impossible — handleGameStart / handleLaunch block it at the start
-    // boundary. If it somehow happens, reject the completion HONESTLY: do NOT
-    // navigate to an unresolvable results screen, do NOT invent an id, do NOT
-    // mark any local session completed by PIN, and do NOT claim durable
-    // completion (no endGameSession / points). Preserve the in-memory scores
-    // under a non-resolvable identity so nothing else is read, and return false
-    // so the caller skips navigation.
-    if (!isDemoGame && endedDbId == null) {
-      console.error("[ralli:game] handleGameEnd REJECTED: persisted game completed without a sessionDbId");
-      toast.error("Couldn't finalize the game — the session id was unavailable. Your scores are safe; please reopen it from Past Sessions.");
+    const isDemoGame  = activeGameIsDemo;
+    const appDbId     = activeGameSessionDbId;      // authoritative
+    const carriedDbId = data?.sessionDbId ?? null;  // what the child held
+    // Persisted game: identity must be resolved AND consistent. Missing on
+    // either side, or a mismatch, is rejected HONESTLY: do NOT broadcast (the
+    // caller hasn't yet), do NOT persist "ended", do NOT navigate, do NOT invent
+    // or choose an id, do NOT mark any local session completed by PIN, and do
+    // NOT claim durable completion. Preserve the in-memory scores under a
+    // non-resolvable identity and return false so the caller aborts.
+    if (!isDemoGame && (appDbId == null || carriedDbId == null || carriedDbId !== appDbId)) {
+      console.error("[ralli:game] handleGameEnd REJECTED: identity unresolved or mismatched", { appDbId, carriedDbId });
+      toast.error("Couldn't finalize the game — the session identity was unavailable or didn't match. Your scores are safe; reopen it from Past Sessions.");
       setGameResultsData({ ...data, sessionDbId: null, sessionCode: null });
       return false;
     }
-    // Persisted → tag with exact dbId; demo → dbId null with code identity.
+    // Accepted. Persisted → exact dbId; demo → null id with code identity.
+    const endedDbId = isDemoGame ? null : appDbId;
     setGameResultsData({ ...data, sessionDbId: endedDbId, sessionCode: lobbyPin });
     setViewResultsDbId(endedDbId);
     setViewResultsCode(lobbyPin);
