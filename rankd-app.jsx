@@ -2135,6 +2135,7 @@ function KahootHostView({ onNav, sessionName, pin, sessionDbId, demoMode, tenant
   //   pauseInFlightRef      — a pause save is currently running (blocks dupes)
   //   pauseError            — the last save failed and must be retried/ended
   const [pausePersisted, setPausePersisted] = useState(false);
+  const [pinCopied, setPinCopied] = useState(false); // brief "Copied!" feedback on the pause overlays
   const pauseInFlightRef = useRef(false);
   // Exact frozen timing payload from the pause attempt — reused verbatim on
   // every Retry so the remaining time is never recalculated from a later render.
@@ -2355,6 +2356,23 @@ function KahootHostView({ onNav, sessionName, pin, sessionDbId, demoMode, tenant
   const isFinalQ      = qIdx === total - 1;
   const timerPct      = q ? (timeLeft / q.timeLimit) * 100 : 0;
   const timerColor    = timerPct > 50 ? C.green : timerPct > 25 ? C.orange : C.red;
+
+  // Shown on both pause overlays so the host can read the EXISTING game PIN to a
+  // player who needs to rejoin (the overlay otherwise covers it). Purely
+  // presentational — uses the `pin` prop as-is; never generates a new PIN,
+  // changes the session, or touches the channel. Copy reuses the same
+  // navigator.clipboard.writeText pattern used elsewhere (invite links).
+  const pinBlock = pin ? (
+    <div style={{ display: "flex", flexDirection: "column", alignItems: "center", gap: 6, marginTop: 4 }}>
+      <span style={{ fontSize: 12, fontWeight: 700, letterSpacing: "0.14em", color: "rgba(255,255,255,0.65)", textTransform: "uppercase" }}>Game PIN</span>
+      <span style={{ fontSize: 40, fontWeight: 900, letterSpacing: "0.14em", color: "#fff", fontVariantNumeric: "tabular-nums" }}>{pin}</span>
+      <button
+        onClick={() => { navigator.clipboard.writeText(String(pin)); setPinCopied(true); setTimeout(() => setPinCopied(false), 1500); }}
+        style={{ padding: "6px 16px", borderRadius: 99, border: `1px solid rgba(255,255,255,0.35)`, background: "transparent", color: "#fff", fontSize: 12, fontWeight: 700, cursor: "pointer" }}>
+        {pinCopied ? "Copied!" : "Copy PIN"}
+      </button>
+    </div>
+  ) : null;
 
   useEffect(() => {
     if (restoreState !== "done") return; // don't reset restored scores during restoration
@@ -3003,7 +3021,8 @@ function KahootHostView({ onNav, sessionName, pin, sessionDbId, demoMode, tenant
         <div style={{ position: "fixed", inset: 0, background: "rgba(0,0,0,0.75)", display: "flex", flexDirection: "column", alignItems: "center", justifyContent: "center", gap: 20, zIndex: 101, backdropFilter: "blur(4px)" }}>
           <div style={{ fontSize: 56 }}>⚠️</div>
           <p style={{ margin: 0, fontSize: 22, fontWeight: 900, color: "#fff" }}>All active players have left. The game has been paused.</p>
-          <p style={{ margin: "-12px 0 0", fontSize: 14, color: "rgba(255,255,255,0.7)" }}>No points are being awarded while paused.</p>
+          <p style={{ margin: "-12px 0 0", fontSize: 14, color: "rgba(255,255,255,0.7)" }}>Share the PIN so a player can rejoin. No points are being awarded while paused.</p>
+          {pinBlock}
           <div style={{ display: "flex", gap: 12, marginTop: 4 }}>
             <button onClick={() => setShowEndConfirm(true)} style={{ padding: "14px 28px", borderRadius: 14, border: `1px solid rgba(255,255,255,0.35)`, background: "transparent", color: "#fff", fontSize: 16, fontWeight: 900, cursor: "pointer" }}>
               End Game
@@ -3022,6 +3041,7 @@ function KahootHostView({ onNav, sessionName, pin, sessionDbId, demoMode, tenant
         <div style={{ position: "fixed", inset: 0, background: "rgba(0,0,0,0.65)", display: "flex", flexDirection: "column", alignItems: "center", justifyContent: "center", gap: 20, zIndex: 100, backdropFilter: "blur(4px)" }}>
           <div style={{ fontSize: 56 }}>⏸</div>
           <p style={{ margin: 0, fontSize: 22, fontWeight: 900, color: "#fff" }}>Game Paused</p>
+          {pinBlock}
           {resumeBlocked && (
             <p style={{ margin: "-12px 0 0", fontSize: 14, color: "#FCA5A5", fontWeight: 700 }}>Waiting for a player to reconnect before you can resume.</p>
           )}
