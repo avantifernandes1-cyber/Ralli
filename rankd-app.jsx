@@ -5882,7 +5882,12 @@ function PlayerSessionDetail({ session, playerId, onBack }) {
           const detail = resolveAnswerDetail(row, q);
           const st     = ANSWER_STATUS_STYLES[detail.status] ?? ANSWER_STATUS_STYLES.unavailable;
           const showCorrect = (detail.status === "incorrect" || detail.status === "unanswered") && detail.correctLabel;
-          const validTime = detail.timeMs != null && detail.timeMs >= 0;
+          // Same validity contract as manager analytics: a response time counts
+          // only if it's non-negative AND within the snapshot question's
+          // configured limit. If the question has no valid positive limit, hide
+          // the time rather than invent a validity range. Stored value untouched.
+          const limitMs   = (q.timeLimit ?? 0) * 1000;
+          const validTime = detail.timeMs != null && detail.timeMs >= 0 && limitMs > 0 && detail.timeMs <= limitMs;
           return (
             <div key={q.id ?? i} style={{ borderRadius: 14, border: `1px solid ${C.border}`, background: C.white, padding: mobile ? 14 : 18 }}>
               <div style={{ display: "flex", alignItems: "flex-start", justifyContent: "space-between", gap: 12 }}>
@@ -6111,7 +6116,7 @@ function RankdJoinPanel({ onJoin, sessions, currentUser }) {
                 dbId:          row.session_id,
                 sessionName:   row.game_sessions?.name ?? "Game",
                 date:          row.game_sessions?.ended_at ? new Date(row.game_sessions.ended_at).toLocaleDateString("en-US", { month: "short", day: "numeric" }) : "—",
-                rank:          row.final_rank ?? i + 1,
+                rank:          row.final_rank ?? null, // array position is NOT proof of placement
                 totalPlayers:  historyCounts[row.session_id] ?? null,
                 score:         row.final_score ?? 0,
                 pin:           row.game_sessions?.pin ?? "—",
@@ -6181,7 +6186,9 @@ function RankdJoinPanel({ onJoin, sessions, currentUser }) {
           }
 
           // Real user DB history display
-          const bestRank = displayHistory.reduce((a, b) => (a.rank <= b.rank ? a : b), displayHistory[0]);
+          // Best Rank considers ONLY rows with a real final_rank (never array position).
+          const rankedRows = displayHistory.filter(s => s.rank != null);
+          const bestRank = rankedRows.length ? rankedRows.reduce((a, b) => (a.rank <= b.rank ? a : b)) : null;
           return (
             <div>
               <div style={{ display: "grid", gridTemplateColumns: "repeat(2, 1fr)", gap: 16, marginBottom: 28 }}>
@@ -6210,13 +6217,13 @@ function RankdJoinPanel({ onJoin, sessions, currentUser }) {
                   onMouseEnter={e => e.currentTarget.style.background = C.pageBg}
                   onMouseLeave={e => e.currentTarget.style.background = "transparent"}>
                     <div style={{ width: 36, height: 36, borderRadius: 10, flexShrink: 0, display: "flex", alignItems: "center", justifyContent: "center", fontSize: 12, fontWeight: 800, background: s.rank === 1 ? C.orange : C.muted, color: s.rank === 1 ? "#fff" : C.textSub }}>
-                      #{s.rank}
+                      {s.rank != null ? `#${s.rank}` : "—"}
                     </div>
                     <div style={{ flex: 1, minWidth: 0 }}>
                       <p style={{ margin: 0, fontSize: 13, fontWeight: 700, color: C.text }}>{s.sessionName}</p>
                       <p style={{ margin: "2px 0 0", fontSize: 11, color: C.textSub }}>
                         {s.date}
-                        {s.totalPlayers != null ? ` · #${s.rank} of ${s.totalPlayers}` : ` · #${s.rank}`}
+                        {s.rank != null ? (s.totalPlayers != null ? ` · #${s.rank} of ${s.totalPlayers}` : ` · #${s.rank}`) : " · —"}
                         {s.questionCount != null && s.questionCount !== "—" ? ` · ${s.questionCount} questions` : ""}
                       </p>
                     </div>
