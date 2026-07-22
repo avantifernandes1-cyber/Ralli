@@ -214,7 +214,6 @@ export async function joinGameSession(sessionId, { playerId, name, emoji = null,
 
   const finalEmoji = emoji;   // caller-authoritative — null clears any prior avatar
   const finalColor = color;
-  console.log("[RALLI_AVATAR_TRACE] joinGameSession", { playerId, callerEmoji: emoji, existingEmoji: existing?.emoji ?? null, storedEmoji: finalEmoji, oldBehaviorWouldStore: existing?.emoji ?? emoji });
 
   const { data, error } = await supabase
     .from("game_session_participants")

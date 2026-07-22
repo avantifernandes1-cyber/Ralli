@@ -162,7 +162,6 @@ function useGameChannel(pin, role) {
       const rawUserEntries = Object.values(state).flat().filter((p) => p.presenceRole === "user" && p.playerId != null);
       const byId = new Map();
       rawUserEntries.forEach((p) => byId.set(p.playerId, p));
-      if (role === "admin") console.log("[RALLI_PRESENCE_TRACE] presence sync", { rawCount: rawUserEntries.length, rawIds: rawUserEntries.map(p => p.playerId), dedupedCount: byId.size, dedupedIds: [...byId.keys()] });
       // emoji/color stay null when the player chose no avatar — never a
       // placeholder. Identity is the id; avatar is purely cosmetic.
       const players = Array.from(byId.values()).map((p) => ({
@@ -172,7 +171,6 @@ function useGameChannel(pin, role) {
         color: p.color ?? null,
         score: 0,
       }));
-      if (role === "admin") console.log("[RALLI_AVATAR_TRACE] host chPlayers (presence)", players.map(p => ({ id: p.id, emoji: p.emoji })));
       setChPlayers(players);
     });
 
@@ -5984,7 +5982,6 @@ function RankdLobbyScreen({ onNav, pin, playerName, playerEmoji, sessionName, ro
     const pidx = Math.abs((playerId ?? "").charCodeAt(0) + ((playerId ?? "").charCodeAt(1) || 0)) % PLAYER_EMOJIS.length;
     // No-avatar players stay null here too — this optimistic self-entry was the
     // last remaining placeholder source (playerEmoji ?? PLAYER_EMOJIS[pidx]).
-    console.log("[RALLI_AVATAR_TRACE] lobby self-entry", { playerId, playerEmojiProp: playerEmoji ?? null, storedEmoji: playerEmoji ?? null });
     const selfEntry = normParticipant({
       player_id: currentUser?.id ?? playerId,
       name:      playerName,
@@ -6085,7 +6082,6 @@ function RankdLobbyScreen({ onNav, pin, playerName, playerEmoji, sessionName, ro
       const db = dbById.get(playerId);
       map.set(playerId, { id: playerId, name: db?.name ?? playerName, emoji: db?.emoji ?? playerEmoji ?? null, color: db?.color ?? PLAYER_COLORS[0], score: 0 });
     }
-    console.log("[RALLI_PRESENCE_TRACE] lobby roster", { role, sessionDbId, presence: chPlayers.map(p => ({ id: p.id, emoji: p.emoji })), db: dbPlayers.map(p => ({ id: p.id, status: p.status, emoji: p.emoji })), visible: Array.from(map.values()).map(p => ({ id: p.id, emoji: p.emoji })) });
     return Array.from(map.values());
   })();
 
@@ -6108,7 +6104,6 @@ function RankdLobbyScreen({ onNav, pin, playerName, playerEmoji, sessionName, ro
     // cosmetic tint. Identity is `id`; gameplay never reads emoji.
     const resolvedEmoji = dbSelf?.emoji ?? playerEmoji ?? null;
     const resolvedColor = dbSelf?.color ?? PLAYER_COLORS[pidx % PLAYER_COLORS.length];
-    console.log("[RALLI_AVATAR_TRACE] lobby PLAYER_JOIN broadcast", { playerId, dbSelfEmoji: dbSelf?.emoji ?? null, playerEmojiProp: playerEmoji ?? null, resolvedEmoji, source: dbSelf?.emoji != null ? "db" : playerEmoji != null ? "selection" : "none(null)" });
     broadcast({ type: GM.PLAYER_JOIN, player: { id: playerId, name: playerName, emoji: resolvedEmoji, color: resolvedColor } });
   }, [isDemoMode, pin, playerId, role, playerEmoji, dbPlayers]); // eslint-disable-line react-hooks/exhaustive-deps
 
@@ -6408,26 +6403,78 @@ function RankdResultsScreen({ onNav, sessionCode, sessions, gameData }) {
     ? realScores.map((p, i) => ({ rank: i+1, id: p.id, name: p.name, emoji: p.emoji ?? null, score: p.score }))
     : [];
 
-  // ONE canonical question source for ALL analytics views. Overview and the
-  // Questions tab derive from the SAME resolved `realQuestions` + game_answers
-  // rows that Player Breakdown uses — never from the in-memory questionHistory,
-  // which only contains REVEALED questions (skips omitted) and so silently
-  // resolved a different, shorter question set than Player Breakdown. Indexing
-  // realQuestions by position and answers by question_idx keeps all three views
-  // in lockstep. Skipped questions are excluded from the correct/total ratio.
-  const questionBreakdown = detailAvailable
+  // ── Deduplicated session answer rows ────────────────────────────────────────
+  // game_answers has no uniqueness guarantee on (session_id, player_id,
+  // question_idx). All answerRows are already scoped to this session, so dedupe
+  // by (player_id, question_idx), keeping the latest row by answered_at (then a
+  // stable id fallback). Analytics must never double-count a duplicate row.
+  const dedupedAnswerRows = (() => {
+    const byKey = new Map();
+    for (const r of (answerRows ?? [])) {
+      const key = `${r.player_id}::${r.question_idx}`;
+      const prev = byKey.get(key);
+      if (!prev) { byKey.set(key, r); continue; }
+      const rt = r.answered_at ? Date.parse(r.answered_at) : 0;
+      const pt = prev.answered_at ? Date.parse(prev.answered_at) : 0;
+      if (rt > pt || (rt === pt && String(r.id ?? "") > String(prev.id ?? ""))) byKey.set(key, r);
+    }
+    return [...byKey.values()];
+  })();
+
+  // A row counts as a real submission (vs an explicit "unanswered" placeholder)
+  // — same contract getAnswerDetail uses, so every metric agrees with Player
+  // Breakdown.
+  const rowHasSubmission = (r) => r.option_idx != null || (r.answer_text != null && r.answer_text !== "")
+    || r.numeric_value != null || (Array.isArray(r.answer_json) && r.answer_json.length > 0);
+
+  // ── ONE canonical per-question analytics structure ──────────────────────────
+  // The single source reused by Overview, Questions tab, Leaderboard highlights,
+  // Toughest Question, Avg Accuracy and Avg Response Time. Derived from the
+  // immutable snapshot questions (realQuestions) + deduplicated session rows —
+  // never the mutable quiz. Accuracy is a fraction (0..1) or null when there is
+  // no eligible data (never a fake 0%). Response times are client-reported, so
+  // only real submissions with a non-null, non-negative time within the
+  // snapshot question's configured limit count.
+  const questionStats = detailAvailable
     ? realQuestions.map((qq, i) => {
-        const rowsForQ = (answerRows ?? []).filter(r => r.question_idx === i && !r.was_skipped);
-        const withTime = rowsForQ.filter(r => r.time_ms != null);
+        const rows    = dedupedAnswerRows.filter(r => r.question_idx === i);
+        const skipped = rows.length > 0 && rows.every(r => r.was_skipped);
+        const graded  = rows.filter(r => !r.was_skipped);
+        const limitMs = (qq.timeLimit ?? 0) * 1000;
+        let correct = 0, incorrect = 0, unanswered = 0;
+        const validTimes = [];
+        for (const r of graded) {
+          if (!rowHasSubmission(r)) { unanswered++; continue; }
+          if (r.is_correct) correct++; else incorrect++;
+          if (r.time_ms != null && r.time_ms >= 0 && (limitMs <= 0 || r.time_ms <= limitMs)) validTimes.push(r.time_ms);
+        }
+        const submitted = correct + incorrect;
+        // Unanswered rows are incorrect OPPORTUNITIES for MC/TF/Type/Slider/Match.
+        // Open-ended persists no unanswered rows, so its denominator is not
+        // comparable — excluded from aggregate accuracy below (never fabricated).
+        const eligible  = submitted + unanswered;
         return {
-          q:       qq.q ?? qq.text ?? `Question ${i+1}`,
-          type:    Q_TYPE_LABELS[qq.type] ?? "Question",
-          correct: rowsForQ.filter(r => r.is_correct).length,
-          total:   rowsForQ.length,
-          avgMs:   withTime.length > 0 ? Math.round(withTime.reduce((s, r) => s + r.time_ms, 0) / withTime.length) : 0,
+          qIdx: i,
+          id:   qq.id ?? null,
+          text: qq.q ?? qq.text ?? `Question ${i+1}`,
+          type: qq.type,
+          typeLabel: Q_TYPE_LABELS[qq.type] ?? "Question",
+          isOpen: qq.type === "open",
+          skipped,
+          correct, incorrect, unanswered, submitted, eligible,
+          validTimes,
+          validTimedCount: validTimes.length,
+          avgValidTimeMs: validTimes.length > 0 ? Math.round(validTimes.reduce((s, t) => s + t, 0) / validTimes.length) : null,
+          accuracy: eligible > 0 ? correct / eligible : null,
         };
       })
     : [];
+
+  // Render-friendly projection (Overview "Question Accuracy" + Questions tab).
+  const questionBreakdown = questionStats.map(q => ({
+    q: q.text, type: q.typeLabel, correct: q.correct, submitted: q.submitted,
+    eligible: q.eligible, accuracy: q.accuracy, avgMs: q.avgValidTimeMs, skipped: q.skipped,
+  }));
 
   // ── Canonical answer-detail renderer/data contract ─────────────────────────
   // Single source of truth for "what did this player submit on this
@@ -6569,15 +6616,38 @@ function RankdResultsScreen({ onNav, sessionCode, sessions, gameData }) {
     { bg: C.orange, glow: "rgba(253,191,36,0.25)", medal: "3rd", height: 64  },
   ];
 
-  const avgAccuracy   = questionBreakdown.length
-    ? Math.round(questionBreakdown.reduce((s,q) => s + Math.round((q.correct / Math.max(q.total,1)) * 100), 0) / questionBreakdown.length)
+  // Overall Avg Accuracy = sum(correct opportunities) / sum(eligible
+  // opportunities) — aggregate counts, NOT an unweighted average of rounded
+  // per-question percentages. Excludes skipped questions, questions with no
+  // eligible data, and open-ended (incomparable denominator). null when there
+  // is no eligible data anywhere (rendered "—", never a fake 0%).
+  const accQs = questionStats.filter(q => !q.skipped && !q.isOpen && q.eligible > 0);
+  const _corrOpp = accQs.reduce((s, q) => s + q.correct, 0);
+  const _eligOpp = accQs.reduce((s, q) => s + q.eligible, 0);
+  const avgAccuracy = _eligOpp > 0 ? Math.round((_corrOpp / _eligOpp) * 100) : null;
+
+  // Overall Avg Response Time = sum(all valid timed submissions) / count — a
+  // single pooled mean, NOT an average of question averages, with no zero
+  // substitution. null when there are no valid timed submissions.
+  const _allValidTimes = questionStats.filter(q => !q.skipped).flatMap(q => q.validTimes);
+  const avgResponseMs = _allValidTimes.length > 0
+    ? Math.round(_allValidTimes.reduce((s, t) => s + t, 0) / _allValidTimes.length)
     : null;
-  const hardestQ      = questionBreakdown.length
-    ? questionBreakdown.reduce((a, b) => (a.correct/Math.max(a.total,1)) <= (b.correct/Math.max(b.total,1)) ? a : b)
-    : null;
-  const avgResponseMs = questionBreakdown.length
-    ? Math.round(questionBreakdown.reduce((s,q) => s + (q.avgMs||0), 0) / questionBreakdown.length)
-    : null;
+
+  // Toughest Question — deterministic, evidence-based (no weighted/normalized
+  // score): exclude skipped, no-submission, and zero-incorrect questions; pick
+  // the highest incorrect-SUBMISSION count; tie → longest valid avg response
+  // time; tie → earliest snapshot order. null → render no card.
+  const toughestQuestion = (() => {
+    const eligible = questionStats.filter(q => !q.skipped && q.submitted > 0 && q.incorrect > 0);
+    if (eligible.length === 0) return null;
+    return eligible.reduce((best, q) => {
+      if (q.incorrect !== best.incorrect) return q.incorrect > best.incorrect ? q : best;
+      const qt = q.avgValidTimeMs ?? -1, bt = best.avgValidTimeMs ?? -1;
+      if (qt !== bt) return qt > bt ? q : best;
+      return q.qIdx < best.qIdx ? q : best;
+    });
+  })();
   const totalPlayers  = leaderboard.length;
 
   const typeColors = {
@@ -6665,15 +6735,15 @@ function RankdResultsScreen({ onNav, sessionCode, sessions, gameData }) {
               ))}
             </div>
             {/* Toughest question */}
-            {hardestQ && (
+            {toughestQuestion && (
               <Card style={{ border: `1px solid rgba(239,68,68,0.2)` }}>
                 <p style={{ margin: "0 0 8px", fontSize: 10, fontWeight: 700, color: C.red, textTransform: "uppercase", letterSpacing: "0.1em" }}>Toughest Question</p>
-                <p style={{ margin: "0 0 12px", fontSize: 14, fontWeight: 600, color: C.text }}>{hardestQ.q}</p>
+                <p style={{ margin: "0 0 12px", fontSize: 14, fontWeight: 600, color: C.text }}>{toughestQuestion.text}</p>
                 <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
                   <div style={{ flex: 1, height: 8, borderRadius: 99, background: C.muted, overflow: "hidden" }}>
-                    <div style={{ height: "100%", borderRadius: 99, width: `${Math.round((hardestQ.correct/Math.max(hardestQ.total,1))*100)}%`, background: C.red }} />
+                    <div style={{ height: "100%", borderRadius: 99, width: `${Math.round((toughestQuestion.incorrect/Math.max(toughestQuestion.submitted,1))*100)}%`, background: C.red }} />
                   </div>
-                  <span style={{ fontSize: 12, fontWeight: 700, color: C.red, flexShrink: 0 }}>{hardestQ.correct}/{hardestQ.total} correct</span>
+                  <span style={{ fontSize: 12, fontWeight: 700, color: C.red, flexShrink: 0 }}>{toughestQuestion.incorrect}/{toughestQuestion.submitted} wrong{toughestQuestion.avgValidTimeMs != null ? ` · ${(toughestQuestion.avgValidTimeMs/1000).toFixed(1)}s avg` : ""}</span>
                 </div>
               </Card>
             )}
@@ -6681,16 +6751,19 @@ function RankdResultsScreen({ onNav, sessionCode, sessions, gameData }) {
             <Card>
               <p style={{ margin: "0 0 14px", fontSize: 10, fontWeight: 700, color: C.textSub, textTransform: "uppercase", letterSpacing: "0.08em" }}>Question Accuracy</p>
               {questionBreakdown.map((q, i) => {
-                const pct = Math.round((q.correct / Math.max(q.total, 1)) * 100);
-                const color = pct >= 80 ? "#059669" : pct >= 60 ? C.orange : C.red;
+                // Honest: skipped and no-eligible-data questions never show a
+                // fake 0% — they render "Skipped" / "No responses" and an empty bar.
+                const pct   = q.accuracy == null ? null : Math.round(q.accuracy * 100);
+                const label = q.skipped ? "Skipped" : pct == null ? "No responses" : `${pct}%`;
+                const color = pct == null ? C.textMuted : pct >= 80 ? "#059669" : pct >= 60 ? C.orange : C.red;
                 return (
                   <div key={i} style={{ marginBottom: 10 }}>
                     <div style={{ display: "flex", justifyContent: "space-between", marginBottom: 4 }}>
                       <span style={{ fontSize: 12, color: C.textSub, flex: 1, whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis", marginRight: 8 }}>Q{i+1}: {q.q}</span>
-                      <span style={{ fontSize: 12, fontWeight: 700, color, flexShrink: 0 }}>{pct}%</span>
+                      <span style={{ fontSize: 12, fontWeight: 700, color, flexShrink: 0 }}>{label}</span>
                     </div>
                     <div style={{ height: 6, borderRadius: 99, background: C.muted }}>
-                      <div style={{ height: "100%", borderRadius: 99, width: `${pct}%`, background: color, transition: "width 0.5s" }} />
+                      <div style={{ height: "100%", borderRadius: 99, width: `${pct ?? 0}%`, background: color, transition: "width 0.5s" }} />
                     </div>
                   </div>
                 );
@@ -6851,15 +6924,15 @@ function RankdResultsScreen({ onNav, sessionCode, sessions, gameData }) {
                 ) : <p style={{ margin: 0, fontSize: 13, color: C.dark, opacity: 0.5 }}>No data yet</p>}
               </div>
 
-              {hardestQ && (
+              {toughestQuestion && (
                 <Card style={{ border: "1px solid rgba(244,63,94,0.2)" }}>
                   <p style={{ margin: "0 0 8px", fontSize: 10, fontWeight: 700, color: "#E11D48", textTransform: "uppercase", letterSpacing: "0.1em" }}>Toughest Question</p>
-                  <p style={{ margin: "0 0 10px", fontSize: 13, fontWeight: 600, color: C.text }}>{hardestQ.q}</p>
+                  <p style={{ margin: "0 0 10px", fontSize: 13, fontWeight: 600, color: C.text }}>{toughestQuestion.text}</p>
                   <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
                     <div style={{ flex: 1, height: 8, borderRadius: 99, overflow: "hidden", background: C.muted }}>
-                      <div style={{ height: "100%", borderRadius: 99, width: `${Math.round((hardestQ.correct/Math.max(hardestQ.total,1))*100)}%`, background: C.red }} />
+                      <div style={{ height: "100%", borderRadius: 99, width: `${Math.round((toughestQuestion.incorrect/Math.max(toughestQuestion.submitted,1))*100)}%`, background: C.red }} />
                     </div>
-                    <span style={{ fontSize: 12, fontWeight: 700, color: "#E11D48", flexShrink: 0 }}>{hardestQ.correct}/{hardestQ.total}</span>
+                    <span style={{ fontSize: 12, fontWeight: 700, color: "#E11D48", flexShrink: 0 }}>{toughestQuestion.incorrect}/{toughestQuestion.submitted} wrong</span>
                   </div>
                 </Card>
               )}
@@ -6875,14 +6948,14 @@ function RankdResultsScreen({ onNav, sessionCode, sessions, gameData }) {
               {leaderboard.length > 0 && (() => {
                 const maxScore = leaderboard[0]?.score || 1;
                 const dist = [
-                  { range: "Top 25%",  players: leaderboard.filter(p => p.score >= maxScore * 0.75), color: C.green   },
-                  { range: "50–75%",   players: leaderboard.filter(p => p.score >= maxScore * 0.5 && p.score < maxScore * 0.75), color: C.orange },
-                  { range: "25–50%",   players: leaderboard.filter(p => p.score >= maxScore * 0.25 && p.score < maxScore * 0.5), color: "#F59E0B" },
-                  { range: "< 25%",    players: leaderboard.filter(p => p.score < maxScore * 0.25), color: C.red      },
+                  { range: "75–100%", players: leaderboard.filter(p => p.score >= maxScore * 0.75), color: C.green   },
+                  { range: "50–74%",  players: leaderboard.filter(p => p.score >= maxScore * 0.5 && p.score < maxScore * 0.75), color: C.orange },
+                  { range: "25–49%",  players: leaderboard.filter(p => p.score >= maxScore * 0.25 && p.score < maxScore * 0.5), color: "#F59E0B" },
+                  { range: "<25%",    players: leaderboard.filter(p => p.score < maxScore * 0.25), color: C.red      },
                 ];
                 return (
                   <Card>
-                    <p style={{ margin: "0 0 12px", fontSize: 10, fontWeight: 700, color: C.textSub, textTransform: "uppercase", letterSpacing: "0.08em" }}>Score Distribution</p>
+                    <p style={{ margin: "0 0 12px", fontSize: 10, fontWeight: 700, color: C.textSub, textTransform: "uppercase", letterSpacing: "0.08em" }}>Score Distribution · % of top score</p>
                     {dist.map(d => (
                       <div key={d.range} style={{ display: "flex", alignItems: "center", gap: 8, fontSize: 11, marginBottom: 8 }}>
                         <span style={{ width: 52, textAlign: "right", color: C.textSub, fontWeight: 500 }}>{d.range}</span>
@@ -6939,10 +7012,11 @@ function RankdResultsScreen({ onNav, sessionCode, sessions, gameData }) {
             <div style={{ display: "flex", flexDirection: "column", gap: 12 }}>
               {questionBreakdown.length === 0 && <div style={{ textAlign: "center", padding: 60, color: C.textMuted, fontSize: 14 }}>{isLegacyDetail ? "Exact question detail unavailable for this historical session." : "No question data available"}</div>}
               {questionBreakdown.map((q, i) => {
-                const pct   = Math.round((q.correct / Math.max(q.total,1)) * 100);
-                const color = pct >= 80 ? "#059669" : pct >= 60 ? C.orange : C.red;
+                const pct   = q.accuracy == null ? null : Math.round(q.accuracy * 100);
+                const label = q.skipped ? "Skipped" : pct == null ? "No responses" : `${pct}%`;
+                const color = pct == null ? C.textMuted : pct >= 80 ? "#059669" : pct >= 60 ? C.orange : C.red;
                 const tc    = typeColors[q.type] ?? { bg: C.muted, text: C.textSub };
-                const clickable = detailAvailable;
+                const clickable = detailAvailable && !q.skipped;
                 return (
                   <Card key={i} onClick={clickable ? () => setSelectedQIdx(i) : undefined} style={clickable ? { cursor: "pointer" } : undefined}>
                     <div style={{ display: "flex", alignItems: "flex-start", gap: 16 }}>
@@ -6962,14 +7036,14 @@ function RankdResultsScreen({ onNav, sessionCode, sessions, gameData }) {
                         <div style={{ display: "flex", alignItems: "center", gap: 16 }}>
                           <div style={{ flex: 1 }}>
                             <div style={{ display: "flex", justifyContent: "space-between", fontSize: 11, marginBottom: 4 }}>
-                              <span style={{ color: C.textSub }}>{q.correct}/{q.total} correct</span>
-                              <span style={{ fontWeight: 700, color }}>{pct}%</span>
+                              <span style={{ color: C.textSub }}>{q.skipped ? "Skipped by host" : `${q.correct}/${q.eligible} correct`}</span>
+                              <span style={{ fontWeight: 700, color }}>{label}</span>
                             </div>
                             <div style={{ height: 8, borderRadius: 99, overflow: "hidden", background: C.muted }}>
-                              <div style={{ height: "100%", borderRadius: 99, width: `${pct}%`, background: color }} />
+                              <div style={{ height: "100%", borderRadius: 99, width: `${pct ?? 0}%`, background: color }} />
                             </div>
                           </div>
-                          {q.avgMs > 0 && (
+                          {q.avgMs != null && (
                             <div style={{ textAlign: "right", flexShrink: 0 }}>
                               <p style={{ margin: 0, fontSize: 10, color: C.textMuted }}>Avg time</p>
                               <p style={{ margin: 0, fontSize: 14, fontWeight: 700, color: C.text }}>{(q.avgMs / 1000).toFixed(1)}s</p>
@@ -22436,7 +22510,6 @@ export default function App() {
     // renders fall back to name-only. Color still gets a stable cosmetic tint.
     const pidx       = Math.abs(gamePlayerId.charCodeAt(0) + (gamePlayerId.charCodeAt(1) || 0)) % PLAYER_EMOJIS.length;
     const finalEmoji = emoji ?? null;
-    console.log("[RALLI_AVATAR_TRACE] handleEnterName (avatar selection)", { playerId: gamePlayerId, selectedEmoji: emoji, joinPayloadEmoji: finalEmoji });
     setLobbyPlayerEmoji(finalEmoji);
 
     // Update local session state (keeps existing local-state consumers working)
