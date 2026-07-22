@@ -1954,7 +1954,7 @@ function KahootHostView({ onNav, sessionName, pin, sessionDbId, tenantId, questi
             return {
               id:         p.player_id,
               name:       p.name,
-              emoji:      p.emoji ?? "❔",
+              emoji:      p.emoji ?? null,   // no-avatar players stay null — name only, no placeholder
               color:      p.color ?? C.textMuted,
               score:      t?.score ?? 0,
               delta:      0,
@@ -2004,7 +2004,13 @@ function KahootHostView({ onNav, sessionName, pin, sessionDbId, tenantId, questi
   // players (not yet in the DB) are still covered there.
   useEffect(() => {
     if (!sessionDbId) return;
-    const HEARTBEAT_FRESH_MS = 25000; // > the 15s heartbeat interval, so a present player is never dropped
+    // 40s window against a 15s heartbeat tolerates one fully-dropped beat
+    // (worst-case present-player gap ~30s < 40s) so ordinary network jitter
+    // never falsely marks a connected player stale. Two consecutive misses
+    // (~45s) are needed before a player drops out — plus the halt watchdog's
+    // own 5s debounce — so a real halt lands ~40-45s after the last player
+    // truly leaves, without false positives from a single lost beat.
+    const HEARTBEAT_FRESH_MS = 40000;
     const refreshRoster = () => {
       getLobbyParticipants(sessionDbId).then(({ data }) => {
         if (!data) return;
@@ -2080,22 +2086,19 @@ function KahootHostView({ onNav, sessionName, pin, sessionDbId, tenantId, questi
   // Single fixed (non-index) placeholder for the rare case a player row has
   // no discoverable identity anywhere (not in scores, presence, or the DB
   // roster) — e.g. a broadcast-only answer that never persisted a
-  // participant row. Deliberately constant, not derived from iteration
-  // order, so it can never look like a real assigned emoji.
-  const UNKNOWN_EMOJI = "❔";
+  // participant row.
   const UNKNOWN_COLOR = C.textMuted;
 
   // Builds a player row for someone who answered but isn't yet in `scores`
-  // or `chPlayers` — looks up their real stored identity from the DB
-  // roster (dbParticipants) by id first. Only falls back to the fixed
-  // UNKNOWN_EMOJI placeholder if the DB roster itself doesn't have them
-  // (never assigns an array-position-derived emoji).
+  // or `chPlayers` — looks up their real stored identity from the DB roster
+  // (dbParticipants) by id first. Emoji stays null when the roster has none
+  // (no-avatar players are name-only — never an assigned placeholder).
   const buildScoreRowFromAnswer = (pid, ans) => {
     const dbP = dbParticipants.find(p => (p.player_id ?? p.id) === pid);
     return {
       id:    pid,
       name:  dbP?.name ?? ans.name ?? pid,
-      emoji: dbP?.emoji ?? UNKNOWN_EMOJI,
+      emoji: dbP?.emoji ?? null,   // no-avatar players stay null — name only, no placeholder
       color: dbP?.color ?? UNKNOWN_COLOR,
       score: 0,
     };
@@ -5927,7 +5930,7 @@ function RankdLobbyScreen({ onNav, pin, playerName, playerEmoji, sessionName, ro
   const normParticipant = (p) => ({
     id:     p.player_id ?? p.id,
     name:   p.name,
-    emoji:  p.emoji  ?? PLAYER_EMOJIS[0],
+    emoji:  p.emoji  ?? null,   // no-avatar players stay null — name only, no placeholder
     color:  p.color  ?? PLAYER_COLORS[0],
     score:  0,
     status: p.status ?? "active",
@@ -6035,7 +6038,7 @@ function RankdLobbyScreen({ onNav, pin, playerName, playerEmoji, sessionName, ro
 
   const basePlayer = role === "admin"
     ? { name: currentUser?.name ?? "Host", emoji: "🦁", color: C.green }
-    : { name: playerName || "You", emoji: playerEmoji ?? "🦊", color: C.orange };
+    : { name: playerName || "You", emoji: playerEmoji ?? null, color: C.orange };
 
   const demoAllPlayers = [basePlayer, ...LOBBY_PLAYERS.filter(p => p.name !== basePlayer.name)];
 
@@ -6180,7 +6183,9 @@ function RankdLobbyScreen({ onNav, pin, playerName, playerEmoji, sessionName, ro
           {displayPlayers.map((p, i) => {
             const isMe = !isDemoMode ? p.id === currentUser?.id : i === 0;
             const EMOJIS = ["🦊","🐯","🦁","🐼","🦊","🐸","🐧","🦄","🦋","🐙"];
-            const emoji = p.emoji ?? EMOJIS[i % EMOJIS.length];
+            // Real no-avatar players stay null (name only, no placeholder circle);
+            // demo players keep an illustrative avatar.
+            const emoji = p.emoji ?? (isDemoMode ? EMOJIS[i % EMOJIS.length] : null);
             const color = p.color ?? [C.orange, C.green, "#3B82F6", "#8B5CF6", "#F43F5E", "#F59E0B"][i % 6];
             return (
               <div key={p.name ?? i} style={{
@@ -6189,11 +6194,11 @@ function RankdLobbyScreen({ onNav, pin, playerName, playerEmoji, sessionName, ro
                 border: `1.5px solid ${isMe && role === "user" ? C.creamBorder : C.cardBorder}`,
                 animation: isDemoMode && i === visibleCount - 1 ? "fadeSlideIn 0.4s ease" : undefined,
               }}>
-                <div style={{
+                {emoji && <div style={{
                   width: 34, height: 34, borderRadius: 9, flexShrink: 0, fontSize: 18,
                   display: "flex", alignItems: "center", justifyContent: "center",
                   background: color + "18", border: `1.5px solid ${color}30`,
-                }}>{emoji}</div>
+                }}>{emoji}</div>}
                 <div style={{ flex: 1, minWidth: 0 }}>
                   <p style={{ margin: 0, fontSize: 13, fontWeight: 700, color: C.text, whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis" }}>{p.name}</p>
                   {isMe && role === "user"  && <p style={{ margin: 0, fontSize: 10, fontWeight: 600, color: C.orange }}>You</p>}
@@ -6286,7 +6291,7 @@ function RankdResultsScreen({ onNav, sessionCode, sessions, gameData }) {
         setDbScores(data.map((p) => ({
           id:    p.player_id,
           name:  p.name,
-          emoji: p.emoji ?? "🙂",
+          emoji: p.emoji ?? null,   // no-avatar players stay null — name only, no placeholder
           color: p.color ?? C.orange,
           score: p.final_score ?? 0,
           delta: 0,
@@ -6347,7 +6352,7 @@ function RankdResultsScreen({ onNav, sessionCode, sessions, gameData }) {
   const detailAvailable = detailLoaded && (answerRows?.length > 0) && (realQuestions?.length > 0);
 
   const leaderboard = realScores
-    ? realScores.map((p, i) => ({ rank: i+1, id: p.id, name: p.name, emoji: p.emoji ?? "🙂", score: p.score }))
+    ? realScores.map((p, i) => ({ rank: i+1, id: p.id, name: p.name, emoji: p.emoji ?? null, score: p.score }))
     : [];
 
   // ONE canonical question source for ALL analytics views. Overview and the
