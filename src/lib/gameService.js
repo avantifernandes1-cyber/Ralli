@@ -412,8 +412,21 @@ export async function getSessionPlayers(sessionId) {
 // ── ANALYTICS ─────────────────────────────────────────────────────────────────
 
 /**
- * Fetch completed game session history for a tenant.
- * Used by Leadership Dashboard and user history views.
+ * Fetch completed game session history for a tenant — the durable data
+ * source behind Ralli Live's "Past Sessions" tab.
+ *
+ * Root cause this fixes: the app never called this function at all. Past
+ * Sessions was instead derived by filtering the same local `sessions` array
+ * that getActiveSessions() populates — but getActiveSessions() only ever
+ * queries non-terminal statuses, so a completed session could never appear
+ * there in the first place, and the 10s active-sessions poll wiped out any
+ * session an in-memory optimistic update had marked "completed" within
+ * seconds. game_sessions.status DOES correctly reach "completed" (and
+ * game_players DOES get its final_score/final_rank rows) via endGameSession()
+ * — verified live against production data — so no backfill was needed here,
+ * only wiring up this read path and normalizing it the same way
+ * getActiveSessions() does, so downstream consumers (RankdResultsScreen's
+ * code-based lookup, session.dbId/quizId usage) work unchanged.
  *
  * @param {string} tenantId
  * @param {number} [limit=20]
@@ -427,7 +440,43 @@ export async function getGameHistory(tenantId, limit = 20) {
     .eq("status", "completed")
     .order("ended_at", { ascending: false })
     .limit(limit);
-  return { data, error };
+
+  if (error || !data) return { data: null, error };
+
+  // Resolve host display names for real (UUID) host_ids in one batch query.
+  // Mock/demo host_ids (seed data, e.g. "demo-host") never match a profiles
+  // row and safely fall back to null (rendered as "Unknown host") below —
+  // never fabricated.
+  const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+  const hostIds = [...new Set(data.map(s => s.host_id).filter(id => id && UUID_RE.test(id)))];
+  let hostNames = {};
+  if (hostIds.length > 0) {
+    const { data: hosts } = await supabase.from("profiles").select("id, name, email").in("id", hostIds);
+    hostNames = Object.fromEntries((hosts ?? []).map(h => [h.id, h.name ?? h.email ?? null]));
+  }
+
+  const normalised = data.map(s => {
+    const players = (s.game_players ?? []).slice().sort((a, b) => (a.final_rank ?? 999) - (b.final_rank ?? 999));
+    const top = players[0] ?? null;
+    return {
+      code:          s.pin,
+      name:          s.name,
+      quizId:        s.quiz_id,
+      questionCount: s.question_count,
+      status:        s.status,
+      playerCount:   players.length,
+      demoMode:      s.demo_mode ?? false,
+      players:       [],
+      dbId:          s.id,
+      endedAt:       s.ended_at,
+      createdAt:     s.created_at,
+      hostId:        s.host_id ?? null,
+      hostName:      hostNames[s.host_id] ?? null,
+      topPlayer:     top ? { name: top.name, score: top.final_score ?? 0, emoji: top.emoji ?? null } : null,
+    };
+  });
+
+  return { data: normalised, error: null };
 }
 
 /**

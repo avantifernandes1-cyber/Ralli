@@ -29,6 +29,7 @@ import {
   markParticipantLeft,
   updateParticipantHeartbeat,
   getPlayerGameHistory,
+  getGameHistory,
   getSessionPlayers,
   getSessionRestoreData,
   getGameAnswersForSession,
@@ -3216,6 +3217,7 @@ function KahootPlayerView({ onNav, playerName, playerId, pin, sessionDbId, broad
   if (phase === "answered" || phase === "reveal") {
     const showResult  = phase === "reveal";
     const hasAnswer   = selectedIdx !== null || openSubmitted || sliderSubmitted || matchSubmitted;
+    const qType       = question?.type;
     const answerLabel = selectedIdx !== null
       ? question?.options?.[selectedIdx]
       : sliderSubmitted
@@ -3230,8 +3232,101 @@ function KahootPlayerView({ onNav, playerName, playerId, pin, sessionDbId, broad
         : matchSubmitted
           ? "🔗"
           : "✎";
+
+    // ── Reveal parity — the ONLY things a player must never see are other
+    // players' responses, the vote/value distribution, and the roster; every
+    // other piece of "what was actually right" information the host sees
+    // should reach the player too. Green = correct, red = their own wrong
+    // submission, neutral = everything else — same rule KahootHostView uses
+    // for its option grid and PLAYER RESPONSES panels, just scoped to this
+    // one player's own answer. `question` already holds the full question
+    // object (correct/acceptedAnswers/pairs/tolerance/explanation) — it was
+    // broadcast in full at SHOW_QUESTION so the answer UI could render, so
+    // showing it back at reveal exposes nothing new. "open" has no fixed
+    // correct answer (host-graded) and isn't in scope here — the Correct!/
+    // Wrong/Not-awarded header above already covers it.
+    const revealDetail = showResult && question && (() => {
+      if (qType === "mc" || qType === "tf") {
+        return (
+          <div style={{ display: "flex", flexDirection: "column", gap: 8, width: "100%" }}>
+            {(question.options ?? []).map((opt, i) => {
+              const isRight = i === question.correct;
+              const isMineWrong = i === selectedIdx && !isRight;
+              const bg = isRight ? "#D1FAE5" : isMineWrong ? "#FEF2F2" : C.muted;
+              const bd = isRight ? "#86EFAC" : isMineWrong ? "#FECACA" : C.creamBorder;
+              const fg = isRight ? "#059669" : isMineWrong ? C.red : C.textMuted;
+              return (
+                <div key={i} style={{ display: "flex", alignItems: "center", gap: 10, padding: "10px 14px", borderRadius: 10, background: bg, border: `1.5px solid ${bd}` }}>
+                  <span style={{ fontSize: 13, fontWeight: 800, color: fg, width: 16, flexShrink: 0, textAlign: "center" }}>{isRight ? "✓" : isMineWrong ? "✗" : ""}</span>
+                  <span style={{ fontSize: 14, fontWeight: 600, color: C.text, flex: 1, textAlign: "left" }}>{opt}</span>
+                  {i === selectedIdx && <span style={{ fontSize: 9, fontWeight: 800, color: C.textMuted, letterSpacing: "0.05em", flexShrink: 0 }}>YOUR PICK</span>}
+                </div>
+              );
+            })}
+            {question.explanation && <p style={{ margin: "2px 0 0", fontSize: 13, color: C.textSub, lineHeight: 1.5, textAlign: "left" }}>{question.explanation}</p>}
+          </div>
+        );
+      }
+      if (qType === "type") {
+        return (
+          <div style={{ display: "flex", flexDirection: "column", gap: 8, width: "100%" }}>
+            <div style={{ padding: "10px 14px", borderRadius: 10, textAlign: "left", background: !openSubmitted ? C.muted : isCorrect ? "#D1FAE5" : "#FEF2F2", border: `1.5px solid ${!openSubmitted ? C.creamBorder : isCorrect ? "#86EFAC" : "#FECACA"}` }}>
+              <div style={{ fontSize: 10, fontWeight: 700, color: C.textMuted, letterSpacing: "0.06em", marginBottom: 4 }}>YOUR ANSWER</div>
+              <span style={{ fontSize: 14, fontWeight: 700, color: C.text }}>{openSubmitted ? (openText || "—") : "No answer submitted"}</span>
+            </div>
+            <div style={{ padding: "10px 14px", borderRadius: 10, textAlign: "left", background: "#D1FAE5", border: "1.5px solid #86EFAC" }}>
+              <div style={{ fontSize: 10, fontWeight: 700, color: "#059669", letterSpacing: "0.06em", marginBottom: 4 }}>ACCEPTED ANSWER{(question.acceptedAnswers?.length ?? 0) > 1 ? "S" : ""}</div>
+              <span style={{ fontSize: 14, fontWeight: 700, color: "#059669" }}>{(question.acceptedAnswers ?? []).join(" / ") || "—"}</span>
+            </div>
+            {question.explanation && <p style={{ margin: 0, fontSize: 13, color: C.textSub, lineHeight: 1.5, textAlign: "left" }}>{question.explanation}</p>}
+          </div>
+        );
+      }
+      if (qType === "slider") {
+        const target = question.correct ?? 5;
+        const tol    = question.tolerance ?? 1;
+        return (
+          <div style={{ display: "flex", flexDirection: "column", gap: 8, width: "100%" }}>
+            <div style={{ padding: "10px 14px", borderRadius: 10, textAlign: "left", background: !sliderSubmitted ? C.muted : isCorrect ? "#D1FAE5" : "#FEF2F2", border: `1.5px solid ${!sliderSubmitted ? C.creamBorder : isCorrect ? "#86EFAC" : "#FECACA"}` }}>
+              <div style={{ fontSize: 10, fontWeight: 700, color: C.textMuted, letterSpacing: "0.06em", marginBottom: 4 }}>YOUR VALUE</div>
+              <span style={{ fontSize: 14, fontWeight: 700, color: C.text }}>{sliderSubmitted ? sliderValue : "No answer submitted"}</span>
+            </div>
+            <div style={{ padding: "10px 14px", borderRadius: 10, textAlign: "left", background: "#D1FAE5", border: "1.5px solid #86EFAC" }}>
+              <div style={{ fontSize: 10, fontWeight: 700, color: "#059669", letterSpacing: "0.06em", marginBottom: 4 }}>CORRECT VALUE</div>
+              <span style={{ fontSize: 14, fontWeight: 700, color: "#059669" }}>{target} <span style={{ fontWeight: 600, opacity: 0.75 }}>(accepted {target - tol}–{target + tol})</span></span>
+            </div>
+            {sliderSubmitted && <p style={{ margin: 0, fontSize: 13, color: C.textSub, lineHeight: 1.5, textAlign: "left" }}>{isCorrect ? `Your value was within ±${tol} of the target.` : "Your value fell outside the accepted range."}</p>}
+          </div>
+        );
+      }
+      if (qType === "match") {
+        const pairs = question.pairs ?? [];
+        return (
+          <div style={{ display: "flex", flexDirection: "column", gap: 8, width: "100%" }}>
+            {pairs.map((pair, li) => {
+              const mine     = matchPairs.find(mp => mp.leftIdx === li);
+              const mineText = mine ? (shuffledRight[mine.rightIdx]?.right ?? null) : null;
+              const isRight  = matchSubmitted && mineText === pair.right;
+              const bg = !matchSubmitted ? C.muted : isRight ? "#D1FAE5" : "#FEF2F2";
+              const bd = !matchSubmitted ? C.creamBorder : isRight ? "#86EFAC" : "#FECACA";
+              return (
+                <div key={li} style={{ padding: "10px 14px", borderRadius: 10, textAlign: "left", background: bg, border: `1.5px solid ${bd}` }}>
+                  <div style={{ fontSize: 13, fontWeight: 700, color: C.text, marginBottom: 2 }}>{pair.left}</div>
+                  <div style={{ fontSize: 13, fontWeight: 600, color: !matchSubmitted ? C.textMuted : isRight ? "#059669" : C.red }}>
+                    {matchSubmitted ? `Your match: ${mineText ?? "—"} ${isRight ? "✓" : "✗"}` : "No answer submitted"}
+                  </div>
+                  {matchSubmitted && !isRight && <div style={{ fontSize: 12, fontWeight: 600, color: "#059669", marginTop: 2 }}>Correct match: {pair.right}</div>}
+                </div>
+              );
+            })}
+          </div>
+        );
+      }
+      return null;
+    })();
+
     return (
-      <div style={{ minHeight: "100%", background: C.cream, display: "flex", flexDirection: "column", alignItems: "center", justifyContent: "center", gap: 20, padding: mobile ? 16 : 32 }}>
+      <div style={{ minHeight: "100%", background: C.cream, display: "flex", flexDirection: "column", alignItems: "center", justifyContent: "center", gap: 20, padding: mobile ? 16 : 32, overflowY: "auto" }}>
         {hasAnswer ? (
           <>
             <div style={{ padding: "16px 24px", borderRadius: 16, background: C.cardBg, border: `1.5px solid ${showResult ? (isCorrect ? "#BBF7D0" : isCorrect === false ? "#FECACA" : C.creamBorder) : C.creamBorder}`, textAlign: "center", maxWidth: 360, width: "100%" }}>
@@ -3259,6 +3354,11 @@ function KahootPlayerView({ onNav, playerName, playerId, pin, sessionDbId, broad
                   }
                   {myDelta > 0 && <div style={{ marginTop: 6, fontSize: 18, fontWeight: 800, color: C.orange }}>+{myDelta.toLocaleString()} pts</div>}
                 </div>
+                {revealDetail && (
+                  <div style={{ width: "100%", maxWidth: 380, maxHeight: mobile ? "36vh" : "40vh", overflowY: "auto", padding: "2px 2px" }}>
+                    {revealDetail}
+                  </div>
+                )}
                 <div style={{ padding: "10px 22px", borderRadius: 12, background: C.cardBg, border: `1px solid ${C.creamBorder}` }}>
                   <span style={{ fontSize: 15, fontWeight: 800, color: C.text }}>{myScore.toLocaleString()} pts</span>
                   {myRank && <span style={{ fontSize: 13, color: C.textMuted, marginLeft: 10 }}>· Rank #{myRank}</span>}
@@ -3268,9 +3368,16 @@ function KahootPlayerView({ onNav, playerName, playerId, pin, sessionDbId, broad
             )}
           </>
         ) : (
-          <div style={{ textAlign: "center" }}>
-            <div style={{ fontSize: 28, fontWeight: 900, color: C.text, marginBottom: 8 }}>Time's up!</div>
-            <div style={{ fontSize: 14, color: C.textMuted }}>No answer recorded</div>
+          <div style={{ display: "flex", flexDirection: "column", alignItems: "center", gap: 16, width: "100%" }}>
+            <div style={{ textAlign: "center" }}>
+              <div style={{ fontSize: 28, fontWeight: 900, color: C.text, marginBottom: 8 }}>Time's up!</div>
+              <div style={{ fontSize: 14, color: C.textMuted }}>{showResult ? "No answer submitted — 0 points awarded" : "No answer recorded"}</div>
+            </div>
+            {showResult && revealDetail && (
+              <div style={{ width: "100%", maxWidth: 380, maxHeight: mobile ? "36vh" : "40vh", overflowY: "auto", padding: "2px 2px" }}>
+                {revealDetail}
+              </div>
+            )}
           </div>
         )}
       </div>
@@ -5279,7 +5386,7 @@ function RankdJoinPanel({ onJoin, sessions, currentUser }) {
 
 // ── RANKD ADMIN PANEL ────────────────────────────────────────
 
-function RankdAdminPanel({ onNav, sessions, onLaunch, onViewResults, onRelaunch }) {
+function RankdAdminPanel({ onNav, sessions, pastSessions = [], onLaunch, onViewResults, onRelaunch }) {
   const [tab, setTab] = useState("active");
 
   // All statuses that can appear from the DB or local state
@@ -5296,8 +5403,13 @@ function RankdAdminPanel({ onNav, sessions, onLaunch, onViewResults, onRelaunch 
   };
 
   const TERMINAL_STATUSES = new Set(["ended", "completed", "canceled", "archived"]);
+  // `sessions` is already active-only (getActiveSessions queries non-terminal
+  // statuses) — this filter is just a defensive belt-and-suspenders, not the
+  // source of truth. `pastSessions` is a real, separately-fetched prop
+  // (getGameHistory — tenant-scoped, status="completed") — it is NEVER
+  // derived from `sessions`, which is what caused Past Sessions to always
+  // show 0 (see getGameHistory's doc comment for the full root cause).
   const activeSessions = sessions.filter(s => !TERMINAL_STATUSES.has(s.status));
-  const pastSessions   = sessions.filter(s =>  TERMINAL_STATUSES.has(s.status));
 
   // Determine the correct CTA label based on session status
   const getSessionActionLabel = (status) => {
@@ -5305,6 +5417,13 @@ function RankdAdminPanel({ onNav, sessions, onLaunch, onViewResults, onRelaunch 
     if (status === "live" || status === "started" ||
         status === "active" || status === "paused")                return "Resume";
     return "Open";
+  };
+
+  const formatPastDate = (iso) => {
+    if (!iso) return "Date unavailable";
+    try {
+      return new Date(iso).toLocaleDateString(undefined, { month: "short", day: "numeric", year: "numeric" });
+    } catch { return "Date unavailable"; }
   };
 
   const SessionRow = ({ s }) => {
@@ -5321,10 +5440,13 @@ function RankdAdminPanel({ onNav, sessions, onLaunch, onViewResults, onRelaunch 
             <h3 style={{ margin: 0, fontSize: 13, fontWeight: 700, color: C.text }}>{s.name}</h3>
             <span style={{ fontSize: 10, fontWeight: 700, padding: "2px 8px", borderRadius: 99, background: sc.bg, color: sc.text }}>{sc.label}</span>
           </div>
-          <div style={{ display: "flex", gap: 14, fontSize: 11, color: C.textSub }}>
+          <div style={{ display: "flex", gap: 14, fontSize: 11, color: C.textSub, flexWrap: "wrap" }}>
             <span>{s.playerCount ?? 0} players</span>
             <span>{s.questionCount} questions</span>
             <span style={{ fontWeight: 900, letterSpacing: "0.12em", fontFamily: "monospace", color: C.textMuted }}>PIN: {s.code}</span>
+            {isPast && <span>{formatPastDate(s.endedAt)}</span>}
+            {isPast && <span>Host: {s.hostName ?? "Unknown host"}</span>}
+            {isPast && s.topPlayer && <span>Top: {s.topPlayer.emoji ? `${s.topPlayer.emoji} ` : ""}{s.topPlayer.name} ({(s.topPlayer.score ?? 0).toLocaleString()} pts)</span>}
           </div>
         </div>
         <div style={{ display: "flex", gap: 8 }}>
@@ -5409,7 +5531,7 @@ function RankdAdminPanel({ onNav, sessions, onLaunch, onViewResults, onRelaunch 
 
 // ── RANKD SCREEN (hub, role-aware) ──────────────────────────
 
-function RankdScreen({ onNav, onJoin, sessions, onLaunch, onViewResults, onRelaunch, role, currentUser }) {
+function RankdScreen({ onNav, onJoin, sessions, pastSessions = [], onLaunch, onViewResults, onRelaunch, role, currentUser }) {
   return (
     <div style={{ display: "flex", flexDirection: "column" }}>
       {/* Hero */}
@@ -5458,7 +5580,7 @@ function RankdScreen({ onNav, onJoin, sessions, onLaunch, onViewResults, onRelau
       {/* Content */}
       <div style={{ background: C.white, borderRadius: "0 0 12px 12px", border: `1px solid ${C.border}`, borderTop: "none" }}>
         {role === "admin"
-          ? <RankdAdminPanel onNav={onNav} sessions={sessions} onLaunch={onLaunch} onViewResults={onViewResults} onRelaunch={onRelaunch} />
+          ? <RankdAdminPanel onNav={onNav} sessions={sessions} pastSessions={pastSessions} onLaunch={onLaunch} onViewResults={onViewResults} onRelaunch={onRelaunch} />
           : <RankdJoinPanel onJoin={onJoin} sessions={sessions} currentUser={currentUser} />}
       </div>
     </div>
@@ -20893,6 +21015,14 @@ export default function App() {
   const [recoveryMode, setRecoveryMode] = useState(recoveryRef.current);
   const [screen,           setScreen]           = useState("home");
   const [sessions,         setSessions]         = useState(INITIAL_SESSIONS);
+  // Past Sessions (Ralli Live) — deliberately separate from `sessions`.
+  // `sessions` is fed exclusively by getActiveSessions(), which only ever
+  // queries non-terminal statuses (and gets fully overwritten on a 10s poll
+  // while on the games screen) — a completed session can never live there
+  // for long. This is fetched via getGameHistory() (tenant-scoped,
+  // status="completed") so the Past Sessions tab has a real, durable data
+  // source instead of filtering an array that structurally excludes it.
+  const [pastSessions,     setPastSessions]     = useState([]);
   const [lobbyPin,         setLobbyPin]         = useState(null);
   const [lobbySessionName, setLobbySessionName] = useState(null);
   const [lobbyPlayerName,  setLobbyPlayerName]  = useState(null);
@@ -21200,6 +21330,7 @@ export default function App() {
         setQuizzesReady(false);    // reset so next real user waits for their quiz load
         setReadinessThreshold(80); // prevent prior tenant's threshold leaking to next demo user
         setSessions(INITIAL_SESSIONS);           // prevent real sessions leaking to next demo user
+        setPastSessions([]);                     // prevent real past sessions leaking to next demo user
         setBattleCards(INITIAL_BATTLE_CARDS);    // prevent real BC data leaking to next demo user
         setBcCategories(INITIAL_BC_CATEGORIES);  // prevent real BC categories leaking to next demo user
         try { sessionStorage.removeItem(LAST_SCREEN_KEY); } catch {} // don't leak screen into the next login
@@ -21223,6 +21354,10 @@ export default function App() {
     // Sessions
     getActiveSessions(tenantId).then(({ data }) => {
       if (data) setSessions(data);
+    });
+    getGameHistory(tenantId).then(({ data, error }) => {
+      if (error) console.error("[ralli:game] getGameHistory failed:", error);
+      if (data) setPastSessions(data);
     });
 
     // Quizzes — real users: clear seed/demo data immediately, then load from Supabase.
@@ -21370,6 +21505,14 @@ export default function App() {
       getActiveSessions(tenantId).then(({ data, error }) => {
         if (error) console.error("[ralli:game] getActiveSessions error:", error);
         if (data) setSessions(data);
+      });
+      // Past Sessions shares the same "keep it current while on this screen"
+      // need as Active — refetched here (not just at login) so a session
+      // completed in another tab/device, or a fresh page load, shows the
+      // correct historical count without requiring a full logout.
+      getGameHistory(tenantId).then(({ data, error }) => {
+        if (error) console.error("[ralli:game] getGameHistory error:", error);
+        if (data) setPastSessions(data);
       });
     };
 
@@ -22109,6 +22252,17 @@ export default function App() {
     endGameSession(lobbyPin, {
       scores:   data?.scores ?? [],
       tenantId: gameTenantId,
+    }).then(() => {
+      // Refresh Past Sessions from the DB now that this session's status/
+      // ended_at/game_players are actually persisted — without this, Past
+      // Sessions wouldn't show the just-finished game until the next login
+      // or the 10s poll on the games screen (see getGameHistory).
+      if (gameTenantId) {
+        getGameHistory(gameTenantId).then(({ data: history, error }) => {
+          if (error) console.error("[ralli] getGameHistory refresh failed:", error);
+          if (history) setPastSessions(history);
+        });
+      }
     }).catch(e => console.error("[ralli] endGameSession failed:", e));
     // Award game points for all real participants, then trigger readiness for each.
     // awardGamePointsForSession returns the deduplicated list of authenticated user IDs
@@ -22164,13 +22318,13 @@ export default function App() {
       case "home":              return isAdminType
         ? <LeadershipDashboardScreen currentOrg={currentOrg} orgUsers={orgUsers} isReal={!!user?._isReal} readinessThreshold={readinessThreshold} />
         : <HomeScreen user={user} onNav={navigate} quizAssignments={user?._isReal ? [] : USER_QUIZ_ASSIGNMENTS_SEED} onResumeLesson={(id) => { setPendingLessonId(id); navigate("learn"); }} onStartCourse={(id) => { setPendingCourseId(id); navigate("learn"); }} onStartQuiz={(id) => { setPendingQuizId(id); navigate("quizzes"); }} orgUsers={orgUsers} isReal={!!user?._isReal} tenantId={currentOrg?.id ?? null} quizzes={quizzes} lastSeenAt={lastSeenAt} onNewAssignments={(n) => setNewAssignmentCount(n)} sharedAssignmentData={sharedAssignmentData} readinessThreshold={readinessThreshold} />;
-      case "rankd":             return <RankdScreen onNav={navigate} onJoin={handleEnterPin} sessions={sessions} onLaunch={handleLaunch} onViewResults={handleViewResults} onRelaunch={handleRelaunch} role={gameRole} currentUser={currentUser} />;
+      case "rankd":             return <RankdScreen onNav={navigate} onJoin={handleEnterPin} sessions={sessions} pastSessions={pastSessions} onLaunch={handleLaunch} onViewResults={handleViewResults} onRelaunch={handleRelaunch} role={gameRole} currentUser={currentUser} />;
       case "rankd-new":         return <NewSessionScreen onNav={navigate} quizzes={quizzes} onCreateSession={handleCreateSession} />;
       case "rankd-quiz-builder":return <QuizBuilderScreen onNav={navigate} onSave={handleSaveQuiz} initialQuiz={editingQuiz} onEditQuiz={handleEditQuiz} />;
       case "rankd-name-entry":  return <RankdNameEntryScreen onNav={navigate} pin={lobbyPin} sessionName={lobbySessionName} onConfirm={handleEnterName} defaultName={userProfile.nickname?.trim() || user?.name || ""} defaultAvatar={userProfile.avatarEmoji} />;
       case "rankd-lobby":       return <RankdLobbyScreen onNav={navigate} pin={lobbyPin} playerName={lobbyPlayerName} playerEmoji={lobbyPlayerEmoji} sessionName={lobbySessionName} role={gameRole} sessions={sessions} currentUser={currentUser} onGameStart={handleGameStart} chPlayers={chPlayers} broadcast={broadcast} playerId={gamePlayerId} chMsg={chMsg} onHostEnd={async () => { await endGameSession(lobbyPin, { tenantId: currentOrg?.id ?? null }); navigate("rankd"); }} />;
       case "rankd-game":        return <RankdGameScreen onNav={navigate} sessionName={lobbySessionName} role={gameRole} playerName={lobbyPlayerName ?? user.name} questions={gameQuestions ?? GAME_QUESTIONS} demoMode={gameRole === "admin" && sessions.find(s => s.code === lobbyPin)?.demoMode !== false} pin={lobbyPin} sessionDbId={sessions.find(s => s.code === lobbyPin)?.dbId ?? null} tenantId={currentOrg?.id ?? user?.orgId ?? null} broadcast={broadcast} chMsg={chMsg} chAnswers={chAnswers} chPlayers={chPlayers} playerId={gamePlayerId} onGameEnd={handleGameEnd} setChAnswers={setChAnswers} />;
-      case "rankd-results":     return <RankdResultsScreen onNav={navigate} sessionCode={viewResultsCode} sessions={sessions} gameData={gameResultsData} />;
+      case "rankd-results":     return <RankdResultsScreen onNav={navigate} sessionCode={viewResultsCode} sessions={[...sessions, ...pastSessions]} gameData={gameResultsData} />;
       case "learn":             return <LearnScreen role={gameRole} user={user} orgUsers={orgUsers} orgs={orgs} onNav={navigate} onAwardXp={handleAwardXp} pendingLessonId={pendingLessonId} onClearPendingLesson={() => setPendingLessonId(null)} pendingCourseId={pendingCourseId} onClearPendingCourse={() => setPendingCourseId(null)} canCreate={perm("actions","create")} canEdit={perm("actions","edit")} canDelete={perm("actions","delete")} canAssign={perm("actions","assign")} tenantId={currentOrg?.id ?? null} isReal={!!user?._isReal} quizzes={quizzes} sharedAssignmentData={sharedAssignmentData} />;
       case "quizzes":           return <QuizzesScreen role={gameRole} onNav={navigate} quizzes={quizzes} onEditQuiz={handleEditQuiz} onDeleteQuiz={handleDeleteQuiz} onToggleFavorite={handleToggleFavorite} onToggleActive={handleToggleActive} pendingQuizId={pendingQuizId} onClearPendingQuiz={() => setPendingQuizId(null)} canCreate={perm("actions","create")} canEdit={perm("actions","edit")} canDelete={perm("actions","delete")} canLaunch={perm("actions","launch")} canAssign={perm("actions","assign")} onAssignQuiz={handleAssignQuiz} onLaunchQuiz={handleCreateSession} orgUsers={orgUsers} orgs={orgs} currentUser={currentUser} tenantId={currentOrg?.id ?? null} isReal={!!user?._isReal} quizzesReady={quizzesReady} sharedAssignmentData={sharedAssignmentData} />;
       case "battlecards":       return (isAdminType && perm("actions","edit"))
