@@ -152,17 +152,26 @@ function useGameChannel(pin, role) {
     // Fires on every join/leave. Flatten all presence entries and filter to
     // user-role entries only (excludes the host's presence entry).
     channel.on("presence", { event: "sync" }, () => {
-      const state   = channel.presenceState();
-      const players = Object.values(state)
-        .flat()
-        .filter((p) => p.presenceRole === "user")
-        .map((p) => ({
-          id:    p.playerId,
-          name:  p.name,
-          emoji: p.emoji  ?? PLAYER_EMOJIS[0],
-          color: p.color  ?? PLAYER_COLORS[0],
-          score: 0,
-        }));
+      const state = channel.presenceState();
+      // Deduplicate by stable playerId. A refresh/reconnect tracks a NEW
+      // presence entry (unique per-connection key) while the old one lingers
+      // until Supabase's presence timeout — without this collapse the same
+      // player counts twice, which (a) duplicated them in the roster and
+      // (b) kept the active-player count above zero so the zero-player halt
+      // never fired. Keep the last entry seen for each id.
+      const byId = new Map();
+      Object.values(state).flat()
+        .filter((p) => p.presenceRole === "user" && p.playerId != null)
+        .forEach((p) => byId.set(p.playerId, p));
+      // emoji/color stay null when the player chose no avatar — never a
+      // placeholder. Identity is the id; avatar is purely cosmetic.
+      const players = Array.from(byId.values()).map((p) => ({
+        id:    p.playerId,
+        name:  p.name,
+        emoji: p.emoji ?? null,
+        color: p.color ?? null,
+        score: 0,
+      }));
       setChPlayers(players);
     });
 
@@ -1984,15 +1993,36 @@ function KahootHostView({ onNav, sessionName, pin, sessionDbId, tenantId, questi
     return () => { cancelled = true; };
   }, [sessionDbId, retryCount]); // eslint-disable-line react-hooks/exhaustive-deps
 
+  // Poll the DB roster and count a participant as active only if its status is
+  // active/joined AND its heartbeat is fresh. Refresh / tab-close / browser-close
+  // / disconnect / dropped-websocket all stop the player's heartbeat, so once
+  // last_seen_at goes stale they no longer count — which is what lets the
+  // zero-player halt fire (previously the row stayed "active" forever, so the
+  // count never reached zero). A just-joined player with no heartbeat yet
+  // (last_seen_at null) falls back to status so it's never falsely dropped.
+  // The halt watchdog maxes this with the presence count, so presence-only
+  // players (not yet in the DB) are still covered there.
   useEffect(() => {
     if (!sessionDbId) return;
-    getLobbyParticipants(sessionDbId).then(({ data }) => {
-      if (!data) return;
-      const active = data.filter(p => !p.status || p.status === "joined" || p.status === "active").length;
-      setDbParticipantCount(Math.max(active, chPlayers.length));
-      setDbParticipants(data);
-    });
-  }, [sessionDbId, chPlayers.length]); // eslint-disable-line react-hooks/exhaustive-deps
+    const HEARTBEAT_FRESH_MS = 25000; // > the 15s heartbeat interval, so a present player is never dropped
+    const refreshRoster = () => {
+      getLobbyParticipants(sessionDbId).then(({ data }) => {
+        if (!data) return;
+        const now = Date.now();
+        const active = data.filter(p => {
+          const statusOk = !p.status || p.status === "joined" || p.status === "active";
+          if (!statusOk) return false;
+          if (!p.last_seen_at) return true;
+          return (now - new Date(p.last_seen_at).getTime()) < HEARTBEAT_FRESH_MS;
+        }).length;
+        setDbParticipantCount(active);
+        setDbParticipants(data);
+      });
+    };
+    refreshRoster();
+    const interval = setInterval(refreshRoster, 5000);
+    return () => clearInterval(interval);
+  }, [sessionDbId]); // eslint-disable-line react-hooks/exhaustive-deps
 
   // `scores` is initially seeded from Presence (chPlayers) so the scoreboard
   // isn't empty while the DB roster is still loading. But Presence identity
@@ -3146,13 +3176,17 @@ function KahootPlayerView({ onNav, playerName, playerId, pin, sessionDbId, tenan
     };
   }, [reconcile]);
 
-  // Heartbeat: keep last_seen_at fresh while in-game so host can detect stale connections
+  // Heartbeat: keep last_seen_at fresh while in-game so the host can detect
+  // stale connections. 15s interval pairs with the host's 25s freshness window
+  // (see the roster poll) so a present player is never dropped, but a gone
+  // player is detected within ~25s. Fire one immediately so a just-joined
+  // player has a fresh timestamp right away, not only after the first interval.
   useEffect(() => {
     if (!sessionDbId || !playerId) return;
-    const interval = setInterval(() => {
-      updateParticipantHeartbeat(sessionDbId, playerId)
-        .catch(e => console.error("[ralli:player] heartbeat failed:", e));
-    }, 30_000);
+    const beat = () => updateParticipantHeartbeat(sessionDbId, playerId)
+      .catch(e => console.error("[ralli:player] heartbeat failed:", e));
+    beat();
+    const interval = setInterval(beat, 15_000);
     return () => clearInterval(interval);
   }, [sessionDbId, playerId]);
 
@@ -6031,7 +6065,10 @@ function RankdLobbyScreen({ onNav, pin, playerName, playerEmoji, sessionName, ro
     if (isDemoMode || role === "admin" || !pin || !playerId) return;
     const dbSelf = dbPlayers.find(p => p.id === playerId);
     const pidx = Math.abs(playerId.charCodeAt(0) + playerId.charCodeAt(1)) % PLAYER_EMOJIS.length;
-    const resolvedEmoji = dbSelf?.emoji ?? playerEmoji ?? PLAYER_EMOJIS[pidx];
+    // Emoji stays null when no avatar was chosen — never a placeholder. Only a
+    // DB record or an explicit selection provides one. Color keeps a stable
+    // cosmetic tint. Identity is `id`; gameplay never reads emoji.
+    const resolvedEmoji = dbSelf?.emoji ?? playerEmoji ?? null;
     const resolvedColor = dbSelf?.color ?? PLAYER_COLORS[pidx % PLAYER_COLORS.length];
     broadcast({ type: GM.PLAYER_JOIN, player: { id: playerId, name: playerName, emoji: resolvedEmoji, color: resolvedColor } });
   }, [isDemoMode, pin, playerId, role, playerEmoji, dbPlayers]); // eslint-disable-line react-hooks/exhaustive-deps
@@ -6297,7 +6334,6 @@ function RankdResultsScreen({ onNav, sessionCode, sessions, gameData }) {
   // Real data only — no mock fallbacks
   const realScores    = gameData?.scores ?? dbScores ?? null;
   const realQuestions = gameData?.questions ?? detailQuestions ?? null;
-  const realQHistory  = gameData?.questionHistory ?? null;
   // Legacy session: answers exist but there's no durable question set to map
   // them to (created before migration 049's snapshot, and not the just-played
   // in-memory game). We show these honestly as "unavailable" rather than risk
@@ -6314,33 +6350,26 @@ function RankdResultsScreen({ onNav, sessionCode, sessions, gameData }) {
     ? realScores.map((p, i) => ({ rank: i+1, id: p.id, name: p.name, emoji: p.emoji ?? "🙂", score: p.score }))
     : [];
 
-  // Prefer the in-memory per-question stats (exact — computed live by
-  // doReveal()) when available; otherwise derive the same shape from the
-  // durable game_answers rows so Overview/Questions still work after a
-  // refresh or when opening results from history, not just right after
-  // playing. Skipped questions are excluded from the correct/total ratio —
-  // "skipped" isn't a correctness outcome.
-  const questionBreakdown = realQHistory?.length
-    ? realQHistory.map((q, i) => ({
-        q:       q.q ?? `Question ${i+1}`,
-        type:    Q_TYPE_LABELS[realQuestions?.[q.qIdx]?.type] ?? "Question",
-        correct: q.correctCount ?? 0,
-        total:   q.totalAnswers ?? leaderboard.length,
-        avgMs:   Math.round(q.avgTimeMs ?? 0),
-      }))
-    : (detailAvailable
-        ? realQuestions.map((qq, i) => {
-            const rowsForQ = (answerRows ?? []).filter(r => r.question_idx === i && !r.was_skipped);
-            const withTime = rowsForQ.filter(r => r.time_ms != null);
-            return {
-              q:       qq.q ?? qq.text ?? `Question ${i+1}`,
-              type:    Q_TYPE_LABELS[qq.type] ?? "Question",
-              correct: rowsForQ.filter(r => r.is_correct).length,
-              total:   rowsForQ.length,
-              avgMs:   withTime.length > 0 ? Math.round(withTime.reduce((s, r) => s + r.time_ms, 0) / withTime.length) : 0,
-            };
-          })
-        : []);
+  // ONE canonical question source for ALL analytics views. Overview and the
+  // Questions tab derive from the SAME resolved `realQuestions` + game_answers
+  // rows that Player Breakdown uses — never from the in-memory questionHistory,
+  // which only contains REVEALED questions (skips omitted) and so silently
+  // resolved a different, shorter question set than Player Breakdown. Indexing
+  // realQuestions by position and answers by question_idx keeps all three views
+  // in lockstep. Skipped questions are excluded from the correct/total ratio.
+  const questionBreakdown = detailAvailable
+    ? realQuestions.map((qq, i) => {
+        const rowsForQ = (answerRows ?? []).filter(r => r.question_idx === i && !r.was_skipped);
+        const withTime = rowsForQ.filter(r => r.time_ms != null);
+        return {
+          q:       qq.q ?? qq.text ?? `Question ${i+1}`,
+          type:    Q_TYPE_LABELS[qq.type] ?? "Question",
+          correct: rowsForQ.filter(r => r.is_correct).length,
+          total:   rowsForQ.length,
+          avgMs:   withTime.length > 0 ? Math.round(withTime.reduce((s, r) => s + r.time_ms, 0) / withTime.length) : 0,
+        };
+      })
+    : [];
 
   // ── Canonical answer-detail renderer/data contract ─────────────────────────
   // Single source of truth for "what did this player submit on this
@@ -22343,11 +22372,12 @@ export default function App() {
   // Navigation to rankd-lobby only happens after the DB write succeeds (or is skipped for demo).
   const handleEnterName = async (name, emoji) => {
     setLobbyPlayerName(name);
-    // Always compute the same emoji used in DB/presence so My card matches manager view.
-    // Seeded from gamePlayerId (currentUser.id when logged in) — not the raw
-    // per-mount playerId — so this hash is stable across refresh/reconnect.
+    // Avatar is optional and PURELY cosmetic — no gameplay logic keys off it
+    // (identity is gamePlayerId everywhere). If the player chose no avatar we
+    // keep emoji null: no placeholder is generated, the DB stores null, and
+    // renders fall back to name-only. Color still gets a stable cosmetic tint.
     const pidx       = Math.abs(gamePlayerId.charCodeAt(0) + (gamePlayerId.charCodeAt(1) || 0)) % PLAYER_EMOJIS.length;
-    const finalEmoji = emoji ?? PLAYER_EMOJIS[pidx];
+    const finalEmoji = emoji ?? null;
     setLobbyPlayerEmoji(finalEmoji);
 
     // Update local session state (keeps existing local-state consumers working)
