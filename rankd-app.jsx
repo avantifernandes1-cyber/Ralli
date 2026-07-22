@@ -2126,8 +2126,19 @@ function KahootHostView({ onNav, sessionName, pin, sessionDbId, demoMode, tenant
   // when the host explicitly does so — reconnecting players never auto-resume.
   const [halted, setHalted] = useState(false);
   const [resumeBlocked, setResumeBlocked] = useState(false); // tried to resume with nobody connected
-  const [pauseError, setPauseError]   = useState(false);     // pause timing failed to persist (retryable)
+  const [pauseError, setPauseError]   = useState(false);     // last pause persist FAILED (retryable)
   const [resumeError, setResumeError] = useState(false);     // resume timing failed to persist (retryable)
+  // Pause state is FOUR distinct things — local `paused` alone is not proof the
+  // pause was durably saved. These separate them so the Retry path is real:
+  //   paused (state)        — locally frozen
+  //   pausePersisted        — the pause was durably confirmed in the DB
+  //   pauseInFlightRef      — a pause save is currently running (blocks dupes)
+  //   pauseError            — the last save failed and must be retried/ended
+  const [pausePersisted, setPausePersisted] = useState(false);
+  const pauseInFlightRef = useRef(false);
+  // Exact frozen timing payload from the pause attempt — reused verbatim on
+  // every Retry so the remaining time is never recalculated from a later render.
+  const frozenPauseRef = useRef(null);
   const zeroSinceRef = useRef(null);
   const haltArmedRef = useRef(true);     // one auto-halt per empty episode; re-arms when a player is present
   const haltActionedRef = useRef(false); // idempotent guard for the pause side effects (persist + broadcast)
@@ -2166,46 +2177,70 @@ function KahootHostView({ onNav, sessionName, pin, sessionDbId, demoMode, tenant
   }, [sessionDbId, restoreState]);
 
   // ── Canonical pause ───────────────────────────────────────────────────────
-  // The ONE pause path (manual pause AND automatic zero-player halt). During a
-  // question it captures the host's canonical remaining time (timeLeft, the
-  // authoritative frozen value), clamps it, and writes it into live_question as
-  // remainingTimeMs + pausedAt + a bumped timingUpdatedAt. Freezes locally FIRST
-  // for safety, then persists and CONFIRMS the durable write before broadcasting
-  // GM.PAUSE — so a recoverable pause state is never announced unless it was
-  // durably saved. On persist failure the host stays locally paused, no PAUSE is
-  // broadcast, and a retryable error is shown (no auto-resume/advance).
-  // Returns true if the pause was durably persisted (and broadcast), else false.
+  // The ONE pause path (manual pause AND automatic zero-player halt). On the
+  // FIRST attempt it captures the host's canonical remaining time (timeLeft, the
+  // authoritative frozen value) and freezes it into a payload stored on
+  // frozenPauseRef — remainingTimeMs + pausedAt + effective questionStartedAt +
+  // timingUpdatedAt + question identity. Every Retry reuses that EXACT payload,
+  // so the remaining time never recalculates from a later render. Freezes
+  // locally first, then persists and CONFIRMS the durable write before
+  // broadcasting GM.PAUSE — a recoverable pause is never announced unless saved.
+  //
+  // Idempotency is keyed on DURABLE success, not local `paused`: once
+  // pausePersisted is true a repeat call is a no-op; while pauseError/in-flight,
+  // a call is a real retry. pauseInFlightRef blocks double-click duplicate
+  // writes/broadcasts. Returns true iff the pause is durably persisted.
   const pauseGame = async () => {
-    if (paused) return true; // already paused — idempotent
-    const nowTs = Date.now();
-    const cur = questions[qIdx];
-    let liveQuestion; // only rewrite timing during a live question
-    if (phase === "question" && cur) {
-      const limitMs = Math.max(0, (cur.timeLimit ?? 0) * 1000);
-      const remainingTimeMs = Math.max(0, Math.min(limitMs, timeLeft * 1000));
-      liveQuestion = {
-        qIdx, question: cur, timeLimit: cur.timeLimit, shuffledRight,
-        // Effective start is preserved (pausing does not consume time), pausedAt
-        // marks the freeze, remainingTimeMs is authoritative while paused.
-        questionStartedAt: nowTs - (limitMs - remainingTimeMs),
-        pausedAt: nowTs, remainingTimeMs, timingUpdatedAt: nowTs,
-      };
+    if (paused && pausePersisted) return true;   // already durably paused — no-op
+    if (pauseInFlightRef.current) return false;  // a save is already running — no dupe
+    pauseInFlightRef.current = true;
+
+    // Build the frozen payload ONCE (first attempt); reuse verbatim on retries.
+    if (!frozenPauseRef.current) {
+      const nowTs = Date.now();
+      const cur = questions[qIdx];
+      let liveQuestion; // only rewrite timing during a live question
+      if (phase === "question" && cur) {
+        const limitMs = Math.max(0, (cur.timeLimit ?? 0) * 1000);
+        const remainingTimeMs = Math.max(0, Math.min(limitMs, timeLeft * 1000));
+        liveQuestion = {
+          qIdx, question: cur, timeLimit: cur.timeLimit, shuffledRight,
+          questionStartedAt: nowTs - (limitMs - remainingTimeMs), // preserved effective start
+          pausedAt: nowTs, remainingTimeMs, timingUpdatedAt: nowTs,
+        };
+      }
+      frozenPauseRef.current = { phase, qIdx, liveQuestion, timingUpdatedAt: nowTs };
     }
+    const frozen = frozenPauseRef.current;
+
     setPaused(true); // freeze local timer immediately (safety)
     if (sessionDbId) {
       const { error } = await updateSessionPhase(sessionDbId, {
-        phase, currentQuestionIndex: qIdx, paused: true,
-        liveQuestion: liveQuestion ?? undefined, // leave timing untouched outside a question
+        phase: frozen.phase, currentQuestionIndex: frozen.qIdx, paused: true,
+        liveQuestion: frozen.liveQuestion ?? undefined,
       });
       if (error) {
         console.error("[ralli:host] pause persist failed — not broadcasting:", error);
-        setPauseError(true); // stays locally paused; host can retry
+        setPauseError(true);              // stays locally paused; Retry reuses `frozen`
+        pauseInFlightRef.current = false; // release so Retry can run
         return false;
       }
     }
+    // Durable success (or demo with no DB) — announce exactly once.
     setPauseError(false);
-    broadcast({ type: GM.PAUSE, qIdx, remainingTimeMs: liveQuestion?.remainingTimeMs ?? null, timingUpdatedAt: liveQuestion?.timingUpdatedAt ?? nowTs });
+    setPausePersisted(true);
+    pauseInFlightRef.current = false;
+    broadcast({ type: GM.PAUSE, qIdx: frozen.qIdx, remainingTimeMs: frozen.liveQuestion?.remainingTimeMs ?? null, timingUpdatedAt: frozen.liveQuestion?.timingUpdatedAt ?? frozen.timingUpdatedAt });
     return true;
+  };
+
+  // Clears the pause-episode retry state (called on successful resume and on a
+  // fresh question start) so the next pause builds a fresh frozen payload.
+  const clearPauseEpisode = () => {
+    frozenPauseRef.current = null;
+    pauseInFlightRef.current = false;
+    setPausePersisted(false);
+    setPauseError(false);
   };
 
   // Halt transition → pause the game exactly once (idempotent). The `halted`
@@ -2234,6 +2269,11 @@ function KahootHostView({ onNav, sessionName, pin, sessionDbId, demoMode, tenant
   // On persist failure it remains paused, does not broadcast RESUME, and shows a
   // retryable error.
   const resumeGame = async () => {
+    // Resume is BLOCKED while the paused state isn't durably saved — a failed or
+    // in-flight pause must first be retried to success (or the host ends the game
+    // via the accepted completion path). Never resume a pause that players and
+    // the DB don't agree is active.
+    if (pauseInFlightRef.current || pauseError) return; // must save (or end) first; pauseError UI explains
     if (connectedNow() < 1) { setResumeBlocked(true); return; }
     setResumeBlocked(false);
     const nowTs = Date.now();
@@ -2263,6 +2303,7 @@ function KahootHostView({ onNav, sessionName, pin, sessionDbId, demoMode, tenant
     haltActionedRef.current = false;
     haltArmedRef.current = true;
     zeroSinceRef.current = null;
+    clearPauseEpisode();   // pause episode is over — next pause builds fresh state
     setHalted(false);
     setPaused(false); // local timer continues from the frozen timeLeft (never reset)
     broadcast({ type: GM.RESUME, qIdx, questionStartedAt: liveQuestion?.questionStartedAt ?? null, remainingTimeMs: resumedRemainingMs, timingUpdatedAt: liveQuestion?.timingUpdatedAt ?? nowTs });
@@ -2333,6 +2374,7 @@ function KahootHostView({ onNav, sessionName, pin, sessionDbId, demoMode, tenant
   // surface a retryable error to the host.
   const startQuestion = async () => {
     if (!q) return;
+    clearPauseEpisode(); // a new question ends any prior pause episode
     const startedAt = Date.now();
     // Matching: one shuffle for this question, shared with every client via the
     // same payload (persisted + broadcast) so all render the same right column.
@@ -2990,14 +3032,22 @@ function KahootHostView({ onNav, sessionName, pin, sessionDbId, demoMode, tenant
             <p style={{ margin: "-12px 0 0", fontSize: 14, color: "#FCA5A5", fontWeight: 700 }}>Couldn't resume — please try again.</p>
           )}
           <div style={{ display: "flex", gap: 12, marginTop: 4 }}>
-            {pauseError && (
-              <button onClick={pauseGame} style={{ padding: "14px 28px", borderRadius: 14, border: `1px solid rgba(255,255,255,0.35)`, background: "transparent", color: "#fff", fontSize: 16, fontWeight: 900, cursor: "pointer" }}>
-                Retry save
+            {pauseError ? (
+              // Pause save FAILED — Resume is not offered; the host must retry the
+              // save to success or end the game (accepted completion path).
+              <>
+                <button onClick={() => setShowEndConfirm(true)} style={{ padding: "14px 28px", borderRadius: 14, border: `1px solid rgba(255,255,255,0.35)`, background: "transparent", color: "#fff", fontSize: 16, fontWeight: 900, cursor: "pointer" }}>
+                  End Game
+                </button>
+                <button onClick={pauseGame} style={{ padding: "14px 28px", borderRadius: 14, border: "none", background: C.orange, color: "#fff", fontSize: 16, fontWeight: 900, cursor: "pointer" }}>
+                  Retry save
+                </button>
+              </>
+            ) : (
+              <button onClick={doTogglePause} style={{ padding: "14px 36px", borderRadius: 14, border: "none", background: C.orange, color: "#fff", fontSize: 17, fontWeight: 900, cursor: "pointer", display: "flex", alignItems: "center", gap: 10 }}>
+                ▶ Resume
               </button>
             )}
-            <button onClick={doTogglePause} style={{ padding: "14px 36px", borderRadius: 14, border: "none", background: C.orange, color: "#fff", fontSize: 17, fontWeight: 900, cursor: "pointer", display: "flex", alignItems: "center", gap: 10 }}>
-              ▶ Resume
-            </button>
           </div>
         </div>
       )}
