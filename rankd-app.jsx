@@ -5923,6 +5923,10 @@ function RankdLobbyScreen({ onNav, pin, playerName, playerEmoji, sessionName, ro
   const [visibleCount, setVisibleCount] = useState(role === "admin" ? 3 : 1);
   const [dots, setDots]                 = useState(".");
   const [pulse, setPulse]               = useState(false);
+  // Player-side terminal state: the host cancelled/ended the session from the
+  // lobby (before gameplay). Set by the realtime FORCE_END/GAME_END event or,
+  // if that was missed, by the durable session-status poll below.
+  const [hostEnded, setHostEnded]       = useState(false);
 
   // DB-backed participant list for the manager lobby.
   // Source of truth: game_session_participants rows for this session.
@@ -6025,7 +6029,7 @@ function RankdLobbyScreen({ onNav, pin, playerName, playerEmoji, sessionName, ro
   // If the session phase advances past 'waiting', navigate to game.
   useEffect(() => {
     if (role === "admin" || isDemoMode || !sessionDbId) return;
-    const interval = setInterval(() => {
+    const check = () => {
       supabase
         .from("game_sessions")
         .select("phase, status")
@@ -6033,10 +6037,16 @@ function RankdLobbyScreen({ onNav, pin, playerName, playerEmoji, sessionName, ro
         .single()
         .then(({ data }) => {
           if (!data) return;
+          // Durable recovery: if the host terminated the session (from the
+          // lobby or otherwise) and the realtime event was missed, resolve to
+          // the ended message rather than sitting in the lobby / "Hang tight".
+          if (["canceled", "ended", "completed"].includes(data.status)) { setHostEnded(true); return; }
           const started = data.status === "started" || (data.phase && data.phase !== "waiting");
           if (started) onNav("rankd-game");
         });
-    }, 2000);
+    };
+    check(); // immediate on mount so a refresh after cancellation resolves at once
+    const interval = setInterval(check, 2000);
     return () => clearInterval(interval);
   }, [sessionDbId, isDemoMode, role]); // eslint-disable-line react-hooks/exhaustive-deps
 
@@ -6102,10 +6112,14 @@ function RankdLobbyScreen({ onNav, pin, playerName, playerEmoji, sessionName, ro
     broadcast({ type: GM.PLAYER_JOIN, player: { id: playerId, name: playerName, emoji: resolvedEmoji, color: resolvedColor } });
   }, [isDemoMode, pin, playerId, role, playerEmoji, dbPlayers]); // eslint-disable-line react-hooks/exhaustive-deps
 
-  // Player side: watch for GAME_START or first SHOW_QUESTION → navigate to game
+  // Player side: watch for GAME_START or first SHOW_QUESTION → navigate to game;
+  // or a host termination (FORCE_END / GAME_END) while still in the lobby →
+  // show the ended message immediately. Reuses the existing terminal events
+  // rather than inventing a new one.
   useEffect(() => {
     if (isDemoMode || role === "admin") return;
     if (chMsg?.type === GM.SHOW_QUESTION || chMsg?.type === GM.GAME_START) onNav("rankd-game");
+    if (chMsg?.type === GM.FORCE_END || chMsg?.type === GM.GAME_END) setHostEnded(true);
   }, [chMsg, isDemoMode, role]);
 
   useEffect(() => {
@@ -6131,6 +6145,19 @@ function RankdLobbyScreen({ onNav, pin, playerName, playerEmoji, sessionName, ro
   }, [session?.status, isDemoMode, role]);
 
   const playerCount = isDemoMode ? displayPlayers.length : realPlayers.length;
+
+  // Host cancelled/ended the session from the lobby — player terminal screen.
+  // No results, no scores; the session was cancelled (never played).
+  if (hostEnded && role !== "admin") {
+    return (
+      <div style={{ minHeight: "100%", background: C.cream, display: "flex", flexDirection: "column", alignItems: "center", justifyContent: "center", gap: 16, padding: 32, textAlign: "center" }}>
+        <div style={{ fontSize: 40 }}>🔚</div>
+        <p style={{ margin: 0, fontSize: 20, fontWeight: 900, color: C.text }}>The host ended this game.</p>
+        <p style={{ margin: 0, fontSize: 14, color: C.textSub }}>This session was cancelled before it started.</p>
+        <button onClick={() => onNav("rankd")} style={{ marginTop: 8, padding: "12px 28px", borderRadius: 14, border: "none", background: C.orange, color: "#fff", fontSize: 15, fontWeight: 800, cursor: "pointer" }}>Back to Games</button>
+      </div>
+    );
+  }
 
   return (
     <div style={{
@@ -22359,7 +22386,7 @@ export default function App() {
         // Only allow joining sessions that are actively waiting for players
         if (remote.status && remote.status !== "waiting") {
           console.warn("[ralli:game] handleEnterPin: session not accepting players, status:", remote.status);
-          return remote.status === "completed" || remote.status === "ended"
+          return ["completed", "ended", "canceled"].includes(remote.status)
             ? "This game has already ended."
             : "This game has already started.";
         }
@@ -22582,7 +22609,20 @@ export default function App() {
       case "rankd-new":         return <NewSessionScreen onNav={navigate} quizzes={quizzes} onCreateSession={handleCreateSession} />;
       case "rankd-quiz-builder":return <QuizBuilderScreen onNav={navigate} onSave={handleSaveQuiz} initialQuiz={editingQuiz} onEditQuiz={handleEditQuiz} />;
       case "rankd-name-entry":  return <RankdNameEntryScreen onNav={navigate} pin={lobbyPin} sessionName={lobbySessionName} onConfirm={handleEnterName} defaultName={userProfile.nickname?.trim() || user?.name || ""} defaultAvatar={userProfile.avatarEmoji} />;
-      case "rankd-lobby":       return <RankdLobbyScreen onNav={navigate} pin={lobbyPin} playerName={lobbyPlayerName} playerEmoji={lobbyPlayerEmoji} sessionName={lobbySessionName} role={gameRole} sessions={sessions} currentUser={currentUser} onGameStart={handleGameStart} chPlayers={chPlayers} broadcast={broadcast} playerId={gamePlayerId} chMsg={chMsg} onHostEnd={async () => { await endGameSession(lobbyPin, { tenantId: currentOrg?.id ?? null }); navigate("rankd"); }} />;
+      case "rankd-lobby":       return <RankdLobbyScreen onNav={navigate} pin={lobbyPin} playerName={lobbyPlayerName} playerEmoji={lobbyPlayerEmoji} sessionName={lobbySessionName} role={gameRole} sessions={sessions} currentUser={currentUser} onGameStart={handleGameStart} chPlayers={chPlayers} broadcast={broadcast} playerId={gamePlayerId} chMsg={chMsg} onHostEnd={async () => {
+        // Ending from the LOBBY (before gameplay) is a CANCELLATION, not a
+        // completed game: notify players immediately, then cancel (not
+        // complete) the session so it stays non-joinable, awards nothing, and
+        // never appears under Past Sessions. Broadcast first (immediate UX),
+        // then the DB write (its await lets the broadcast flush before the
+        // channel tears down on navigate). Durable status="canceled" is the
+        // recovery source if a player misses the broadcast.
+        broadcast({ type: GM.FORCE_END, cancelled: true });
+        const dbId = sessions.find(s => s.code === lobbyPin)?.dbId ?? null;
+        const tid = currentOrg?.id ?? user?.orgId ?? null;
+        if (dbId) await cancelGameSession(dbId, tid);
+        navigate("rankd");
+      }} />;
       case "rankd-game":        return <RankdGameScreen onNav={navigate} sessionName={lobbySessionName} role={gameRole} playerName={lobbyPlayerName ?? user.name} questions={gameQuestions ?? GAME_QUESTIONS} demoMode={gameRole === "admin" && sessions.find(s => s.code === lobbyPin)?.demoMode !== false} pin={lobbyPin} sessionDbId={sessions.find(s => s.code === lobbyPin)?.dbId ?? null} tenantId={currentOrg?.id ?? user?.orgId ?? null} broadcast={broadcast} chMsg={chMsg} chStatus={chStatus} chAnswers={chAnswers} chPlayers={chPlayers} playerId={gamePlayerId} onGameEnd={handleGameEnd} setChAnswers={setChAnswers} />;
       case "rankd-results":     return <RankdResultsScreen onNav={navigate} sessionCode={viewResultsCode} sessions={[...sessions, ...pastSessions]} gameData={gameResultsData} />;
       case "learn":             return <LearnScreen role={gameRole} user={user} orgUsers={orgUsers} orgs={orgs} onNav={navigate} onAwardXp={handleAwardXp} pendingLessonId={pendingLessonId} onClearPendingLesson={() => setPendingLessonId(null)} pendingCourseId={pendingCourseId} onClearPendingCourse={() => setPendingCourseId(null)} canCreate={perm("actions","create")} canEdit={perm("actions","edit")} canDelete={perm("actions","delete")} canAssign={perm("actions","assign")} tenantId={currentOrg?.id ?? null} isReal={!!user?._isReal} quizzes={quizzes} sharedAssignmentData={sharedAssignmentData} />;
