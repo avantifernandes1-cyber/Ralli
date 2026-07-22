@@ -1,238 +1,127 @@
-# ralli
+# Ralli
 
-ralli is a sales readiness platform combining LMS, gamification, coaching, and performance insights.
+Ralli is a production SaaS platform for Sales Readiness.
 
-Core principles:
+Mission:
 
-- Prioritize simplicity, usability, and engagement.
-- Build for three personas: reps, managers, and executives.
-- Optimize for action, not dashboards.
-- Prefer insights over raw metrics.
-- ask questions if you do not know, do not assume.
+Measure readiness, not completion.
 
-Design:
+The platform combines:
 
-- Light-mode first.
-- Follow the ralli brand.
-- Use clean, modern interfaces.
-- Avoid excessive emojis and AI-looking copy.
-- Favor clarity over decoration.
-- Minimize clicks and cognitive load.
+- Learning
+- Quizzes
+- Courses
+- Battle Cards
+- Ralli Live
+- Readiness Scoring
+- Leadership Analytics
+- Assignments
+- Coaching
 
-Implementation:
+This is a production application.
 
-- Think before making changes.
-- Understand existing architecture first.
-- Reuse existing components whenever possible.
-- Make the smallest change necessary.
-- Preserve existing functionality.
-- Avoid unnecessary refactors.
-- Avoid duplicate logic.
-- Keep components modular and consistent.
-
-Bugs:
-
-- Identify root cause before fixing.
-- Explain the issue before making changes.
-- Patch instead of rewriting.
-
-Token efficiency:
-
-- Be credit-conscious without sacrificing quality.
-- Avoid rewriting large files unless necessary.
-- Avoid redesigning unrelated pages.
-- Reuse patterns and components.
-- Prefer incremental improvements.
-
-Scope:
-
-- Build only what is requested.
-- Do not implement future ideas unless explicitly asked.
-- MVP solutions are preferred.
-
-Requirements:
-
-- Consider loading states.
-- Consider empty states.
-- Consider responsiveness.
-- Consider accessibility.
-- Maintain visual consistency.
-
-Assets:
-
-- Screenshots and provided assets are the source of truth.
-- Never guess branding, logos, or behaviors.
-- Ask when requirements are unclear.
-
-At the end of each task:
-
-1. Summarize the root cause (if applicable).
-2. List files modified.
-3. Describe the changes made.
-4. Do not change unrelated code.
-
-# Architecture & Security Principles
-
-These principles apply to the entire project unless explicitly overridden.
-
-## Build for Production
-
-Build every feature with production architecture in mind.
-
-Do not build disposable prototypes or temporary implementations that will require major rewrites later.
-
-If backend functionality is unavailable, use mock data only as a temporary data source while preserving the final data model, API boundaries, authentication flow, and database integration points.
+Never build throwaway implementations.
 
 ---
 
-## Multi-Tenant Architecture
+## Engineering Principles
 
-Assume olli is a multi-tenant SaaS platform.
+Single source of truth.
 
-Every company (tenant) has its own isolated data.
+Reuse existing services before creating new ones.
 
-Never assume a single-company application.
+Avoid duplicate business logic.
 
----
+Prefer additive migrations.
 
-## Authentication
+Avoid breaking schema changes.
 
-Do not build custom authentication.
+Maintain tenant isolation.
 
-Design the application to integrate with a production authentication provider (e.g. Supabase Auth).
+Never fabricate analytics.
 
-Authentication should determine:
+Never invent placeholder calculations.
 
-* User identity
-* Company (tenant)
-* Role
-* Permissions
+Hide unfinished beta functionality instead of exposing incomplete features.
 
 ---
 
-## Authorization
+## Workflow
 
-All application behavior should support Role-Based Access Control (RBAC).
+Audit
 
-Roles should remain independent.
+↓
 
-Current roles include:
+Implement
 
-* User
-* Manager
-* Admin
+↓
 
-Future roles may be added without restructuring existing code.
+Validate
 
-Never allow functionality intended for one role to unintentionally affect another role.
+↓
 
----
+Return Pass/Fail table
 
-## Routing
+↓
 
-Separate the public website from the authenticated application.
+Stop
 
-Example structure:
-
-* `/` → Marketing website
-* `/login` → Authentication
-* Authenticated application routes remain protected after login
-
-Future public pages should be able to be added without restructuring routing.
+Never continue into another feature without explicit instruction.
 
 ---
 
-## Data Model
+## Git Rules
 
-Avoid hardcoded values.
+Never push automatically.
 
-Preserve clear relationships between:
+Never commit automatically.
 
-* Companies
-* Users
-* Teams
-* Roles
-* Courses
-* Lessons
-* Quizzes
-* Games
-* Battle Cards
-* Assignments
-* Progress
-* XP
-* Analytics
+Wait for approval.
+
+Never rename migrations.
+
+Never rewrite migration history.
 
 ---
 
-## Security
+## Product Priorities
 
-Assume all application data is private.
+1. Correctness
 
-Never expose data across companies.
+2. Consistency
 
-Never expose data outside a user's permissions.
+3. UX
 
-Never store passwords manually.
+4. Performance
 
-Authentication providers should handle credential storage.
-
----
-
-## Feature Development
-
-Before implementing new functionality:
-
-1. Inspect the existing architecture.
-2. Reuse existing components where possible.
-3. Make the smallest possible change.
-4. Avoid unnecessary refactoring.
-5. Preserve existing functionality.
-
-Implement production-ready solutions whenever practical.
+5. New Features
 
 ---
 
-## Scalability
+## Product Philosophy
 
-Design every feature so it can support:
+Managers should accomplish tasks in as few clicks as possible.
 
-* Multiple companies
-* Multiple teams
-* Thousands of users
-* Future subscription plans
-* Future permissions
-* Future integrations
+Everything should have one source of truth.
 
-Avoid architectural decisions that would require rebuilding these systems later.
+Automation is preferred over manual work.
+
+Training should never end.
+
+Readiness should continuously improve.
+
+Completion is not comprehension.
 
 ---
 
-## Development Philosophy
+## Read Before Work
 
-Favor:
+Source-of-truth documentation (see `docs/README.md` for the full index):
 
-* Reusable components
-* Modular architecture
-* Clear separation of concerns
-* Predictable routing
-* Centralized configuration
-* Minimal code duplication
-
-Every implementation should be easy to extend, easy to maintain, and consistent with the existing architecture.
-Architectural Changes
-
-Before introducing architectural changes, first inspect the existing implementation.
-
-Determine whether the requested feature can be implemented using the current architecture.
-
-If architectural changes are necessary to support a production-ready implementation:
-
-Identify only the components that require modification.
-Preserve existing functionality wherever possible.
-Maintain backward compatibility unless explicitly instructed otherwise.
-Avoid unnecessary refactoring.
-Do not rewrite working code solely for preference or style.
-
-When a structural change is required, modify only the minimum set of components needed while maintaining the integrity of the existing application.
-
-Favor incremental improvements over large rewrites.
+- docs/product/RALLI_PHILOSOPHY.md
+- docs/product/PRODUCT_DECISIONS.md
+- docs/product/ROADMAP.md
+- docs/engineering/BETA_CHECKLIST.md
+- docs/engineering/KNOWN_BUGS.md
+- docs/engineering/CHANGELOG.md
+- docs/product/FUTURE_ROADMAP.md
