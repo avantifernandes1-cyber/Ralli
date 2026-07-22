@@ -6349,16 +6349,15 @@ function RankdResultsScreen({ onNav, sessionCode, sessions, gameData }) {
   }, [session?.dbId]); // eslint-disable-line react-hooks/exhaustive-deps
 
   // ── Answer-detail drill-down (Player Breakdown / Questions tabs) ───────────
-  // gameData.questions/questionHistory are in-memory only (lost on refresh or
-  // when opening results from history), and neither ever held the canonical
-  // per-player-per-question answer anyway — only aggregate counts. The
-  // durable source is game_answers (one row per player per question, see
-  // migrations 044/045) joined against the quiz's canonical question set
-  // (fetched by quiz_id, since sessions don't snapshot questions). Either
-  // piece can be legitimately missing for an old session — callers must
-  // treat that as "answer detail unavailable", not an error.
-  const [answerRows,   setAnswerRows]   = useState(null); // raw game_answers rows, or [] once fetched-but-empty
-  const [detailQuestions, setDetailQuestions] = useState(null); // canonical questions from the quiz, or [] if quiz gone
+  // Canonical historical question source is game_sessions.question_snapshot
+  // (migration 049): the exact question set + order captured at session
+  // creation. game_answers is scoped to this exact session_id. The mutable
+  // current quiz is NEVER used as historical fallback data. In-memory
+  // gameData.questions is trusted ONLY for demo / non-persisted sessions that
+  // have no database session id. A real session whose snapshot is genuinely
+  // unavailable degrades honestly to "Exact question detail unavailable".
+  const [answerRows,   setAnswerRows]   = useState(null); // game_answers rows for this session, or [] once fetched-empty
+  const [detailQuestions, setDetailQuestions] = useState(null); // immutable snapshot questions, or null if none
   const [detailLoaded, setDetailLoaded] = useState(false);
   const [selectedPlayerId, setSelectedPlayerId] = useState(null);
   const [selectedQIdx,     setSelectedQIdx]     = useState(null);
@@ -6368,36 +6367,37 @@ function RankdResultsScreen({ onNav, sessionCode, sessions, gameData }) {
     let cancelled = false;
     Promise.all([
       getGameAnswersForSession(session.dbId),
-      // Authoritative question source: the durable per-session snapshot taken at
-      // creation (migration 049). NOT getQuizById — the current quiz is mutable
-      // and would show questions that weren't asked if it was edited after the
-      // game. Legacy sessions (pre-snapshot) return null here and degrade to the
-      // honest "unavailable" path below rather than reconstructing from the quiz.
       getSessionQuestionSnapshot(session.dbId),
     ]).then(([answersRes, snapRes]) => {
       if (cancelled) return;
       setAnswerRows(answersRes.data ?? []);
-      // snapshot (durable, exact) → in-memory gameData (exact, just-played) → null (legacy)
-      setDetailQuestions(snapRes.data ?? gameData?.questions ?? null);
+      // Persisted session: the immutable snapshot is the ONLY canonical source.
+      // No fallback to gameData or the mutable quiz — a missing snapshot is an
+      // honest "unavailable", never silently substituted.
+      setDetailQuestions(snapRes.data ?? null);
       setDetailLoaded(true);
     }).catch(() => { if (!cancelled) setDetailLoaded(true); });
     return () => { cancelled = true; };
   }, [session?.dbId]); // eslint-disable-line react-hooks/exhaustive-deps
 
-  // Real data only — no mock fallbacks
   const realScores    = gameData?.scores ?? dbScores ?? null;
-  const realQuestions = gameData?.questions ?? detailQuestions ?? null;
-  // Legacy session: answers exist but there's no durable question set to map
-  // them to (created before migration 049's snapshot, and not the just-played
-  // in-memory game). We show these honestly as "unavailable" rather than risk
-  // mapping answers onto the mutable current quiz.
-  const isLegacyDetail = detailLoaded && (answerRows?.length > 0) && (realQuestions == null || realQuestions.length === 0);
+  // Canonical question-source precedence:
+  //  • Real persisted session (session.dbId): the immutable snapshot ONLY (null
+  //    → unavailable). gameData.questions is NOT preferred, so immediate results
+  //    read the same historical truth as a reopened session.
+  //  • Demo / non-persisted session (no dbId): in-memory gameData.questions.
+  const realQuestions = session?.dbId ? detailQuestions : (gameData?.questions ?? null);
 
-  // Detail is only trustworthy once both pieces loaded successfully and are
-  // non-empty — either being empty means we genuinely can't reconstruct
-  // per-question answers for this session (legacy session, deleted quiz, or
-  // a session that never played a single question).
-  const detailAvailable = detailLoaded && (answerRows?.length > 0) && (realQuestions?.length > 0);
+  // Snapshot-present and answer-rows-present are SEPARATE concerns: a valid
+  // snapshot can exist with zero answers (nobody submitted before the game
+  // ended) — the questions are still historically known.
+  const questionDetailAvailable = detailLoaded && (realQuestions?.length > 0);
+  const answerDataAvailable     = detailLoaded && (answerRows?.length > 0);
+
+  // "Exact question detail unavailable" applies ONLY to a real persisted session
+  // whose immutable snapshot is genuinely missing (pre-049) — never to a
+  // snapshot that simply has no answers.
+  const isLegacyDetail = detailLoaded && !!session?.dbId && !(realQuestions?.length > 0);
 
   const leaderboard = realScores
     ? realScores.map((p, i) => ({ rank: i+1, id: p.id, name: p.name, emoji: p.emoji ?? null, score: p.score }))
@@ -6427,6 +6427,18 @@ function RankdResultsScreen({ onNav, sessionCode, sessions, gameData }) {
   const rowHasSubmission = (r) => r.option_idx != null || (r.answer_text != null && r.answer_text !== "")
     || r.numeric_value != null || (Array.isArray(r.answer_json) && r.answer_json.length > 0);
 
+  // ONE canonical answer lookup keyed by player_id + question_idx, built from
+  // the SAME deduplicated (latest answered_at, then id) rows the aggregation
+  // uses. Overview, Toughest Question, Player Breakdown, and BOTH Questions
+  // drill-downs resolve rows through this — so no view can pick a stale/first
+  // duplicate while another picks the latest. Never uses raw answerRows.find.
+  const answerByPlayerQ = (() => {
+    const m = new Map();
+    for (const r of dedupedAnswerRows) m.set(`${r.player_id}::${r.question_idx}`, r);
+    return m;
+  })();
+  const getAnswerRow = (pid, qIdx) => answerByPlayerQ.get(`${pid}::${qIdx}`) ?? null;
+
   // ── ONE canonical per-question analytics structure ──────────────────────────
   // The single source reused by Overview, Questions tab, Leaderboard highlights,
   // Toughest Question, Avg Accuracy and Avg Response Time. Derived from the
@@ -6435,7 +6447,7 @@ function RankdResultsScreen({ onNav, sessionCode, sessions, gameData }) {
   // no eligible data (never a fake 0%). Response times are client-reported, so
   // only real submissions with a non-null, non-negative time within the
   // snapshot question's configured limit count.
-  const questionStats = detailAvailable
+  const questionStats = questionDetailAvailable
     ? realQuestions.map((qq, i) => {
         const rows    = dedupedAnswerRows.filter(r => r.question_idx === i);
         const skipped = rows.length > 0 && rows.every(r => r.was_skipped);
@@ -6750,6 +6762,9 @@ function RankdResultsScreen({ onNav, sessionCode, sessions, gameData }) {
             {/* Question accuracy breakdown */}
             <Card>
               <p style={{ margin: "0 0 14px", fontSize: 10, fontWeight: 700, color: C.textSub, textTransform: "uppercase", letterSpacing: "0.08em" }}>Question Accuracy</p>
+              {questionDetailAvailable && !answerDataAvailable && (
+                <p style={{ margin: "0 0 12px", fontSize: 12, color: C.textMuted, fontStyle: "italic" }}>No responses were recorded for this session — questions shown for reference.</p>
+              )}
               {questionBreakdown.map((q, i) => {
                 // Honest: skipped and no-eligible-data questions never show a
                 // fake 0% — they render "Skipped" / "No responses" and an empty bar.
@@ -6793,12 +6808,12 @@ function RankdResultsScreen({ onNav, sessionCode, sessions, gameData }) {
                     </div>
                   </div>
                 </Card>
-                {!detailAvailable ? (
+                {!questionDetailAvailable ? (
                   <Card><p style={{ margin: 0, fontSize: 13, color: C.textMuted, fontStyle: "italic", textAlign: "center", padding: 20 }}>{isLegacyDetail ? "Exact question detail unavailable for this historical session." : "Answer detail unavailable for this session."}</p></Card>
                 ) : (
                   <div style={{ display: "flex", flexDirection: "column", gap: 10 }}>
                     {realQuestions.map((question, i) => {
-                      const row = (answerRows ?? []).find(r => r.question_idx === i && r.player_id === player.id);
+                      const row = getAnswerRow(player.id, i);
                       const detail = getAnswerDetail(row, question);
                       return renderQuestionCardForPlayer(question, i, detail);
                     })}
@@ -6946,19 +6961,31 @@ function RankdResultsScreen({ onNav, sessionCode, sessions, gameData }) {
               )}
 
               {leaderboard.length > 0 && (() => {
-                const maxScore = leaderboard[0]?.score || 1;
+                // No fabricated denominator: if the top score is zero (or there
+                // is no valid positive top score), there is no relative
+                // distribution to draw — say so honestly.
+                const maxScore = leaderboard[0]?.score ?? 0;
+                if (!(maxScore > 0)) {
+                  return (
+                    <Card>
+                      <p style={{ margin: "0 0 8px", fontSize: 10, fontWeight: 700, color: C.textSub, textTransform: "uppercase", letterSpacing: "0.08em" }}>Score Distribution</p>
+                      <p style={{ margin: 0, fontSize: 12, color: C.textMuted, fontStyle: "italic" }}>Score distribution unavailable because no points were awarded.</p>
+                    </Card>
+                  );
+                }
+                // Continuous boundaries → mathematically accurate labels.
                 const dist = [
-                  { range: "75–100%", players: leaderboard.filter(p => p.score >= maxScore * 0.75), color: C.green   },
-                  { range: "50–74%",  players: leaderboard.filter(p => p.score >= maxScore * 0.5 && p.score < maxScore * 0.75), color: C.orange },
-                  { range: "25–49%",  players: leaderboard.filter(p => p.score >= maxScore * 0.25 && p.score < maxScore * 0.5), color: "#F59E0B" },
-                  { range: "<25%",    players: leaderboard.filter(p => p.score < maxScore * 0.25), color: C.red      },
+                  { range: "75%–100%", players: leaderboard.filter(p => p.score >= maxScore * 0.75), color: C.green   },
+                  { range: "50%–<75%", players: leaderboard.filter(p => p.score >= maxScore * 0.5 && p.score < maxScore * 0.75), color: C.orange },
+                  { range: "25%–<50%", players: leaderboard.filter(p => p.score >= maxScore * 0.25 && p.score < maxScore * 0.5), color: "#F59E0B" },
+                  { range: "<25%",     players: leaderboard.filter(p => p.score < maxScore * 0.25), color: C.red      },
                 ];
                 return (
                   <Card>
                     <p style={{ margin: "0 0 12px", fontSize: 10, fontWeight: 700, color: C.textSub, textTransform: "uppercase", letterSpacing: "0.08em" }}>Score Distribution · % of top score</p>
                     {dist.map(d => (
                       <div key={d.range} style={{ display: "flex", alignItems: "center", gap: 8, fontSize: 11, marginBottom: 8 }}>
-                        <span style={{ width: 52, textAlign: "right", color: C.textSub, fontWeight: 500 }}>{d.range}</span>
+                        <span style={{ width: 62, textAlign: "right", color: C.textSub, fontWeight: 500 }}>{d.range}</span>
                         <div style={{ flex: 1, height: 16, borderRadius: 6, overflow: "hidden", background: C.muted }}>
                           <div style={{
                             height: "100%", borderRadius: 6, minWidth: d.players.length > 0 ? 28 : 0,
@@ -6982,7 +7009,7 @@ function RankdResultsScreen({ onNav, sessionCode, sessions, gameData }) {
             if (!question) return <div style={{ textAlign: "center", padding: 60, color: C.textMuted, fontSize: 14 }}>Question not found.</div>;
             const groups = { correct: [], incorrect: [], unanswered: [], skipped: [], unavailable: [] };
             leaderboard.forEach(player => {
-              const row = (answerRows ?? []).find(r => r.question_idx === selectedQIdx && r.player_id === player.id);
+              const row = getAnswerRow(player.id, selectedQIdx);
               const detail = getAnswerDetail(row, question);
               (groups[detail.status] ?? groups.unavailable).push({ player, detail });
             });
@@ -7016,7 +7043,7 @@ function RankdResultsScreen({ onNav, sessionCode, sessions, gameData }) {
                 const label = q.skipped ? "Skipped" : pct == null ? "No responses" : `${pct}%`;
                 const color = pct == null ? C.textMuted : pct >= 80 ? "#059669" : pct >= 60 ? C.orange : C.red;
                 const tc    = typeColors[q.type] ?? { bg: C.muted, text: C.textSub };
-                const clickable = detailAvailable && !q.skipped;
+                const clickable = questionDetailAvailable && !q.skipped;
                 return (
                   <Card key={i} onClick={clickable ? () => setSelectedQIdx(i) : undefined} style={clickable ? { cursor: "pointer" } : undefined}>
                     <div style={{ display: "flex", alignItems: "flex-start", gap: 16 }}>
