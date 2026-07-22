@@ -1829,7 +1829,7 @@ const Q_TYPE_ICONS  = { mc: "", tf: "", type: "", open: "", slider: "", match: "
 // ── REAL GAME HOST VIEW ──────────────────────────────────────
 const PURPLE = "#8B5CF6";
 
-function KahootHostView({ onNav, sessionName, pin, sessionDbId, tenantId, questions, broadcast, chAnswers, chPlayers, onGameEnd, setChAnswers }) {
+function KahootHostView({ onNav, sessionName, pin, sessionDbId, demoMode, tenantId, questions, broadcast, chAnswers, chPlayers, onGameEnd, setChAnswers }) {
   const mobile       = useMobile();
   const [phase,      setPhase]      = useState("countdown");
   const [qIdx,       setQIdx]       = useState(0);
@@ -2442,7 +2442,7 @@ function KahootHostView({ onNav, sessionName, pin, sessionDbId, tenantId, questi
   const doNext = () => {
     if (isFinalQ) {
       broadcast({ type: GM.GAME_END, scores });
-      if (onGameEnd) onGameEnd({ scores, questions, questionHistory });
+      if (onGameEnd) onGameEnd({ scores, questions, questionHistory, sessionDbId, demoMode });
       persistPhase("ended", qIdx, false);
       onNav("rankd-results");
       return;
@@ -2464,7 +2464,7 @@ function KahootHostView({ onNav, sessionName, pin, sessionDbId, tenantId, questi
   const doForceEnd = () => {
     setShowEndConfirm(false);
     broadcast({ type: GM.FORCE_END, scores });
-    if (onGameEnd) onGameEnd({ scores, questions, questionHistory });
+    if (onGameEnd) onGameEnd({ scores, questions, questionHistory, sessionDbId, demoMode });
     persistPhase("ended", qIdx, false);
     onNav("rankd-results");
   };
@@ -3848,7 +3848,7 @@ function KahootPlayerView({ onNav, playerName, playerId, pin, sessionDbId, tenan
 function RankdGameScreen({ onNav, sessionName, role, playerName, questions = GAME_QUESTIONS, demoMode = true, pin, sessionDbId, tenantId, broadcast, chMsg, chStatus, chAnswers, chPlayers, playerId, onGameEnd, setChAnswers }) {
   // Real multiplayer mode — route to Kahoot views
   if (!demoMode && role === "admin") {
-    return <KahootHostView onNav={onNav} sessionName={sessionName} pin={pin} sessionDbId={sessionDbId} tenantId={tenantId} questions={questions} broadcast={broadcast} chAnswers={chAnswers} chPlayers={chPlayers} onGameEnd={onGameEnd} setChAnswers={setChAnswers} />;
+    return <KahootHostView onNav={onNav} sessionName={sessionName} pin={pin} sessionDbId={sessionDbId} demoMode={demoMode} tenantId={tenantId} questions={questions} broadcast={broadcast} chAnswers={chAnswers} chPlayers={chPlayers} onGameEnd={onGameEnd} setChAnswers={setChAnswers} />;
   }
   if (!demoMode && role !== "admin") {
     return <KahootPlayerView onNav={onNav} playerName={playerName} playerId={playerId} pin={pin} sessionDbId={sessionDbId} tenantId={tenantId} broadcast={broadcast} chMsg={chMsg} chStatus={chStatus} />;
@@ -4018,7 +4018,7 @@ function RankdGameScreen({ onNav, sessionName, role, playerName, questions = GAM
 
   const handleNext = () => {
     if (isFinalQ) {
-      if (onGameEnd) onGameEnd({ scores, questions, questionHistory: [] });
+      if (onGameEnd) onGameEnd({ scores, questions, questionHistory: [], sessionDbId, demoMode });
       onNav("rankd-results");
       return;
     } else {
@@ -4053,7 +4053,7 @@ function RankdGameScreen({ onNav, sessionName, role, playerName, questions = GAM
     setShowEndConfirm(false);
     if (onGameEnd) {
       // onGameEnd sets gameResultsData and navigates to rankd-results
-      onGameEnd({ scores, questions, questionHistory: [] });
+      onGameEnd({ scores, questions, questionHistory: [], sessionDbId, demoMode });
     } else {
       onNav("rankd-results");
     }
@@ -6339,7 +6339,7 @@ function RankdResultsScreen({ onNav, sessionDbId, sessionCode, sessions, gameDat
   const inMemoryForThisSession = !!gameData && (
     sessionDbId != null
       ? gameData.sessionDbId === sessionDbId                                   // persisted: exact id match
-      : (gameData.sessionDbId == null && gameData.sessionCode === sessionCode) // demo: code match, no dbId
+      : (gameData.sessionDbId == null && gameData.sessionCode != null && sessionCode != null && gameData.sessionCode === sessionCode) // demo: non-null code match, no dbId
   );
   const [tab, setTab] = useState("summary");
   const [dbScores, setDbScores] = useState(null);
@@ -22722,9 +22722,28 @@ export default function App() {
 
   // Admin: game over — navigate to results + persist final scores
   const handleGameEnd = (data) => {
-    // Tag the in-memory results with the EXACT session identity so the results
-    // screen only trusts them for this specific session (never "the latest game").
-    const endedDbId = sessions.find(s => s.code === lobbyPin)?.dbId ?? null;
+    // Use the EXACT session id carried through onGameEnd from the game component
+    // (KahootHostView / RankdGameScreen already hold it) — NEVER re-derived from
+    // lobbyPin, a reusable join code whose local lookup can be stale/ambiguous.
+    const endedDbId = data?.sessionDbId ?? null;
+    const isDemoGame = !!data?.demoMode;
+    // A real (non-demo) game that reaches completion without a session id is a
+    // genuine error — do NOT demote it to a demo, do not invent an id, and do
+    // not open results that could resolve (by code) to another session. Keep the
+    // in-memory scores safe in state and surface a clear error instead.
+    if (!isDemoGame && endedDbId == null) {
+      console.error("[ralli:game] handleGameEnd: persisted game completed without a sessionDbId");
+      toast.error("Couldn't open results — the session id was unavailable. Your game data is safe; please try again from Past Sessions.");
+      // Preserve the completed scores in state, but with a NON-resolvable
+      // identity (null id + null code) so the results screen can't resolve or
+      // match another session — it degrades to an honest empty state, never a
+      // wrong session, and no id is invented.
+      setGameResultsData({ ...data, sessionDbId: null, sessionCode: null });
+      setViewResultsDbId(null); setViewResultsCode(null);
+      setSessions(prev => prev.map(s => s.code === lobbyPin ? { ...s, status: "completed" } : s));
+      return;
+    }
+    // Persisted → tag with exact dbId; demo → dbId null with code identity.
     setGameResultsData({ ...data, sessionDbId: endedDbId, sessionCode: lobbyPin });
     setViewResultsDbId(endedDbId);
     setViewResultsCode(lobbyPin);
