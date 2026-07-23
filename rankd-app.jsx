@@ -79,6 +79,7 @@ import { sendInviteEmail } from "./src/lib/emailService.js";
 import { provisionTenant, buildInviteUrl, normalizeProvisionedOrg, createMemberInvite } from "./src/lib/provisioningService.js";
 import { awardLessonPoints, awardCoursePoints, awardGamePointsForSession, getLeaderboard, computeUserMeta, getUserStreak } from "./src/lib/scoringService.js";
 import { triggerReadinessUpdate, getTopicHeatmap, getOrgMetrics, getRepTopicScores, getUserPerformance, getRecommendations } from "./src/lib/insightsService.js";
+import { isReadinessRepRole } from "./src/lib/readinessFormula.js"; // shared readiness-population rule
 
 // ── MOBILE HOOK ────────────────────────────────────────────
 function useMobile() {
@@ -1248,9 +1249,9 @@ function PersonalDashboardScreen({
           {
             label: "Overall Readiness",
             value: readinessScore != null ? `${readinessScore}%` : "—",
-            sub:   readinessScore != null ? "Last 30 days" : "Complete activities to unlock",
+            sub:   readinessScore != null ? "Current readiness" : "Complete activities to unlock",
             color: readinessScore != null ? scoreColor(readinessScore) : C.textMuted,
-            tooltip: "Weighted average of your quiz accuracy, lesson completion, and game performance over the past 30 days.",
+            tooltip: "Weighted average of your quiz accuracy (latest attempt per quiz), lesson completion, and game performance. Reflects your current standing, not a fixed 30-day window.",
           },
           {
             label: "Knowledge Score",
@@ -16093,6 +16094,9 @@ function KPIDetailModal({ title, subtitle, onClose, isEmpty, emptyMessage, child
 function LeadershipDashboardScreen({ currentOrg, orgUsers = [], isReal = false, readinessThreshold = 80 }) {
   const mobile      = useMobile();
   const realMembers = orgUsers.filter(u => u._isReal);
+  // Readiness/coverage population = active REPS only (managers/admins excluded),
+  // the SAME shared rule the reconciliation backfill uses.
+  const realReps    = realMembers.filter(u => isReadinessRepRole(u.role));
   const hasRealData = !isReal || realMembers.length > 0;
   // Blocking Fix 3 — raw, orgUsers-independent fetch results only. Name/role
   // resolution against orgUsers happens in the `liveData` useMemo below, not
@@ -16255,7 +16259,21 @@ function LeadershipDashboardScreen({ currentOrg, orgUsers = [], isReal = false, 
   // from before this fix — only *when* orgUsers gets applied changed.
   const liveData = useMemo(() => {
     if (!rawFetch) return null;
-    const { hasReadinessScores, rows, heatmap, assignments, quizAttempts, lessonCompletions, courses, lessons, quizzes, pointEvents } = rawFetch;
+    const { hasReadinessScores: _rawHasScores, rows: allRows, heatmap, assignments, quizAttempts, lessonCompletions, courses, lessons, quizzes, pointEvents } = rawFetch;
+
+    // Canonical population: keep ONLY score rows whose user resolves to an ACTIVE
+    // REP (shared isReadinessRepRole). Managers/admins, and unknown/unresolved
+    // profiles (e.g. during late orgUsers loading, or a cross-tenant/removed id),
+    // are excluded from EVERY readiness metric below — never rendered, never
+    // averaged. Excluding unknowns also makes late orgUsers loading safe: until a
+    // row's role resolves it simply doesn't count, so a manager can never briefly
+    // appear as a rep. An excluded row is surfaced diagnostically only.
+    const repRows       = allRows.filter(r => { const m = orgUsers.find(u => u.id === r.user_id); return !!m && isReadinessRepRole(m.role); });
+    const excludedRows  = allRows.filter(r => !repRows.includes(r));
+    const rows          = repRows;
+    // hasReadinessScores means "at least one ACTIVE REP score", not any tenant row.
+    const hasReadinessScores = repRows.length > 0;
+    if (excludedRows.length) console.warn("[ralli] dashboard: readiness rows excluded from rep metrics (non-rep/unknown)", { count: excludedRows.length });
 
     // Actionable KPI Cards — content-name lookups for the Active Assignments
     // detail view. Reuses the already-correct getTenantLessons/getTenantCourses/
@@ -16284,15 +16302,22 @@ function LeadershipDashboardScreen({ currentOrg, orgUsers = [], isReal = false, 
     for (const c of lessonCompletions) noteActivity(c.profileId, c.completedAt);
     for (const e of pointEvents) noteActivity(e.user_id, e.created_at);
 
-    // Knowledge Heatmap empty-state diagnosis — getTopicHeatmap (called in
-    // the fetch effect above) returns [] for three different underlying
-    // reasons (no active quizzes, no attempts yet, or quizzes exist/have
-    // attempts but none carry skill tags) and doesn't distinguish them in
-    // its return value. quizAttempts is already fetched tenant-wide for the
-    // Active/Overdue Assignments calc below, so we get this diagnosis for
-    // free, no new query: if attempts exist tenant-wide but the heatmap
-    // still came back empty, tags — not missing activity — are the reason.
-    const heatmapNeedsTags = heatmap.length === 0 && quizAttempts.length > 0;
+    // Knowledge Heatmap empty-state diagnosis — getTopicHeatmap returns [] for
+    // SEVERAL different reasons (no active quizzes, no attempts, attempts only
+    // on archived/missing quizzes, malformed tags, a query error, or genuinely
+    // untagged quizzes) and does not distinguish them. We must therefore only
+    // claim "no tags" when the data PROVES it: the heatmap is empty, there ARE
+    // active quizzes AND attempts, and NONE of the tenant's active quizzes carry
+    // a tag (checked against the real tenant_quizzes.tags already loaded here).
+    // Any other cause — including a failed quizzes/attempts fetch (which comes
+    // back null → [] and makes activeQuizzesForTags empty) — falls through to a
+    // neutral empty state instead of asserting an unproven reason.
+    const activeQuizzesForTags = (quizzes ?? []).filter(q => (q.status ?? "active") === "active");
+    const anyActiveQuizTagged  = activeQuizzesForTags.some(q => (q.tags?.length ?? 0) > 0);
+    const heatmapNeedsTags = heatmap.length === 0
+      && quizAttempts.length > 0
+      && activeQuizzesForTags.length > 0
+      && !anyActiveQuizTagged;
 
     // Build people array from orgUsers + readiness_scores rows.
     // Beta Cleanup — `tag` is now computed from the real score (reusing the
@@ -16317,8 +16342,12 @@ function LeadershipDashboardScreen({ currentOrg, orgUsers = [], isReal = false, 
         // recorded learning activity at all.
         lastActivityAt: lastActivityByUser.get(r.user_id) ?? null,
         readinessScore,
-        previousScore:  readinessScore,
-        trend:         0,
+        // No durable prior-period snapshot exists for real tenants, so the prior
+        // score and trend/change are UNAVAILABLE — null, never the current score.
+        // Delta consumers must treat null as "no comparison" (not 0). Demo seed
+        // (LEADERSHIP_SEED) keeps its own real previousScore untouched.
+        previousScore:  null,
+        trend:         null,
         tag:           readinessScore >= 85 ? "top" : readinessScore < readinessThreshold ? "coaching" : undefined,
         color:         ["#6366f1","#f59e0b","#10b981","#ec4899","#3b82f6"][i % 5],
       };
@@ -16403,7 +16432,17 @@ function LeadershipDashboardScreen({ currentOrg, orgUsers = [], isReal = false, 
     return {
       hasReadinessScores,
       heatmapNeedsTags,
-      company: { readinessScore: avg, previousScore: avg, targetScore: 90, trend: [], period: "Current" },
+      // Honest freshness inputs. lastComputedAt is the NEWEST single rep's
+      // readiness_scores.computed_at (rows fetched computed_at DESC) — it is NOT
+      // proof the whole company was refreshed then, so the label says "Latest
+      // readiness update" and pairs it with coverage (scoredMembers of active).
+      // Newest REP row's computed_at (rows are already rep-filtered + DESC), so a
+      // manager/admin score row can never drive the freshness timestamp.
+      lastComputedAt: rows[0]?.computed_at ?? null,
+      // Coverage counts rep score rows only (rows === repRows here).
+      scoredMembers:  rows.length,
+      // previousScore null — no prior-period snapshot exists; never the current avg.
+      company: { readinessScore: avg, previousScore: null, targetScore: 90, trend: [], period: "Current" },
       // BETA NOTE:
       // Hidden until supporting infrastructure is production-ready.
       // Do not remove.
@@ -16507,9 +16546,12 @@ function LeadershipDashboardScreen({ currentOrg, orgUsers = [], isReal = false, 
   // ── helpers ──
   const scoreColor = (s) => s >= 85 ? C.trueGreen : s >= 70 ? C.orange : C.red;
   const scoreBg    = (s) => s >= 85 ? C.trueGreenBg : s >= 70 ? C.orangeLight : C.redBg;
-  const delta      = (curr, prev) => curr - prev;
-  const deltaLabel = (d) => d > 0 ? `+${d}` : `${d}`;
-  const deltaColor = (d) => d > 0 ? C.trueGreen : d < 0 ? C.red : C.textMuted;
+  // Never compute a delta when either side is unavailable — return null so
+  // consumers show "no comparison" rather than a fabricated number (a real
+  // tenant has no prior-period snapshot, so prev is null there).
+  const delta      = (curr, prev) => (curr == null || prev == null) ? null : curr - prev;
+  const deltaLabel = (d) => d == null ? "—" : (d > 0 ? `+${d}` : `${d}`);
+  const deltaColor = (d) => d == null ? C.textMuted : (d > 0 ? C.trueGreen : d < 0 ? C.red : C.textMuted);
   // Fix 1: safe accessor handles both real data (avgScore) and seed data (score)
   const getTopicScore = (t) => Number(t?.avgScore ?? t?.score ?? 0);
 
@@ -16675,8 +16717,8 @@ function LeadershipDashboardScreen({ currentOrg, orgUsers = [], isReal = false, 
     const list = sortAssignmentsForDetail(data.unresolvedAssignments ?? []);
     return (
       <KPIDetailModal
-        title="Active Assignments"
-        subtitle="Every unresolved assignment — overdue first, then soonest due"
+        title="Active Rep Assignments"
+        subtitle="Every unresolved rep assignment (one row per rep) — overdue first, then soonest due"
         onClose={() => setOpenKpiDetail(null)}
         isEmpty={list.length === 0}
         emptyMessage="No unresolved assignments right now — everything assigned has been completed."
@@ -16851,14 +16893,32 @@ function LeadershipDashboardScreen({ currentOrg, orgUsers = [], isReal = false, 
           <p style={{ margin: "4px 0 0", fontSize: 13, color: C.textSub }}>
             Sales Readiness · {company.period}{currentOrg ? ` · ${currentOrg.name}` : ""}
           </p>
+          {/* Honest freshness label — readiness_scores are cached and recomputed
+              per rep on activity. "Latest readiness update" is the newest SINGLE
+              rep's recompute (NOT a claim the whole company refreshed then), so
+              it is paired with scored coverage. (Roadmap: Last Updated.) */}
+          {isReal && hasReadinessData && data.lastComputedAt && (
+            <p style={{ margin: "2px 0 0", fontSize: 11, color: C.textMuted }}>
+              Latest readiness update {new Date(data.lastComputedAt).toLocaleDateString("en-US", { month: "short", day: "numeric", year: "numeric" })}
+              {realReps.length > 0 && ` · ${data.scoredMembers ?? 0} of ${realReps.length} active reps scored`}
+            </p>
+          )}
         </div>
         <div style={{ display: "flex", gap: 8, alignItems: "center" }}>
           {hasReadinessData ? (
             <>
               <ScoreBadge score={company.readinessScore} size={16} />
-              <span style={{ fontSize: 13, fontWeight: 600, color: deltaColor(companyDelta) }}>
-                {deltaLabel(companyDelta)} pts
-              </span>
+              {/* Period-over-period delta requires a durable prior-period
+                  readiness snapshot, which does not exist for real tenants
+                  (readiness_scores stores one current score per user, no
+                  history). Showing it for real data would fabricate "0 pts".
+                  Only the demo seed (LEADERSHIP_SEED, isReal === false) has a
+                  real previousScore, so the comparison is shown only there. */}
+              {!isReal && (
+                <span style={{ fontSize: 13, fontWeight: 600, color: deltaColor(companyDelta) }}>
+                  {deltaLabel(companyDelta)} pts
+                </span>
+              )}
             </>
           ) : (
             <span style={{ fontSize: 12, fontWeight: 600, color: C.textMuted }}>Readiness not yet available</span>
@@ -16882,7 +16942,10 @@ function LeadershipDashboardScreen({ currentOrg, orgUsers = [], isReal = false, 
             label: "Overall Readiness",
             value: hasReadinessData ? `${readiness}%` : "—",
             sub: hasReadinessData
-              ? (m ? `${m.totalMembersScored} members scored` : `${deltaLabel(companyDelta)} pts vs last period`)
+              // Real tenants never show a period-over-period delta (no prior
+              // snapshot exists — that would fabricate a number). Demo seed
+              // (isReal === false) keeps its genuine "vs last period" delta.
+              ? (m ? `${m.totalMembersScored} members scored` : (!isReal ? `${deltaLabel(companyDelta)} pts vs last period` : "Current readiness"))
               : "Not yet available",
             color: hasReadinessData ? scoreColor(readiness) : C.textMuted,
           },
@@ -16923,9 +16986,13 @@ function LeadershipDashboardScreen({ currentOrg, orgUsers = [], isReal = false, 
             // data.risk.activeAssignments, computed above via the shared
             // Resolved Assignment engine (see the useEffect) — same source
             // as the Company Risk "Overdue Assignments" card below.
-            label: "Active Assignments",
+            // The count and drill-down are per (assignment, targeted user) pair
+            // — a team/org assignment expands to one row per member — so the
+            // label names that exact unit ("Rep Assignments") rather than
+            // implying a count of assignment records.
+            label: "Active Rep Assignments",
             value: `${data.risk.activeAssignments ?? 0}`,
-            sub: "Not yet completed",
+            sub: "Rep assignments not yet completed",
             color: C.blue,
             detailKey: "activeAssignments",
           },
@@ -17305,18 +17372,20 @@ function LeadershipDashboardScreen({ currentOrg, orgUsers = [], isReal = false, 
           </>
         ) : (
           <div style={{ padding: "24px 0", textAlign: "center", color: C.textSub, fontSize: 13 }}>
-            {/* Knowledge Heatmap Verification — data.heatmapNeedsTags (real
-                tenants only; undefined for demo, where the seed heatmap is
-                never empty) distinguishes "reps just haven't attempted
-                tagged quizzes yet" from the actual live-verified cause on
-                the DeAndre Test tenant: quiz attempts already exist, but the
-                tenant's quiz has no skill tags set, so getTopicHeatmap has
-                nothing to bucket them into. Telling a manager to wait for
-                more quiz activity would be wrong in that case — the fix is
-                adding tags to the quiz, not more attempts. */}
+            {/* Knowledge Heatmap — topic scores require per-quiz skill tags
+                (tenant_quizzes.tags, read by getTopicHeatmap). CAPABILITY GAP:
+                the Quiz Builder currently exposes NO way to add or edit those
+                tags, and no import path populates them, so real tenants' quizzes
+                are always untagged and this view cannot fill. The copy therefore
+                must NOT tell a manager to "edit" tags that no control can set.
+                data.heatmapNeedsTags is now proven (untagged active quizzes WITH
+                attempts) vs a neutral empty; both messages state the capability
+                is not yet available rather than blaming activity or tagging the
+                manager can't do. Recommend hiding this card until quiz tagging
+                ships (see FUTURE_ROADMAP: Quiz Topics/Tags). */}
             {data.heatmapNeedsTags
-              ? "No skill tags are set on this tenant's quizzes yet. Add tags to your quizzes (Quizzes → Edit) to see topic-by-topic readiness here — attempts already exist, they just aren't tagged."
-              : "Skill data will appear here after reps complete tagged quizzes."}
+              ? "Topic-by-topic readiness needs skill tags on your quizzes. Quiz tagging isn't available yet, so this view can't be populated — it's a planned capability."
+              : "Topic insights will appear here once quiz tagging is available."}
           </div>
         )}
       </Card>
@@ -17488,7 +17557,10 @@ function LeadershipDashboardScreen({ currentOrg, orgUsers = [], isReal = false, 
             <div style={{ width: 36 }} />
             <div style={{ flex: 1, fontSize: 11, fontWeight: 700, color: C.textMuted, letterSpacing: "0.04em" }}>REP</div>
             <div style={{ width: 80, fontSize: 11, fontWeight: 700, color: C.textMuted, textAlign: "right" }}>READINESS</div>
-            <div style={{ width: 60, fontSize: 11, fontWeight: 700, color: C.textMuted, textAlign: "right" }}>CHANGE</div>
+            {/* CHANGE = period-over-period readiness delta. Hidden for real
+                tenants (no prior-period snapshot exists → would fabricate
+                "0 pts"); shown only for the demo seed which has a real prev. */}
+            {!isReal && <div style={{ width: 60, fontSize: 11, fontWeight: 700, color: C.textMuted, textAlign: "right" }}>CHANGE</div>}
             <div style={{ width: 100, fontSize: 11, fontWeight: 700, color: C.textMuted, textAlign: "right" }}>STATUS</div>
           </div>
 
@@ -17524,9 +17596,11 @@ function LeadershipDashboardScreen({ currentOrg, orgUsers = [], isReal = false, 
                   <div style={{ width: 80, textAlign: "right" }}>
                     <ScoreBadge score={p.score} />
                   </div>
-                  <div style={{ width: 60, textAlign: "right", fontSize: 13, fontWeight: 700, color: deltaColor(d) }}>
-                    {deltaLabel(d)} pts
-                  </div>
+                  {!isReal && (
+                    <div style={{ width: 60, textAlign: "right", fontSize: 13, fontWeight: 700, color: deltaColor(d) }}>
+                      {deltaLabel(d)} pts
+                    </div>
+                  )}
                   <div style={{ width: 100, textAlign: "right" }}>
                     {tag
                       ? <Pill label={tag.label} color={tag.color} />

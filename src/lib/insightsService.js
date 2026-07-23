@@ -20,13 +20,30 @@
  */
 
 import { supabase } from "./supabase.js";
+// Pure readiness formula (no DB/client access) — the SINGLE implementation,
+// shared with the server-only reconciliation tool so the formula is never
+// duplicated and the browser client is never imported into Node.
+import {
+  WEIGHTS,
+  latestAttemptsByUserQuiz,
+  validAttemptScore,
+  computeUserReadiness,
+  isReadinessRepRole,
+} from "./readinessFormula.js";
+// Re-export the shared pieces so existing importers keep working.
+export { WEIGHTS, latestAttemptsByUserQuiz, validAttemptScore, isReadinessRepRole } from "./readinessFormula.js";
 
-// ── Scoring weights (must sum to 1.0) ─────────────────────────────────────────
-const WEIGHTS = {
-  learning: 0.35, // lesson + course completion rate
-  quiz:     0.40, // quiz accuracy and pass rate
-  game:     0.25, // game participation + accuracy
-};
+// Canonical readiness population — active profiles in THIS tenant whose role is a
+// rep (managers/admins/superadmins/inactive/cross-tenant excluded). Returns the
+// rep id Set. Used to filter EVERY rep-performance input before aggregation.
+async function getActiveRepIds(tenantId) {
+  const { data, error } = await supabase
+    .from("profiles").select("id, role")
+    .eq("tenant_id", tenantId).neq("status", "inactive");
+  if (error) return { repIds: null, error };
+  const repIds = new Set((data ?? []).filter(p => isReadinessRepRole(p.role)).map(p => p.id));
+  return { repIds, error: null };
+}
 
 // ── Readiness threshold (tenant-configurable) ─────────────────────────────────
 // Single shared source of truth for the "below threshold" cutoff used across
@@ -93,6 +110,9 @@ function pctScore(numerator, denominator) {
   return clamp((numerator / denominator) * 100);
 }
 
+// latestAttemptsByUserQuiz + validAttemptScore now live in ./readinessFormula.js
+// (imported above) — one implementation shared with the reconciliation tool.
+
 // ── User performance aggregation ─────────────────────────────────────────────
 
 /**
@@ -107,8 +127,6 @@ function pctScore(numerator, denominator) {
 export async function getUserPerformance(tenantId, userId, { windowDays = 30 } = {}) {
   if (!tenantId || !userId) return { data: null, error: new Error("Missing params") };
 
-  const since = new Date(Date.now() - windowDays * 24 * 60 * 60 * 1000).toISOString();
-
   // Fetch in parallel
   const [
     { data: pointEvents, error: peError },
@@ -122,7 +140,7 @@ export async function getUserPerformance(tenantId, userId, { windowDays = 30 } =
       .eq("user_id", userId),
     supabase
       .from("quiz_attempts")
-      .select("quiz_id, score, passed, attempt_num, created_at")
+      .select("id, quiz_id, score, passed, attempt_num, created_at")
       .eq("tenant_id", tenantId)
       .eq("user_id", userId)
       .order("created_at", { ascending: false }),
@@ -135,90 +153,24 @@ export async function getUserPerformance(tenantId, userId, { windowDays = 30 } =
 
   const error = peError ?? qaError ?? lcError ?? null;
 
-  // ── Point event aggregation ──
-  const events = pointEvents ?? [];
-  const recentEvents = events.filter(e => e.created_at >= since);
-
-  const totalXp = events.reduce((s, e) => s + e.points, 0);
-  const recentXp = recentEvents.reduce((s, e) => s + e.points, 0);
-
-  const lessonsCompletedIds = new Set(
-    events.filter(e => e.source_type === "lesson").map(e => e.source_id)
-  );
-  const coursesCompletedIds = new Set(
-    events.filter(e => e.source_type === "course").map(e => e.source_id)
-  );
-  const gamesPlayedIds = new Set(
-    events.filter(e => e.source_type === "game").map(e => e.source_id)
-  );
-
-  // ── Quiz attempt aggregation ──
-  const attempts = quizAttempts ?? [];
-  const totalAttempts = attempts.length;
-  const passedAttempts = attempts.filter(a => a.passed).length;
-  const avgQuizScore = totalAttempts > 0
-    ? Math.round(attempts.reduce((s, a) => s + a.score, 0) / totalAttempts)
-    : 0;
-  const passRate = pctScore(passedAttempts, totalAttempts);
-
-  // Most recent attempt per quiz (for current accuracy)
-  const latestByQuiz = {};
-  for (const a of attempts) {
-    if (!latestByQuiz[a.quiz_id]) latestByQuiz[a.quiz_id] = a;
-  }
-  const uniqueQuizzesAttempted = Object.keys(latestByQuiz).length;
-  const uniqueQuizzesPassed = Object.values(latestByQuiz).filter(a => a.passed).length;
-
-  // ── Component scores ──
-  // Learning: ratio of completions within tenant content is hard to compute without
-  // knowing total assigned content — use XP earned from learning sources as proxy.
-  const learningXp  = events.filter(e => e.source_type === "lesson" || e.source_type === "course").reduce((s, e) => s + e.points, 0);
-  const gameXp      = events.filter(e => e.source_type === "game").reduce((s, e) => s + e.points, 0);
-
-  // Learning score: caps at 100 at 10 lessons + 3 courses
-  const learningScore = clamp(
-    (lessonsCompletedIds.size / 10) * 60 + (coursesCompletedIds.size / 3) * 40
-  );
-
-  // Quiz score: weighted avg of pass rate + avg score
-  const quizScore = clamp(passRate * 0.6 + avgQuizScore * 0.4);
-
-  // Game score: participation + implied accuracy from XP (25 base + score points per game)
-  const gameParticipation = gamesPlayedIds.size;
-  const gameScore = gameParticipation > 0
-    ? clamp((gameParticipation / 5) * 60 + Math.min(gameXp / 1000, 1) * 40)
-    : 0;
-
-  // Composite readiness score
-  const score = clamp(
-    learningScore * WEIGHTS.learning +
-    quizScore     * WEIGHTS.quiz +
-    gameScore     * WEIGHTS.game
-  );
-
-  const data = {
-    userId,
-    tenantId,
+  // Composite readiness via the ONE shared pure formula (readinessFormula.js) —
+  // the same implementation the server reconciliation tool uses (no duplication,
+  // no browser client in Node). Log any invalid latest attempts for diagnosis
+  // (quiz/attempt ids only — never full profile or answer data).
+  const perf = computeUserReadiness({
+    pointEvents:       pointEvents ?? [],
+    quizAttempts:      quizAttempts ?? [],
+    lessonCompletions: lessonCompletions ?? [],
     windowDays,
-    score,
-    learningScore,
-    quizScore,
-    gameScore,
-    totalXp,
-    recentXp,
-    lessonsCompleted:     lessonsCompletedIds.size,
-    coursesCompleted:     coursesCompletedIds.size,
-    gamesPlayed:          gameParticipation,
-    quizzesAttempted:     uniqueQuizzesAttempted,
-    quizzesPassed:        uniqueQuizzesPassed,
-    avgQuizScore,
-    passRate,
-    totalQuizAttempts:    totalAttempts,
-    // For trend / recommendation engine
-    recentQuizAttempts:   attempts.filter(a => a.created_at >= since),
-    weakQuizzes:          Object.values(latestByQuiz).filter(a => !a.passed),
-    computedAt:           new Date().toISOString(),
-  };
+  });
+  if (perf.invalidLatestQuizzes) {
+    console.warn("[ralli] readiness: invalid latest quiz attempt(s) excluded from readiness", {
+      tenantId, userId,
+      quizzes: perf.invalidLatest.map(a => ({ quizId: a.quiz_id, attemptId: a.id })),
+    });
+  }
+  const { invalidLatest: _invalidLatest, ...perfData } = perf; // don't leak raw attempt objects
+  const data = { userId, tenantId, ...perfData };
 
   return { data, error };
 }
@@ -274,6 +226,11 @@ export async function computeAndSaveReadinessScore(tenantId, userId, opts = {}) 
 
   return { data: perf, error: upsertError };
 }
+
+// NOTE: the one-time readiness reconciliation/backfill is an OPERATIONS tool and
+// deliberately does NOT live here (this module imports the browser Supabase
+// client). It lives under server/ with a service-role client that never enters
+// the app bundle. See server/reconcileReadiness.mjs.
 
 // ── Rules-based recommendations ───────────────────────────────────────────────
 
@@ -569,7 +526,7 @@ export function triggerReadinessUpdate(tenantId, userId) {
 export async function getTopicHeatmap(tenantId, { threshold = DEFAULT_READINESS_THRESHOLD } = {}) {
   if (!tenantId) return [];
 
-  const [{ data: quizzes, error: qErr }, { data: attempts, error: aErr }] =
+  const [{ data: quizzes, error: qErr }, { data: attemptsRaw, error: aErr }, { repIds, error: repErr }] =
     await Promise.all([
       supabase
         .from("tenant_quizzes")
@@ -578,11 +535,16 @@ export async function getTopicHeatmap(tenantId, { threshold = DEFAULT_READINESS_
         .eq("status", "active"),
       supabase
         .from("quiz_attempts")
-        .select("user_id, quiz_id, score, passed, created_at")
+        .select("id, user_id, quiz_id, score, passed, attempt_num, created_at")
         .eq("tenant_id", tenantId),
+      getActiveRepIds(tenantId),
     ]);
 
-  if (qErr || aErr || !quizzes?.length || !attempts?.length) return [];
+  if (qErr || aErr || repErr || !quizzes?.length || !attemptsRaw?.length || !repIds) return [];
+  // Restrict to ACTIVE REPS before latest-attempt/topic aggregation — a
+  // manager/admin attempt must never affect topic readiness.
+  const attempts = attemptsRaw.filter(a => repIds.has(a.user_id));
+  if (!attempts.length) return [];
 
   // Build quiz → tags[] map (normalize JSONB which may be string array or null)
   const quizTags = {};
@@ -596,24 +558,17 @@ export async function getTopicHeatmap(tenantId, { threshold = DEFAULT_READINESS_
     quizTags[q.id] = tags.filter(Boolean).map(t => String(t).trim().toLowerCase());
   }
 
-  // Keep only the latest attempt per (user, quiz) pair
-  const latestAttempts = {};
-  for (const a of attempts) {
-    const key = `${a.user_id}::${a.quiz_id}`;
-    if (
-      !latestAttempts[key] ||
-      new Date(a.created_at) > new Date(latestAttempts[key].created_at)
-    ) {
-      latestAttempts[key] = a;
-    }
-  }
+  // Keep only the latest attempt per (user, quiz) pair (shared resolver)
+  const latestAttempts = latestAttemptsByUserQuiz(attempts);
 
-  // Bucket scores by topic
+  // Bucket scores by topic — same valid-latest rule as composite readiness: a
+  // latest attempt with an invalid score is EXCLUDED (never bucketed as a 0).
   const topicMap = {}; // topic → { scores: [{ userId, score, passed }] }
-  for (const a of Object.values(latestAttempts)) {
+  for (const a of latestAttempts.values()) {
     const tags = quizTags[a.quiz_id] ?? [];
     if (!tags.length) continue;
-    const score = typeof a.score === "number" ? a.score : parseFloat(a.score) || 0;
+    const score = validAttemptScore(a);
+    if (score == null) continue;
     for (const tag of tags) {
       if (!topicMap[tag]) topicMap[tag] = { scores: [] };
       topicMap[tag].scores.push({ userId: a.user_id, score, passed: !!a.passed });
@@ -661,7 +616,7 @@ export async function getRepTopicScores(tenantId, userId) {
         .eq("status", "active"),
       supabase
         .from("quiz_attempts")
-        .select("quiz_id, score, passed, created_at")
+        .select("id, user_id, quiz_id, score, passed, attempt_num, created_at")
         .eq("tenant_id", tenantId)
         .eq("user_id", userId),
     ]);
@@ -679,21 +634,15 @@ export async function getRepTopicScores(tenantId, userId) {
     quizTags[q.id] = tags.filter(Boolean).map(t => String(t).trim().toLowerCase());
   }
 
-  // Latest attempt per quiz
-  const latestByQuiz = {};
-  for (const a of attempts) {
-    if (
-      !latestByQuiz[a.quiz_id] ||
-      new Date(a.created_at) > new Date(latestByQuiz[a.quiz_id].created_at)
-    ) {
-      latestByQuiz[a.quiz_id] = a;
-    }
-  }
+  // Latest attempt per quiz (shared resolver)
+  const latestByQuiz = latestAttemptsByUserQuiz(attempts);
 
   const topicMap = {};
-  for (const a of Object.values(latestByQuiz)) {
+  for (const a of latestByQuiz.values()) {
     const tags = quizTags[a.quiz_id] ?? [];
-    const score = typeof a.score === "number" ? a.score : parseFloat(a.score) || 0;
+    // Same valid-latest rule — an invalid latest score is excluded, not a 0.
+    const score = validAttemptScore(a);
+    if (score == null) continue;
     for (const tag of tags) {
       if (!topicMap[tag]) topicMap[tag] = { scores: [], passed: 0 };
       topicMap[tag].scores.push(score);
@@ -713,15 +662,19 @@ export async function getRepTopicScores(tenantId, userId) {
 
 /**
  * Compute org-level summary metrics for the Leadership Dashboard KPI cards.
+ * ALL metrics are scoped to ACTIVE REPS ONLY (isReadinessRepRole) — managers,
+ * admins, superadmins, inactive/unknown/cross-tenant users are excluded before
+ * aggregation.
  *
  * Returns:
  *   {
- *     overallReadiness:   number,   // avg of latest readiness_scores per user
- *     avgQuizScore:       number,   // avg of all quiz_attempts.score
- *     completionPct:      number,   // % of scored users with ≥1 lesson_completion
- *     belowThreshold:     number,   // readiness_scores < threshold
- *     activeLearners:     number,   // distinct users in user_point_events last 30d
- *     totalMembersScored: number,
+ *     overallReadiness:   number,   // avg of latest readiness_scores per REP
+ *     avgQuizScore:       number,   // avg of REPS' latest valid attempt per quiz
+ *     completionPct:      number,   // % of ACTIVE REPS with ≥1 lesson_completion
+ *     belowThreshold:     number,   // REP readiness_scores < threshold
+ *     activeLearners:     number,   // distinct ACTIVE REPS with point events in last 30d
+ *     totalMembersScored: number,   // reps WITH a readiness score
+ *     totalActiveMembers: number,   // active rep count (coverage denominator)
  *   }
  *
  * @param {string} tenantId
@@ -733,23 +686,24 @@ export async function getOrgMetrics(tenantId, { threshold = DEFAULT_READINESS_TH
 
   const thirtyDaysAgo = new Date(Date.now() - 30 * 24 * 60 * 60 * 1000).toISOString();
 
+  // Canonical population FIRST — every metric below aggregates ONLY active reps.
+  const { repIds, error: repErr } = await getActiveRepIds(tenantId);
+  if (repErr) { console.error("[ralli] getOrgMetrics: rep population error", repErr); return null; }
+
   const [
     { data: scores,      error: sErr  },
     { data: attempts,    error: aErr  },
     { data: completions, error: cErr  },
     { data: events,      error: eErr  },
-    // Fix 7: active member count from profiles (excludes inactive/removed members)
-    { count: activeMemberCount, error: mErr },
   ] = await Promise.all([
     supabase
       .from("readiness_scores")
       .select("user_id, score, computed_at")
       .eq("tenant_id", tenantId)
       .order("computed_at", { ascending: false }),
-    // Fix 2: fetch user_id + quiz_id + created_at so we can deduplicate retakes
     supabase
       .from("quiz_attempts")
-      .select("user_id, quiz_id, score, created_at")
+      .select("id, user_id, quiz_id, score, attempt_num, created_at")
       .eq("tenant_id", tenantId),
     supabase
       .from("lesson_completions")
@@ -760,60 +714,52 @@ export async function getOrgMetrics(tenantId, { threshold = DEFAULT_READINESS_TH
       .select("user_id")
       .eq("tenant_id", tenantId)
       .gte("created_at", thirtyDaysAgo),
-    // Fix 7: count active profiles (same filter the orgUsers loader uses)
-    supabase
-      .from("profiles")
-      .select("id", { count: "exact", head: true })
-      .eq("tenant_id", tenantId)
-      .neq("status", "inactive"),
   ]);
 
-  if (sErr || aErr || cErr || eErr || mErr) {
-    console.error("[ralli] getOrgMetrics error", { sErr, aErr, cErr, eErr, mErr });
+  if (sErr || aErr || cErr || eErr) {
+    console.error("[ralli] getOrgMetrics error", { sErr, aErr, cErr, eErr });
     return null;
   }
 
-  // Deduplicate: keep latest score per user
+  const activeRepCount = repIds.size;
+  // Zero active reps → honest empty coverage; never fall back to manager rows.
+  if (activeRepCount === 0) {
+    return { overallReadiness: 0, avgQuizScore: 0, completionPct: 0, belowThreshold: 0,
+      activeLearners: 0, totalMembersScored: 0, totalActiveMembers: 0 };
+  }
+
+  // Readiness — latest score per REP user only.
   const latestByUser = {};
   for (const row of (scores ?? [])) {
+    if (!repIds.has(row.user_id)) continue;                    // exclude non-rep / unknown rows
     if (!latestByUser[row.user_id]) latestByUser[row.user_id] = row.score;
   }
   const userScores = Object.values(latestByUser);
-  const totalMembersScored = userScores.length;
-
+  const totalMembersScored = userScores.length;                // reps WITH a score
   const overallReadiness = totalMembersScored
     ? Math.round(userScores.reduce((s, v) => s + v, 0) / totalMembersScored)
     : 0;
-
   const belowThreshold = userScores.filter(s => s < threshold).length;
 
-  // Fix 2: deduplicate quiz attempts to latest per user+quiz before averaging
-  const latestAttemptMap = {};
-  for (const a of (attempts ?? [])) {
-    const key = `${a.user_id}::${a.quiz_id}`;
-    if (!latestAttemptMap[key] || new Date(a.created_at) > new Date(latestAttemptMap[key].created_at)) {
-      latestAttemptMap[key] = a;
-    }
-  }
-  const dedupedScores = Object.values(latestAttemptMap).map(a =>
-    typeof a.score === "number" ? a.score : parseFloat(a.score) || 0
-  );
+  // Average Quiz Score — reps' latest valid attempt per quiz.
+  const repAttempts = (attempts ?? []).filter(a => repIds.has(a.user_id));
+  const dedupedScores = [...latestAttemptsByUserQuiz(repAttempts).values()]
+    .map(validAttemptScore).filter(s => s != null);
   const avgQuizScore = dedupedScores.length
     ? Math.round(dedupedScores.reduce((s, v) => s + v, 0) / dedupedScores.length)
     : 0;
 
-  // Users who have completed at least one lesson
-  const usersWithCompletions = new Set(
-    (completions ?? []).map(c => c.profile_id)
+  // Content Completion — % of ACTIVE REPS with ≥1 lesson completion (numerator
+  // counts only rep completers; denominator is the active-rep count).
+  const repsWithCompletions = new Set(
+    (completions ?? []).map(c => c.profile_id).filter(id => repIds.has(id))
   );
-  // Fix 7: use active member count as denominator (not just scored members)
-  const memberDenominator = (activeMemberCount ?? 0) > 0 ? activeMemberCount : totalMembersScored;
-  const completionPct = memberDenominator
-    ? Math.round((usersWithCompletions.size / memberDenominator) * 100)
-    : 0;
+  const completionPct = Math.round((repsWithCompletions.size / activeRepCount) * 100);
 
-  // Distinct active learners in last 30 days
-  const activeLearners = new Set((events ?? []).map(e => e.user_id)).size;
+  // Active Learners — distinct ACTIVE REPS with qualifying activity in last 30d.
+  const activeLearners = new Set(
+    (events ?? []).map(e => e.user_id).filter(id => repIds.has(id))
+  ).size;
 
   return {
     overallReadiness,
@@ -822,6 +768,6 @@ export async function getOrgMetrics(tenantId, { threshold = DEFAULT_READINESS_TH
     belowThreshold,
     activeLearners,
     totalMembersScored,
-    totalActiveMembers: activeMemberCount ?? totalMembersScored,
+    totalActiveMembers: activeRepCount,
   };
 }
