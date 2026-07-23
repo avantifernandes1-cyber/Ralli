@@ -74,7 +74,7 @@ import {
   updateLastSeenAssignmentsAt,
   subscribeToTenantAssignments,
 } from "./src/lib/contentService.js";
-import { resolveAssignmentStatus, isQualifyingEvent, daysUntilDue } from "./src/lib/assignmentEngine.js";
+import { resolveAssignmentStatus, resolveLatestQuizAssignment, isQualifyingEvent, daysUntilDue } from "./src/lib/assignmentEngine.js";
 import { getProfile, createMissingProfile, getTenantProfiles } from "./src/lib/profileService.js";
 import { sendInviteEmail } from "./src/lib/emailService.js";
 import { provisionTenant, buildInviteUrl, normalizeProvisionedOrg, createMemberInvite } from "./src/lib/provisioningService.js";
@@ -816,7 +816,25 @@ function HomeScreen({ user, onNav, quizAssignments = [], onResumeLesson, onStart
         (a.assignedTo?.type === "individual" && a.assignedTo?.userId === user?.id)   ||
         (a.assignedTo?.type === "team"       && userTeamId && userTeamId === a.assignedTo?.teamId)
       );
-      return mine.map(a => {
+      // Dedupe quiz assignments to the LATEST per quiz (one actionable card per
+      // quiz) via the shared engine helper, so a resolved-by-failure original +
+      // its reassignment don't both count as pending. Lesson/course rows pass
+      // through unchanged.
+      const quizRowsByContent = new Map();
+      const dedupedMine = [];
+      for (const a of mine) {
+        if (a.contentType === "quiz") {
+          if (!quizRowsByContent.has(a.contentId)) quizRowsByContent.set(a.contentId, []);
+          quizRowsByContent.get(a.contentId).push(a);
+        } else {
+          dedupedMine.push(a);
+        }
+      }
+      for (const [contentId, rows] of quizRowsByContent) {
+        const latest = resolveLatestQuizAssignment(rows, homeQuizAttempts.filter(at => at.quiz_id === contentId)).latest;
+        if (latest) dedupedMine.push(latest);
+      }
+      return dedupedMine.map(a => {
         const isCourse = a.contentType === "course";
         const isLesson = a.contentType === "lesson";
         const content  = isCourse ? homeCourses.find(c => c.id === a.contentId)
@@ -12935,35 +12953,47 @@ function resolveAssignedUsers(assignedTo, orgUsers) {
 // enforces server-side. attemptCount/latestScore intentionally stay
 // ungated — they're a full attempt-history display, not a resolution check.
 function buildQuizAssignmentRows(assignments, attempts, quizzes, orgUsers) {
-  return assignments.flatMap(a => {
+  // ONE primary row per (user, quiz), resolved against the LATEST assignment
+  // instance via the shared engine helper. A quiz reassigned N times to the
+  // same rep is a single row (not N), and every column is scoped to the latest
+  // assignment's window — never a lifetime value masquerading as the current
+  // assignment. Older instances and the FULL attempt history are preserved on
+  // the row (older / allAttempts) for the drill-down.
+  const byUserQuiz = new Map();
+  for (const a of assignments) {
     const quiz = quizzes.find(q => q.id === a.contentId);
-    if (!quiz) return [];
+    if (!quiz) continue;
     const users = resolveAssignedUsers(a.assignedTo, orgUsers);
-    return users.map(u => {
-      const userAttempts = u._isAggregate ? [] : attempts
-        .filter(at => at.quiz_id === a.contentId && at.user_id === u.id)
-        .slice()
-        .sort((x, y) => new Date(y.created_at) - new Date(x.created_at)); // newest first
-      const attemptCount = userAttempts.length;
-      const latestScore  = userAttempts[0]?.score ?? null;
-      const bestScore    = userAttempts.length ? Math.max(...userAttempts.map(at => at.score ?? 0)) : null;
+    for (const u of users) {
+      const key = `${u.id}::${a.contentId}`;
+      if (!byUserQuiz.has(key)) byUserQuiz.set(key, { quiz, user: u, rows: [] });
+      byUserQuiz.get(key).rows.push(a);
+    }
+  }
 
-      const engineResult = u._isAggregate
-        ? { status: "not_started", progress: 0, completedAt: null }
-        : resolveAssignmentStatus("quiz", a, { attempts: userAttempts });
-      // QUIZ_STATUS_CONFIG's internal key for the not-yet-started state is
-      // still "assigned" (wired into statusTab filtering below); its
-      // displayed label is "Not Started" (Assignment Experience Priority 6),
-      // matching the engine's own "not_started" vocabulary.
-      const status = engineResult.status === "not_started" ? "assigned" : engineResult.status;
+  return [...byUserQuiz.values()].map(({ quiz, user, rows }) => {
+    const allAttempts = user._isAggregate ? [] : attempts
+      .filter(at => at.quiz_id === quiz.id && at.user_id === user.id)
+      .slice()
+      .sort((x, y) => new Date(y.created_at) - new Date(x.created_at)); // newest first — full history
 
-      return {
-        key: `${a.id}-${u.id}`,
-        assignment: a, quiz, user: u,
-        attempts: userAttempts, attemptCount, latestScore, bestScore,
-        status, progress: engineResult.progress, completedAt: engineResult.completedAt,
-      };
-    });
+    // Shared reduction: latest assignment + status + metrics scoped to it.
+    const r = resolveLatestQuizAssignment(rows, allAttempts);
+    const latest = r.latest ?? rows[0];
+    // QUIZ_STATUS_CONFIG's internal key for the not-yet-started state is
+    // still "assigned" (wired into the status filter below); its displayed
+    // label is "Not Started", matching the engine's "not_started" vocabulary.
+    const status = r.status === "not_started" ? "assigned" : r.status;
+
+    return {
+      key: `${latest?.id}-${user.id}`,
+      assignment: latest, quiz, user,
+      attempts: r.scopedAttempts,        // scoped to latest assignment — powers Attempts column
+      allAttempts,                        // full lifetime history — powers the drill-down
+      olderAssignments: r.older ?? [],    // prior assignment instances (history)
+      attemptCount: r.attemptCount, latestScore: r.latestScore, bestScore: r.bestScore,
+      status, progress: r.progress, completedAt: r.completedAt,
+    };
   });
 }
 
@@ -12971,7 +13001,10 @@ function buildQuizAssignmentRows(assignments, attempts, quizzes, orgUsers) {
 // completion date, and per-question answers vs. correct answers. Reuses
 // QuizResultsView's grading logic via its read-only mode.
 function QuizAttemptDrilldown({ row, onBack }) {
-  const { quiz, user, attempts } = row;
+  const { quiz, user } = row;
+  // Drill-down shows the FULL lifetime attempt history (across every
+  // reassignment), not just the latest-assignment window the table scopes to.
+  const attempts = row.allAttempts ?? row.attempts ?? [];
   const [openId, setOpenId] = useState(attempts[0]?.id ?? null);
 
   return (
@@ -13122,7 +13155,8 @@ function QuizTrackingPanel({ quizzes, orgUsers, tenantId, isReal, refreshKey, on
   const [attempts,    setAttempts]    = useState([]);
   const [loading,     setLoading]     = useState(isReal);
   const [loadError,   setLoadError]   = useState(null); // Task 8 — manager tracking data
-  const [statusTab,   setStatusTab]   = useState("assigned");
+  const [statusTab,   setStatusTab]   = useState("all"); // Assignments opens on All
+  const [assigneeFilter, setAssigneeFilter] = useState("all");
   const [search,      setSearch]      = useState("");
   const [selectedKey, setSelectedKey] = useState(null); // row.key of drilled-in assignment
 
@@ -13199,8 +13233,14 @@ function QuizTrackingPanel({ quizzes, orgUsers, tenantId, isReal, refreshKey, on
 
   if (loadError) return <ErrorState message={loadError} onRetry={loadTracking} />;
 
-  const rowsForStatusTab = statusTab === "all" ? searchedRows : statusTab === "drafts" ? [] : searchedRows.filter(r => r.status === statusTab);
-  const draftsToShow = (statusTab === "drafts" || statusTab === "all") ? searchedDrafts : [];
+  const assigneeFiltered = assigneeFilter === "all" ? searchedRows : searchedRows.filter(r => r.user.id === assigneeFilter);
+  const rowsForStatusTab = statusTab === "all" ? assigneeFiltered : assigneeFiltered.filter(r => r.status === statusTab);
+  // Drafts (never-assigned quizzes) show only in the unfiltered All view.
+  const draftsToShow = (statusTab === "all" && assigneeFilter === "all") ? searchedDrafts : [];
+  // Assignee options come from the actual rows (real reps only).
+  const assigneeOptions = [...new Map(allRows.map(r => [r.user.id, r.user])).values()]
+    .filter(u => u && !u._isAggregate && u.id)
+    .sort((a, b) => (a.name ?? "").localeCompare(b.name ?? ""));
 
   return (
     <div style={{ display: "flex", flexDirection: "column", gap: 16 }}>
@@ -13215,24 +13255,31 @@ function QuizTrackingPanel({ quizzes, orgUsers, tenantId, isReal, refreshKey, on
         {search && <button onClick={() => setSearch("")} style={{ background: "none", border: "none", cursor: "pointer", fontSize: 12, color: C.textMuted, padding: 0 }}>✕</button>}
       </div>
 
-      {/* Status tabs */}
-      <div style={{ display: "flex", gap: 6, flexWrap: "wrap" }}>
-        {[
-          ["assigned",    `Not Started (${counts.assigned})`],
-          ["in_progress", `In Progress (${counts.in_progress})`],
-          ["completed",   `Completed (${counts.completed})`],
-          ["overdue",     `Overdue (${counts.overdue})`],
-          ["drafts",      `Drafts (${counts.drafts})`],
-          ["all",         `All (${counts.all})`],
-        ].map(([id, label]) => (
-          <button key={id} onClick={() => setStatusTab(id)} style={{
-            padding: "7px 14px", borderRadius: 8,
-            border: `1px solid ${statusTab === id ? C.orange : C.border}`,
-            background: statusTab === id ? C.orangeLight : C.white,
-            color: statusTab === id ? C.orange : C.textSub,
-            fontSize: 13, fontWeight: 600, cursor: "pointer",
-          }}>{label}</button>
-        ))}
+      {/* Filters — one Status dropdown (exactly the 5 states) + an Assignee dropdown */}
+      <div style={{ display: "flex", gap: 10, flexWrap: "wrap", alignItems: "center" }}>
+        <label style={{ display: "flex", alignItems: "center", gap: 6, fontSize: 12, color: C.textSub, fontWeight: 600 }}>
+          Status
+          <select value={statusTab} onChange={e => setStatusTab(e.target.value)} style={{
+            padding: "7px 12px", borderRadius: 8, border: `1px solid ${C.border}`, background: C.white,
+            color: C.text, fontSize: 13, fontWeight: 600, cursor: "pointer", fontFamily: "inherit",
+          }}>
+            <option value="all">All ({counts.all})</option>
+            <option value="assigned">Not Started ({counts.assigned})</option>
+            <option value="in_progress">In Progress ({counts.in_progress})</option>
+            <option value="completed">Completed ({counts.completed})</option>
+            <option value="overdue">Overdue ({counts.overdue})</option>
+          </select>
+        </label>
+        <label style={{ display: "flex", alignItems: "center", gap: 6, fontSize: 12, color: C.textSub, fontWeight: 600 }}>
+          Assignee
+          <select value={assigneeFilter} onChange={e => setAssigneeFilter(e.target.value)} style={{
+            padding: "7px 12px", borderRadius: 8, border: `1px solid ${C.border}`, background: C.white,
+            color: C.text, fontSize: 13, fontWeight: 600, cursor: "pointer", fontFamily: "inherit", maxWidth: 220,
+          }}>
+            <option value="all">All assignees</option>
+            {assigneeOptions.map(u => <option key={u.id} value={u.id}>{u.name}</option>)}
+          </select>
+        </label>
       </div>
 
       {/* Assignment rows table */}
@@ -13243,7 +13290,12 @@ function QuizTrackingPanel({ quizzes, orgUsers, tenantId, isReal, refreshKey, on
                 content, status, assigned/due, required, progress, completion
                 date — plus quiz-only latest/best score and attempts. */}
             <div style={{ minWidth: 980, display: "grid", gridTemplateColumns: "1.8fr 1.2fr 0.75fr 0.75fr 0.85fr 0.8fr 1fr 0.6fr 0.85fr", gap: 10, padding: "10px 16px", background: C.pageBg, fontSize: 11, fontWeight: 700, color: C.textMuted, letterSpacing: "0.05em" }}>
-              <span>QUIZ</span><span>REP / TEAM</span><span>ASSIGNED</span><span>DUE</span><span>STATUS</span><span>PROGRESS</span><span>SCORE</span><span>ATTEMPTS</span><span>DONE</span>
+              <span>QUIZ</span><span>REP / TEAM</span><span>ASSIGNED</span><span>DUE</span>
+              <span title="Resolved state of the latest assignment: Not Started, In Progress (attempted, not passed), Completed (passed), or Overdue (past due, not passed).">STATUS</span>
+              <span title="Binary for this assignment: 0% until the quiz is passed, 100% once passed. Quizzes have no partial progress.">PROGRESS</span>
+              <span title="Latest and best score from attempts made after this assignment's assigned date.">SCORE</span>
+              <span title="Number of attempts made after this assignment's assigned date.">ATTEMPTS</span>
+              <span title="Date of the first passing attempt after this assignment's assigned date.">DONE</span>
             </div>
             {rowsForStatusTab.map(row => {
               const sc = QUIZ_STATUS_CONFIG[row.status];
@@ -13259,7 +13311,10 @@ function QuizTrackingPanel({ quizzes, orgUsers, tenantId, isReal, refreshKey, on
               // failed-but-attempted quiz is exactly where a manager most
               // needs to see the question-by-question breakdown (Self-Paced
               // Quiz audit: Manager Review — no ambiguity).
-              const isClickable = row.attemptCount > 0;
+              // Clickable whenever there's ANY attempt on record (full lifetime
+              // history), so a fresh reassignment row still opens the drill-down
+              // showing prior instances' attempts — not just this window's.
+              const isClickable = (row.allAttempts?.length ?? row.attemptCount) > 0;
               return (
                 <div key={row.key} style={{ minWidth: 980, display: "grid", gridTemplateColumns: "1.8fr 1.2fr 0.75fr 0.75fr 0.85fr 0.8fr 1fr 0.6fr 0.85fr", gap: 10, padding: "13px 16px", background: C.white, borderTop: `1px solid ${C.border}`, alignItems: "center" }}>
                   <div style={{ minWidth: 0 }}>
@@ -13360,20 +13415,37 @@ function QuizzesScreen({ role, onNav, quizzes, onEditQuiz, onDeleteQuiz, onToggl
           (a.assignedTo.type === "team"       && userTeamId && userTeamId === a.assignedTo.teamId)
         )
       );
-      return mine.map(a => {
-        const quiz = quizzes.find(q => q.id === a.contentId);
-        if (!quiz) return null;
-        return {
+      // One card per quiz: dedupe assignment rows to the LATEST per quiz and
+      // resolve its status through the shared engine helper — a prior pass no
+      // longer hides a later reassignment, and a failed current assignment is
+      // one Retry, never a second card.
+      const rowsByContent = new Map();
+      for (const a of mine) {
+        if (!rowsByContent.has(a.contentId)) rowsByContent.set(a.contentId, []);
+        rowsByContent.get(a.contentId).push(a);
+      }
+      const out = [];
+      for (const [contentId, rows] of rowsByContent) {
+        const quiz = quizzes.find(q => q.id === contentId);
+        if (!quiz) continue;
+        const attemptsForQuiz = (sharedAssignmentData?.quizAttempts ?? []).filter(at => at.quiz_id === contentId);
+        const r = resolveLatestQuizAssignment(rows, attemptsForQuiz);
+        const a = r.latest;
+        out.push({
           ...quiz,
-          id:         quiz.id,
-          title:      quiz.name,
-          dueAt:      a.dueAt === "Open" ? null : a.dueAt,
-          assignedAt: a.assignedAt,
-          required:   a.required,
-          attempts:   [],
-        };
-      }).filter(Boolean);
-    }, [isReal, currentUser, sharedAssignmentData?.assignments, quizzes]);
+          id:             quiz.id,
+          title:          quiz.name,
+          dueAt:          a.dueAt === "Open" ? null : a.dueAt,
+          assignedAt:     a.assignedAt,
+          required:       a.required,
+          attempts:       [],
+          resolvedStatus: r.status,                 // not_started | in_progress | completed | overdue
+          isComplete:     r.status === "completed", // canonical, instance-aware (latest assignment)
+          scopedAttempts: r.scopedAttempts,         // attempts AFTER the latest assignment (newest first)
+        });
+      }
+      return out;
+    }, [isReal, currentUser, sharedAssignmentData?.assignments, sharedAssignmentData?.quizAttempts, quizzes]);
 
     // Attempt history keyed by quiz_id — source of truth for retake detection.
     // For real users, comes from userQuizAttempts (DB-backed, shared).
@@ -13557,16 +13629,23 @@ function QuizzesScreen({ role, onNav, quizzes, onEditQuiz, onDeleteQuiz, onToggl
     // ── Tab filter ──
     // For real users, attempt history comes from userQuizAttempts (DB-backed).
     // quiz.attempts is always [] for real users — only used as demo fallback.
+    // "Done" is instance-aware for real users: resolvedStatus === "completed"
+    // (a PASS at/after the LATEST assignment), NOT a lifetime passed attempt —
+    // so a reassignment after an old pass correctly reappears as To Do. Demo
+    // has no assignment instances, so it keeps its passed-attempt shortcut.
+    const isQuizDone = (quiz) => isReal
+      ? quiz.resolvedStatus === "completed"
+      : (userQuizAttempts[quiz.id] ?? quiz.attempts).some(a => a.passed);
+
     const tabFiltered = searchFiltered.filter(quiz => {
-      const attempts = userQuizAttempts[quiz.id] ?? quiz.attempts;
-      const isDone   = attempts.some(a => a.passed);
+      const isDone = isQuizDone(quiz);
       if (tab === "todo")      return !isDone;
       if (tab === "completed") return isDone;
       return true;
     });
 
-    const todoCount      = searchFiltered.filter(q => !(userQuizAttempts[q.id] ?? q.attempts).some(a => a.passed)).length;
-    const completedCount = searchFiltered.filter(q =>  (userQuizAttempts[q.id] ?? q.attempts).some(a => a.passed)).length;
+    const todoCount      = searchFiltered.filter(q => !isQuizDone(q)).length;
+    const completedCount = searchFiltered.filter(q =>  isQuizDone(q)).length;
 
     return (
       <div style={{ display: "flex", flexDirection: "column", gap: 20 }}>
@@ -13618,13 +13697,16 @@ function QuizzesScreen({ role, onNav, quizzes, onEditQuiz, onDeleteQuiz, onToggl
         ) : (
           <div style={{ display: "flex", flexDirection: "column", gap: 12 }}>
             {tabFiltered.map(quiz => {
-              // For real users, use DB-backed attempt history (keyed by quiz_id, ordered DESC).
-              // For demo users, fall back to quiz.attempts (ordered ascending, last = most recent).
-              const attempts    = userQuizAttempts[quiz.id] ?? quiz.attempts;
+              // Real users: scope the card's state to the LATEST assignment
+              // instance (quiz.scopedAttempts = attempts at/after it), so a
+              // fresh reassignment reads "Start" (not "Resume/Retry") even when
+              // older lifetime attempts exist, and Retry shows only for a failed
+              // attempt on THIS assignment. Demo keeps its lifetime attempts.
+              const attempts    = isReal ? (quiz.scopedAttempts ?? []) : quiz.attempts;
               const lastAttempt = attempts.length > 0
-                ? (userQuizAttempts[quiz.id] != null ? attempts[0] : attempts[attempts.length - 1])
+                ? (isReal ? attempts[0] : attempts[attempts.length - 1])
                 : null;
-              const isPassed    = lastAttempt?.passed ?? false;
+              const isPassed    = isReal ? (quiz.resolvedStatus === "completed") : (lastAttempt?.passed ?? false);
               const hasTried    = attempts.length > 0;
               const dueStatus   = getDueStatus(quiz.dueAt);
               const progress    = getDueProgress(quiz.assignedAt, quiz.dueAt);

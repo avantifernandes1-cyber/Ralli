@@ -245,3 +245,77 @@ export function resolveAssignmentStatus(contentType, assignment, data = {}) {
 export function isEligibleForReassignment(contentType, assignment, data = {}) {
   return resolveAssignmentStatus(contentType, assignment, data).isResolved;
 }
+
+// ─────────────────────────────────────────────────────────────────────────────
+// LATEST-ASSIGNMENT DEDUPE (one actionable quiz per user + quiz)
+// ─────────────────────────────────────────────────────────────────────────────
+
+/**
+ * Given every quiz assignment row that targets ONE user for ONE quiz (an
+ * original plus any reassignments), plus that user's attempts on that quiz,
+ * collapse them to the single LATEST applicable assignment and resolve it.
+ *
+ * Why: a resolved-by-failure or previously-passed assignment stays in
+ * tenant_assignments as history, and a manager may reassign after resolution.
+ * Surfacing every row independently double-counts one quiz (Home over-counts;
+ * a stale lifetime pass makes To Do hide a new reassignment). This is the one
+ * shared reduction so Home, Quizzes → To Do, and the manager table agree.
+ *
+ * It does NOT re-implement resolution — status/progress/completedAt come from
+ * resolveAssignmentStatus(), and the attempt gate is the same isQualifyingEvent()
+ * every other consumer uses. History is preserved: the older rows come back in
+ * `older`, and the caller keeps the full attempt list for drill-down.
+ *
+ * Deterministic selection: newest `assigned_at`, tie-broken by descending id,
+ * so the same set always collapses to the same row.
+ *
+ * Metrics are scoped to the latest assignment's window (attempts at/after its
+ * assigned_at) — a "Not Started" reassignment never shows a prior instance's
+ * score/attempts as if they belonged to it.
+ *
+ * @param {Array<Object>} assignments - quiz assignment rows (app or raw shape) for ONE user + quiz
+ * @param {Array<{created_at: string, passed: boolean, score?: number}>} attempts - that user's attempts on that quiz
+ * @returns {{
+ *   latest: Object|null, older: Array<Object>,
+ *   status: 'not_started'|'in_progress'|'completed'|'overdue', isActive: boolean, isResolved: boolean,
+ *   progress: number, completedAt: string|null,
+ *   scopedAttempts: Array<Object>, attemptCount: number, latestScore: number|null, bestScore: number|null
+ * }}
+ */
+export function resolveLatestQuizAssignment(assignments = [], attempts = []) {
+  if (!assignments || assignments.length === 0) {
+    return {
+      latest: null, older: [],
+      status: "not_started", isActive: false, isResolved: false,
+      progress: 0, completedAt: null,
+      scopedAttempts: [], attemptCount: 0, latestScore: null, bestScore: null,
+    };
+  }
+
+  const sorted = [...assignments].sort((a, b) => {
+    const ta = new Date(assignedAtOf(a) ?? 0).getTime();
+    const tb = new Date(assignedAtOf(b) ?? 0).getTime();
+    if (tb !== ta) return tb - ta;                       // newest assigned_at first
+    return String(b?.id ?? "").localeCompare(String(a?.id ?? "")); // deterministic id tie-break
+  });
+  const latest = sorted[0];
+  const older  = sorted.slice(1);
+
+  const resolved = resolveAssignmentStatus("quiz", latest, { attempts });
+
+  const assignedAtRaw  = assignedAtOf(latest);
+  const scopedAttempts = (attempts ?? [])
+    .filter(at => isQualifyingEvent(at.created_at, assignedAtRaw))
+    .slice()
+    .sort((x, y) => new Date(y.created_at).getTime() - new Date(x.created_at).getTime()); // newest first
+  const attemptCount = scopedAttempts.length;
+  const latestScore  = scopedAttempts[0]?.score ?? null;
+  const bestScore    = scopedAttempts.length ? Math.max(...scopedAttempts.map(at => at.score ?? 0)) : null;
+
+  return {
+    latest, older,
+    status: resolved.status, isActive: resolved.isActive, isResolved: resolved.isResolved,
+    progress: resolved.progress, completedAt: resolved.completedAt,
+    scopedAttempts, attemptCount, latestScore, bestScore,
+  };
+}
