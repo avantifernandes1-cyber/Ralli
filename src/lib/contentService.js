@@ -269,6 +269,10 @@ function dbToQuiz(row) {
     // rankd-app.jsx's `quiz.passingScore ?? 90`). Do NOT default it here —
     // that would silently change existing quizzes' effective passing score.
     passingScore: typeof row.passing_score === "number" ? row.passing_score : null,
+    // Server-computed, questions-only revision hash (migration 054). The quiz-
+    // taking flow submits the revision it loaded so the server can reject a
+    // submission graded against questions that changed mid-attempt.
+    questionRevision: row.question_revision ?? null,
     createdAt:  row.created_at ? new Date(row.created_at).toLocaleDateString("en-US", { month: "short", day: "numeric", year: "numeric" }) : "—",
   };
 }
@@ -1176,6 +1180,36 @@ export async function submitQuizAttemptAtomic(tenantId, userId, quizId, attempt,
     p_passed:          attempt.passed ?? false,
     p_answers:         attempt.answers ?? [],
     p_idempotency_key: idempotencyKey ?? null,
+  });
+  return { data, error };
+}
+
+/**
+ * Server-authoritative quiz submission (Input Authority Hardening — Area 1,
+ * migration 054). Unlike submitQuizAttemptAtomic(), this does NOT trust a
+ * client-computed score/passed: the server recomputes both from the canonical
+ * questions (mirroring isAnswerCorrect), rejects a submission whose loaded
+ * `expectedRevision` no longer matches the quiz (mid-attempt edit), and stamps
+ * trusted provenance the client cannot forge. Identity is derived server-side
+ * from auth.uid() — no user id is passed.
+ *
+ * Returns data.status: 'ok' (attempt persisted, use data.attempt/server_score)
+ * or 'quiz_changed' (nothing persisted; caller should reload the quiz).
+ *
+ * @param {string} tenantId
+ * @param {string} quizId
+ * @param {Array}  answers            - [{ questionId, selected, ... }] in question order
+ * @param {string} expectedRevision   - quiz.questionRevision loaded at attempt start
+ * @param {string} idempotencyKey      - stable per quiz-taking session
+ */
+export async function submitQuizAttemptAtomicV2(tenantId, quizId, answers, expectedRevision, idempotencyKey) {
+  if (!tenantId || !quizId) return { data: null, error: new Error("Missing required params") };
+  const { data, error } = await supabase.rpc("submit_quiz_attempt_atomic_v2", {
+    p_tenant_id:         tenantId,
+    p_quiz_id:           quizId,
+    p_answers:           answers ?? [],
+    p_expected_revision: expectedRevision ?? null,
+    p_idempotency_key:   idempotencyKey ?? null,
   });
   return { data, error };
 }

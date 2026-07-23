@@ -61,6 +61,7 @@ import {
   getArchivedContent,
   getTenantLessonCompletions,
   submitQuizAttemptAtomic,
+  submitQuizAttemptAtomicV2,
   getUserQuizAttempts,
   getTenantQuizAttempts,
   getTenantBcCategories,
@@ -12234,7 +12235,7 @@ function QuizTakingView({ quiz, onComplete, onExit }) {
         quiz.questions[i].type !== "open" && isAnswerCorrect(quiz.questions[i], a.selected)
       ).length;
       const score   = gradedTotal > 0 ? Math.round((correctCount / gradedTotal) * 100) : 100;
-      const attempt = { id: `at${Date.now()}`, date: new Date().toISOString().slice(0,10), score, passed: score >= (quiz.passingScore ?? 90), answers: answerList, submissionId: submissionIdRef.current };
+      const attempt = { id: `at${Date.now()}`, date: new Date().toISOString().slice(0,10), score, passed: score >= (quiz.passingScore ?? 100), answers: answerList, submissionId: submissionIdRef.current };
       onComplete(attempt);
     } else {
       // Self-Paced Quiz Timers — reset timeLeft in this SAME batch as
@@ -12635,14 +12636,12 @@ function QuizResultsView({ quiz, attempt, onRetake, onBack, showRetake = true, s
   ).length;
   const passed  = attempt.passed;
   // Effective passing score for display — must mirror the exact fallback rule
-  // QuizTakingView.next() already uses when computing attempt.passed
-  // (quiz.passingScore ?? 90), so the copy shown here can never disagree with
-  // the rule that actually decided pass/fail. Legacy quizzes saved before the
-  // passingScore column existed have passingScore === null/undefined and
-  // correctly keep showing the old 90% fallback; quizzes with a saved value
-  // (new quizzes default to 100, existing quizzes keep whatever was set) show
-  // that value instead.
-  const effectivePassingScore = typeof quiz.passingScore === "number" ? quiz.passingScore : 90;
+  // QuizTakingView.next() uses when computing the provisional attempt.passed
+  // (quiz.passingScore ?? 100) AND the server's authoritative default
+  // (COALESCE(passing_score, 100), migration 054), so the copy shown here can
+  // never disagree with either. Default is 100 per PRODUCT_DECISIONS.md; quizzes
+  // with a saved passing_score keep whatever was set.
+  const effectivePassingScore = typeof quiz.passingScore === "number" ? quiz.passingScore : 100;
 
   return (
     <div style={{ maxWidth: 640, margin: "0 auto", display: "flex", flexDirection: "column", gap: 20 }}>
@@ -13456,10 +13455,24 @@ function QuizzesScreen({ role, onNav, quizzes, onEditQuiz, onDeleteQuiz, onToggl
       // retry or a double-click on Finish can never insert a second attempt
       // row or award XP twice; the RPC just returns the original result.
       if (isReal && currentUser?.id && tenantId) {
-        submitQuizAttemptAtomic(tenantId, currentUser.id, activeId, attempt, attempt.submissionId)
+        // Input Authority Hardening — Area 1: submit through the server-
+        // authoritative v2 RPC. The server recomputes score/passed from the
+        // canonical questions (client score/passed is now provisional display
+        // only) and rejects a submission graded against questions that changed
+        // mid-attempt (status 'quiz_changed'), keyed on the revision loaded
+        // with the quiz. attempt.answers is [{questionId, selected, ...}].
+        submitQuizAttemptAtomicV2(tenantId, activeId, attempt.answers, activeQuiz?.questionRevision, attempt.submissionId)
           .then(({ data, error }) => {
             if (error) {
-              console.error("[ralli] submitQuizAttemptAtomic failed:", error);
+              console.error("[ralli] submitQuizAttemptAtomicV2 failed:", error);
+              return;
+            }
+            if (data?.status === "quiz_changed") {
+              // Questions changed while this attempt was in progress — nothing
+              // was persisted or awarded. Prompt a reload instead of silently
+              // grading against different questions.
+              toast.error("This quiz changed while you were taking it. Please reload and try again.");
+              loadUserQuizData?.();
               return;
             }
             const savedAttempt = data?.attempt;
