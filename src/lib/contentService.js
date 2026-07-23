@@ -1184,6 +1184,42 @@ export async function submitQuizAttemptAtomic(tenantId, userId, quizId, attempt,
   return { data, error };
 }
 
+// ── Learner-safe quiz access (Answer Confidentiality — Stage 1, migration 055) ──
+// Learners NEVER receive canonical answers. These RPCs are the only learner read
+// path for quiz content/history; managers keep the full canonical reads above.
+
+/** Sanitized library/assignment metadata for the caller — one call, no answer bodies. */
+export async function listQuizzesForLearner() {
+  const { data, error } = await supabase.rpc("list_quizzes_for_learner");
+  return { data: data ?? null, error };
+}
+
+/** Playable, sanitized quiz (no answer keys) + question_revision for one assigned quiz. */
+export async function getQuizForAttempt(quizId) {
+  if (!quizId) return { data: null, error: new Error("Missing quizId") };
+  const { data, error } = await supabase.rpc("get_quiz_for_attempt", { p_quiz_id: quizId });
+  return { data: data ?? null, error };
+}
+
+/**
+ * The caller's OWN quiz-attempt SUMMARIES (no answers, no snapshots, no other
+ * users' rows) — for Home / To-Do / assignment status / history lists. Learner
+ * screens use this instead of getUserQuizAttempts(), whose raw rows include the
+ * answers JSON (legacy rows carry canonical `correct` there). Detailed review is
+ * a separate, pass-gated call (getQuizReview).
+ */
+export async function getMyQuizAttemptsSafe() {
+  const { data, error } = await supabase.rpc("list_my_quiz_attempts_safe");
+  return { data: data ?? null, error };
+}
+
+/** The caller's own attempt history; canonical answers revealed only after an official pass. */
+export async function getQuizReview(quizId) {
+  if (!quizId) return { data: null, error: new Error("Missing quizId") };
+  const { data, error } = await supabase.rpc("get_quiz_review", { p_quiz_id: quizId });
+  return { data: data ?? null, error };
+}
+
 /**
  * Server-authoritative quiz submission (Input Authority Hardening — Area 1,
  * migration 054). Unlike submitQuizAttemptAtomic(), this does NOT trust a
@@ -1245,10 +1281,38 @@ export async function getUserQuizAttempts(tenantId, userId) {
 export async function getTenantQuizAttempts(tenantId) {
   const { data, error } = await supabase
     .from("quiz_attempts")
-    .select("id, user_id, quiz_id, score, passed, attempt_num, answers, created_at")
+    // grading_provenance/verified_revision let the manager drill-down tell a
+    // trusted (server_v2, snapshot-backed) attempt from a legacy one, so it can
+    // reveal the immutable historical answer key instead of guessing.
+    .select("id, user_id, quiz_id, score, passed, attempt_num, answers, created_at, grading_provenance, verified_revision")
     .eq("tenant_id", tenantId)
     .order("created_at", { ascending: false });
   return { data, error };
+}
+
+/**
+ * Immutable per-attempt solution snapshots for a set of attempts, keyed by
+ * attempt_id. Managers/admins read these directly (RLS: quiz_attempt_solutions
+ * qas_select_manager). This is the manager drill-down's ONLY source of the
+ * historical answer key — never the quiz's current mutable questions — so a
+ * quiz edited after the attempt can't retroactively rewrite what the rep was
+ * graded against. Attempts without a snapshot (legacy) simply won't appear in
+ * the returned map, and the UI degrades honestly.
+ *
+ * @param {string[]} attemptIds
+ * @returns {Promise<{ data: Object<string, Array>|null, error: Object|null }>}
+ */
+export async function getAttemptSolutions(attemptIds) {
+  const ids = Array.isArray(attemptIds) ? attemptIds.filter(Boolean) : [];
+  if (ids.length === 0) return { data: {}, error: null };
+  const { data, error } = await supabase
+    .from("quiz_attempt_solutions")
+    .select("attempt_id, solution")
+    .in("attempt_id", ids);
+  if (error) return { data: null, error };
+  const byAttempt = {};
+  for (const row of data ?? []) byAttempt[String(row.attempt_id)] = row.solution;
+  return { data: byAttempt, error: null };
 }
 
 // ─────────────────────────────────────────────────────────────────────────────

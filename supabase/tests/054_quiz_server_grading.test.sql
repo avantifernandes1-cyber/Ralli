@@ -66,12 +66,14 @@ BEGIN
     {"questionId":"q5","selected":[{"leftIdx":0,"rightText":"1"},{"leftIdx":1,"rightText":"2"}]},
     {"questionId":"q6","selected":"essay"}]'::jsonb, rev, gen_random_uuid());
   ASSERT (r->>'server_score')='100' AND (r->>'server_passed')='true', 'all-correct 100/passed';
-  -- sanitized answers: client "correct":999/"isCorrect":false must be overwritten by server truth
-  a := (r->'attempt'->'answers')->0;   -- q1
-  ASSERT (a->>'correct')='1', 'q1 correct overwritten to canonical 1 (was 999)';
+  -- learner-safe answers (migration 055): response answers are top-level, carry
+  -- selected + server isCorrect, and NEVER the canonical correct. Any client
+  -- "correct"/"isCorrect" is ignored.
+  a := (r->'answers')->0;   -- q1
+  ASSERT NOT (a ? 'correct'), 'q1 canonical correct NOT returned (learner-safe)';
   ASSERT (a->>'isCorrect')='true', 'q1 server isCorrect=true';
   ASSERT (a->'selected')::text='1', 'q1 selected preserved';
-  ASSERT ((r->'attempt'->'answers')->5->>'isCorrect') IS NULL, 'open isCorrect NULL (manual)';
+  ASSERT ((r->'answers')->5->>'isCorrect') IS NULL, 'open isCorrect NULL (manual)';
 
   -- one wrong -> 80, fail against default 100
   r := public.submit_quiz_attempt_atomic_v2('00000000-0000-0000-0000-0000000000a0','00000000-0000-0000-0000-0000000000f1','[
@@ -139,7 +141,7 @@ BEGIN
     {"questionId":"q4","selected":5},{"questionId":"q5","selected":[{"leftIdx":0,"rightText":"1"},{"leftIdx":1,"rightText":"2"}]},
     {"questionId":"q6","selected":"x"}]'::jsonb, rev, key);
   ASSERT (r1->>'alreadyRecorded')='false' AND (r2->>'alreadyRecorded')='true', 'idempotent dedup';
-  ASSERT (r1->>'pointsAwarded')::int > 0 AND (r2->>'pointsAwarded')='0', 'XP awarded once, not on the dedup';
+  ASSERT (r1->>'pointsAwarded')::int > 0 AND (r2->>'alreadyRecorded')='true' AND NOT (r2 ? 'pointsAwarded'), 'XP awarded once; dedup awards none';
   SELECT count(*) INTO att FROM public.quiz_attempts WHERE idempotency_key=key;
   ASSERT att=1, 'exactly one attempt for the key';
   SELECT grading_provenance INTO prov FROM public.quiz_attempts WHERE idempotency_key=key;
