@@ -11,6 +11,7 @@ import {
   hasAnswerKeys,
   metaToCatalogQuiz,
   metaListToCatalog,
+  questionCountOf,
   rpcQuizToTakeable,
   matchColumns,
   buildSubmissionAnswers,
@@ -55,6 +56,24 @@ const canonicalSolution = [
   ok("1d hasAnswerKeys(false) on sanitized", hasAnswerKeys(sanitizedRpc.questions) === false);
   ok("1e hasAnswerKeys(true) on canonical", hasAnswerKeys(canonicalSolution) === true);
   eq("1f metaListToCatalog maps + drops nulls", metaListToCatalog([{ id: "a", name: "A", question_count: 1 }, null]).length, 1);
+}
+
+// ── 1b. questionCountOf: explicit count first (learner), canonical fallback ───
+{
+  // Learner metadata cards (NO questions body) — must use server questionCount.
+  eq("1b-0 learner meta 0 questions", questionCountOf(metaToCatalogQuiz({ id: "q", name: "Q", question_count: 0 })), 0);
+  eq("1b-1 learner meta 1 question",  questionCountOf(metaToCatalogQuiz({ id: "q", name: "Q", question_count: 1 })), 1);
+  eq("1b-n learner meta multiple",    questionCountOf(metaToCatalogQuiz({ id: "q", name: "Q", question_count: 6 })), 6);
+  ok("1b learner meta has no questions body", !("questions" in metaToCatalogQuiz({ id: "q", name: "Q", question_count: 6 })));
+  // Manager/admin canonical objects (no questionCount) — fall back to length.
+  eq("1b-mgr-0 canonical empty", questionCountOf({ id: "q", questions: [] }), 0);
+  eq("1b-mgr-1 canonical one",   questionCountOf({ id: "q", questions: [{ id: "a", type: "mc", correct: 0 }] }), 1);
+  eq("1b-mgr-n canonical many",  questionCountOf({ id: "q", questions: sanitizedRpc.questions }), 6);
+  // Agreement: same quiz, learner-meta count == manager-canonical length.
+  eq("1b agree learner==manager", questionCountOf(metaToCatalogQuiz({ id: "q", name: "Q", question_count: 6 })), questionCountOf({ questions: sanitizedRpc.questions }));
+  // Robust to junk.
+  eq("1b null → 0", questionCountOf(null), 0);
+  eq("1b no fields → 0", questionCountOf({ id: "q" }), 0);
 }
 
 // ── 2. Sanitized quiz round-trips; every type preserved, no keys ─────────────

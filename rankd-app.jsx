@@ -81,6 +81,7 @@ import {
 import { resolveAssignmentStatus, resolveLatestQuizAssignment, isQualifyingEvent, daysUntilDue } from "./src/lib/assignmentEngine.js";
 import {
   metaListToCatalog,
+  questionCountOf,
   rpcQuizToTakeable,
   matchColumns,
   buildSubmissionAnswers,
@@ -1440,7 +1441,7 @@ function PersonalDashboardScreen({
                     <div style={{ display: "flex", gap: 10, marginTop: 4, fontSize: 12, color: C.textSub }}>
                       {contentKind === "course" && <span>{(content.lessonIds ?? []).length} lessons</span>}
                       {contentKind === "lesson" && content.duration && <span>⏱ {content.duration}</span>}
-                      {contentKind === "quiz"   && <span>{(content.questions ?? []).length} questions</span>}
+                      {contentKind === "quiz"   && <span>{questionCountOf(content)} questions</span>}
                       {(content.xp || content.xp === 0) && <span style={{ color: C.orange, fontWeight: 600 }}>+{content.xp} XP</span>}
                       {item.dueAt && item.dueAt !== "Open" && <span>Due {item.dueAt}</span>}
                     </div>
@@ -14151,7 +14152,7 @@ function QuizzesScreen({ role, onNav, quizzes, onEditQuiz, onDeleteQuiz, onToggl
                       {quiz.description && <p style={{ margin: "0 0 6px", fontSize: 12, color: C.textSub }}>{quiz.description}</p>}
                       <div style={{ display: "flex", gap: 12, flexWrap: "wrap" }}>
                         <span style={{ fontSize: 12, color: C.textMuted }}>{quiz.track}</span>
-                        <span style={{ fontSize: 12, color: C.textMuted }}>{quiz.questionCount ?? quiz.questions?.length ?? 0} questions</span>
+                        <span style={{ fontSize: 12, color: C.textMuted }}>{questionCountOf(quiz)} questions</span>
                         <span style={{ fontSize: 12, color: diffColors[quiz.difficulty] ?? C.textMuted, fontWeight: 700 }}>{quiz.difficulty}</span>
                         <span style={{ fontSize: 12, fontWeight: 700, color: C.orange }}>+{quiz.xp} XP</span>
                         {lastAttempt && <span style={{ fontSize: 12, color: C.textMuted }}>Last score: {lastAttempt.score}%</span>}

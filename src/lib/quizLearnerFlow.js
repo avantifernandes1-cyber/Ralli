@@ -57,6 +57,20 @@ export function metaListToCatalog(list) {
 }
 
 /**
+ * The ONE safe question-count resolver for any quiz shape. Prefers the explicit
+ * server-derived `questionCount` (learner metadata cards — which deliberately
+ * carry NO `questions` body), and falls back to `questions.length` ONLY for
+ * canonical manager/admin quiz objects. This lets Home, To-Do, the catalog, and
+ * every learner summary show the real count without ever fetching answer-bearing
+ * question bodies just to display a number.
+ */
+export function questionCountOf(quiz) {
+  if (!quiz || typeof quiz !== "object") return 0;
+  if (typeof quiz.questionCount === "number") return quiz.questionCount;
+  return Array.isArray(quiz.questions) ? quiz.questions.length : 0;
+}
+
+/**
  * get_quiz_for_attempt() payload → the quiz object QuizTakingView consumes.
  * Questions are already sanitized by the server; we only rename the snake_case
  * revision and expose `passingScore`. We assert (defensively) that nothing
