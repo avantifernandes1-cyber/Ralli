@@ -23531,7 +23531,14 @@ export default function App() {
   // never reuses a stale quiz. Role-gated exactly like the bootstrap load: a
   // learner refreshes sanitized metadata (no answers), never the canonical
   // catalog; the fresh sanitized quiz + revision are fetched at Start/Retake.
-  const refreshQuizzes = useCallback(() => {
+  //
+  // MUST be a plain function, not useCallback: this sits AFTER the `if
+  // (!currentUser) return <LoginScreen/>` early return above, so a hook here is
+  // skipped on the signed-out render and called once signed in — a change in
+  // hook order that unmounts the whole App (white screen on login). It's only
+  // ever called imperatively (never a hook/effect dependency), so per-render
+  // recreation is harmless, matching the sibling handlers in this block.
+  const refreshQuizzes = () => {
     const tid = currentOrg?.id ?? null;
     if (!currentUser?._isReal || !tid) return;
     if (currentUser.role === "user") {
@@ -23539,7 +23546,7 @@ export default function App() {
     } else {
       getTenantQuizzes(tid).then(({ data }) => { if (data !== null) setQuizzes(data); });
     }
-  }, [currentUser, currentOrg?.id]);
+  };
 
   const handleDeleteQuiz = async (id) => {
     // Demo / non-UUID path: synchronous localStorage behavior unchanged
