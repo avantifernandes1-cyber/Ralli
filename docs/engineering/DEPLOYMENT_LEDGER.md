@@ -56,5 +56,31 @@ user production approval. Ledger row 19.
 
 **Security status:** application data flow is learner-safe. Raw REST/API SELECT confidentiality is
 **not yet closed** — `tenant_quizzes_select` and `quiz_attempts_tenant_read` still permit a learner's
-own direct reads. That is closed only by migration **056** (legacy-SELECT revocation), which is **not
-created and not applied**. Legacy access remains intact and unrevoked.
+own direct reads. (Sequencing note: the RLS legacy-SELECT revocation was renumbered to migration
+**057** — a migration is atomic and cannot mix an "apply now" RPC change with an "apply later" RLS
+change; 057 is not created/applied. Migration **056** below is the RPC-only Stage A.)
+
+## 2026-07-24 — Answer confidentiality Stage A (RPC sanitization + tag RPC 056)
+
+Branch `fix/readiness-versioning` @ `7162411` ("fix: sanitize quiz review answers + learner-safe
+insight sources"). Applied via one controlled `apply_migration` (Strategy A). SHA-256 re-confirmed
+against the committed HEAD blob immediately before application.
+
+| Order | Prod version (ledger) | Prod name | Git file | Commit | SQL SHA-256 | Applied (UTC) | Verification |
+|---|---|---|---|---|---|---|---|
+| 7 | `20260724184808` | 056_quiz_learner_safe_insights | supabase/migrations/056_quiz_learner_safe_insights.sql | 7162411 | 2efe302b35d80cb0a7cf3c22e5fe1bae18d9a2837b9ba18b9c8da8b7a6f6727f | 2026-07-24 18:48:08 | PASS — see below |
+
+**Verification (all read-only, post-apply):**
+- Objects: `get_quiz_review(uuid)` replaced; `_quiz_answers_learner_safe(jsonb)` + `list_quiz_tags_for_learner()` created, correct signatures.
+- Leak closed: as the affected learner (56dafe93) on a quiz with pre-055 server_v2 + legacy attempts, `get_quiz_review` returns `revealAvailable=false`, **0** canonical keys across all answers (was >0 pre-056), every answer projected to `{questionId, selected, isCorrect, timeSpent}`, `solutionsByAttempt={}` before a pass.
+- Reveal source: `get_quiz_review` reads `quiz_attempt_solutions` only (never `tenant_quizzes`) — snapshot-only reveal (structural; prod has no official pass to exercise live).
+- `list_quiz_tags_for_learner` = exactly `eligible ∪ own-attempt-history`, tenant-scoped, no extra/missing rows, no other-user widening, no cross-tenant.
+- Grants: `get_quiz_review` + `list_quiz_tags_for_learner` EXECUTE = authenticated only (anon denied); `_quiz_answers_learner_safe` locked from authenticated + anon.
+- No side effects: RLS policies on `tenant_quizzes`/`quiz_attempts`/`quiz_attempt_solutions` **unchanged** (baseline); table SELECT grants unchanged (9); **0** non-internal triggers; **0 rows changed by the migration** (the 2 newest attempts predate the 18:48:08 apply; 056 contains no DML). Legacy `submit_quiz_attempt_atomic` intact.
+- Current production app operational: `main` (legacy) does not call these RPCs and reads tables directly (unchanged) → unaffected; applying 056 pre-merge is backward compatible.
+
+Operator: applied by Claude Code via the controlled Supabase `apply_migration` tool, under explicit
+user production approval. Ledger row 20.
+
+**Not done:** RLS lockdown migration **057** not created/applied; frontend not merged/deployed to
+production; nothing else committed or pushed. Migration 055 unmodified.
