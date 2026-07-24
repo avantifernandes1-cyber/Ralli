@@ -29,4 +29,32 @@ is expected. The mapping in this table is the reconciliation of record.
 **Deferred (not applied):** `038_realtime_tenant_assignments` (unapplied historically) and the
 `027` dedup index (possible divergence) — each to be handled as a separate future forward migration.
 
-**Not done post-054:** migration 055 (legacy revocation) not created; branch not pushed; preview not deployed.
+**Not done post-054:** branch not pushed; preview not deployed. (The legacy-SELECT
+**revocation** is migration **056**, not yet created — see below; 055 is the additive
+learner-safe access layer.)
+
+## 2026-07-24 — Answer confidentiality Stage 1 (learner-safe quiz access 055)
+
+Branch `fix/readiness-versioning` @ HEAD `1c1d6ce` (055 committed in `1c1d6ce`, "fix: protect
+learner quiz answers"). Applied via one controlled `apply_migration` call under Strategy A.
+SHA-256 re-confirmed against the committed HEAD blob immediately before application.
+
+| Order | Prod version (ledger) | Prod name | Git file | Commit | SQL SHA-256 | Applied (UTC) | Verification |
+|---|---|---|---|---|---|---|---|
+| 6 | `20260724000340` | 055_learner_safe_quiz_access | supabase/migrations/055_learner_safe_quiz_access.sql | 1c1d6ce | cc3c09a381e55f0a4bbbbba31ddc36a23d43978c42a9de4c246b7a00f747f941 | 2026-07-24 00:03:40 | PASS — see below |
+
+**Verification (all read-only, post-apply):**
+- Backfill: **1** snapshot total = the single exact-revision-match `server_v2` attempt; 1 v2-mismatch + 25 legacy remain unsnapshotted; 0 snapshots on untrusted rows.
+- Learner RPCs present, `SECURITY DEFINER`, EXECUTE = authenticated only (anon/public denied): `list_quizzes_for_learner`, `get_quiz_for_attempt`, `get_quiz_review`, `list_my_quiz_attempts_safe`; internal helpers `_quiz_sanitize_for_attempt`/`_quiz_learner_can_access` locked (no anon/authenticated/public EXECUTE).
+- `submit_quiz_attempt_atomic_v2`: writes the immutable snapshot in-transaction, stores `isCorrect` (no canonical `correct`), returns learner-safe object (no `to_jsonb(v_attempt)`).
+- `quiz_attempt_solutions`: RLS enabled; single policy `qas_select_manager` (SELECT, manager/admin only); **no** INSERT/UPDATE/DELETE policy; no non-internal triggers.
+- Legacy path intact: `submit_quiz_attempt_atomic` present; `quiz_attempts` (`own_insert`, `tenant_read`) and `tenant_quizzes` (select/insert/update/delete) policies **unchanged**.
+- No unrelated schema change; no migration-056 objects; readiness pipeline inert (`readiness_recalc_queue` = 0 rows; 0 non-internal triggers on quiz tables).
+
+Operator: applied by Claude Code via the controlled Supabase `apply_migration` tool, under explicit
+user production approval. Ledger row 19.
+
+**Security status:** application data flow is learner-safe. Raw REST/API SELECT confidentiality is
+**not yet closed** — `tenant_quizzes_select` and `quiz_attempts_tenant_read` still permit a learner's
+own direct reads. That is closed only by migration **056** (legacy-SELECT revocation), which is **not
+created and not applied**. Legacy access remains intact and unrevoked.
