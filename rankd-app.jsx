@@ -61,7 +61,12 @@ import {
   getArchivedContent,
   getTenantLessonCompletions,
   submitQuizAttemptAtomic,
-  getUserQuizAttempts,
+  submitQuizAttemptAtomicV2,
+  listQuizzesForLearner,
+  getQuizForAttempt,
+  getQuizReview,
+  getMyQuizAttemptsSafe,
+  getAttemptSolutions,
   getTenantQuizAttempts,
   getTenantBcCategories,
   getTenantBattleCards,
@@ -73,7 +78,19 @@ import {
   updateLastSeenAssignmentsAt,
   subscribeToTenantAssignments,
 } from "./src/lib/contentService.js";
-import { resolveAssignmentStatus, isQualifyingEvent, daysUntilDue } from "./src/lib/assignmentEngine.js";
+import { resolveAssignmentStatus, resolveLatestQuizAssignment, isQualifyingEvent, daysUntilDue } from "./src/lib/assignmentEngine.js";
+import {
+  metaListToCatalog,
+  questionCountOf,
+  rpcQuizToTakeable,
+  matchColumns,
+  buildSubmissionAnswers,
+  interpretSubmit,
+  buildAttemptReview,
+  buildLearnerReviewModel,
+  buildManagerAttemptReview,
+  reviewRows,
+} from "./src/lib/quizLearnerFlow.js";
 import { getProfile, createMissingProfile, getTenantProfiles } from "./src/lib/profileService.js";
 import { sendInviteEmail } from "./src/lib/emailService.js";
 import { provisionTenant, buildInviteUrl, normalizeProvisionedOrg, createMemberInvite } from "./src/lib/provisioningService.js";
@@ -665,7 +682,11 @@ function useSharedUserAssignmentData(tenantId, userId, enabled) {
     Promise.all([
       getTenantAssignments(tenantId),
       getLessonCompletionsWithDates(userId),
-      getUserQuizAttempts(tenantId, userId),
+      // Answer confidentiality: learner list/status/history need only summaries.
+      // getMyQuizAttemptsSafe returns the caller's own attempts WITHOUT the
+      // answers JSON (legacy rows carry canonical `correct` there); raw
+      // quiz_attempts rows never reach a learner's browser.
+      getMyQuizAttemptsSafe(),
     ]).then(([{ data: a }, { data: done }, { data: attempts }]) => {
       if (a) { setAssignments(a); setLoadedAt(Date.now()); }
       if (done) setLessonCompletionsAt(done);
@@ -815,7 +836,25 @@ function HomeScreen({ user, onNav, quizAssignments = [], onResumeLesson, onStart
         (a.assignedTo?.type === "individual" && a.assignedTo?.userId === user?.id)   ||
         (a.assignedTo?.type === "team"       && userTeamId && userTeamId === a.assignedTo?.teamId)
       );
-      return mine.map(a => {
+      // Dedupe quiz assignments to the LATEST per quiz (one actionable card per
+      // quiz) via the shared engine helper, so a resolved-by-failure original +
+      // its reassignment don't both count as pending. Lesson/course rows pass
+      // through unchanged.
+      const quizRowsByContent = new Map();
+      const dedupedMine = [];
+      for (const a of mine) {
+        if (a.contentType === "quiz") {
+          if (!quizRowsByContent.has(a.contentId)) quizRowsByContent.set(a.contentId, []);
+          quizRowsByContent.get(a.contentId).push(a);
+        } else {
+          dedupedMine.push(a);
+        }
+      }
+      for (const [contentId, rows] of quizRowsByContent) {
+        const latest = resolveLatestQuizAssignment(rows, homeQuizAttempts.filter(at => at.quiz_id === contentId)).latest;
+        if (latest) dedupedMine.push(latest);
+      }
+      return dedupedMine.map(a => {
         const isCourse = a.contentType === "course";
         const isLesson = a.contentType === "lesson";
         const content  = isCourse ? homeCourses.find(c => c.id === a.contentId)
@@ -942,8 +981,9 @@ function PersonalDashboardScreen({
   useEffect(() => {
     if (!isReal || !tenantId || !user?.id) { setPerfLoading(false); return; }
     Promise.all([
-      getUserPerformance(tenantId, user.id),
-      getRepTopicScores(tenantId, user.id),
+      // Own performance/topics → learner-safe RPC source (survives migration 057).
+      getUserPerformance(tenantId, user.id, { safe: true }),
+      getRepTopicScores(tenantId, user.id, { safe: true }),
       supabase
         .from("user_point_events")
         // Task 18 — quiz_attempt_id (added 041_quiz_attempt_id_on_point_events.sql)
@@ -1045,14 +1085,38 @@ function PersonalDashboardScreen({
   // QuizResultsView-based review modal, so there's one review experience, not two.
   const openAttemptReview = (quiz, rawAttempt) => {
     if (!quiz || !rawAttempt) return;
-    const quizForReview = isReal ? { ...quiz, title: quiz.name ?? quiz.title } : quiz;
-    const attempt = isReal ? {
-      score: rawAttempt.score, passed: rawAttempt.passed, answers: rawAttempt.answers ?? [],
-      date: rawAttempt.created_at
-        ? new Date(rawAttempt.created_at).toLocaleDateString("en-US", { month: "short", day: "numeric", year: "numeric" })
-        : "",
-    } : rawAttempt; // demo attempts already have { score, passed, answers, date }
-    setActivityReview({ quiz: quizForReview, attempt });
+    if (!isReal) {
+      // Demo — canonical seed quiz, rendered by QuizResultsView as before.
+      setActivityReview({ mode: "demo", quiz, attempt: rawAttempt });
+      return;
+    }
+    // Real learner — answer key is pass-gated and comes ONLY from the immutable
+    // snapshot via get_quiz_review. The SANITIZED current questions (no answer
+    // keys) are fetched only to LABEL a trusted attempt's rows so a failed
+    // review shows the real prompt; legacy attempts get no labels and degrade
+    // honestly. The learner's browser never receives canonical answer keys here.
+    const quizName = quiz.name ?? quiz.title ?? "Quiz";
+    const fmt = (iso) => { try { return new Date(iso).toLocaleDateString("en-US", { month: "short", day: "numeric", year: "numeric" }); } catch { return ""; } };
+    setActivityReview({ mode: "loading", quizName });
+    Promise.allSettled([getQuizReview(quiz.id), getQuizForAttempt(quiz.id)])
+      .then(([revRes, quizRes]) => {
+        const review = revRes.status === "fulfilled" ? revRes.value : { data: null, error: revRes.reason };
+        if (review.error || !review.data) { setActivityReview({ mode: "error", quizName, quizId: quiz.id }); return; }
+        const sanitized = (quizRes.status === "fulfilled" && !quizRes.value.error && quizRes.value.data)
+          ? (rpcQuizToTakeable(quizRes.value.data)?.questions ?? null) : null;
+        const m = buildLearnerReviewModel({ reviewData: review.data, attemptId: rawAttempt.id, sanitizedQuestions: sanitized });
+        if (!m) { setActivityReview({ mode: "error", quizName, quizId: quiz.id }); return; }
+        setActivityReview({
+          mode: "real", quizName, quizId: quiz.id,
+          model: {
+            attempt:     { score: m.score, passed: m.passed, date: fmt(m.createdAt) },
+            rows:        m.rows,
+            reveal:      m.reveal,
+            unavailable: m.unavailable,
+          },
+        });
+      })
+      .catch(() => setActivityReview({ mode: "error", quizName, quizId: quiz.id }));
   };
 
   // ── Demo topic scores derived from USER_GAME_HISTORY answers ──────────────
@@ -1170,6 +1234,8 @@ function PersonalDashboardScreen({
       }
       if (!raw) return null;
       return {
+        id:      raw.id,           // needed to match the exact attempt in get_quiz_review
+        created_at: raw.created_at,
         score:   raw.score,
         passed:  raw.passed,
         answers: raw.answers ?? [],
@@ -1186,8 +1252,7 @@ function PersonalDashboardScreen({
     if (info.kind === "quiz") {
       const attempt = findAttemptForEvent(e, info.quiz);
       if (!attempt) return; // no matching attempt on record — safe no-op fallback
-      const quizForReview = isReal ? { ...info.quiz, title: info.quiz.name ?? info.quiz.title } : info.quiz;
-      setActivityReview({ quiz: quizForReview, attempt });
+      openAttemptReview(info.quiz, attempt);
     } else if (info.kind === "lesson") {
       onResumeLesson?.(info.lesson.id);
     } else if (info.kind === "course") {
@@ -1383,7 +1448,7 @@ function PersonalDashboardScreen({
                     <div style={{ display: "flex", gap: 10, marginTop: 4, fontSize: 12, color: C.textSub }}>
                       {contentKind === "course" && <span>{(content.lessonIds ?? []).length} lessons</span>}
                       {contentKind === "lesson" && content.duration && <span>⏱ {content.duration}</span>}
-                      {contentKind === "quiz"   && <span>{(content.questions ?? []).length} questions</span>}
+                      {contentKind === "quiz"   && <span>{questionCountOf(content)} questions</span>}
                       {(content.xp || content.xp === 0) && <span style={{ color: C.orange, fontWeight: 600 }}>+{content.xp} XP</span>}
                       {item.dueAt && item.dueAt !== "Open" && <span>Due {item.dueAt}</span>}
                     </div>
@@ -1638,7 +1703,9 @@ function PersonalDashboardScreen({
         )}
       </Card>
 
-      {/* ── Recent Activity: quiz review modal — reuses the existing QuizResultsView ── */}
+      {/* ── Recent Activity: quiz review modal ──
+          Demo → canonical QuizResultsView. Real learners → answer-safe
+          SnapshotQuizReview built from get_quiz_review (pass-gated snapshot). */}
       {activityReview && (
         <div
           onClick={() => setActivityReview(null)}
@@ -1650,12 +1717,28 @@ function PersonalDashboardScreen({
             style={{ background: C.white, borderRadius: C.radius, width: "100%", maxWidth: 680,
               maxHeight: "90vh", overflowY: "auto", boxShadow: "0 8px 40px rgba(11,18,32,0.18)", padding: 24 }}
           >
-            <QuizResultsView
-              quiz={activityReview.quiz}
-              attempt={activityReview.attempt}
-              onRetake={() => { const id = activityReview.quiz.id; setActivityReview(null); onStartQuiz?.(id); }}
-              onBack={() => setActivityReview(null)}
-            />
+            {activityReview.mode === "demo" ? (
+              <QuizResultsView
+                quiz={activityReview.quiz}
+                attempt={activityReview.attempt}
+                onRetake={() => { const id = activityReview.quiz.id; setActivityReview(null); onStartQuiz?.(id); }}
+                onBack={() => setActivityReview(null)}
+              />
+            ) : activityReview.mode === "loading" ? (
+              <LoadingState rows={3} message="Loading your results…" />
+            ) : activityReview.mode === "error" ? (
+              <ErrorState message="We couldn't load these results. Please try again." onRetry={() => setActivityReview(null)} />
+            ) : activityReview.mode === "real" ? (
+              <SnapshotQuizReview
+                quizName={activityReview.quizName}
+                attempt={activityReview.model.attempt}
+                rows={activityReview.model.rows}
+                reveal={activityReview.model.reveal}
+                unavailable={activityReview.model.unavailable}
+                onRetake={() => { const id = activityReview.quizId; setActivityReview(null); onStartQuiz?.(id); }}
+                onBack={() => setActivityReview(null)}
+              />
+            ) : null}
           </div>
         </div>
       )}
@@ -11925,7 +12008,15 @@ function MatchCard({ ri, placedLeftIdx, revealed, isPicked, isDragged, rightText
 }
 
 // ── QuizTakingView ────────────────────────────────────────────────────────────
-function QuizTakingView({ quiz, onComplete, onExit }) {
+// Answer-confidentiality (migration 055): for real learners this view renders a
+// SANITIZED quiz (no answer keys) and shows ONLY neutral "Answer locked"
+// confirmation — never green/red correctness, the correct answer, explanations,
+// targets/tolerance, accepted answers, or the matching solution — and never
+// computes a client-side score/pass (the server grades). Demo mode passes
+// `revealFeedback` to keep its original teach-as-you-go per-question feedback on
+// its own canonical seed data. Default is the safe (neutral) mode: if the prop
+// is ever omitted, a learner cannot leak an answer.
+function QuizTakingView({ quiz, onComplete, onExit, revealFeedback = false }) {
   const mobile = useMobile(); // matching is the first two-column layout in this view — needs to stack on narrow screens
   const [qIdx,          setQIdx]          = useState(0);
   const [answers,       setAnswers]       = useState({});
@@ -11987,9 +12078,16 @@ function QuizTakingView({ quiz, onComplete, onExit }) {
     setMatchPicked(null);
     setMatchDrag(null);
     setMatchOverZone(null);
-    setShuffledRight(q.type === "match" && q.pairs?.length
-      ? [...q.pairs].sort(() => Math.random() - 0.5)
-      : []);
+    // Right-hand answer pool as an array of STRINGS. Learner-safe sanitized
+    // quizzes already carry an INDEPENDENTLY SHUFFLED, decoupled `rightChoices`
+    // (server-side, so the client never sees the pairing) — used as-is. Demo's
+    // canonical `pairs` are shuffled here client-side, as before.
+    setShuffledRight((() => {
+      if (q.type !== "match") return [];
+      const { rightChoices } = matchColumns(q);
+      if (Array.isArray(q.rightChoices) && q.rightChoices.length) return rightChoices.slice();
+      return [...rightChoices].sort(() => Math.random() - 0.5);
+    })());
     // Self-Paced Quiz Timers — fresh countdown for the question that just
     // became active. A question with no timeLimit (legacy data) gets `null`,
     // which the countdown effect below treats as "no timer" rather than 0s.
@@ -12043,16 +12141,24 @@ function QuizTakingView({ quiz, onComplete, onExit }) {
   const sliderVal = sliderDraft !== null ? sliderDraft
     : (selected !== null ? selected : Math.round((sliderMin + sliderMax) / 2));
 
-  // Match helpers
+  // Match helpers. Prompts come from the sanitized `leftItems` (learner) or the
+  // canonical `pairs` (demo). A canonical prompt also carries `.right` (the
+  // solution) — referenced ONLY under `fb` (feedback) below, never in learner mode.
   const matchPairs   = Array.isArray(selected) ? selected : [];
-  const matchPrompts = q.pairs ?? [];
+  const matchPrompts = (Array.isArray(q.pairs) && q.pairs.length)
+    ? q.pairs
+    : matchColumns(q).leftItems.map(left => ({ left }));
   const matchAllDone = matchPrompts.length > 0 && matchPairs.length >= matchPrompts.length;
   const getPairForLeft  = (li) => matchPairs.find(mp => mp.leftIdx === li);
   const getPairForRight = (ri) => matchPairs.find(mp => mp.rightIdx === ri);
 
-  // Correctness per type — delegates to the same logic used in results/scoring.
-  const isCorrect = revealed && isAnswerCorrect(q, selected);
-  const isWrong = revealed && !isCorrect && selected !== null;
+  // Feedback gating. `revealed` == this question is answered/locked (drives
+  // progression + input disabling for BOTH modes). `fb` == also SHOW correctness
+  // — demo only. In learner mode fb is always false, so no answer key, colour,
+  // or explanation is ever read or rendered, and isAnswerCorrect() is never called.
+  const showFeedback = !!revealFeedback;
+  const fb = revealed && showFeedback;
+  const isCorrect = fb && isAnswerCorrect(q, selected);
 
   const choose = (idx) => {
     if (revealed) return;
@@ -12096,10 +12202,10 @@ function QuizTakingView({ quiz, onComplete, onExit }) {
       if (sourcePair && sourcePair.leftIdx === targetLeftIdx) return prev;
       const targetPair  = current.find(mp => mp.leftIdx === targetLeftIdx);   // what's currently in the target slot (undefined = empty)
       const next = current.filter(mp => mp.rightIdx !== rightIdx && mp.leftIdx !== targetLeftIdx);
-      next.push({ leftIdx: targetLeftIdx, rightIdx, rightText: shuffledRight[rightIdx]?.right });
+      next.push({ leftIdx: targetLeftIdx, rightIdx, rightText: shuffledRight[rightIdx] });
       if (targetPair && sourcePair) {
         // True swap: the card displaced from the target slot takes the dragged card's old slot.
-        next.push({ leftIdx: sourcePair.leftIdx, rightIdx: targetPair.rightIdx, rightText: shuffledRight[targetPair.rightIdx]?.right });
+        next.push({ leftIdx: sourcePair.leftIdx, rightIdx: targetPair.rightIdx, rightText: shuffledRight[targetPair.rightIdx] });
       }
       // If targetPair existed but sourcePair didn't (card came from the pool), the
       // displaced card simply isn't re-added — it returns to the pool.
@@ -12216,25 +12322,24 @@ function QuizTakingView({ quiz, onComplete, onExit }) {
 
   const next = () => {
     if (isLast) {
-      const answerList = quiz.questions.map(ques => ({
-        questionId: ques.id,
-        selected:   answers[ques.id] ?? null,
-        correct:    ques.correct,
-        // Self-Paced Quiz Timers — seconds actually spent, only present for
-        // questions that had a timeLimit (see the `revealed`-keyed effect
-        // above). Purely additive to the existing answer shape.
-        timeSpent:  answerTimes[ques.id] ?? null,
-      }));
-      // Open-ended questions are manually graded — there is no in-app grader here,
-      // so they're excluded entirely from the automatic score (not counted right,
-      // not counted wrong, not counted toward the denominator). A quiz with 4
-      // graded questions + 1 open-ended response scores out of 4, not 5.
-      const gradedTotal   = quiz.questions.filter(ques => ques.type !== "open").length;
-      const correctCount  = answerList.filter((a, i) =>
-        quiz.questions[i].type !== "open" && isAnswerCorrect(quiz.questions[i], a.selected)
-      ).length;
-      const score   = gradedTotal > 0 ? Math.round((correctCount / gradedTotal) * 100) : 100;
-      const attempt = { id: `at${Date.now()}`, date: new Date().toISOString().slice(0,10), score, passed: score >= (quiz.passingScore ?? 90), answers: answerList, submissionId: submissionIdRef.current };
+      // Server-safe submission: one entry per question, matching decoupled to
+      // {leftIdx, rightText}, NO canonical `correct`. This is exactly what
+      // submit_quiz_attempt_atomic_v2 grades.
+      const answerList = buildSubmissionAnswers(quiz.questions, answers, answerTimes);
+      // Client score/pass are computed ONLY for demo (revealFeedback) — demo has
+      // canonical seed data and no server. Real learners submit and let the
+      // server grade; onComplete ignores any client score for real users, so we
+      // leave them null here (there are no answer keys to score against anyway).
+      let score = null, passed = null;
+      if (showFeedback) {
+        const gradedTotal  = quiz.questions.filter(ques => ques.type !== "open").length;
+        const correctCount = quiz.questions.filter(ques =>
+          ques.type !== "open" && isAnswerCorrect(ques, answers[ques.id] ?? null)
+        ).length;
+        score  = gradedTotal > 0 ? Math.round((correctCount / gradedTotal) * 100) : 100;
+        passed = score >= (quiz.passingScore ?? 100);
+      }
+      const attempt = { id: `at${Date.now()}`, date: new Date().toISOString().slice(0,10), score, passed, answers: answerList, submissionId: submissionIdRef.current };
       onComplete(attempt);
     } else {
       // Self-Paced Quiz Timers — reset timeLeft in this SAME batch as
@@ -12252,6 +12357,11 @@ function QuizTakingView({ quiz, onComplete, onExit }) {
       setRevealed(false);
     }
   };
+
+  // Learner mode shows NO per-question message once an answer is locked — the
+  // learner's own selection stays visible (highlighted option / disabled input /
+  // placed cards) and the Next button appears immediately, with no "Answer
+  // locked" text, no correctness, and no feedback pause.
 
   return (
     <div style={{ maxWidth: 640, margin: "0 auto", display: "flex", flexDirection: "column", gap: 20 }}>
@@ -12306,12 +12416,12 @@ function QuizTakingView({ quiz, onComplete, onExit }) {
               autoFocus
               style={{
                 width: "100%", boxSizing: "border-box", padding: "14px 16px", borderRadius: 12,
-                border: `2px solid ${revealed ? (isCorrect ? C.trueGreen : "#EF4444") : C.creamBorder}`,
-                background: revealed ? (isCorrect ? "#DCFCE7" : "#FEE2E2") : C.pageBg,
+                border: `2px solid ${fb ? (isCorrect ? C.trueGreen : "#EF4444") : C.creamBorder}`,
+                background: fb ? (isCorrect ? "#DCFCE7" : "#FEE2E2") : C.pageBg,
                 color: C.text, fontSize: 15, fontWeight: 600, outline: "none", fontFamily: "inherit",
               }}
             />
-            {revealed && (
+            {fb ? (
               <div style={{ padding: "10px 14px", borderRadius: 10, background: isCorrect ? "#F0FDF4" : "#FFF7ED", border: `1px solid ${isCorrect ? "#86EFAC" : C.creamBorder}`, fontSize: 13 }}>
                 {isCorrect
                   ? <strong style={{ color: "#166534" }}>Correct!</strong>
@@ -12319,7 +12429,7 @@ function QuizTakingView({ quiz, onComplete, onExit }) {
                 }
                 {q.explanation && <p style={{ margin: "6px 0 0", fontSize: 12, color: C.textSub, lineHeight: 1.6 }}>{q.explanation}</p>}
               </div>
-            )}
+            ) : null}
             {!revealed && (
               <button onClick={commitType} disabled={!textDraft.trim()} style={{
                 padding: "12px 28px", borderRadius: 12, border: "none", alignSelf: "flex-end",
@@ -12327,7 +12437,7 @@ function QuizTakingView({ quiz, onComplete, onExit }) {
                 color: textDraft.trim() ? "#fff" : C.textMuted,
                 fontSize: 14, fontWeight: 700, cursor: textDraft.trim() ? "pointer" : "default",
               }}>
-                Check Answer
+                {showFeedback ? "Check Answer" : "Submit Answer"}
               </button>
             )}
           </div>
@@ -12335,7 +12445,7 @@ function QuizTakingView({ quiz, onComplete, onExit }) {
           /* ── Slider ── */
           <div style={{ display: "flex", flexDirection: "column", gap: 16 }}>
             <div style={{ textAlign: "center" }}>
-              <span style={{ fontSize: 36, fontWeight: 900, lineHeight: 1, color: revealed ? (isCorrect ? "#166534" : C.red) : C.orange }}>{sliderVal}</span>
+              <span style={{ fontSize: 36, fontWeight: 900, lineHeight: 1, color: fb ? (isCorrect ? "#166534" : C.red) : C.orange }}>{sliderVal}</span>
               <div style={{ fontSize: 12, color: C.textMuted, marginTop: 4 }}>{sliderMin} – {sliderMax}</div>
             </div>
             <input type="range" min={sliderMin} max={sliderMax} step={q.step ?? 1} value={sliderVal} disabled={revealed}
@@ -12346,22 +12456,22 @@ function QuizTakingView({ quiz, onComplete, onExit }) {
               <span>{q.minLabel ? `${q.minLabel} (${sliderMin})` : sliderMin}</span>
               <span>{q.maxLabel ? `${q.maxLabel} (${sliderMax})` : sliderMax}</span>
             </div>
-            {revealed && (
+            {fb ? (
               <div style={{ padding: "10px 14px", borderRadius: 10, background: isCorrect ? "#F0FDF4" : "#FFF7ED", border: `1px solid ${isCorrect ? "#86EFAC" : C.creamBorder}`, fontSize: 13, color: C.text }}>
                 <strong style={{ color: isCorrect ? "#166534" : C.orange }}>
                   {isCorrect ? `Correct! Target: ${q.correct ?? 5} ±${q.tolerance ?? 1}` : `Target was ${q.correct ?? 5} ±${q.tolerance ?? 1}.`}
                 </strong>
                 {!isCorrect && <span style={{ color: C.textSub }}> You answered {selected}.</span>}
               </div>
-            )}
-            {revealed && q.explanation && (
+            ) : null}
+            {fb && q.explanation && (
               <div style={{ padding: "12px 16px", borderRadius: 10, background: C.pageBg, border: `1px solid ${C.creamBorder}` }}>
                 <p style={{ margin: 0, fontSize: 13, color: C.text, lineHeight: 1.6 }}>{q.explanation}</p>
               </div>
             )}
             {!revealed && (
               <button onClick={commitSlider} style={{ padding: "12px 28px", borderRadius: 12, border: "none", background: C.orange, color: "#fff", fontSize: 14, fontWeight: 700, cursor: "pointer", alignSelf: "flex-end" }}>
-                Check Answer
+                {showFeedback ? "Check Answer" : "Submit Answer"}
               </button>
             )}
           </div>
@@ -12416,8 +12526,9 @@ function QuizTakingView({ quiz, onComplete, onExit }) {
                     <p style={{ margin: "0 0 4px", fontSize: 10, fontWeight: 700, color: C.textMuted, textTransform: "uppercase", letterSpacing: "0.08em" }}>Prompts</p>
                     {matchPrompts.map((pair, li) => {
                       const pairInfo  = getPairForLeft(li);
-                      const isRevealCorrect = revealed && pairInfo && pairInfo.rightText === pair.right;
-                      const isRevealWrong   = revealed && pairInfo && pairInfo.rightText !== pair.right;
+                      // Correctness (pair.right) is ONLY known/shown in demo feedback mode.
+                      const isRevealCorrect = fb && pairInfo && pairInfo.rightText === pair.right;
+                      const isRevealWrong   = fb && pairInfo && pairInfo.rightText !== pair.right;
                       const isOver = matchOverZone === li;
                       const canDrop = matchPicked !== null || (matchDrag && matchDrag.moved);
                       let zoneBorder = C.creamBorder, zoneBg = "transparent";
@@ -12458,7 +12569,7 @@ function QuizTakingView({ quiz, onComplete, onExit }) {
                                     ri={pairInfo.rightIdx} placedLeftIdx={li} revealed={revealed} C={C}
                                     isPicked={matchPicked === pairInfo.rightIdx}
                                     isDragged={matchDrag?.rightIdx === pairInfo.rightIdx && matchDrag.moved}
-                                    rightText={shuffledRight[pairInfo.rightIdx]?.right}
+                                    rightText={shuffledRight[pairInfo.rightIdx]}
                                     onStartDrag={startMatchDrag} onActivateKey={handleCardActivate} onUnplace={unplaceMatchCard}
                                   />
                                 </div>
@@ -12497,7 +12608,7 @@ function QuizTakingView({ quiz, onComplete, onExit }) {
                           key={ri} ri={ri} placedLeftIdx={null} revealed={revealed} C={C}
                           isPicked={matchPicked === ri}
                           isDragged={matchDrag?.rightIdx === ri && matchDrag.moved}
-                          rightText={shuffledRight[ri]?.right}
+                          rightText={shuffledRight[ri]}
                           onStartDrag={startMatchDrag} onActivateKey={handleCardActivate} onUnplace={unplaceMatchCard}
                         />
                       ))}
@@ -12512,7 +12623,7 @@ function QuizTakingView({ quiz, onComplete, onExit }) {
                     zIndex: 2000, pointerEvents: "none", width: 180,
                   }}>
                     <div style={ghostCardStyle}>
-                      <span>{shuffledRight[matchDrag.rightIdx]?.right}</span>
+                      <span>{shuffledRight[matchDrag.rightIdx]}</span>
                     </div>
                   </div>
                 )}
@@ -12553,7 +12664,7 @@ function QuizTakingView({ quiz, onComplete, onExit }) {
             />
             {revealed && (
               <div style={{ padding: "10px 14px", borderRadius: 10, background: C.pageBg, border: `1px solid ${C.creamBorder}`, fontSize: 13, color: C.textSub }}>
-                <strong style={{ color: C.text }}>Response recorded.</strong> Open-ended answers are reviewed manually and aren't auto-scored.
+                <strong style={{ color: C.text }}>Submitted.</strong> Open-ended answers are reviewed manually and aren't auto-scored.
               </div>
             )}
             {!revealed && (
@@ -12577,14 +12688,18 @@ function QuizTakingView({ quiz, onComplete, onExit }) {
                 : String(opt ?? "").trim();
               const isBlank     = !optLabel.trim();
               const isSelected  = selected === i;
-              const isRight     = revealed && i === q.correct;
-              const isThisWrong = revealed && isSelected && i !== q.correct;
+              const isRight     = fb && i === q.correct;
+              const isThisWrong = fb && isSelected && i !== q.correct;
+              // Neutral "this is the answer I locked in" highlight — shown before
+              // reveal (both modes) and, in learner mode, after locking too. It
+              // conveys the learner's own choice, never correctness.
+              const isPick      = isSelected && (!revealed || !showFeedback);
               if (isBlank) console.warn("[ralli] Invalid quiz option", { quizId: quiz.id, questionId: q.id, optionIndex: i, originalOption: opt });
               let bg = C.cardBg, border = C.creamBorder, color = C.text;
-              if (isRight)                 { bg = "#DCFCE7"; border = C.trueGreen; color = "#166534"; }
-              if (isThisWrong)             { bg = "#FEE2E2"; border = "#EF4444";   color = "#991B1B"; }
-              if (!revealed && isSelected) { bg = C.orangeLight; border = C.orange; }
-              if (isBlank)                 { bg = C.pageBg;  border = C.muted; }
+              if (isRight)     { bg = "#DCFCE7"; border = C.trueGreen; color = "#166534"; }
+              if (isThisWrong) { bg = "#FEE2E2"; border = "#EF4444";   color = "#991B1B"; }
+              if (isPick)      { bg = C.orangeLight; border = C.orange; }
+              if (isBlank)     { bg = C.pageBg;  border = C.muted; }
               return (
                 <button key={i} onClick={() => !isBlank && choose(i)} disabled={isBlank} style={{
                   display: "flex", alignItems: "center", gap: 12, padding: "12px 16px", borderRadius: 12,
@@ -12592,7 +12707,7 @@ function QuizTakingView({ quiz, onComplete, onExit }) {
                   cursor: revealed || isBlank ? "default" : "pointer", textAlign: "left", width: "100%",
                   transition: "all 0.15s", opacity: isBlank ? 0.45 : 1,
                 }}>
-                  <div style={{ width: 28, height: 28, borderRadius: "50%", flexShrink: 0, display: "flex", alignItems: "center", justifyContent: "center", fontSize: 12, fontWeight: 800, background: isRight ? C.trueGreen : isThisWrong ? "#EF4444" : (!revealed && isSelected) ? C.orange : C.muted, color: (isRight || isThisWrong || (!revealed && isSelected)) ? "#fff" : C.textMuted }}>
+                  <div style={{ width: 28, height: 28, borderRadius: "50%", flexShrink: 0, display: "flex", alignItems: "center", justifyContent: "center", fontSize: 12, fontWeight: 800, background: isRight ? C.trueGreen : isThisWrong ? "#EF4444" : isPick ? C.orange : C.muted, color: (isRight || isThisWrong || isPick) ? "#fff" : C.textMuted }}>
                     {isRight ? "✓" : isThisWrong ? "✗" : String.fromCharCode(65 + i)}
                   </div>
                   {isBlank
@@ -12605,8 +12720,10 @@ function QuizTakingView({ quiz, onComplete, onExit }) {
           </div>
         )}
 
-        {/* Explanation — MC/TF/Match only (slider, type show feedback inline; open isn't graded; unsupported types show their own notice) */}
-        {revealed && !isSlider && !isType && !isOpen && isKnownType && q.explanation && (
+        {/* Explanation — MC/TF/Match only, DEMO feedback mode only (learner mode
+            never reveals the explanation). Slider/type show feedback inline;
+            open isn't graded; unsupported types show their own notice. */}
+        {fb && !isSlider && !isType && !isOpen && isKnownType && q.explanation && (
           <div style={{ marginTop: 16, padding: "12px 16px", borderRadius: 10, background: isCorrect ? "#F0FDF4" : "#FFF7ED", border: `1px solid ${isCorrect ? "#86EFAC" : C.creamBorder}` }}>
             <p style={{ margin: 0, fontSize: 13, color: C.text, lineHeight: 1.6 }}><strong style={{ color: isCorrect ? "#166534" : C.orange }}>{isCorrect ? "Correct" : "Not quite"}.</strong> {q.explanation}</p>
           </div>
@@ -12635,14 +12752,12 @@ function QuizResultsView({ quiz, attempt, onRetake, onBack, showRetake = true, s
   ).length;
   const passed  = attempt.passed;
   // Effective passing score for display — must mirror the exact fallback rule
-  // QuizTakingView.next() already uses when computing attempt.passed
-  // (quiz.passingScore ?? 90), so the copy shown here can never disagree with
-  // the rule that actually decided pass/fail. Legacy quizzes saved before the
-  // passingScore column existed have passingScore === null/undefined and
-  // correctly keep showing the old 90% fallback; quizzes with a saved value
-  // (new quizzes default to 100, existing quizzes keep whatever was set) show
-  // that value instead.
-  const effectivePassingScore = typeof quiz.passingScore === "number" ? quiz.passingScore : 90;
+  // QuizTakingView.next() uses when computing the provisional attempt.passed
+  // (quiz.passingScore ?? 100) AND the server's authoritative default
+  // (COALESCE(passing_score, 100), migration 054), so the copy shown here can
+  // never disagree with either. Default is 100 per PRODUCT_DECISIONS.md; quizzes
+  // with a saved passing_score keep whatever was set.
+  const effectivePassingScore = typeof quiz.passingScore === "number" ? quiz.passingScore : 100;
 
   return (
     <div style={{ maxWidth: 640, margin: "0 auto", display: "flex", flexDirection: "column", gap: 20 }}>
@@ -12784,6 +12899,176 @@ function QuizResultsView({ quiz, attempt, onRetake, onBack, showRetake = true, s
             );
           })}
         </div>
+      </div>
+    </div>
+  );
+}
+
+// ── SnapshotQuizReview ────────────────────────────────────────────────────────
+// Answer-confidentiality-safe results/review renderer (migration 055). Used for
+// the real learner's post-submit results + Home history review, and the manager
+// drill-down. It NEVER recomputes correctness client-side and NEVER reads the
+// quiz's current mutable questions:
+//   • per-question right/wrong comes from the server's stored `isCorrect`;
+//   • the correct answer / explanation is shown ONLY when `reveal` is true and
+//     ONLY from the immutable per-attempt snapshot (`row.solution`);
+//   • when reveal is expected but the snapshot is absent (legacy / pre-snapshot),
+//     `unavailable` shows an honest "Exact historical answer detail unavailable"
+//     — the current quiz is never substituted for historical truth.
+// `rows` is the output of reviewRows(); `attempt` supplies the authoritative
+// score/pass for the header card.
+function SnapshotQuizReview({
+  quizName, attempt, rows = [], reveal = false, unavailable = false, points = null,
+  onRetake, onBack, showRetake = true, showBack = true, backLabel = "← Back to Quizzes", subtitle = null,
+  // Detailed review can load AFTER the (already-accepted) score/pass: 'ready'
+  // shows the rows; 'loading'/'error' keep the server score visible while the
+  // per-question detail is fetched/retried — the score/pass is never lost and
+  // a review-fetch failure NEVER triggers a resubmit.
+  reviewStatus = "ready", onRetryReview = null,
+}) {
+  const gradedRows  = rows.filter(r => r.type !== "open");
+  const correctCount = rows.filter(r => r.isCorrect === true).length;
+  const passed = !!attempt?.passed;
+  const score  = attempt?.score;
+
+  const optionLabel = (opts, idx) =>
+    (Array.isArray(opts) && idx != null && opts[idx] != null) ? String(opts[idx]) : (idx != null ? `Option ${Number(idx) + 1}` : null);
+
+  return (
+    <div style={{ maxWidth: 640, margin: "0 auto", display: "flex", flexDirection: "column", gap: 20 }}>
+      {showBack && (
+        <button onClick={onBack} style={{ background: "none", border: "none", cursor: "pointer", fontSize: 13, fontWeight: 600, color: C.textSub, padding: 0, alignSelf: "flex-start" }}>{backLabel}</button>
+      )}
+
+      {/* Score card — server-authoritative score/pass */}
+      <Card style={{ textAlign: "center", padding: "32px 24px" }}>
+        <div style={{ fontSize: 52, fontWeight: 900, color: passed ? C.trueGreen : C.red, lineHeight: 1 }}>{score}%</div>
+        <div style={{ marginTop: 8, marginBottom: 4, fontSize: 16, fontWeight: 800, color: C.text }}>{quizName}</div>
+        {subtitle && <div style={{ fontSize: 12, color: C.textMuted, marginBottom: 4 }}>{subtitle}</div>}
+        <div style={{ fontSize: 13, color: C.textSub, marginBottom: 16 }}>
+          {correctCount} of {gradedRows.length} correct{attempt?.date ? ` · ${attempt.date}` : ""}
+        </div>
+        <div style={{ display: "inline-flex", alignItems: "center", gap: 8, padding: "6px 16px", borderRadius: 99, background: passed ? "#DCFCE7" : "#FEE2E2", border: `1px solid ${passed ? "#86EFAC" : "#FCA5A5"}` }}>
+          <span style={{ fontSize: 13, fontWeight: 800, color: passed ? "#166534" : "#991B1B" }}>{passed ? "Passed" : "Retry"}</span>
+        </div>
+        {points != null && points > 0 && (
+          <div style={{ marginTop: 12, fontSize: 12, fontWeight: 700, color: C.orange }}>+{points} XP</div>
+        )}
+        {showRetake && onRetake && (
+          <button onClick={onRetake} style={{ marginTop: 20, padding: "10px 24px", borderRadius: 10, border: `1px solid ${C.orange}`, background: C.orangeLight, color: C.orange, fontSize: 13, fontWeight: 700, cursor: "pointer" }}>
+            Retake Quiz
+          </button>
+        )}
+      </Card>
+
+      {/* Honest degrade — no immutable record for this attempt (legacy, or an
+          official pass whose quiz changed before a snapshot existed). Shown
+          regardless of reveal so legacy learner reviews say so plainly. */}
+      {unavailable && (
+        <div style={{ padding: "12px 16px", borderRadius: 10, background: "#FFF7ED", border: `1px solid ${C.creamBorder}`, fontSize: 13, color: C.textSub }}>
+          Exact historical answer detail unavailable for this attempt.
+        </div>
+      )}
+
+      {/* Per-question breakdown */}
+      <div>
+        <div style={{ fontSize: 11, fontWeight: 700, color: C.textMuted, letterSpacing: "0.08em", textTransform: "uppercase", marginBottom: 12 }}>Question Review</div>
+        {reviewStatus === "loading" ? (
+          <LoadingState rows={3} message="Loading your review…" />
+        ) : reviewStatus === "error" ? (
+          <ErrorState message="Your score is saved, but we couldn't load the detailed review. Please try again." onRetry={onRetryReview} />
+        ) : (
+        <div style={{ display: "flex", flexDirection: "column", gap: 10 }}>
+          {rows.map((r, i) => {
+            const isOpenQ  = r.type === "open";
+            const isMatchQ = r.type === "match";
+            const isKnownQ = ["mc", "tf", "type", "slider", "match", "open"].includes(r.type);
+            const sol = r.solution; // canonical, only present when revealing
+            const badgeBg   = (isOpenQ || r.isCorrect == null) ? C.muted   : r.isCorrect ? "#DCFCE7" : "#FEE2E2";
+            const badgeColor= (isOpenQ || r.isCorrect == null) ? C.textSub : r.isCorrect ? "#166534" : "#991B1B";
+            const hasAnswer = isMatchQ
+              ? Array.isArray(r.selected) && r.selected.length > 0
+              : (r.selected !== null && r.selected !== undefined && r.selected !== "");
+            const badgeText = !isKnownQ ? "Unsupported"
+              : isOpenQ ? (hasAnswer ? "Submitted" : "Skipped")
+              : r.isCorrect == null ? "Submitted"
+              : r.isCorrect ? "Correct" : "Incorrect";
+            const borderColor = (isOpenQ || r.isCorrect == null) ? C.creamBorder : r.isCorrect ? C.trueGreen : C.red;
+            const timeLabel = r.timeSpent != null ? `Answered in ${r.timeSpent}s` : null;
+
+            // Submitted answer label (non-matching)
+            let answerLabel = null;
+            if (r.type === "mc" || r.type === "tf") answerLabel = optionLabel(r.options, r.selected);
+            else if (r.type === "type" || r.type === "open") answerLabel = typeof r.selected === "string" ? r.selected : null;
+            else if (r.type === "slider") answerLabel = (r.selected != null ? String(r.selected) : null);
+
+            // Correct-answer label (reveal + snapshot only)
+            let correctLabel = null;
+            if (reveal && sol) {
+              if (r.type === "mc" || r.type === "tf") correctLabel = optionLabel(sol.options, sol.correct);
+              else if (r.type === "type") correctLabel = (sol.acceptedAnswers ?? []).join(", ") || null;
+              else if (r.type === "slider") correctLabel = `${sol.correct ?? 5} ±${sol.tolerance ?? 1}`;
+            }
+
+            return (
+              <Card key={r.questionId ?? i} style={{ borderLeft: `4px solid ${borderColor}` }}>
+                <div style={{ display: "flex", alignItems: "flex-start", justifyContent: "space-between", gap: 12, marginBottom: 4 }}>
+                  <p style={{ margin: 0, fontSize: 14, fontWeight: 600, color: C.text, lineHeight: 1.5 }}>{i + 1}. {r.text || `Question ${i + 1}`}</p>
+                  <span style={{ fontSize: 12, fontWeight: 700, color: badgeColor, flexShrink: 0, padding: "2px 8px", borderRadius: 99, background: badgeBg }}>{badgeText}</span>
+                </div>
+                {timeLabel && <div style={{ fontSize: 11, color: C.textMuted, marginBottom: 8 }}>{timeLabel}</div>}
+
+                {/* Matching — per-pair breakdown (labels from leftItems; correct only when revealing) */}
+                {isMatchQ && (
+                  <div style={{ display: "flex", flexDirection: "column", gap: 6 }}>
+                    {(reveal && Array.isArray(sol?.pairs)
+                      ? sol.pairs.map((pair, li) => {
+                          const mp = (r.selected ?? []).find(m => m.leftIdx === li);
+                          const pairOk = !!mp && mp.rightText === pair.right;
+                          return (
+                            <div key={li} style={{ fontSize: 13, color: pairOk ? "#166534" : "#991B1B" }}>
+                              <strong>{pair.left}</strong> → {mp ? mp.rightText : <em style={{ color: C.textMuted }}>no match</em>}
+                              {!pairOk && <span style={{ color: "#166534" }}> (correct: {pair.right})</span>}
+                            </div>
+                          );
+                        })
+                      : (r.selected ?? []).map((mp, li) => (
+                          <div key={li} style={{ fontSize: 13, color: C.textSub }}>
+                            <strong>{(r.leftItems ?? [])[mp.leftIdx] ?? `Prompt ${mp.leftIdx + 1}`}</strong> → {mp.rightText}
+                          </div>
+                        ))
+                    )}
+                  </div>
+                )}
+
+                {/* Submitted answer (non-matching) */}
+                {!isMatchQ && hasAnswer && (
+                  <div style={{ fontSize: 13, color: isOpenQ ? C.textSub : (r.isCorrect ? "#166534" : "#991B1B") }}>
+                    <strong>Your answer:</strong> {answerLabel || <em style={{ color: C.textMuted }}>—</em>}
+                  </div>
+                )}
+                {!isMatchQ && !hasAnswer && (
+                  <div style={{ fontSize: 13, color: C.textMuted }}><em>No answer submitted.</em></div>
+                )}
+
+                {/* Correct answer — reveal + snapshot only, and only when the learner got it wrong */}
+                {!isMatchQ && reveal && sol && r.isCorrect === false && correctLabel && (
+                  <div style={{ fontSize: 13, color: "#166534", marginTop: 4 }}>
+                    <strong>Correct answer:</strong> {correctLabel}
+                  </div>
+                )}
+
+                {/* Explanation — reveal + snapshot only */}
+                {reveal && sol?.explanation && (
+                  <div style={{ marginTop: 8, padding: "10px 12px", borderRadius: 8, background: C.pageBg, border: `1px solid ${C.creamBorder}` }}>
+                    <p style={{ margin: 0, fontSize: 12, color: C.textSub, lineHeight: 1.6 }}>{sol.explanation}</p>
+                  </div>
+                )}
+              </Card>
+            );
+          })}
+        </div>
+        )}
       </div>
     </div>
   );
@@ -12936,44 +13221,74 @@ function resolveAssignedUsers(assignedTo, orgUsers) {
 // enforces server-side. attemptCount/latestScore intentionally stay
 // ungated — they're a full attempt-history display, not a resolution check.
 function buildQuizAssignmentRows(assignments, attempts, quizzes, orgUsers) {
-  return assignments.flatMap(a => {
+  // ONE primary row per (user, quiz), resolved against the LATEST assignment
+  // instance via the shared engine helper. A quiz reassigned N times to the
+  // same rep is a single row (not N), and every column is scoped to the latest
+  // assignment's window — never a lifetime value masquerading as the current
+  // assignment. Older instances and the FULL attempt history are preserved on
+  // the row (older / allAttempts) for the drill-down.
+  const byUserQuiz = new Map();
+  for (const a of assignments) {
     const quiz = quizzes.find(q => q.id === a.contentId);
-    if (!quiz) return [];
+    if (!quiz) continue;
     const users = resolveAssignedUsers(a.assignedTo, orgUsers);
-    return users.map(u => {
-      const userAttempts = u._isAggregate ? [] : attempts
-        .filter(at => at.quiz_id === a.contentId && at.user_id === u.id)
-        .slice()
-        .sort((x, y) => new Date(y.created_at) - new Date(x.created_at)); // newest first
-      const attemptCount = userAttempts.length;
-      const latestScore  = userAttempts[0]?.score ?? null;
-      const bestScore    = userAttempts.length ? Math.max(...userAttempts.map(at => at.score ?? 0)) : null;
+    for (const u of users) {
+      const key = `${u.id}::${a.contentId}`;
+      if (!byUserQuiz.has(key)) byUserQuiz.set(key, { quiz, user: u, rows: [] });
+      byUserQuiz.get(key).rows.push(a);
+    }
+  }
 
-      const engineResult = u._isAggregate
-        ? { status: "not_started", progress: 0, completedAt: null }
-        : resolveAssignmentStatus("quiz", a, { attempts: userAttempts });
-      // QUIZ_STATUS_CONFIG's internal key for the not-yet-started state is
-      // still "assigned" (wired into statusTab filtering below); its
-      // displayed label is "Not Started" (Assignment Experience Priority 6),
-      // matching the engine's own "not_started" vocabulary.
-      const status = engineResult.status === "not_started" ? "assigned" : engineResult.status;
+  return [...byUserQuiz.values()].map(({ quiz, user, rows }) => {
+    const allAttempts = user._isAggregate ? [] : attempts
+      .filter(at => at.quiz_id === quiz.id && at.user_id === user.id)
+      .slice()
+      .sort((x, y) => new Date(y.created_at) - new Date(x.created_at)); // newest first — full history
 
-      return {
-        key: `${a.id}-${u.id}`,
-        assignment: a, quiz, user: u,
-        attempts: userAttempts, attemptCount, latestScore, bestScore,
-        status, progress: engineResult.progress, completedAt: engineResult.completedAt,
-      };
-    });
+    // Shared reduction: latest assignment + status + metrics scoped to it.
+    const r = resolveLatestQuizAssignment(rows, allAttempts);
+    const latest = r.latest ?? rows[0];
+    // QUIZ_STATUS_CONFIG's internal key for the not-yet-started state is
+    // still "assigned" (wired into the status filter below); its displayed
+    // label is "Not Started", matching the engine's "not_started" vocabulary.
+    const status = r.status === "not_started" ? "assigned" : r.status;
+
+    return {
+      key: `${latest?.id}-${user.id}`,
+      assignment: latest, quiz, user,
+      attempts: r.scopedAttempts,        // scoped to latest assignment — powers Attempts column
+      allAttempts,                        // full lifetime history — powers the drill-down
+      olderAssignments: r.older ?? [],    // prior assignment instances (history)
+      attemptCount: r.attemptCount, latestScore: r.latestScore, bestScore: r.bestScore,
+      status, progress: r.progress, completedAt: r.completedAt,
+    };
   });
 }
 
 // Read-only breakdown of every attempt a rep has made on one quiz — score,
-// completion date, and per-question answers vs. correct answers. Reuses
-// QuizResultsView's grading logic via its read-only mode.
+// completion date, and per-question submission vs. the IMMUTABLE historical
+// answer key. The answer key comes ONLY from each attempt's solution snapshot
+// (quiz_attempt_solutions), never the quiz's current mutable questions, so a
+// quiz edited after the attempt can't rewrite what the rep was graded against.
+// Trusted (server_v2) attempts have a snapshot; legacy attempts don't and
+// degrade honestly ("Exact historical answer detail unavailable").
 function QuizAttemptDrilldown({ row, onBack }) {
-  const { quiz, user, attempts } = row;
+  const { quiz, user } = row;
+  // Drill-down shows the FULL lifetime attempt history (across every
+  // reassignment), not just the latest-assignment window the table scopes to.
+  const attempts = row.allAttempts ?? row.attempts ?? [];
   const [openId, setOpenId] = useState(attempts[0]?.id ?? null);
+  const [snapshots, setSnapshots] = useState(null); // { attemptId: solution[] } | null (loading)
+
+  useEffect(() => {
+    let alive = true;
+    const ids = attempts.map(a => a.id).filter(Boolean);
+    if (ids.length === 0) { setSnapshots({}); return; }
+    getAttemptSolutions(ids)
+      .then(({ data }) => { if (alive) setSnapshots(data ?? {}); })
+      .catch(() => { if (alive) setSnapshots({}); });
+    return () => { alive = false; };
+  }, [row.key]); // eslint-disable-line react-hooks/exhaustive-deps
 
   return (
     <div style={{ display: "flex", flexDirection: "column", gap: 16 }}>
@@ -13015,12 +13330,22 @@ function QuizAttemptDrilldown({ row, onBack }) {
                 </button>
                 {isOpen && (
                   <div style={{ padding: "0 18px 18px", borderTop: `1px solid ${C.creamBorder}` }}>
-                    <QuizResultsView
-                      quiz={{ ...quiz, title: quiz.title ?? quiz.name }}
-                      attempt={{ score: at.score, passed: at.passed, date: dateLabel, answers: at.answers ?? [] }}
-                      showRetake={false}
-                      showBack={false}
-                    />
+                    {snapshots === null ? (
+                      <LoadingState rows={2} message="Loading attempt detail…" />
+                    ) : (() => {
+                      const mar = buildManagerAttemptReview(at, snapshots[String(at.id)]);
+                      return (
+                        <SnapshotQuizReview
+                          quizName={quiz.title ?? quiz.name}
+                          attempt={{ score: at.score, passed: at.passed, date: dateLabel }}
+                          rows={reviewRows({ answers: mar.answers, solution: mar.solution, reveal: mar.reveal })}
+                          reveal={mar.reveal}
+                          unavailable={mar.unavailable}
+                          showRetake={false}
+                          showBack={false}
+                        />
+                      );
+                    })()}
                   </div>
                 )}
               </div>
@@ -13123,7 +13448,8 @@ function QuizTrackingPanel({ quizzes, orgUsers, tenantId, isReal, refreshKey, on
   const [attempts,    setAttempts]    = useState([]);
   const [loading,     setLoading]     = useState(isReal);
   const [loadError,   setLoadError]   = useState(null); // Task 8 — manager tracking data
-  const [statusTab,   setStatusTab]   = useState("assigned");
+  const [statusTab,   setStatusTab]   = useState("all"); // Assignments opens on All
+  const [assigneeFilter, setAssigneeFilter] = useState("all");
   const [search,      setSearch]      = useState("");
   const [selectedKey, setSelectedKey] = useState(null); // row.key of drilled-in assignment
 
@@ -13200,8 +13526,14 @@ function QuizTrackingPanel({ quizzes, orgUsers, tenantId, isReal, refreshKey, on
 
   if (loadError) return <ErrorState message={loadError} onRetry={loadTracking} />;
 
-  const rowsForStatusTab = statusTab === "all" ? searchedRows : statusTab === "drafts" ? [] : searchedRows.filter(r => r.status === statusTab);
-  const draftsToShow = (statusTab === "drafts" || statusTab === "all") ? searchedDrafts : [];
+  const assigneeFiltered = assigneeFilter === "all" ? searchedRows : searchedRows.filter(r => r.user.id === assigneeFilter);
+  const rowsForStatusTab = statusTab === "all" ? assigneeFiltered : assigneeFiltered.filter(r => r.status === statusTab);
+  // Drafts (never-assigned quizzes) show only in the unfiltered All view.
+  const draftsToShow = (statusTab === "all" && assigneeFilter === "all") ? searchedDrafts : [];
+  // Assignee options come from the actual rows (real reps only).
+  const assigneeOptions = [...new Map(allRows.map(r => [r.user.id, r.user])).values()]
+    .filter(u => u && !u._isAggregate && u.id)
+    .sort((a, b) => (a.name ?? "").localeCompare(b.name ?? ""));
 
   return (
     <div style={{ display: "flex", flexDirection: "column", gap: 16 }}>
@@ -13216,24 +13548,31 @@ function QuizTrackingPanel({ quizzes, orgUsers, tenantId, isReal, refreshKey, on
         {search && <button onClick={() => setSearch("")} style={{ background: "none", border: "none", cursor: "pointer", fontSize: 12, color: C.textMuted, padding: 0 }}>✕</button>}
       </div>
 
-      {/* Status tabs */}
-      <div style={{ display: "flex", gap: 6, flexWrap: "wrap" }}>
-        {[
-          ["assigned",    `Not Started (${counts.assigned})`],
-          ["in_progress", `In Progress (${counts.in_progress})`],
-          ["completed",   `Completed (${counts.completed})`],
-          ["overdue",     `Overdue (${counts.overdue})`],
-          ["drafts",      `Drafts (${counts.drafts})`],
-          ["all",         `All (${counts.all})`],
-        ].map(([id, label]) => (
-          <button key={id} onClick={() => setStatusTab(id)} style={{
-            padding: "7px 14px", borderRadius: 8,
-            border: `1px solid ${statusTab === id ? C.orange : C.border}`,
-            background: statusTab === id ? C.orangeLight : C.white,
-            color: statusTab === id ? C.orange : C.textSub,
-            fontSize: 13, fontWeight: 600, cursor: "pointer",
-          }}>{label}</button>
-        ))}
+      {/* Filters — one Status dropdown (exactly the 5 states) + an Assignee dropdown */}
+      <div style={{ display: "flex", gap: 10, flexWrap: "wrap", alignItems: "center" }}>
+        <label style={{ display: "flex", alignItems: "center", gap: 6, fontSize: 12, color: C.textSub, fontWeight: 600 }}>
+          Status
+          <select value={statusTab} onChange={e => setStatusTab(e.target.value)} style={{
+            padding: "7px 12px", borderRadius: 8, border: `1px solid ${C.border}`, background: C.white,
+            color: C.text, fontSize: 13, fontWeight: 600, cursor: "pointer", fontFamily: "inherit",
+          }}>
+            <option value="all">All ({counts.all})</option>
+            <option value="assigned">Not Started ({counts.assigned})</option>
+            <option value="in_progress">In Progress ({counts.in_progress})</option>
+            <option value="completed">Completed ({counts.completed})</option>
+            <option value="overdue">Overdue ({counts.overdue})</option>
+          </select>
+        </label>
+        <label style={{ display: "flex", alignItems: "center", gap: 6, fontSize: 12, color: C.textSub, fontWeight: 600 }}>
+          Assignee
+          <select value={assigneeFilter} onChange={e => setAssigneeFilter(e.target.value)} style={{
+            padding: "7px 12px", borderRadius: 8, border: `1px solid ${C.border}`, background: C.white,
+            color: C.text, fontSize: 13, fontWeight: 600, cursor: "pointer", fontFamily: "inherit", maxWidth: 220,
+          }}>
+            <option value="all">All assignees</option>
+            {assigneeOptions.map(u => <option key={u.id} value={u.id}>{u.name}</option>)}
+          </select>
+        </label>
       </div>
 
       {/* Assignment rows table */}
@@ -13244,7 +13583,12 @@ function QuizTrackingPanel({ quizzes, orgUsers, tenantId, isReal, refreshKey, on
                 content, status, assigned/due, required, progress, completion
                 date — plus quiz-only latest/best score and attempts. */}
             <div style={{ minWidth: 980, display: "grid", gridTemplateColumns: "1.8fr 1.2fr 0.75fr 0.75fr 0.85fr 0.8fr 1fr 0.6fr 0.85fr", gap: 10, padding: "10px 16px", background: C.pageBg, fontSize: 11, fontWeight: 700, color: C.textMuted, letterSpacing: "0.05em" }}>
-              <span>QUIZ</span><span>REP / TEAM</span><span>ASSIGNED</span><span>DUE</span><span>STATUS</span><span>PROGRESS</span><span>SCORE</span><span>ATTEMPTS</span><span>DONE</span>
+              <span>QUIZ</span><span>REP / TEAM</span><span>ASSIGNED</span><span>DUE</span>
+              <span title="Resolved state of the latest assignment: Not Started, In Progress (attempted, not passed), Completed (passed), or Overdue (past due, not passed).">STATUS</span>
+              <span title="Binary for this assignment: 0% until the quiz is passed, 100% once passed. Quizzes have no partial progress.">PROGRESS</span>
+              <span title="Latest and best score from attempts made after this assignment's assigned date.">SCORE</span>
+              <span title="Number of attempts made after this assignment's assigned date.">ATTEMPTS</span>
+              <span title="Date of the first passing attempt after this assignment's assigned date.">DONE</span>
             </div>
             {rowsForStatusTab.map(row => {
               const sc = QUIZ_STATUS_CONFIG[row.status];
@@ -13260,7 +13604,10 @@ function QuizTrackingPanel({ quizzes, orgUsers, tenantId, isReal, refreshKey, on
               // failed-but-attempted quiz is exactly where a manager most
               // needs to see the question-by-question breakdown (Self-Paced
               // Quiz audit: Manager Review — no ambiguity).
-              const isClickable = row.attemptCount > 0;
+              // Clickable whenever there's ANY attempt on record (full lifetime
+              // history), so a fresh reassignment row still opens the drill-down
+              // showing prior instances' attempts — not just this window's.
+              const isClickable = (row.allAttempts?.length ?? row.attemptCount) > 0;
               return (
                 <div key={row.key} style={{ minWidth: 980, display: "grid", gridTemplateColumns: "1.8fr 1.2fr 0.75fr 0.75fr 0.85fr 0.8fr 1fr 0.6fr 0.85fr", gap: 10, padding: "13px 16px", background: C.white, borderTop: `1px solid ${C.border}`, alignItems: "center" }}>
                   <div style={{ minWidth: 0 }}>
@@ -13335,7 +13682,7 @@ function QuizTrackingPanel({ quizzes, orgUsers, tenantId, isReal, refreshKey, on
 }
 
 // ── QuizzesScreen (user branch rewritten, admin branch preserved) ─────────────
-function QuizzesScreen({ role, onNav, quizzes, onEditQuiz, onDeleteQuiz, onToggleFavorite, onToggleActive, pendingQuizId, onClearPendingQuiz, canCreate = true, canEdit = true, canDelete = true, canLaunch = true, canAssign = true, onAssignQuiz, onLaunchQuiz, orgUsers = [], orgs = [], currentUser = null, tenantId = null, isReal = false, quizzesReady = false, sharedAssignmentData = null }) {
+function QuizzesScreen({ role, onNav, quizzes, onEditQuiz, onDeleteQuiz, onToggleFavorite, onToggleActive, pendingQuizId, onClearPendingQuiz, canCreate = true, canEdit = true, canDelete = true, canLaunch = true, canAssign = true, onAssignQuiz, onLaunchQuiz, orgUsers = [], orgs = [], currentUser = null, tenantId = null, isReal = false, quizzesReady = false, sharedAssignmentData = null, onRefreshQuizzes = null }) {
 
   // ── USER VIEW ─────────────────────────────────────────────────────────────
   if (role === "user") {
@@ -13361,20 +13708,37 @@ function QuizzesScreen({ role, onNav, quizzes, onEditQuiz, onDeleteQuiz, onToggl
           (a.assignedTo.type === "team"       && userTeamId && userTeamId === a.assignedTo.teamId)
         )
       );
-      return mine.map(a => {
-        const quiz = quizzes.find(q => q.id === a.contentId);
-        if (!quiz) return null;
-        return {
+      // One card per quiz: dedupe assignment rows to the LATEST per quiz and
+      // resolve its status through the shared engine helper — a prior pass no
+      // longer hides a later reassignment, and a failed current assignment is
+      // one Retry, never a second card.
+      const rowsByContent = new Map();
+      for (const a of mine) {
+        if (!rowsByContent.has(a.contentId)) rowsByContent.set(a.contentId, []);
+        rowsByContent.get(a.contentId).push(a);
+      }
+      const out = [];
+      for (const [contentId, rows] of rowsByContent) {
+        const quiz = quizzes.find(q => q.id === contentId);
+        if (!quiz) continue;
+        const attemptsForQuiz = (sharedAssignmentData?.quizAttempts ?? []).filter(at => at.quiz_id === contentId);
+        const r = resolveLatestQuizAssignment(rows, attemptsForQuiz);
+        const a = r.latest;
+        out.push({
           ...quiz,
-          id:         quiz.id,
-          title:      quiz.name,
-          dueAt:      a.dueAt === "Open" ? null : a.dueAt,
-          assignedAt: a.assignedAt,
-          required:   a.required,
-          attempts:   [],
-        };
-      }).filter(Boolean);
-    }, [isReal, currentUser, sharedAssignmentData?.assignments, quizzes]);
+          id:             quiz.id,
+          title:          quiz.name,
+          dueAt:          a.dueAt === "Open" ? null : a.dueAt,
+          assignedAt:     a.assignedAt,
+          required:       a.required,
+          attempts:       [],
+          resolvedStatus: r.status,                 // not_started | in_progress | completed | overdue
+          isComplete:     r.status === "completed", // canonical, instance-aware (latest assignment)
+          scopedAttempts: r.scopedAttempts,         // attempts AFTER the latest assignment (newest first)
+        });
+      }
+      return out;
+    }, [isReal, currentUser, sharedAssignmentData?.assignments, sharedAssignmentData?.quizAttempts, quizzes]);
 
     // Attempt history keyed by quiz_id — source of truth for retake detection.
     // For real users, comes from userQuizAttempts (DB-backed, shared).
@@ -13396,20 +13760,118 @@ function QuizzesScreen({ role, onNav, quizzes, onEditQuiz, onDeleteQuiz, onToggl
     const quizDataError     = isReal ? (sharedAssignmentData?.error ?? null) : null;
     const loadUserQuizData  = useCallback(() => { sharedAssignmentData?.retry?.(); }, [sharedAssignmentData?.retry]);
 
-    // view: "list" | "taking" | "results"
+    // view: "list" | "starting" | "start_error" | "taking" | "submitting" | "results"
     const [view,         setView]         = useState("list");
     const [activeId,     setActiveId]     = useState(null);
-    const [activeAttempt,setActiveAttempt]= useState(null);
+    const [activeAttempt,setActiveAttempt]= useState(null); // demo results only
     const [tab,          setTab]          = useState("todo");
     const [search,       setSearch]       = useState("");
+    // Learner-safe taking: `takeQuiz` is the SANITIZED quiz (get_quiz_for_attempt)
+    // for real users, or the canonical demo seed for demo users — never the
+    // App-level catalog (which for learners carries no question bodies at all).
+    const [takeQuiz,     setTakeQuiz]     = useState(null);
+    // Server-authoritative results/review model (SnapshotQuizReview) for real users.
+    const [reviewModel,  setReviewModel]  = useState(null);
+    // The attempt currently being reviewed (for a retryable review reload). Kept
+    // separate from the taking flow so a review failure never starts a quiz.
+    const [reviewTarget, setReviewTarget] = useState(null);
+    const submittingRef = useRef(false);   // hard guard against a double submission
 
-    const activeQuiz = assignments.find(q => q.id === activeId);
-
-    const startQuiz  = (id) => { setActiveId(id); setView("taking"); };
-    const retakeQuiz = (id) => { setActiveId(id); setActiveAttempt(null); setView("taking"); };
-    const viewResults= (id, attempt) => { setActiveId(id); setActiveAttempt(attempt); setView("results"); };
+    const activeQuiz = assignments.find(q => q.id === activeId); // catalog card (metadata)
 
     const toast = useToast();
+
+    // Load a quiz for taking. Real users fetch the SANITIZED quiz on demand
+    // (Start AND Retake both refetch, so a mid-flight edit / new revision is
+    // always picked up — no hard refresh). An RPC failure shows a Retry state,
+    // and NEVER falls back to canonical quiz data. Demo uses the local seed.
+    const beginQuiz = (id) => {
+      setActiveId(id);
+      setActiveAttempt(null);
+      setReviewModel(null);
+      if (!isReal) {
+        setTakeQuiz(assignments.find(q => q.id === id) ?? null);
+        setView("taking");
+        return;
+      }
+      setTakeQuiz(null);
+      setView("starting");
+      getQuizForAttempt(id)
+        .then(({ data, error }) => {
+          if (error || !data) { setView("start_error"); return; }
+          setTakeQuiz(rpcQuizToTakeable(data));
+          setView("taking");
+        })
+        .catch(() => setView("start_error"));
+    };
+    const startQuiz  = (id) => beginQuiz(id);
+    const retakeQuiz = (id) => beginQuiz(id);
+
+    const fmtDate = (iso) => { try { return new Date(iso).toLocaleDateString("en-US", { month: "short", day: "numeric", year: "numeric" }); } catch { return ""; } };
+
+    // Load the pass-gated per-question review for an attempt AFTER its score is
+    // already accepted/shown. On failure it flips reviewStatus to 'error' (a
+    // retryable review-loading error) — it NEVER resubmits and NEVER fabricates
+    // answer detail; the server score/pass stays visible throughout.
+    const loadReview = (attemptId) => {
+      setReviewModel(m => (m ? { ...m, status: "loading" } : m));
+      getQuizReview(activeId)
+        .then(({ data, error }) => {
+          if (error) { setReviewModel(m => (m ? { ...m, status: "error" } : m)); return; }
+          const ar = buildAttemptReview(data, attemptId);
+          setReviewModel(m => (m ? {
+            ...m,
+            status:      "ready",
+            rows:        reviewRows({ answers: ar?.answers ?? m.fallbackAnswers ?? [], solution: ar?.solution ?? null, labelQuestions: takeQuiz?.questions ?? null, reveal: ar?.reveal ?? false }),
+            reveal:      ar?.reveal ?? false,
+            unavailable: ar?.unavailable ?? false,
+          } : m));
+        })
+        .catch(() => setReviewModel(m => (m ? { ...m, status: "error" } : m)));
+    };
+
+    // Review a past attempt. Real users go through get_quiz_review, so the answer
+    // key is revealed ONLY for an official pass and ONLY from the immutable
+    // snapshot — never the current mutable quiz. The SANITIZED current questions
+    // (get_quiz_for_attempt, NO answer keys) are fetched only to LABEL a trusted
+    // attempt's rows (real prompt/type/options) so a failed review isn't blank;
+    // legacy attempts get no labels and degrade honestly. This review flow has
+    // its OWN loading/error states with a Back action and NEVER starts/opens the
+    // quiz (the taking-flow "start_error" Retry, which begins the quiz, is not
+    // reused here).
+    const viewResults = (id, attempt) => {
+      setActiveId(id);
+      if (!isReal) {
+        setTakeQuiz(assignments.find(q => q.id === id) ?? null);
+        setActiveAttempt(attempt);
+        setReviewModel(null);
+        setView("results");
+        return;
+      }
+      setReviewTarget({ id, attempt });
+      setReviewModel(null);
+      setView("review_loading");
+      Promise.allSettled([getQuizReview(id), getQuizForAttempt(id)])
+        .then(([revRes, quizRes]) => {
+          const review = revRes.status === "fulfilled" ? revRes.value : { data: null, error: revRes.reason };
+          if (review.error || !review.data) { setView("review_error"); return; }
+          const sanitized = (quizRes.status === "fulfilled" && !quizRes.value.error && quizRes.value.data)
+            ? (rpcQuizToTakeable(quizRes.value.data)?.questions ?? null) : null;
+          const m = buildLearnerReviewModel({ reviewData: review.data, attemptId: attempt?.id, sanitizedQuestions: sanitized });
+          if (!m) { setView("review_error"); return; }
+          setReviewModel({
+            attempt:     { score: m.score, passed: m.passed, date: fmtDate(m.createdAt) },
+            rows:        m.rows,
+            reveal:      m.reveal,
+            unavailable: m.unavailable,
+            points:      null,
+            status:      "ready",
+            attemptId:   m.attemptId,
+          });
+          setView("results");
+        })
+        .catch(() => setView("review_error"));
+    };
 
     // Deep-link: open a specific quiz navigated here from HomeScreen.
     // For real users, assignments arrive async — hold until assignmentsLoaded is true
@@ -13436,63 +13898,147 @@ function QuizzesScreen({ role, onNav, quizzes, onEditQuiz, onDeleteQuiz, onToggl
 
     const onComplete = (attempt) => {
       if (!isReal) {
-        // Demo only — quiz.attempts is the sole source of truth for demo
-        // (userQuizAttempts always stays {} in demo mode). Real users don't
-        // need this: userQuizAttempts (derived from the shared hook below)
-        // is what every downstream read actually uses.
+        // Demo only — no server; keep the optimistic local results (canonical
+        // seed data, rendered by QuizResultsView with its own client grading).
         setDemoAssignments(prev => prev.map(q => q.id === activeId
           ? { ...q, attempts: [...q.attempts, attempt] }
           : q
         ));
+        setActiveAttempt(attempt);
+        setView("results");
+        return;
       }
-      setActiveAttempt(attempt);
-      setView("results");
-      // Task 15 — persist the attempt AND award its XP atomically via a
-      // single RPC (submit_quiz_attempt_atomic, 039_atomic_quiz_completion.sql)
-      // instead of two independent, un-awaited writes. attempt_num is now
-      // computed server-side under an advisory lock (never client-supplied),
-      // and attempt.submissionId (stable per QuizTakingView session — see
-      // its submissionIdRef) is passed as the idempotency key, so a network
-      // retry or a double-click on Finish can never insert a second attempt
-      // row or award XP twice; the RPC just returns the original result.
-      if (isReal && currentUser?.id && tenantId) {
-        submitQuizAttemptAtomic(tenantId, currentUser.id, activeId, attempt, attempt.submissionId)
-          .then(({ data, error }) => {
-            if (error) {
-              console.error("[ralli] submitQuizAttemptAtomic failed:", error);
-              return;
-            }
-            const savedAttempt = data?.attempt;
-            // Optimistically patch the shared hook's attempt list (Task 13)
-            // so this and every other mounted consumer (Home, manager
-            // tracking) sees the retake state immediately, without waiting
-            // for a refetch/realtime round-trip. Use the server's own
-            // created_at/score/passed so it exactly matches the persisted
-            // row (also correct on the alreadyRecorded/dedup path, where
-            // savedAttempt is the ORIGINAL row, not this retry's payload).
-            if (savedAttempt) {
-              sharedAssignmentData?.applyLocalQuizAttempt?.({
-                quiz_id: activeId, score: savedAttempt.score, passed: savedAttempt.passed,
-                answers: savedAttempt.answers ?? [], created_at: savedAttempt.created_at,
-              });
-            }
-            // Readiness is a pure recompute-and-upsert (safely recomputable,
-            // see 039's migration header) — kept as a follow-up fire-and-
-            // forget call outside the atomic transaction, exactly as before.
-            triggerReadinessUpdate(tenantId, currentUser.id);
-          })
-          .catch(e => console.error("[ralli] submitQuizAttemptAtomic failed:", e));
-      }
+      if (!(currentUser?.id && tenantId)) return;
+      if (submittingRef.current) return;   // ignore a second Finish before the first resolves
+      submittingRef.current = true;
+
+      // Do NOT show results/pass/XP until the server confirms. Client score is
+      // never treated as truth; the results screen is built from the server's
+      // authoritative response + the pass-gated review (get_quiz_review).
+      setView("submitting");
+      submitQuizAttemptAtomicV2(tenantId, activeId, attempt.answers, takeQuiz?.questionRevision, attempt.submissionId)
+        .then(async ({ data, error }) => {
+          const res = interpretSubmit(data, error);
+          if (res.kind === "error") {
+            console.error("[ralli] submitQuizAttemptAtomicV2 failed:", error);
+            toast.error("Couldn't submit your quiz. Please try again.");
+            setView("taking");   // no success screen; let them retry the submit
+            return;
+          }
+          if (res.kind === "quiz_changed") {
+            // Rejected stale submission — NOTHING persisted or awarded. Show no
+            // success; clear ALL cached quiz/answer/attempt state and reload the
+            // latest sanitized quiz + revision (no hard refresh).
+            toast.error("This quiz changed while you were taking it. Reloading the latest version.");
+            setActiveAttempt(null);
+            setReviewModel(null);
+            setTakeQuiz(null);
+            setView("list");
+            loadUserQuizData?.();
+            onRefreshQuizzes?.();
+            return;
+          }
+          // status 'ok' — server-authoritative (also the idempotent replay path:
+          // a lost response + retry with the SAME submissionId returns the
+          // existing attempt, alreadyRecorded, with no duplicate attempt/XP).
+          // The accepted score/pass is shown IMMEDIATELY; the per-question review
+          // (pass-gated snapshot) loads separately and is independently retryable
+          // — a review-fetch failure never loses the score and never resubmits.
+          setReviewModel({
+            attempt:     { score: res.score, passed: res.passed, date: fmtDate(res.attempt?.created_at ?? new Date().toISOString()) },
+            points:      res.points,
+            status:      "loading",
+            rows:        [], reveal: false, unavailable: false,
+            attemptId:   res.attempt?.id ?? null,
+            fallbackAnswers: res.answers ?? [],
+          });
+          setView("results");
+          sharedAssignmentData?.applyLocalQuizAttempt?.({
+            quiz_id: activeId, score: res.score, passed: res.passed,
+            answers: [], created_at: res.attempt?.created_at ?? new Date().toISOString(),
+          });
+          triggerReadinessUpdate(tenantId, currentUser.id);
+          loadReview(res.attempt?.id ?? null);
+        })
+        .catch(e => {
+          console.error("[ralli] submitQuizAttemptAtomicV2 failed:", e);
+          toast.error("Couldn't submit your quiz. Please try again.");
+          setView("taking");
+        })
+        .finally(() => { submittingRef.current = false; });
     };
 
-    // ── Quiz taking ──
-    if (view === "taking" && activeQuiz) {
-      return <QuizTakingView quiz={activeQuiz} onComplete={onComplete} onExit={() => setView("list")} />;
+    // ── Loading the sanitized quiz for a real learner (Start / Retake) ──
+    if (view === "starting") {
+      return <LoadingState rows={2} message="Loading quiz…" />;
+    }
+
+    // ── Start failed — Retry only; NEVER fall back to canonical quiz data ──
+    if (view === "start_error") {
+      return (
+        <div style={{ display: "flex", flexDirection: "column", gap: 20 }}>
+          <button onClick={() => setView("list")} style={{ background: "none", border: "none", cursor: "pointer", fontSize: 13, fontWeight: 600, color: C.textSub, padding: 0, alignSelf: "flex-start" }}>← Back to Quizzes</button>
+          <ErrorState message="We couldn't load this quiz. Please try again." onRetry={() => startQuiz(activeId)} />
+        </div>
+      );
+    }
+
+    // ── Reviewing a past attempt — its OWN loading/error, with a Back action.
+    //    Crucially this NEVER starts or opens the quiz (unlike start_error). ──
+    if (view === "review_loading") {
+      return (
+        <div style={{ display: "flex", flexDirection: "column", gap: 20 }}>
+          <button onClick={() => setView("list")} style={{ background: "none", border: "none", cursor: "pointer", fontSize: 13, fontWeight: 600, color: C.textSub, padding: 0, alignSelf: "flex-start" }}>← Back to Quizzes</button>
+          <LoadingState rows={2} message="Loading your results…" />
+        </div>
+      );
+    }
+    if (view === "review_error") {
+      return (
+        <div style={{ display: "flex", flexDirection: "column", gap: 20 }}>
+          <button onClick={() => setView("list")} style={{ background: "none", border: "none", cursor: "pointer", fontSize: 13, fontWeight: 600, color: C.textSub, padding: 0, alignSelf: "flex-start" }}>← Back to Quizzes</button>
+          <ErrorState message="We couldn't load these results. Please try again." onRetry={() => reviewTarget && viewResults(reviewTarget.id, reviewTarget.attempt)} />
+        </div>
+      );
+    }
+
+    // ── Submitting — server is grading; no results/pass/XP until it confirms ──
+    if (view === "submitting") {
+      return (
+        <div style={{ padding: 56, textAlign: "center", background: C.white, borderRadius: 16, border: `1px solid ${C.border}` }}>
+          <div style={{ fontSize: 15, fontWeight: 700, color: C.text, marginBottom: 6 }}>Submitting…</div>
+          <p style={{ fontSize: 13, color: C.textSub, margin: 0 }}>Grading your quiz on the server. Please wait.</p>
+        </div>
+      );
+    }
+
+    // ── Quiz taking — sanitized quiz for real learners (no answer keys, no
+    //    client feedback); demo keeps its canonical seed + teach-as-you-go. ──
+    if (view === "taking" && takeQuiz) {
+      return <QuizTakingView quiz={takeQuiz} onComplete={onComplete} onExit={() => setView("list")} revealFeedback={!isReal} />;
     }
 
     // ── Results ──
-    if (view === "results" && activeQuiz && activeAttempt) {
-      return <QuizResultsView quiz={activeQuiz} attempt={activeAttempt} onRetake={() => retakeQuiz(activeId)} onBack={() => setView("list")} />;
+    if (view === "results") {
+      if (isReal && reviewModel) {
+        return (
+          <SnapshotQuizReview
+            quizName={activeQuiz?.title ?? activeQuiz?.name ?? "Quiz"}
+            attempt={reviewModel.attempt}
+            rows={reviewModel.rows}
+            reveal={reviewModel.reveal}
+            unavailable={reviewModel.unavailable}
+            points={reviewModel.points}
+            reviewStatus={reviewModel.status ?? "ready"}
+            onRetryReview={() => loadReview(reviewModel.attemptId)}
+            onRetake={() => retakeQuiz(activeId)}
+            onBack={() => setView("list")}
+          />
+        );
+      }
+      if (!isReal && takeQuiz && activeAttempt) {
+        return <QuizResultsView quiz={takeQuiz} attempt={activeAttempt} onRetake={() => retakeQuiz(activeId)} onBack={() => setView("list")} />;
+      }
     }
 
     // ── Loading state for real users ──
@@ -13544,16 +14090,23 @@ function QuizzesScreen({ role, onNav, quizzes, onEditQuiz, onDeleteQuiz, onToggl
     // ── Tab filter ──
     // For real users, attempt history comes from userQuizAttempts (DB-backed).
     // quiz.attempts is always [] for real users — only used as demo fallback.
+    // "Done" is instance-aware for real users: resolvedStatus === "completed"
+    // (a PASS at/after the LATEST assignment), NOT a lifetime passed attempt —
+    // so a reassignment after an old pass correctly reappears as To Do. Demo
+    // has no assignment instances, so it keeps its passed-attempt shortcut.
+    const isQuizDone = (quiz) => isReal
+      ? quiz.resolvedStatus === "completed"
+      : (userQuizAttempts[quiz.id] ?? quiz.attempts).some(a => a.passed);
+
     const tabFiltered = searchFiltered.filter(quiz => {
-      const attempts = userQuizAttempts[quiz.id] ?? quiz.attempts;
-      const isDone   = attempts.some(a => a.passed);
+      const isDone = isQuizDone(quiz);
       if (tab === "todo")      return !isDone;
       if (tab === "completed") return isDone;
       return true;
     });
 
-    const todoCount      = searchFiltered.filter(q => !(userQuizAttempts[q.id] ?? q.attempts).some(a => a.passed)).length;
-    const completedCount = searchFiltered.filter(q =>  (userQuizAttempts[q.id] ?? q.attempts).some(a => a.passed)).length;
+    const todoCount      = searchFiltered.filter(q => !isQuizDone(q)).length;
+    const completedCount = searchFiltered.filter(q =>  isQuizDone(q)).length;
 
     return (
       <div style={{ display: "flex", flexDirection: "column", gap: 20 }}>
@@ -13605,13 +14158,16 @@ function QuizzesScreen({ role, onNav, quizzes, onEditQuiz, onDeleteQuiz, onToggl
         ) : (
           <div style={{ display: "flex", flexDirection: "column", gap: 12 }}>
             {tabFiltered.map(quiz => {
-              // For real users, use DB-backed attempt history (keyed by quiz_id, ordered DESC).
-              // For demo users, fall back to quiz.attempts (ordered ascending, last = most recent).
-              const attempts    = userQuizAttempts[quiz.id] ?? quiz.attempts;
+              // Real users: scope the card's state to the LATEST assignment
+              // instance (quiz.scopedAttempts = attempts at/after it), so a
+              // fresh reassignment reads "Start" (not "Resume/Retry") even when
+              // older lifetime attempts exist, and Retry shows only for a failed
+              // attempt on THIS assignment. Demo keeps its lifetime attempts.
+              const attempts    = isReal ? (quiz.scopedAttempts ?? []) : quiz.attempts;
               const lastAttempt = attempts.length > 0
-                ? (userQuizAttempts[quiz.id] != null ? attempts[0] : attempts[attempts.length - 1])
+                ? (isReal ? attempts[0] : attempts[attempts.length - 1])
                 : null;
-              const isPassed    = lastAttempt?.passed ?? false;
+              const isPassed    = isReal ? (quiz.resolvedStatus === "completed") : (lastAttempt?.passed ?? false);
               const hasTried    = attempts.length > 0;
               const dueStatus   = getDueStatus(quiz.dueAt);
               const progress    = getDueProgress(quiz.assignedAt, quiz.dueAt);
@@ -13632,7 +14188,7 @@ function QuizzesScreen({ role, onNav, quizzes, onEditQuiz, onDeleteQuiz, onToggl
                       {quiz.description && <p style={{ margin: "0 0 6px", fontSize: 12, color: C.textSub }}>{quiz.description}</p>}
                       <div style={{ display: "flex", gap: 12, flexWrap: "wrap" }}>
                         <span style={{ fontSize: 12, color: C.textMuted }}>{quiz.track}</span>
-                        <span style={{ fontSize: 12, color: C.textMuted }}>{quiz.questions.length} questions</span>
+                        <span style={{ fontSize: 12, color: C.textMuted }}>{questionCountOf(quiz)} questions</span>
                         <span style={{ fontSize: 12, color: diffColors[quiz.difficulty] ?? C.textMuted, fontWeight: 700 }}>{quiz.difficulty}</span>
                         <span style={{ fontSize: 12, fontWeight: 700, color: C.orange }}>+{quiz.xp} XP</span>
                         {lastAttempt && <span style={{ fontSize: 12, color: C.textMuted }}>Last score: {lastAttempt.score}%</span>}
@@ -17736,7 +18292,9 @@ function ProgressScreen({ currentUser = null, isReal = false, tenantId = null })
 
     Promise.all([
       getLessonCompletions(uid),
-      getUserQuizAttempts(tenantId, uid),
+      // Own attempt SUMMARIES only (no answers JSON) — this screen reads just
+      // passed/quiz_id. See getMyQuizAttemptsSafe (answer confidentiality).
+      getMyQuizAttemptsSafe(),
       supabase.from("tenant_lessons").select("id", { count: "exact", head: true }).eq("tenant_id", tenantId),
       supabase.from("user_point_events")
         .select("points, created_at")
@@ -21067,13 +21625,13 @@ function InsightsScreen({ user, isReal = false, tenantId = null, orgUsers = [], 
           if (teamErr) { setError("Could not load team insights."); return; }
           setTeamData(team);
           // Also load own perf if available
-          const { data: myPerf } = await insightsSvc.getUserPerformance(tenantId, user.id);
+          const { data: myPerf } = await insightsSvc.getUserPerformance(tenantId, user.id, { safe: true });
           if (myPerf) {
             setPerf(myPerf);
             setRecs(insightsSvc.getRecommendations(myPerf));
           }
         } else {
-          const { data: myPerf, error: perfErr } = await insightsSvc.getUserPerformance(tenantId, user.id);
+          const { data: myPerf, error: perfErr } = await insightsSvc.getUserPerformance(tenantId, user.id, { safe: true });
           if (perfErr || !myPerf) { setError("Could not load your insights."); return; }
           setPerf(myPerf);
           setRecs(insightsSvc.getRecommendations(myPerf));
@@ -22420,16 +22978,32 @@ export default function App() {
       if (data) setPastSessions(data);
     });
 
-    // Quizzes — real users: clear seed/demo data immediately, then load from Supabase.
-    // Clearing prevents demo quiz flash while the DB fetch is in-flight.
-    // setQuizzesReady(true) signals QuizzesScreen that quizzes are resolved so it
-    // can safely merge quiz assignments without hitting a race condition.
+    // Quizzes — real users: clear seed/demo data immediately, then load from
+    // Supabase. Clearing prevents demo quiz flash AND guarantees stale quiz data
+    // from a previous identity/role never lingers across a change (the effect
+    // re-runs on id/role/tenant change). setQuizzesReady(true) signals
+    // QuizzesScreen that quizzes are resolved so it can merge assignments safely.
+    //
+    // ANSWER CONFIDENTIALITY (migration 055): a plain learner ('user') loads
+    // ONLY sanitized metadata (list_quizzes_for_learner — no question bodies, no
+    // answers), never getTenantQuizzes. Managers/admins keep the full canonical
+    // catalog (they legitimately author/review quizzes). Learners fetch a
+    // sanitized quiz on demand at Start/Retake; canonical data never reaches
+    // a learner's browser during bootstrap, Home, To-Do, start, or refresh.
     setQuizzes([]);
-    getTenantQuizzes(tenantId).then(({ data, error }) => {
-      if (error) console.error("[ralli] getTenantQuizzes failed:", error);
-      if (data !== null) setQuizzes(data);
-      setQuizzesReady(true); // signal even on error so QuizzesScreen doesn't hang
-    });
+    if (currentUser.role === "user") {
+      listQuizzesForLearner().then(({ data, error }) => {
+        if (error) console.error("[ralli] listQuizzesForLearner failed:", error);
+        setQuizzes(metaListToCatalog(data ?? []));
+        setQuizzesReady(true);
+      });
+    } else {
+      getTenantQuizzes(tenantId).then(({ data, error }) => {
+        if (error) console.error("[ralli] getTenantQuizzes failed:", error);
+        if (data !== null) setQuizzes(data);
+        setQuizzesReady(true); // signal even on error so QuizzesScreen doesn't hang
+      });
+    }
 
     // Profile prefs — load from Supabase (nickname, avatarEmoji, notifPrefs)
     // BC data is loaded in a separate useEffect keyed on currentOrg.id
@@ -22479,7 +23053,7 @@ export default function App() {
         const rt = ts?.learning_settings?.readinessThreshold;
         setReadinessThreshold(typeof rt === "number" && rt >= 0 && rt <= 100 ? rt : 80);
       });
-  }, [currentUser?.id, currentUser?._isReal]); // eslint-disable-line react-hooks/exhaustive-deps
+  }, [currentUser?.id, currentUser?._isReal, currentUser?.role, currentUser?.orgId]); // eslint-disable-line react-hooks/exhaustive-deps
 
   // ── Load orgAdmin's own tenant into orgs[] ────────────────────────────────
   // Root cause fix: both login paths only fetched tenant.status, never the full row.
@@ -22988,6 +23562,27 @@ export default function App() {
 
   const handleEditQuiz = (quiz) => {
     setEditingQuiz(quiz);
+  };
+
+  // Refetch the quiz catalog — used after a `quiz_changed` rejection so a Retake
+  // never reuses a stale quiz. Role-gated exactly like the bootstrap load: a
+  // learner refreshes sanitized metadata (no answers), never the canonical
+  // catalog; the fresh sanitized quiz + revision are fetched at Start/Retake.
+  //
+  // MUST be a plain function, not useCallback: this sits AFTER the `if
+  // (!currentUser) return <LoginScreen/>` early return above, so a hook here is
+  // skipped on the signed-out render and called once signed in — a change in
+  // hook order that unmounts the whole App (white screen on login). It's only
+  // ever called imperatively (never a hook/effect dependency), so per-render
+  // recreation is harmless, matching the sibling handlers in this block.
+  const refreshQuizzes = () => {
+    const tid = currentOrg?.id ?? null;
+    if (!currentUser?._isReal || !tid) return;
+    if (currentUser.role === "user") {
+      listQuizzesForLearner().then(({ data }) => { setQuizzes(metaListToCatalog(data ?? [])); });
+    } else {
+      getTenantQuizzes(tid).then(({ data }) => { if (data !== null) setQuizzes(data); });
+    }
   };
 
   const handleDeleteQuiz = async (id) => {
@@ -23534,7 +24129,7 @@ export default function App() {
       case "rankd-game":        return <RankdGameScreen onNav={navigate} sessionName={lobbySessionName} role={gameRole} playerName={lobbyPlayerName ?? user.name} playerEmoji={lobbyPlayerEmoji} questions={gameQuestions ?? GAME_QUESTIONS} demoMode={gameRole === "admin" && activeGameIsDemo} pin={lobbyPin} sessionDbId={activeGameSessionDbId} tenantId={currentOrg?.id ?? user?.orgId ?? null} broadcast={broadcast} trackPlayerPresence={trackPlayerPresence} chMsg={chMsg} chStatus={chStatus} chAnswers={chAnswers} chPlayers={chPlayers} playerId={gamePlayerId} onGameEnd={handleGameEnd} setChAnswers={setChAnswers} />;
       case "rankd-results":     return <RankdResultsScreen onNav={navigate} sessionDbId={viewResultsDbId} sessionCode={viewResultsCode} sessions={[...sessions, ...pastSessions]} gameData={gameResultsData} />;
       case "learn":             return <LearnScreen role={gameRole} user={user} orgUsers={orgUsers} orgs={orgs} onNav={navigate} onAwardXp={handleAwardXp} pendingLessonId={pendingLessonId} onClearPendingLesson={() => setPendingLessonId(null)} pendingCourseId={pendingCourseId} onClearPendingCourse={() => setPendingCourseId(null)} canCreate={perm("actions","create")} canEdit={perm("actions","edit")} canDelete={perm("actions","delete")} canAssign={perm("actions","assign")} tenantId={currentOrg?.id ?? null} isReal={!!user?._isReal} quizzes={quizzes} sharedAssignmentData={sharedAssignmentData} />;
-      case "quizzes":           return <QuizzesScreen role={gameRole} onNav={navigate} quizzes={quizzes} onEditQuiz={handleEditQuiz} onDeleteQuiz={handleDeleteQuiz} onToggleFavorite={handleToggleFavorite} onToggleActive={handleToggleActive} pendingQuizId={pendingQuizId} onClearPendingQuiz={() => setPendingQuizId(null)} canCreate={perm("actions","create")} canEdit={perm("actions","edit")} canDelete={perm("actions","delete")} canLaunch={perm("actions","launch")} canAssign={perm("actions","assign")} onAssignQuiz={handleAssignQuiz} onLaunchQuiz={handleCreateSession} orgUsers={orgUsers} orgs={orgs} currentUser={currentUser} tenantId={currentOrg?.id ?? null} isReal={!!user?._isReal} quizzesReady={quizzesReady} sharedAssignmentData={sharedAssignmentData} />;
+      case "quizzes":           return <QuizzesScreen role={gameRole} onNav={navigate} quizzes={quizzes} onEditQuiz={handleEditQuiz} onDeleteQuiz={handleDeleteQuiz} onToggleFavorite={handleToggleFavorite} onToggleActive={handleToggleActive} pendingQuizId={pendingQuizId} onClearPendingQuiz={() => setPendingQuizId(null)} canCreate={perm("actions","create")} canEdit={perm("actions","edit")} canDelete={perm("actions","delete")} canLaunch={perm("actions","launch")} canAssign={perm("actions","assign")} onAssignQuiz={handleAssignQuiz} onLaunchQuiz={handleCreateSession} orgUsers={orgUsers} orgs={orgs} currentUser={currentUser} tenantId={currentOrg?.id ?? null} isReal={!!user?._isReal} quizzesReady={quizzesReady} sharedAssignmentData={sharedAssignmentData} onRefreshQuizzes={refreshQuizzes} />;
       case "battlecards":       return (isAdminType && perm("actions","edit"))
         ? <BattleCardsAdminScreen categories={bcCategories} cards={battleCards} onSaveCategory={handleSaveBcCategory} onDeleteCategory={handleDeleteBcCategory} onSaveCard={handleSaveBattleCard} onDeleteCard={handleDeleteBattleCard} />
         : <BattleCardsScreen categories={bcCategories} cards={battleCards} isLoading={bcLoading} isReal={!!user?._isReal} />;

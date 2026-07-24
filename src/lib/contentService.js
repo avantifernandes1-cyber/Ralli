@@ -269,6 +269,10 @@ function dbToQuiz(row) {
     // rankd-app.jsx's `quiz.passingScore ?? 90`). Do NOT default it here —
     // that would silently change existing quizzes' effective passing score.
     passingScore: typeof row.passing_score === "number" ? row.passing_score : null,
+    // Server-computed, questions-only revision hash (migration 054). The quiz-
+    // taking flow submits the revision it loaded so the server can reject a
+    // submission graded against questions that changed mid-attempt.
+    questionRevision: row.question_revision ?? null,
     createdAt:  row.created_at ? new Date(row.created_at).toLocaleDateString("en-US", { month: "short", day: "numeric", year: "numeric" }) : "—",
   };
 }
@@ -1180,6 +1184,72 @@ export async function submitQuizAttemptAtomic(tenantId, userId, quizId, attempt,
   return { data, error };
 }
 
+// ── Learner-safe quiz access (Answer Confidentiality — Stage 1, migration 055) ──
+// Learners NEVER receive canonical answers. These RPCs are the only learner read
+// path for quiz content/history; managers keep the full canonical reads above.
+
+/** Sanitized library/assignment metadata for the caller — one call, no answer bodies. */
+export async function listQuizzesForLearner() {
+  const { data, error } = await supabase.rpc("list_quizzes_for_learner");
+  return { data: data ?? null, error };
+}
+
+/** Playable, sanitized quiz (no answer keys) + question_revision for one assigned quiz. */
+export async function getQuizForAttempt(quizId) {
+  if (!quizId) return { data: null, error: new Error("Missing quizId") };
+  const { data, error } = await supabase.rpc("get_quiz_for_attempt", { p_quiz_id: quizId });
+  return { data: data ?? null, error };
+}
+
+/**
+ * The caller's OWN quiz-attempt SUMMARIES (no answers, no snapshots, no other
+ * users' rows) — for Home / To-Do / assignment status / history lists. Learner
+ * screens use this instead of getUserQuizAttempts(), whose raw rows include the
+ * answers JSON (legacy rows carry canonical `correct` there). Detailed review is
+ * a separate, pass-gated call (getQuizReview).
+ */
+export async function getMyQuizAttemptsSafe() {
+  const { data, error } = await supabase.rpc("list_my_quiz_attempts_safe");
+  return { data: data ?? null, error };
+}
+
+/** The caller's own attempt history; canonical answers revealed only after an official pass. */
+export async function getQuizReview(quizId) {
+  if (!quizId) return { data: null, error: new Error("Missing quizId") };
+  const { data, error } = await supabase.rpc("get_quiz_review", { p_quiz_id: quizId });
+  return { data: data ?? null, error };
+}
+
+/**
+ * Server-authoritative quiz submission (Input Authority Hardening — Area 1,
+ * migration 054). Unlike submitQuizAttemptAtomic(), this does NOT trust a
+ * client-computed score/passed: the server recomputes both from the canonical
+ * questions (mirroring isAnswerCorrect), rejects a submission whose loaded
+ * `expectedRevision` no longer matches the quiz (mid-attempt edit), and stamps
+ * trusted provenance the client cannot forge. Identity is derived server-side
+ * from auth.uid() — no user id is passed.
+ *
+ * Returns data.status: 'ok' (attempt persisted, use data.attempt/server_score)
+ * or 'quiz_changed' (nothing persisted; caller should reload the quiz).
+ *
+ * @param {string} tenantId
+ * @param {string} quizId
+ * @param {Array}  answers            - [{ questionId, selected, ... }] in question order
+ * @param {string} expectedRevision   - quiz.questionRevision loaded at attempt start
+ * @param {string} idempotencyKey      - stable per quiz-taking session
+ */
+export async function submitQuizAttemptAtomicV2(tenantId, quizId, answers, expectedRevision, idempotencyKey) {
+  if (!tenantId || !quizId) return { data: null, error: new Error("Missing required params") };
+  const { data, error } = await supabase.rpc("submit_quiz_attempt_atomic_v2", {
+    p_tenant_id:         tenantId,
+    p_quiz_id:           quizId,
+    p_answers:           answers ?? [],
+    p_expected_revision: expectedRevision ?? null,
+    p_idempotency_key:   idempotencyKey ?? null,
+  });
+  return { data, error };
+}
+
 /**
  * Fetch all quiz attempts for a user within a tenant.
  * Used by insightsService to compute quiz accuracy per topic.
@@ -1211,10 +1281,38 @@ export async function getUserQuizAttempts(tenantId, userId) {
 export async function getTenantQuizAttempts(tenantId) {
   const { data, error } = await supabase
     .from("quiz_attempts")
-    .select("id, user_id, quiz_id, score, passed, attempt_num, answers, created_at")
+    // grading_provenance/verified_revision let the manager drill-down tell a
+    // trusted (server_v2, snapshot-backed) attempt from a legacy one, so it can
+    // reveal the immutable historical answer key instead of guessing.
+    .select("id, user_id, quiz_id, score, passed, attempt_num, answers, created_at, grading_provenance, verified_revision")
     .eq("tenant_id", tenantId)
     .order("created_at", { ascending: false });
   return { data, error };
+}
+
+/**
+ * Immutable per-attempt solution snapshots for a set of attempts, keyed by
+ * attempt_id. Managers/admins read these directly (RLS: quiz_attempt_solutions
+ * qas_select_manager). This is the manager drill-down's ONLY source of the
+ * historical answer key — never the quiz's current mutable questions — so a
+ * quiz edited after the attempt can't retroactively rewrite what the rep was
+ * graded against. Attempts without a snapshot (legacy) simply won't appear in
+ * the returned map, and the UI degrades honestly.
+ *
+ * @param {string[]} attemptIds
+ * @returns {Promise<{ data: Object<string, Array>|null, error: Object|null }>}
+ */
+export async function getAttemptSolutions(attemptIds) {
+  const ids = Array.isArray(attemptIds) ? attemptIds.filter(Boolean) : [];
+  if (ids.length === 0) return { data: {}, error: null };
+  const { data, error } = await supabase
+    .from("quiz_attempt_solutions")
+    .select("attempt_id, solution")
+    .in("attempt_id", ids);
+  if (error) return { data: null, error };
+  const byAttempt = {};
+  for (const row of data ?? []) byAttempt[String(row.attempt_id)] = row.solution;
+  return { data: byAttempt, error: null };
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
