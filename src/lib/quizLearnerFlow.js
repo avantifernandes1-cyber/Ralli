@@ -234,6 +234,40 @@ export function buildManagerAttemptReview(attempt, snapshot) {
 }
 
 /**
+ * Normalize get_quiz_review output for ONE attempt into a render-ready learner
+ * review model. Centralizes the trusted/label/unavailable rules so every learner
+ * review surface (post-submit, Quizzes "View Results", Home Recent Quizzes)
+ * behaves identically:
+ *   - TRUSTED (server_v2): may label rows with the SANITIZED current questions
+ *     (real prompt/type/options, NO answer keys) so a FAILED review shows the
+ *     real prompt + submission + Correct/Incorrect; the answer KEY is revealed
+ *     only when the server unlocked it (official pass) and ONLY from the
+ *     immutable snapshot.
+ *   - LEGACY (untrusted): NEVER substitute current questions — labels are
+ *     withheld and `unavailable` is forced so the UI shows score/metadata +
+ *     "Exact historical answer detail unavailable".
+ * `sanitizedQuestions` must be answer-key-free (from get_quiz_for_attempt).
+ */
+export function buildLearnerReviewModel({ reviewData, attemptId, sanitizedQuestions = null, fallbackAnswers = null }) {
+  const ar = buildAttemptReview(reviewData, attemptId);
+  if (!ar) return null;
+  const trusted = ar.provenance === "server_v2";
+  const labels = trusted ? (Array.isArray(sanitizedQuestions) ? sanitizedQuestions : null) : null;
+  const answers = (Array.isArray(ar.answers) && ar.answers.length) ? ar.answers : (fallbackAnswers ?? []);
+  return {
+    attemptId:   ar.attemptId,
+    score:       ar.score,
+    passed:      ar.passed,
+    createdAt:   ar.createdAt,
+    trusted,
+    reveal:      ar.reveal,
+    // Honest degrade: reveal-but-no-snapshot OR any untrusted (legacy) attempt.
+    unavailable: ar.unavailable || !trusted,
+    rows: reviewRows({ answers, solution: ar.solution, labelQuestions: labels, reveal: ar.reveal }),
+  };
+}
+
+/**
  * Per-question review row for the shared SnapshotQuizReview renderer. Combines:
  *   - the learner-safe submitted answer (with server `isCorrect`),
  *   - optional SANITIZED label questions (question text / option labels / left

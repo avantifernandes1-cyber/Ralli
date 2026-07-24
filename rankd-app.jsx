@@ -87,6 +87,7 @@ import {
   buildSubmissionAnswers,
   interpretSubmit,
   buildAttemptReview,
+  buildLearnerReviewModel,
   buildManagerAttemptReview,
   reviewRows,
 } from "./src/lib/quizLearnerFlow.js";
@@ -1089,23 +1090,28 @@ function PersonalDashboardScreen({
       return;
     }
     // Real learner — answer key is pass-gated and comes ONLY from the immutable
-    // snapshot via get_quiz_review; the current mutable quiz is never used and
-    // the learner's browser never receives canonical questions here.
+    // snapshot via get_quiz_review. The SANITIZED current questions (no answer
+    // keys) are fetched only to LABEL a trusted attempt's rows so a failed
+    // review shows the real prompt; legacy attempts get no labels and degrade
+    // honestly. The learner's browser never receives canonical answer keys here.
     const quizName = quiz.name ?? quiz.title ?? "Quiz";
     const fmt = (iso) => { try { return new Date(iso).toLocaleDateString("en-US", { month: "short", day: "numeric", year: "numeric" }); } catch { return ""; } };
     setActivityReview({ mode: "loading", quizName });
-    getQuizReview(quiz.id)
-      .then(({ data, error }) => {
-        if (error) { setActivityReview({ mode: "error", quizName, quizId: quiz.id }); return; }
-        const ar = buildAttemptReview(data, rawAttempt.id);
-        if (!ar) { setActivityReview({ mode: "error", quizName, quizId: quiz.id }); return; }
+    Promise.allSettled([getQuizReview(quiz.id), getQuizForAttempt(quiz.id)])
+      .then(([revRes, quizRes]) => {
+        const review = revRes.status === "fulfilled" ? revRes.value : { data: null, error: revRes.reason };
+        if (review.error || !review.data) { setActivityReview({ mode: "error", quizName, quizId: quiz.id }); return; }
+        const sanitized = (quizRes.status === "fulfilled" && !quizRes.value.error && quizRes.value.data)
+          ? (rpcQuizToTakeable(quizRes.value.data)?.questions ?? null) : null;
+        const m = buildLearnerReviewModel({ reviewData: review.data, attemptId: rawAttempt.id, sanitizedQuestions: sanitized });
+        if (!m) { setActivityReview({ mode: "error", quizName, quizId: quiz.id }); return; }
         setActivityReview({
           mode: "real", quizName, quizId: quiz.id,
           model: {
-            attempt:     { score: ar.score, passed: ar.passed, date: fmt(ar.createdAt) },
-            rows:        reviewRows({ answers: ar.answers, solution: ar.solution, reveal: ar.reveal }),
-            reveal:      ar.reveal,
-            unavailable: ar.unavailable,
+            attempt:     { score: m.score, passed: m.passed, date: fmt(m.createdAt) },
+            rows:        m.rows,
+            reveal:      m.reveal,
+            unavailable: m.unavailable,
           },
         });
       })
@@ -12351,13 +12357,10 @@ function QuizTakingView({ quiz, onComplete, onExit, revealFeedback = false }) {
     }
   };
 
-  // Neutral, correctness-free confirmation shown once an answer is locked in
-  // learner (non-feedback) mode — the ONLY per-question feedback a learner sees.
-  const lockedNote = (label = "Answer locked") => (
-    <div style={{ padding: "10px 14px", borderRadius: 10, background: C.pageBg, border: `1px solid ${C.creamBorder}`, fontSize: 13, color: C.textSub }}>
-      <strong style={{ color: C.text }}>{label}</strong>
-    </div>
-  );
+  // Learner mode shows NO per-question message once an answer is locked — the
+  // learner's own selection stays visible (highlighted option / disabled input /
+  // placed cards) and the Next button appears immediately, with no "Answer
+  // locked" text, no correctness, and no feedback pause.
 
   return (
     <div style={{ maxWidth: 640, margin: "0 auto", display: "flex", flexDirection: "column", gap: 20 }}>
@@ -12425,7 +12428,7 @@ function QuizTakingView({ quiz, onComplete, onExit, revealFeedback = false }) {
                 }
                 {q.explanation && <p style={{ margin: "6px 0 0", fontSize: 12, color: C.textSub, lineHeight: 1.6 }}>{q.explanation}</p>}
               </div>
-            ) : revealed && lockedNote()}
+            ) : null}
             {!revealed && (
               <button onClick={commitType} disabled={!textDraft.trim()} style={{
                 padding: "12px 28px", borderRadius: 12, border: "none", alignSelf: "flex-end",
@@ -12459,7 +12462,7 @@ function QuizTakingView({ quiz, onComplete, onExit, revealFeedback = false }) {
                 </strong>
                 {!isCorrect && <span style={{ color: C.textSub }}> You answered {selected}.</span>}
               </div>
-            ) : revealed && lockedNote()}
+            ) : null}
             {fb && q.explanation && (
               <div style={{ padding: "12px 16px", borderRadius: 10, background: C.pageBg, border: `1px solid ${C.creamBorder}` }}>
                 <p style={{ margin: 0, fontSize: 13, color: C.text, lineHeight: 1.6 }}>{q.explanation}</p>
@@ -12639,7 +12642,6 @@ function QuizTakingView({ quiz, onComplete, onExit, revealFeedback = false }) {
                     </button>
                   </>
                 )}
-                {revealed && !showFeedback && lockedNote("Matches locked")}
               </div>
             );
           })()
@@ -12714,7 +12716,6 @@ function QuizTakingView({ quiz, onComplete, onExit, revealFeedback = false }) {
                 </button>
               );
             })}
-            {revealed && !showFeedback && lockedNote()}
           </div>
         )}
 
@@ -12959,8 +12960,10 @@ function SnapshotQuizReview({
         )}
       </Card>
 
-      {/* Honest degrade — reveal unlocked but no immutable record for this attempt */}
-      {reveal && unavailable && (
+      {/* Honest degrade — no immutable record for this attempt (legacy, or an
+          official pass whose quiz changed before a snapshot existed). Shown
+          regardless of reveal so legacy learner reviews say so plainly. */}
+      {unavailable && (
         <div style={{ padding: "12px 16px", borderRadius: 10, background: "#FFF7ED", border: `1px solid ${C.creamBorder}`, fontSize: 13, color: C.textSub }}>
           Exact historical answer detail unavailable for this attempt.
         </div>
@@ -13768,6 +13771,9 @@ function QuizzesScreen({ role, onNav, quizzes, onEditQuiz, onDeleteQuiz, onToggl
     const [takeQuiz,     setTakeQuiz]     = useState(null);
     // Server-authoritative results/review model (SnapshotQuizReview) for real users.
     const [reviewModel,  setReviewModel]  = useState(null);
+    // The attempt currently being reviewed (for a retryable review reload). Kept
+    // separate from the taking flow so a review failure never starts a quiz.
+    const [reviewTarget, setReviewTarget] = useState(null);
     const submittingRef = useRef(false);   // hard guard against a double submission
 
     const activeQuiz = assignments.find(q => q.id === activeId); // catalog card (metadata)
@@ -13823,9 +13829,15 @@ function QuizzesScreen({ role, onNav, quizzes, onEditQuiz, onDeleteQuiz, onToggl
         .catch(() => setReviewModel(m => (m ? { ...m, status: "error" } : m)));
     };
 
-    // Review a past (passed) attempt. Real users go through get_quiz_review, so
-    // the answer key is revealed ONLY for an official pass, and ONLY from the
-    // immutable snapshot — never the current mutable quiz. Demo uses its seed.
+    // Review a past attempt. Real users go through get_quiz_review, so the answer
+    // key is revealed ONLY for an official pass and ONLY from the immutable
+    // snapshot — never the current mutable quiz. The SANITIZED current questions
+    // (get_quiz_for_attempt, NO answer keys) are fetched only to LABEL a trusted
+    // attempt's rows (real prompt/type/options) so a failed review isn't blank;
+    // legacy attempts get no labels and degrade honestly. This review flow has
+    // its OWN loading/error states with a Back action and NEVER starts/opens the
+    // quiz (the taking-flow "start_error" Retry, which begins the quiz, is not
+    // reused here).
     const viewResults = (id, attempt) => {
       setActiveId(id);
       if (!isReal) {
@@ -13835,25 +13847,29 @@ function QuizzesScreen({ role, onNav, quizzes, onEditQuiz, onDeleteQuiz, onToggl
         setView("results");
         return;
       }
+      setReviewTarget({ id, attempt });
       setReviewModel(null);
-      setView("starting");
-      getQuizReview(id)
-        .then(({ data, error }) => {
-          if (error) { setView("start_error"); return; }
-          const ar = buildAttemptReview(data, attempt?.id);
-          if (!ar) { setView("start_error"); return; }
+      setView("review_loading");
+      Promise.allSettled([getQuizReview(id), getQuizForAttempt(id)])
+        .then(([revRes, quizRes]) => {
+          const review = revRes.status === "fulfilled" ? revRes.value : { data: null, error: revRes.reason };
+          if (review.error || !review.data) { setView("review_error"); return; }
+          const sanitized = (quizRes.status === "fulfilled" && !quizRes.value.error && quizRes.value.data)
+            ? (rpcQuizToTakeable(quizRes.value.data)?.questions ?? null) : null;
+          const m = buildLearnerReviewModel({ reviewData: review.data, attemptId: attempt?.id, sanitizedQuestions: sanitized });
+          if (!m) { setView("review_error"); return; }
           setReviewModel({
-            attempt:     { score: ar.score, passed: ar.passed, date: fmtDate(ar.createdAt) },
-            rows:        reviewRows({ answers: ar.answers, solution: ar.solution, reveal: ar.reveal }),
-            reveal:      ar.reveal,
-            unavailable: ar.unavailable,
+            attempt:     { score: m.score, passed: m.passed, date: fmtDate(m.createdAt) },
+            rows:        m.rows,
+            reveal:      m.reveal,
+            unavailable: m.unavailable,
             points:      null,
             status:      "ready",
-            attemptId:   ar.attemptId,
+            attemptId:   m.attemptId,
           });
           setView("results");
         })
-        .catch(() => setView("start_error"));
+        .catch(() => setView("review_error"));
     };
 
     // Deep-link: open a specific quiz navigated here from HomeScreen.
@@ -13962,6 +13978,25 @@ function QuizzesScreen({ role, onNav, quizzes, onEditQuiz, onDeleteQuiz, onToggl
         <div style={{ display: "flex", flexDirection: "column", gap: 20 }}>
           <button onClick={() => setView("list")} style={{ background: "none", border: "none", cursor: "pointer", fontSize: 13, fontWeight: 600, color: C.textSub, padding: 0, alignSelf: "flex-start" }}>← Back to Quizzes</button>
           <ErrorState message="We couldn't load this quiz. Please try again." onRetry={() => startQuiz(activeId)} />
+        </div>
+      );
+    }
+
+    // ── Reviewing a past attempt — its OWN loading/error, with a Back action.
+    //    Crucially this NEVER starts or opens the quiz (unlike start_error). ──
+    if (view === "review_loading") {
+      return (
+        <div style={{ display: "flex", flexDirection: "column", gap: 20 }}>
+          <button onClick={() => setView("list")} style={{ background: "none", border: "none", cursor: "pointer", fontSize: 13, fontWeight: 600, color: C.textSub, padding: 0, alignSelf: "flex-start" }}>← Back to Quizzes</button>
+          <LoadingState rows={2} message="Loading your results…" />
+        </div>
+      );
+    }
+    if (view === "review_error") {
+      return (
+        <div style={{ display: "flex", flexDirection: "column", gap: 20 }}>
+          <button onClick={() => setView("list")} style={{ background: "none", border: "none", cursor: "pointer", fontSize: 13, fontWeight: 600, color: C.textSub, padding: 0, alignSelf: "flex-start" }}>← Back to Quizzes</button>
+          <ErrorState message="We couldn't load these results. Please try again." onRetry={() => reviewTarget && viewResults(reviewTarget.id, reviewTarget.attempt)} />
         </div>
       );
     }

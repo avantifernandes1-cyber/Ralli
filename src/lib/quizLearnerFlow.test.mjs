@@ -17,6 +17,7 @@ import {
   buildSubmissionAnswers,
   interpretSubmit,
   buildAttemptReview,
+  buildLearnerReviewModel,
   buildManagerAttemptReview,
   reviewRows,
 } from "./quizLearnerFlow.js";
@@ -201,6 +202,48 @@ const canonicalSolution = [
   const rows = reviewRows({ answers, labelQuestions: sanitizedRpc.questions, reveal: false });
   eq("8a match left labels from sanitized leftItems", rows[0].leftItems, ["L1", "L2"]);
   eq("8b match no answer key without reveal", rows[0].solution, null);
+}
+
+// ── 9. buildLearnerReviewModel — EXACT production payload shapes ──────────────
+// Failed server_v2 answer as stored in prod: {questionId, selected, isCorrect,
+// timeSpent, correct}. Sanitized labels have text+type+options, NO keys.
+{
+  const prodAnswer = { questionId: "z1", selected: 1, isCorrect: false, timeSpent: 6, correct: 3 };
+  const sanitized  = [{ id: "z1", type: "mc", text: "2 plus 2?", options: ["4", "5", "6", "7"] }];
+
+  // FAILED trusted review — real prompt + type + submission + isCorrect, no key.
+  const failed = buildLearnerReviewModel({
+    reviewData: { attempts: [{ attempt_id: "at1", attempt_num: 1, score: 0, passed: false, provenance: "server_v2", created_at: "2026-07-24T00:00:00Z", answers: [prodAnswer] }], revealAvailable: false, solutionsByAttempt: {} },
+    attemptId: "at1", sanitizedQuestions: sanitized,
+  });
+  ok("9a failed trusted",       failed && failed.trusted === true);
+  eq("9b failed reveal false",  failed.reveal, false);
+  eq("9c failed not unavailable", failed.unavailable, false);
+  eq("9d failed row type resolved (NOT Unsupported)", failed.rows[0].type, "mc");
+  eq("9e failed row text resolved (NOT 'Question N')", failed.rows[0].text, "2 plus 2?");
+  eq("9f failed row keeps server isCorrect", failed.rows[0].isCorrect, false);
+  ok("9g failed row exposes NO answer key", failed.rows[0].solution === null);
+  ok("9h failed row selected preserved", failed.rows[0].selected === 1);
+
+  // PASSED trusted review — snapshot supplies prompt/type/key + explanation.
+  const passed = buildLearnerReviewModel({
+    reviewData: { attempts: [{ attempt_id: "at2", attempt_num: 2, score: 100, passed: true, provenance: "server_v2", created_at: "2026-07-24T00:00:00Z", answers: [{ questionId: "m1", selected: 1, isCorrect: true }] }], revealAvailable: true, solutionsByAttempt: { at2: canonicalSolution } },
+    attemptId: "at2", sanitizedQuestions: null,
+  });
+  eq("9i passed reveal true", passed.reveal, true);
+  eq("9j passed not unavailable", passed.unavailable, false);
+  eq("9k passed row text from snapshot", passed.rows[0].text, "Pick");
+  ok("9l passed row reveals key from snapshot", passed.rows[0].solution && passed.rows[0].solution.correct === 1);
+
+  // LEGACY review — no labels substituted, unavailable note, no key.
+  const legacy = buildLearnerReviewModel({
+    reviewData: { attempts: [{ attempt_id: "at0", attempt_num: 1, score: 100, passed: true, provenance: null, created_at: "2026-01-01T00:00:00Z", answers: [{ questionId: "z1", selected: 0 }] }], revealAvailable: false, solutionsByAttempt: {} },
+    attemptId: "at0", sanitizedQuestions: sanitized, // provided but MUST be ignored
+  });
+  eq("9m legacy untrusted", legacy.trusted, false);
+  eq("9n legacy unavailable=true", legacy.unavailable, true);
+  ok("9o legacy does NOT substitute current questions (no label text)", legacy.rows[0].text === null);
+  ok("9p legacy exposes no key", legacy.rows[0].solution === null);
 }
 
 console.log(`\n${pass} passed, ${fail} failed`);
