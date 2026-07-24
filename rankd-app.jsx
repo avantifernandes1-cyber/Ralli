@@ -96,6 +96,8 @@ import { sendInviteEmail } from "./src/lib/emailService.js";
 import { provisionTenant, buildInviteUrl, normalizeProvisionedOrg, createMemberInvite } from "./src/lib/provisioningService.js";
 import { awardLessonPoints, awardCoursePoints, awardGamePointsForSession, getLeaderboard, computeUserMeta, getUserStreak } from "./src/lib/scoringService.js";
 import { triggerReadinessUpdate, getTopicHeatmap, getOrgMetrics, getRepTopicScores, getUserPerformance, getRecommendations } from "./src/lib/insightsService.js";
+import { listTenantQuizTags, listQuizTagMap, listQuizClassification, getQuizTagState, createQuizTag, renameQuizTag, archiveQuizTag, restoreQuizTag, mergeQuizTags, setQuizTags } from "./src/lib/taxonomyService.js";
+import { CLASSIFICATION, deriveClassificationState, tagCapabilities, buildBuilderTagRows, computeSaveTagIntent, tagSectionTouched, quizTagModel, filterQuizzesByTag, tagUsageCounts, resolveTag, normalizeTagError, savePayloadId } from "./src/lib/quizTagsUi.js";
 
 // ── MOBILE HOOK ────────────────────────────────────────────
 function useMobile() {
@@ -8029,7 +8031,316 @@ function NewSessionScreen({ onNav, quizzes, onCreateSession }) {
 
 // ── QUIZ BUILDER SCREEN ──────────────────────────────────────
 
-function QuizBuilderScreen({ onNav, onSave, initialQuiz }) {
+// ═══════════════════════════════════════════════════════════════════════════
+// Quiz Tags UI (Manager) — normalized taxonomy from migrations 058/059.
+// Never reads the deprecated tenant_quizzes.tags JSONB; identity is the stable
+// tag id. Classification is explicit (awaiting / tagged / uncategorized).
+// ═══════════════════════════════════════════════════════════════════════════
+const TAG_STATE_STYLE = {
+  awaiting:      { bg: C.muted,       fg: C.textMuted,  dot: C.textMuted },
+  tagged:        { bg: C.greenBg,     fg: C.trueGreen,  dot: C.trueGreen },
+  uncategorized: { bg: C.blueBg,      fg: C.blue,       dot: C.blue },
+};
+
+function ClassificationBadge({ state, suffix }) {
+  const s = TAG_STATE_STYLE[state] ?? TAG_STATE_STYLE.awaiting;
+  return (
+    <span style={{ display: "inline-flex", alignItems: "center", gap: 6, fontSize: 11, fontWeight: 700,
+      padding: "3px 9px", borderRadius: 999, background: s.bg, color: s.fg }}>
+      <span style={{ width: 6, height: 6, borderRadius: 999, background: s.dot }} />
+      {CLASSIFICATION[state]?.label ?? "Awaiting classification"}{suffix ? ` · ${suffix}` : ""}
+    </span>
+  );
+}
+
+function TagChip({ label, archived, onRemove }) {
+  return (
+    <span style={{ display: "inline-flex", alignItems: "center", gap: 6, fontSize: 12, fontWeight: 600,
+      padding: "4px 10px", borderRadius: 999,
+      background: archived ? C.muted : C.orangeLight, color: archived ? C.textMuted : C.orange,
+      border: `1px solid ${archived ? C.border : C.orangeBorder}` }}>
+      {label}{archived ? " · archived" : ""}
+      {onRemove && (
+        <button onClick={onRemove} title="Remove tag" style={{ background: "none", border: "none", cursor: "pointer",
+          color: "inherit", fontSize: 13, lineHeight: 1, padding: 0 }}>×</button>
+      )}
+    </span>
+  );
+}
+
+// Read-only tag/classification display for Library cards.
+function QuizTagChips({ model, catalogById }) {
+  const chips = (model.tagIds ?? []).map(id => {
+    const t = resolveTag(id, catalogById) || catalogById.get(id);
+    return { id, label: t ? t.label : "(unknown)", archived: !t || t.status === "archived" };
+  });
+  return (
+    <div style={{ display: "flex", flexWrap: "wrap", alignItems: "center", gap: 6, marginTop: 8 }}>
+      <ClassificationBadge state={model.state} />
+      {chips.map(c => <TagChip key={c.id} label={c.label} archived={c.archived} />)}
+    </div>
+  );
+}
+
+// Builder tag section — presentational; the builder owns state + save orchestration.
+function QuizTagsSection({ caps, catalog, loading, wasClassified, initialTagIds,
+                           selectedTagIds, onAddTag, onRemoveTag,
+                           markedUncategorized, onToggleUncategorized, onOpenManager, tagError }) {
+  const rows = buildBuilderTagRows(catalog, selectedTagIds);
+  const pendingState = wasClassified
+    ? deriveClassificationState(true, selectedTagIds)
+    : (markedUncategorized ? "uncategorized" : (selectedTagIds.length > 0 ? "tagged" : "awaiting"));
+  const touched = tagSectionTouched({ wasClassified, initialTagIds, selectedTagIds, markedUncategorized });
+  const suffix = !wasClassified && pendingState !== "awaiting" ? "applies on Save" : (touched ? "unsaved" : "");
+
+  return (
+    <div style={{ border: `1px solid ${C.border}`, borderRadius: 12, padding: 16, background: C.white, marginTop: 16 }}>
+      <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", gap: 12, flexWrap: "wrap" }}>
+        <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
+          <span style={{ fontSize: 13, fontWeight: 800, color: C.text }}>Topic Tags</span>
+          <ClassificationBadge state={pendingState} suffix={suffix} />
+        </div>
+        <button type="button" onClick={onOpenManager} style={{ background: "none", border: "none", cursor: "pointer",
+          color: C.orange, fontSize: 12, fontWeight: 700 }}>{caps.canGovern ? "Manage tags →" : "View tags →"}</button>
+      </div>
+
+      {loading ? (
+        <div style={{ fontSize: 12, color: C.textMuted, marginTop: 10 }}>Loading tags…</div>
+      ) : (
+        <>
+          <div style={{ display: "flex", flexWrap: "wrap", gap: 8, marginTop: 12 }}>
+            {rows.selected.length === 0 && (
+              <span style={{ fontSize: 12, color: C.textMuted }}>No tags assigned.</span>
+            )}
+            {rows.selected.map(r => (
+              <TagChip key={r.id} label={r.label} archived={r.archived} onRemove={() => onRemoveTag(r.id)} />
+            ))}
+          </div>
+
+          <div style={{ display: "flex", alignItems: "center", gap: 10, marginTop: 12, flexWrap: "wrap" }}>
+            <select value="" onChange={(e) => { if (e.target.value) onAddTag(e.target.value); }}
+              style={{ padding: "8px 10px", borderRadius: 8, border: `1px solid ${C.border}`, background: C.inputBg,
+                fontSize: 13, color: C.text, minWidth: 180 }}>
+              <option value="">+ Add a tag…</option>
+              {rows.assignable.map(a => <option key={a.id} value={a.id}>{a.label}</option>)}
+            </select>
+            {rows.assignable.length === 0 && (
+              <span style={{ fontSize: 11, color: C.textMuted }}>
+                {caps.canGovern ? "No active tags yet — create some in Manage tags." : "No active tags available."}
+              </span>
+            )}
+            {!wasClassified && (
+              <button type="button" onClick={onToggleUncategorized}
+                style={{ padding: "8px 12px", borderRadius: 8, fontSize: 12, fontWeight: 700, cursor: "pointer",
+                  border: `1px solid ${markedUncategorized ? C.blue : C.border}`,
+                  background: markedUncategorized ? C.blueBg : C.white,
+                  color: markedUncategorized ? C.blue : C.textSub }}>
+                {markedUncategorized ? "✓ Marked Uncategorized" : "Mark as Uncategorized"}
+              </button>
+            )}
+          </div>
+
+          {!wasClassified && pendingState === "awaiting" && (
+            <div style={{ fontSize: 11, color: C.textMuted, marginTop: 10 }}>
+              This quiz is <b>Awaiting classification</b>. Add a tag or Mark as Uncategorized to classify it — saving without a decision leaves it awaiting.
+            </div>
+          )}
+          {tagError && (
+            <div style={{ fontSize: 12, color: C.red, background: C.redBg, border: `1px solid ${C.red}`, borderRadius: 8,
+              padding: "8px 10px", marginTop: 10 }}>
+              Tags didn’t save: {tagError} — the quiz content was saved; press <b>Save Quiz</b> again to retry (no duplicate is created).
+            </div>
+          )}
+        </>
+      )}
+    </div>
+  );
+}
+
+// Shared taxonomy management surface (one place, under Quizzes).
+function TagManagerModal({ tenantId, caps, onClose, onChanged }) {
+  const [catalog, setCatalog]   = useState([]);
+  const [usage,   setUsage]     = useState(new Map());
+  const [loading, setLoading]   = useState(true);
+  const [newLabel, setNewLabel] = useState("");
+  const [busy,    setBusy]      = useState(false);
+  const [renameId, setRenameId] = useState(null);
+  const [renameVal, setRenameVal] = useState("");
+  const [confirmArchive, setConfirmArchive] = useState(null);
+  const [mergeSrc, setMergeSrc] = useState("");
+  const [mergeTgt, setMergeTgt] = useState("");
+  const [err,     setErr]       = useState(null);
+
+  const load = async () => {
+    setLoading(true);
+    const [{ data: tags }, { data: mapRows }] = await Promise.all([
+      listTenantQuizTags(tenantId, { includeArchived: true }),
+      listQuizTagMap(tenantId),
+    ]);
+    setCatalog(tags ?? []);
+    setUsage(tagUsageCounts(mapRows ?? []));
+    setLoading(false);
+  };
+  useEffect(() => { if (tenantId) load(); /* eslint-disable-next-line */ }, [tenantId]);
+
+  const byId = new Map(catalog.map(t => [t.id, t]));
+  const active   = catalog.filter(t => t.status === "active");
+  const archived = catalog.filter(t => t.status === "archived");
+
+  const run = async (fn, okMsg, ctx) => {
+    setBusy(true); setErr(null);
+    const { error } = await fn();
+    setBusy(false);
+    if (error) { setErr(normalizeTagError(error, ctx)); return false; }
+    toast.success(okMsg);
+    await load();
+    onChanged?.();
+    return true;
+  };
+
+  const doCreate = async () => {
+    if (!newLabel.trim() || busy) return;
+    const ok = await run(() => createQuizTag(newLabel.trim()), "Tag created.", { label: newLabel.trim() });
+    if (ok) setNewLabel("");
+  };
+  const doRename = async (id) => {
+    if (!renameVal.trim() || busy) return;
+    const ok = await run(() => renameQuizTag(id, renameVal.trim()), "Tag renamed.", { label: renameVal.trim() });
+    if (ok) { setRenameId(null); setRenameVal(""); }
+  };
+  const doArchive = async (id) => { if (await run(() => archiveQuizTag(id), "Tag archived.")) setConfirmArchive(null); };
+  const doRestore = async (id) => { await run(() => restoreQuizTag(id), "Tag restored."); };
+  const doMerge = async () => {
+    if (!mergeSrc || !mergeTgt || mergeSrc === mergeTgt || busy) return;
+    const ok = await run(() => mergeQuizTags(mergeSrc, mergeTgt), "Tags merged.");
+    if (ok) { setMergeSrc(""); setMergeTgt(""); }
+  };
+
+  return (
+    <div style={{ position: "fixed", inset: 0, background: "rgba(0,0,0,0.45)", display: "flex", alignItems: "center",
+      justifyContent: "center", zIndex: 1000, padding: 20 }} onClick={onClose}>
+      <div onClick={(e) => e.stopPropagation()} style={{ background: C.white, borderRadius: 16, padding: 24,
+        width: "100%", maxWidth: 560, maxHeight: "85vh", overflowY: "auto", boxShadow: "0 24px 60px rgba(0,0,0,0.2)" }}>
+        <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", marginBottom: 4 }}>
+          <h3 style={{ margin: 0, fontSize: 18, fontWeight: 800, color: C.text }}>Quiz Tags</h3>
+          <button onClick={onClose} style={{ background: "none", border: "none", fontSize: 20, cursor: "pointer", color: C.textMuted }}>×</button>
+        </div>
+        <p style={{ margin: "0 0 16px", fontSize: 12, color: C.textSub }}>
+          {caps.canGovern
+            ? "Create, rename, archive, restore and merge your organization’s quiz topic tags."
+            : "Active tags you can assign to quizzes. Only admins can create or change the taxonomy."}
+        </p>
+
+        {err && (
+          <div style={{ fontSize: 12, color: C.red, background: C.redBg, border: `1px solid ${C.red}`, borderRadius: 8, padding: "8px 10px", marginBottom: 12 }}>{err}</div>
+        )}
+
+        {caps.canGovern && (
+          <div style={{ display: "flex", gap: 8, marginBottom: 16 }}>
+            <input value={newLabel} onChange={(e) => setNewLabel(e.target.value)} placeholder="New tag name (e.g. Objection Handling)"
+              onKeyDown={(e) => { if (e.key === "Enter") doCreate(); }}
+              style={{ flex: 1, padding: "9px 12px", borderRadius: 8, border: `1px solid ${C.border}`, background: C.inputBg, fontSize: 13, color: C.text }} />
+            <button onClick={doCreate} disabled={busy || !newLabel.trim()} style={{ padding: "9px 16px", borderRadius: 8, border: "none",
+              cursor: busy || !newLabel.trim() ? "not-allowed" : "pointer", fontSize: 13, fontWeight: 700, color: "#fff",
+              background: busy || !newLabel.trim() ? C.muted : C.orange }}>Create</button>
+          </div>
+        )}
+
+        {loading ? (
+          <div style={{ fontSize: 13, color: C.textMuted, padding: 20, textAlign: "center" }}>Loading tags…</div>
+        ) : (
+          <>
+            <div style={{ fontSize: 11, fontWeight: 700, color: C.textMuted, textTransform: "uppercase", letterSpacing: "0.05em", marginBottom: 8 }}>Active ({active.length})</div>
+            {active.length === 0 && <div style={{ fontSize: 12, color: C.textMuted, marginBottom: 12 }}>No active tags yet.</div>}
+            <div style={{ display: "flex", flexDirection: "column", gap: 6, marginBottom: 18 }}>
+              {active.map(t => (
+                <div key={t.id} style={{ display: "flex", alignItems: "center", gap: 8, padding: "8px 10px", borderRadius: 8, border: `1px solid ${C.border}` }}>
+                  {renameId === t.id ? (
+                    <>
+                      <input value={renameVal} onChange={(e) => setRenameVal(e.target.value)} autoFocus
+                        onKeyDown={(e) => { if (e.key === "Enter") doRename(t.id); if (e.key === "Escape") setRenameId(null); }}
+                        style={{ flex: 1, padding: "6px 8px", borderRadius: 6, border: `1px solid ${C.orange}`, fontSize: 13, color: C.text }} />
+                      <button onClick={() => doRename(t.id)} disabled={busy} style={{ fontSize: 12, fontWeight: 700, color: C.orange, background: "none", border: "none", cursor: "pointer" }}>Save</button>
+                      <button onClick={() => setRenameId(null)} style={{ fontSize: 12, color: C.textMuted, background: "none", border: "none", cursor: "pointer" }}>Cancel</button>
+                    </>
+                  ) : (
+                    <>
+                      <span style={{ flex: 1, fontSize: 13, fontWeight: 600, color: C.text }}>{t.label}</span>
+                      <span style={{ fontSize: 11, color: C.textMuted }}>{usage.get(t.id) || 0} quiz{(usage.get(t.id) || 0) !== 1 ? "zes" : ""}</span>
+                      {caps.canGovern && (
+                        <>
+                          <button onClick={() => { setRenameId(t.id); setRenameVal(t.label); }} style={{ fontSize: 12, fontWeight: 700, color: C.textSub, background: "none", border: "none", cursor: "pointer" }}>Rename</button>
+                          {confirmArchive === t.id ? (
+                            <>
+                              <button onClick={() => doArchive(t.id)} disabled={busy} style={{ fontSize: 12, fontWeight: 700, color: C.red, background: "none", border: "none", cursor: "pointer" }}>Confirm archive</button>
+                              <button onClick={() => setConfirmArchive(null)} style={{ fontSize: 12, color: C.textMuted, background: "none", border: "none", cursor: "pointer" }}>Cancel</button>
+                            </>
+                          ) : (
+                            <button onClick={() => setConfirmArchive(t.id)} style={{ fontSize: 12, fontWeight: 700, color: C.textSub, background: "none", border: "none", cursor: "pointer" }}>Archive</button>
+                          )}
+                        </>
+                      )}
+                    </>
+                  )}
+                </div>
+              ))}
+            </div>
+
+            {caps.canGovern && active.length >= 2 && (
+              <div style={{ border: `1px solid ${C.border}`, borderRadius: 10, padding: 12, marginBottom: 18, background: C.pageBg }}>
+                <div style={{ fontSize: 12, fontWeight: 800, color: C.text, marginBottom: 8 }}>Merge tags</div>
+                <div style={{ display: "flex", alignItems: "center", gap: 8, flexWrap: "wrap" }}>
+                  <select value={mergeSrc} onChange={(e) => setMergeSrc(e.target.value)} style={{ padding: "7px 9px", borderRadius: 8, border: `1px solid ${C.border}`, fontSize: 12, color: C.text, background: C.white }}>
+                    <option value="">Merge (source)…</option>
+                    {active.map(t => <option key={t.id} value={t.id}>{t.label}</option>)}
+                  </select>
+                  <span style={{ fontSize: 12, color: C.textMuted }}>→ into</span>
+                  <select value={mergeTgt} onChange={(e) => setMergeTgt(e.target.value)} style={{ padding: "7px 9px", borderRadius: 8, border: `1px solid ${C.border}`, fontSize: 12, color: C.text, background: C.white }}>
+                    <option value="">Target…</option>
+                    {active.filter(t => t.id !== mergeSrc).map(t => <option key={t.id} value={t.id}>{t.label}</option>)}
+                  </select>
+                </div>
+                {mergeSrc && mergeTgt && (
+                  <div style={{ marginTop: 10, fontSize: 12, color: C.textSub }}>
+                    Merge <b>{byId.get(mergeSrc)?.label}</b> into <b>{byId.get(mergeTgt)?.label}</b>? The source is archived; its quiz assignments move to the target. History is preserved.
+                    <div style={{ marginTop: 8 }}>
+                      <button onClick={doMerge} disabled={busy} style={{ padding: "7px 14px", borderRadius: 8, border: "none", cursor: "pointer", fontSize: 12, fontWeight: 700, color: "#fff", background: C.orange }}>Confirm merge</button>
+                    </div>
+                  </div>
+                )}
+              </div>
+            )}
+
+            <div style={{ fontSize: 11, fontWeight: 700, color: C.textMuted, textTransform: "uppercase", letterSpacing: "0.05em", marginBottom: 8 }}>Archived ({archived.length})</div>
+            {archived.length === 0 && <div style={{ fontSize: 12, color: C.textMuted }}>No archived tags.</div>}
+            <div style={{ display: "flex", flexDirection: "column", gap: 6 }}>
+              {archived.map(t => {
+                const merged = !!t.merged_into;
+                return (
+                  <div key={t.id} style={{ display: "flex", alignItems: "center", gap: 8, padding: "8px 10px", borderRadius: 8, border: `1px solid ${C.border}`, background: C.muted }}>
+                    <span style={{ flex: 1, fontSize: 13, fontWeight: 600, color: C.textSub }}>
+                      {t.label}{merged ? <span style={{ fontSize: 11, color: C.textMuted }}> · merged into {byId.get(t.merged_into)?.label ?? "another tag"}</span> : ""}
+                    </span>
+                    {caps.canGovern && !merged && (
+                      <button onClick={() => doRestore(t.id)} disabled={busy} style={{ fontSize: 12, fontWeight: 700, color: C.orange, background: "none", border: "none", cursor: "pointer" }}>Restore</button>
+                    )}
+                    {caps.canGovern && merged && (
+                      <span style={{ fontSize: 11, color: C.textMuted }}>merged — cannot restore</span>
+                    )}
+                  </div>
+                );
+              })}
+            </div>
+          </>
+        )}
+      </div>
+    </div>
+  );
+}
+
+const QUIZ_UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+
+function QuizBuilderScreen({ onNav, onSave, onDone, initialQuiz, isReal = false, tenantId = null, role = null }) {
   const mobile  = useMobile();
   const makeBlank = (type = "mc") => {
     const base = { id: `q_${Date.now()}_${Math.random().toString(36).slice(2)}`, q: "", type, timeLimit: 20 };
@@ -8060,6 +8371,56 @@ function QuizBuilderScreen({ onNav, onSave, initialQuiz }) {
   );
   const [activeIdx, setActiveIdx] = useState(0);
   const activeQ = qs[activeIdx];
+
+  // ── Topic Tags (normalized taxonomy 058/059) ──────────────────────────────
+  const caps = tagCapabilities(role);
+  const showTags = isReal && caps.canAssign;
+  // Adopt the stable DB id as soon as we have one so a retry after a partial
+  // save UPDATEs the same row (upsertQuiz) instead of INSERTing a duplicate.
+  const [savedQuizId, setSavedQuizId] = useState(
+    initialQuiz?.id && QUIZ_UUID_RE.test(String(initialQuiz.id)) ? initialQuiz.id : null
+  );
+  const [tagCatalog, setTagCatalog]         = useState([]);
+  const [tagsLoading, setTagsLoading]       = useState(showTags);
+  const [wasClassified, setWasClassified]   = useState(false);
+  const [initialTagIds, setInitialTagIds]   = useState([]);
+  const [selectedTagIds, setSelectedTagIds] = useState([]);
+  const [markedUncat, setMarkedUncat]       = useState(false);
+  const [showTagManager, setShowTagManager] = useState(false);
+  const [saving, setSaving]                 = useState(false);
+  const [tagError, setTagError]             = useState(null);
+
+  // Load catalog + this quiz's saved tag state ONCE. Keyed on the existing quiz
+  // id only — never on savedQuizId — so adopting the canonical id after a save
+  // (or a partial failure) never re-fetches and wipes the manager's in-progress
+  // selection. New quizzes (no existing id) start Awaiting with no tags.
+  const existingQuizId = initialQuiz?.id && QUIZ_UUID_RE.test(String(initialQuiz.id)) ? initialQuiz.id : null;
+  useEffect(() => {
+    if (!showTags || !tenantId) { setTagsLoading(false); return; }
+    let alive = true;
+    (async () => {
+      setTagsLoading(true);
+      const { data: catalog } = await listTenantQuizTags(tenantId, { includeArchived: true });
+      let cls = false, ids = [];
+      if (existingQuizId) {
+        const { data: st } = await getQuizTagState(existingQuizId);
+        cls = !!st?.classifiedAt; ids = st?.tagIds ?? [];
+      }
+      if (!alive) return;
+      setTagCatalog(catalog ?? []);
+      setWasClassified(cls); setInitialTagIds(ids); setSelectedTagIds(ids);
+      setTagsLoading(false);
+    })();
+    return () => { alive = false; };
+  }, [showTags, tenantId, existingQuizId]);
+
+  const reloadTagCatalog = async () => {
+    const { data: catalog } = await listTenantQuizTags(tenantId, { includeArchived: true });
+    setTagCatalog(catalog ?? []);
+  };
+  const addTag    = (id) => { setSelectedTagIds(prev => prev.includes(id) ? prev : [...prev, id]); setMarkedUncat(false); setTagError(null); };
+  const removeTag = (id) => { setSelectedTagIds(prev => prev.filter(x => x !== id)); setTagError(null); };
+  const toggleUncat = () => { setMarkedUncat(prev => { const next = !prev; if (next) setSelectedTagIds([]); return next; }); setTagError(null); };
 
   const updateQ  = (updates) => setQs(prev => prev.map((q, i) => i === activeIdx ? { ...q, ...updates } : q));
   // Switching a question's type has to discard type-specific fields (options,
@@ -8096,16 +8457,43 @@ function QuizBuilderScreen({ onNav, onSave, initialQuiz }) {
 
   const canSave = name.trim() && qs.length > 0 && qs.every(isQComplete);
 
-  const handleSave = () => {
-    if (!canSave) return;
-    onSave({
+  const handleSave = async () => {
+    if (!canSave || saving) return;
+    setSaving(true); setTagError(null);
+    // Phase 1 — persist quiz content. Reuse the single content-save path
+    // (onSave → handleSaveQuiz → upsertQuiz). Using savedQuizId once known makes
+    // every retry an UPDATE, never a duplicate INSERT.
+    const res = await onSave({
       ...(initialQuiz ?? {}),
-      id: initialQuiz?.id ?? Date.now().toString(),
+      id: savePayloadId({ savedQuizId, initialQuizId: initialQuiz?.id, fallbackId: Date.now().toString() }),
       name: name.trim(),
       questions: qs,
       passingScore: Math.max(0, Math.min(100, Math.round(Number(passingScore) || 0))),
       createdAt: initialQuiz?.createdAt ?? new Date().toLocaleDateString("en-US", { month: "short", day: "numeric" }),
     });
+    if (!res?.ok || !res.quiz) { setSaving(false); return; } // onSave surfaced the content error
+    const canonicalId = res.quiz.id;
+    setSavedQuizId(canonicalId);
+
+    // Phase 2 — tag assignment / classification (real backend + assign role only).
+    // Report tag success ONLY after setQuizTags succeeds; a failure keeps the
+    // manager here in a retryable state and never claims the whole save worked.
+    if (showTags) {
+      const intent = computeSaveTagIntent({ wasClassified, initialTagIds, selectedTagIds, markedUncategorized: markedUncat });
+      if (intent.action !== "none") {
+        const { error } = await setQuizTags(canonicalId, intent.tagIds, { classify: intent.classify });
+        if (error) {
+          setTagError(normalizeTagError(error));
+          toast.error("Quiz saved, but tags didn’t save. Press Save again to retry.");
+          setSaving(false);
+          return;
+        }
+        setWasClassified(true); setInitialTagIds(intent.tagIds); setSelectedTagIds(intent.tagIds); setMarkedUncat(false);
+      }
+    }
+    setSaving(false);
+    toast.success("Quiz saved.");
+    (onDone ?? (() => onNav("quizzes")))();
   };
 
   const optLetters = ["A","B","C","D"];
@@ -8326,8 +8714,36 @@ function QuizBuilderScreen({ onNav, onSave, initialQuiz }) {
         <div style={{ fontSize:12, color: canSave ? "#059669" : C.textMuted, fontWeight:600, flexShrink:0 }}>
           {canSave ? `✓ ${qs.length} q${qs.length!==1?"s":""} ready` : `${qs.filter(isQComplete).length} / ${qs.length} complete`}
         </div>
-        <button onClick={handleSave} disabled={!canSave} style={{ padding:"10px 24px", borderRadius:12, border:"none", cursor:canSave?"pointer":"not-allowed", fontSize:14, fontWeight:700, color:"#fff", background:canSave?C.orange:C.muted, flexShrink:0 }}>Save Quiz</button>
+        <button onClick={handleSave} disabled={!canSave || saving} style={{ padding:"10px 24px", borderRadius:12, border:"none", cursor:(!canSave||saving)?"not-allowed":"pointer", fontSize:14, fontWeight:700, color:"#fff", background:(!canSave||saving)?C.muted:C.orange, flexShrink:0 }}>{saving ? "Saving…" : "Save Quiz"}</button>
       </div>
+
+      {/* Topic Tags (managers/orgAdmin; real backend only) */}
+      {showTags && (
+        <div style={{ flexShrink: 0, marginBottom: 20 }}>
+          <QuizTagsSection
+            caps={caps}
+            catalog={tagCatalog}
+            loading={tagsLoading}
+            wasClassified={wasClassified}
+            initialTagIds={initialTagIds}
+            selectedTagIds={selectedTagIds}
+            onAddTag={addTag}
+            onRemoveTag={removeTag}
+            markedUncategorized={markedUncat}
+            onToggleUncategorized={toggleUncat}
+            onOpenManager={() => setShowTagManager(true)}
+            tagError={tagError}
+          />
+        </div>
+      )}
+      {showTagManager && (
+        <TagManagerModal
+          tenantId={tenantId}
+          caps={caps}
+          onClose={() => setShowTagManager(false)}
+          onChanged={reloadTagCatalog}
+        />
+      )}
 
       {/* Two-panel */}
       <div style={{ flex:1, display:"grid", gridTemplateColumns: mobile ? "1fr" : "240px 1fr", gridTemplateRows: mobile ? "auto 1fr" : undefined, gap:20, minHeight:0 }}>
@@ -13077,7 +13493,7 @@ function SnapshotQuizReview({
 // ── QuizLibraryGrid ──────────────────────────────────────────────────────────
 // Admin/Manager quiz list. Displays each quiz with edit, delete, favorite, and
 // active-toggle actions. Production hook: replace callbacks with API mutations.
-function QuizLibraryGrid({ quizzes, onEditQuiz, onNav, onDeleteQuiz, onToggleFavorite, onToggleActive, onAssign, onLaunchQuiz, canEdit = true, canDelete = true, canAssign = true, canLaunch = false }) {
+function QuizLibraryGrid({ quizzes, onEditQuiz, onNav, onDeleteQuiz, onToggleFavorite, onToggleActive, onAssign, onLaunchQuiz, canEdit = true, canDelete = true, canAssign = true, canLaunch = false, tagModelByQuiz = null, tagCatalogById = new Map() }) {
   const [confirmDelete, setConfirmDelete] = useState(null); // quiz id pending delete confirm
 
   return (
@@ -13105,6 +13521,9 @@ function QuizLibraryGrid({ quizzes, onEditQuiz, onNav, onDeleteQuiz, onToggleFav
                 {qCount} question{qCount !== 1 ? "s" : ""} · Created {quiz.createdAt}
                 {quiz.track ? ` · ${quiz.track}` : ""}
               </div>
+              {tagModelByQuiz && (
+                <QuizTagChips model={quizTagModel(tagModelByQuiz, quiz.id)} catalogById={tagCatalogById} />
+              )}
             </div>
 
             {/* Actions */}
@@ -14242,6 +14661,43 @@ function QuizzesScreen({ role, onNav, quizzes, onEditQuiz, onDeleteQuiz, onToggl
   const [adminTab,    setAdminTab]      = useState("library"); // "library" | "tracking"
   const [refreshKey,  setRefreshKey]    = useState(0); // bumped after a new assignment so tracking refetches
 
+  // ── Normalized quiz tags (058/059) for Library display + filtering ────────
+  const tagCaps = tagCapabilities(currentUser?.role);
+  const tagsEnabled = isReal && !!tenantId && tagCaps.canAssign;
+  const [tagCatalog, setTagCatalog]     = useState([]);
+  const [tagModelByQuiz, setTagModel]   = useState(new Map());
+  const [tagFilter, setTagFilter]       = useState({ kind: "all" });
+  const [showTagManager, setShowTagManager] = useState(false);
+  const [tagRefreshKey, setTagRefreshKey]   = useState(0);
+
+  useEffect(() => {
+    if (!tagsEnabled) return;
+    let alive = true;
+    (async () => {
+      const [{ data: catalog }, { data: mapRows }, { data: cls }] = await Promise.all([
+        listTenantQuizTags(tenantId, { includeArchived: true }),
+        listQuizTagMap(tenantId),
+        listQuizClassification(tenantId),
+      ]);
+      if (!alive) return;
+      setTagCatalog(catalog ?? []);
+      const byQuiz = new Map();
+      for (const q of (cls ?? [])) byQuiz.set(q.id, { classifiedAt: q.tags_classified_at ?? null, tagIds: [] });
+      for (const r of (mapRows ?? [])) {
+        const e = byQuiz.get(r.quiz_id) ?? { classifiedAt: null, tagIds: [] };
+        e.tagIds = [...e.tagIds, r.tag_id];
+        byQuiz.set(r.quiz_id, e);
+      }
+      setTagModel(byQuiz);
+    })();
+    return () => { alive = false; };
+  }, [tagsEnabled, tenantId, tagRefreshKey, quizzes.length]);
+
+  const tagCatalogById = new Map(tagCatalog.map(t => [t.id, t]));
+  const tagUsage = tagUsageCounts([...tagModelByQuiz.values()].flatMap(m => m.tagIds.map(id => ({ tag_id: id }))));
+  const activeCatalog = tagCatalog.filter(t => t.status === "active");
+  const libraryQuizzes = tagsEnabled ? filterQuizzesByTag(quizzes, tagModelByQuiz, tagFilter) : quizzes;
+
   return (
     <div style={{ display: "flex", flexDirection: "column", gap: 20 }}>
       <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", flexWrap: "wrap", gap: 12 }}>
@@ -14253,13 +14709,22 @@ function QuizzesScreen({ role, onNav, quizzes, onEditQuiz, onDeleteQuiz, onToggl
               : "Assignment status and results for every rep"}
           </p>
         </div>
-        {canCreate && adminTab === "library" && (
-          <button onClick={() => { onEditQuiz(null); onNav("rankd-quiz-builder"); }} style={{
-            display: "flex", alignItems: "center", gap: 8, padding: "10px 20px",
-            borderRadius: 12, border: "none", cursor: "pointer",
-            fontSize: 13, fontWeight: 700, color: "#fff", background: C.orange,
-          }}>✚ Create Quiz</button>
-        )}
+        <div style={{ display: "flex", alignItems: "center", gap: 8, flexWrap: "wrap" }}>
+          {tagsEnabled && adminTab === "library" && (
+            <button onClick={() => setShowTagManager(true)} style={{
+              display: "flex", alignItems: "center", gap: 6, padding: "10px 16px",
+              borderRadius: 12, border: `1px solid ${C.border}`, cursor: "pointer",
+              fontSize: 13, fontWeight: 700, color: C.text, background: C.white,
+            }}>🏷 {tagCaps.canGovern ? "Manage Tags" : "View Tags"}</button>
+          )}
+          {canCreate && adminTab === "library" && (
+            <button onClick={() => { onEditQuiz(null); onNav("rankd-quiz-builder"); }} style={{
+              display: "flex", alignItems: "center", gap: 8, padding: "10px 20px",
+              borderRadius: 12, border: "none", cursor: "pointer",
+              fontSize: 13, fontWeight: 700, color: "#fff", background: C.orange,
+            }}>✚ Create Quiz</button>
+          )}
+        </div>
       </div>
 
       {/* Library / Assignments tab switcher */}
@@ -14288,29 +14753,66 @@ function QuizzesScreen({ role, onNav, quizzes, onEditQuiz, onDeleteQuiz, onToggl
             )}
           </div>
         ) : (
-          <QuizLibraryGrid
-            quizzes={quizzes}
-            onEditQuiz={onEditQuiz}
-            onNav={onNav}
-            onDeleteQuiz={onDeleteQuiz}
-            onToggleFavorite={onToggleFavorite}
-            onToggleActive={onToggleActive}
-            onAssign={canAssign ? (quiz) => setAssignModal(quiz) : null}
-            canEdit={canEdit}
-            canDelete={canDelete}
-            canAssign={canAssign}
-            canLaunch={canLaunch}
-            onLaunchQuiz={canLaunch && onLaunchQuiz ? (quiz) => onLaunchQuiz({
-              code:          String(Math.floor(100000 + Math.random() * 900000)),
-              name:          quiz.name,
-              quizId:        quiz.id,
-              questionCount: quiz.questions?.length ?? 0,
-              status:        "waiting",
-              playerCount:   0,
-              demoMode:      false,
-              players:       [],
-            }) : null}
-          />
+          <>
+            {/* Stable-ID tag filters (honest states; never invents tags) */}
+            {tagsEnabled && (
+              <div style={{ display: "flex", flexWrap: "wrap", alignItems: "center", gap: 6 }}>
+                {[
+                  { key: "all",           label: `All (${quizzes.length})`,                                                filter: { kind: "all" } },
+                  { key: "awaiting",      label: `Awaiting`,      filter: { kind: "awaiting" } },
+                  { key: "uncategorized", label: `Uncategorized`, filter: { kind: "uncategorized" } },
+                ].map(chip => {
+                  const on = tagFilter.kind === chip.filter.kind && !tagFilter.tagId;
+                  return (
+                    <button key={chip.key} onClick={() => setTagFilter(chip.filter)} style={{
+                      padding: "6px 12px", borderRadius: 999, fontSize: 12, fontWeight: 700, cursor: "pointer",
+                      border: `1px solid ${on ? C.orange : C.border}`, background: on ? C.orangeLight : C.white,
+                      color: on ? C.orange : C.textSub }}>{chip.label}</button>
+                  );
+                })}
+                {activeCatalog.map(t => {
+                  const on = tagFilter.kind === "tag" && tagFilter.tagId === t.id;
+                  return (
+                    <button key={t.id} onClick={() => setTagFilter({ kind: "tag", tagId: t.id })} style={{
+                      padding: "6px 12px", borderRadius: 999, fontSize: 12, fontWeight: 700, cursor: "pointer",
+                      border: `1px solid ${on ? C.orange : C.border}`, background: on ? C.orangeLight : C.white,
+                      color: on ? C.orange : C.textSub }}>{t.label} · {tagUsage.get(t.id) || 0}</button>
+                  );
+                })}
+              </div>
+            )}
+            {tagsEnabled && libraryQuizzes.length === 0 ? (
+              <div style={{ padding: 40, borderRadius: 16, border: `2px dashed ${C.border}`, textAlign: "center", background: C.white }}>
+                <p style={{ fontSize: 14, fontWeight: 700, color: C.text, margin: 0 }}>No quizzes match this filter.</p>
+              </div>
+            ) : (
+              <QuizLibraryGrid
+                quizzes={libraryQuizzes}
+                tagModelByQuiz={tagsEnabled ? tagModelByQuiz : null}
+                tagCatalogById={tagCatalogById}
+                onEditQuiz={onEditQuiz}
+                onNav={onNav}
+                onDeleteQuiz={onDeleteQuiz}
+                onToggleFavorite={onToggleFavorite}
+                onToggleActive={onToggleActive}
+                onAssign={canAssign ? (quiz) => setAssignModal(quiz) : null}
+                canEdit={canEdit}
+                canDelete={canDelete}
+                canAssign={canAssign}
+                canLaunch={canLaunch}
+                onLaunchQuiz={canLaunch && onLaunchQuiz ? (quiz) => onLaunchQuiz({
+                  code:          String(Math.floor(100000 + Math.random() * 900000)),
+                  name:          quiz.name,
+                  quizId:        quiz.id,
+                  questionCount: quiz.questions?.length ?? 0,
+                  status:        "waiting",
+                  playerCount:   0,
+                  demoMode:      false,
+                  players:       [],
+                }) : null}
+              />
+            )}
+          </>
         )
       ) : (
         <QuizTrackingPanel
@@ -14349,6 +14851,16 @@ function QuizzesScreen({ role, onNav, quizzes, onEditQuiz, onDeleteQuiz, onToggl
             setRefreshKey(k => k + 1); // refetch tracking panel so the new assignment shows immediately
           }}
           onClose={() => setAssignModal(null)}
+        />
+      )}
+
+      {/* Shared taxonomy management surface */}
+      {showTagManager && tagsEnabled && (
+        <TagManagerModal
+          tenantId={tenantId}
+          caps={tagCaps}
+          onClose={() => setShowTagManager(false)}
+          onChanged={() => setTagRefreshKey(k => k + 1)}
         />
       )}
     </div>
@@ -23520,34 +24032,29 @@ export default function App() {
   };
 
   // ── Quiz CRUD ──
+  // Phase-1 quiz-content persistence ONLY. Returns { ok, quiz, error } and does
+  // NOT toast/navigate — the builder orchestrates the toast, navigation, and the
+  // phase-2 tag save so a tag failure keeps the manager in a retryable state
+  // without a false "saved" or a duplicate quiz. This remains the SINGLE
+  // quiz-save path (upsertQuiz). No optimistic state overwrites a failed server
+  // response: for real users, state is updated only from the persisted row.
   const handleSaveQuiz = async (quiz) => {
-    // For real users, persist to Supabase and get a stable UUID back.
-    // Fall back to user.orgId if currentOrg hasn't loaded yet (async race on first login).
     const orgId = currentOrg?.id ?? user?.orgId ?? null;
     if (user?._isReal && orgId) {
       const { data: saved, error } = await upsertQuiz(orgId, quiz, user.id);
-      if (error) { console.error("[ralli] upsertQuiz failed:", error); toast.error("Failed to save quiz. Please try again."); }
-      // Only use saved (with stable DB UUID) if the upsert succeeded.
-      // If it failed, don't silently add a non-persisted quiz to state for real users.
-      if (!saved) {
-        console.error("[ralli] handleSaveQuiz: upsert returned no data, aborting state update");
-        toast.error("Quiz save failed. Please try again.");
-        setEditingQuiz(null);
-        setScreen("quizzes");
-        return;
+      if (error || !saved) {
+        console.error("[ralli] upsertQuiz failed:", error);
+        toast.error("Failed to save quiz. Please try again.");
+        return { ok: false, error: error ?? new Error("upsert returned no data") };
       }
-      const canonical = saved;
       setQuizzes(prev =>
-        prev.find(q => q.id === quiz.id || q.id === canonical.id)
-          ? prev.map(q => (q.id === quiz.id || q.id === canonical.id) ? canonical : q)
-          : [...prev, canonical]
-      ); // real users: no localStorage write — Supabase is source of truth
-      setEditingQuiz(null);
-      toast.success("Quiz saved.");
-      setScreen("quizzes");
-      return;
+        prev.find(q => q.id === quiz.id || q.id === saved.id)
+          ? prev.map(q => (q.id === quiz.id || q.id === saved.id) ? saved : q)
+          : [...prev, saved]
+      ); // real users: Supabase is source of truth
+      return { ok: true, quiz: saved };
     }
-    // Demo / offline path
+    // Demo / offline path (no real backend → no tag assignment)
     setQuizzes(prev => {
       const updated = prev.find(q => q.id === quiz.id)
         ? prev.map(q => q.id === quiz.id ? quiz : q)
@@ -23555,10 +24062,12 @@ export default function App() {
       try { localStorage.setItem("ralli_quizzes", JSON.stringify(updated)); } catch {}
       return updated;
     });
-    setEditingQuiz(null);
-    toast.success("Quiz saved.");
-    setScreen("quizzes");
+    return { ok: true, quiz };
   };
+
+  // Navigate away + clear the editing quiz once the builder's full save
+  // (content + tags) has succeeded.
+  const handleQuizBuilderDone = () => { setEditingQuiz(null); setScreen("quizzes"); };
 
   const handleEditQuiz = (quiz) => {
     setEditingQuiz(quiz);
@@ -24096,7 +24605,7 @@ export default function App() {
         : <HomeScreen user={user} onNav={navigate} quizAssignments={user?._isReal ? [] : USER_QUIZ_ASSIGNMENTS_SEED} onResumeLesson={(id) => { setPendingLessonId(id); navigate("learn"); }} onStartCourse={(id) => { setPendingCourseId(id); navigate("learn"); }} onStartQuiz={(id) => { setPendingQuizId(id); navigate("quizzes"); }} orgUsers={orgUsers} isReal={!!user?._isReal} tenantId={currentOrg?.id ?? null} quizzes={quizzes} lastSeenAt={lastSeenAt} onNewAssignments={(n) => setNewAssignmentCount(n)} sharedAssignmentData={sharedAssignmentData} readinessThreshold={readinessThreshold} />;
       case "rankd":             return <RankdScreen onNav={navigate} onJoin={handleEnterPin} sessions={sessions} pastSessions={pastSessions} onLaunch={handleLaunch} onViewResults={handleViewResults} onRelaunch={handleRelaunch} role={gameRole} currentUser={currentUser} />;
       case "rankd-new":         return <NewSessionScreen onNav={navigate} quizzes={quizzes} onCreateSession={handleCreateSession} />;
-      case "rankd-quiz-builder":return <QuizBuilderScreen onNav={navigate} onSave={handleSaveQuiz} initialQuiz={editingQuiz} onEditQuiz={handleEditQuiz} />;
+      case "rankd-quiz-builder":return <QuizBuilderScreen onNav={navigate} onSave={handleSaveQuiz} onDone={handleQuizBuilderDone} initialQuiz={editingQuiz} onEditQuiz={handleEditQuiz} isReal={!!user?._isReal} tenantId={currentOrg?.id ?? null} role={currentUser?.role ?? null} />;
       case "rankd-name-entry":  return <RankdNameEntryScreen onNav={navigate} pin={lobbyPin} sessionName={lobbySessionName} onConfirm={handleEnterName} defaultName={userProfile.nickname?.trim() || user?.name || ""} defaultAvatar={userProfile.avatarEmoji} />;
       case "rankd-lobby":       return <RankdLobbyScreen onNav={navigate} pin={lobbyPin} playerName={lobbyPlayerName} playerEmoji={lobbyPlayerEmoji} sessionName={lobbySessionName} role={gameRole} sessions={sessions} currentUser={currentUser} onGameStart={handleGameStart} chPlayers={chPlayers} broadcast={broadcast} trackPlayerPresence={trackPlayerPresence} playerId={gamePlayerId} chMsg={chMsg} onHostEnd={async () => {
         // Ending from the LOBBY (before gameplay) is a CANCELLATION, not a
