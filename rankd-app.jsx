@@ -981,8 +981,9 @@ function PersonalDashboardScreen({
   useEffect(() => {
     if (!isReal || !tenantId || !user?.id) { setPerfLoading(false); return; }
     Promise.all([
-      getUserPerformance(tenantId, user.id),
-      getRepTopicScores(tenantId, user.id),
+      // Own performance/topics → learner-safe RPC source (survives migration 057).
+      getUserPerformance(tenantId, user.id, { safe: true }),
+      getRepTopicScores(tenantId, user.id, { safe: true }),
       supabase
         .from("user_point_events")
         // Task 18 — quiz_attempt_id (added 041_quiz_attempt_id_on_point_events.sql)
@@ -21624,13 +21625,13 @@ function InsightsScreen({ user, isReal = false, tenantId = null, orgUsers = [], 
           if (teamErr) { setError("Could not load team insights."); return; }
           setTeamData(team);
           // Also load own perf if available
-          const { data: myPerf } = await insightsSvc.getUserPerformance(tenantId, user.id);
+          const { data: myPerf } = await insightsSvc.getUserPerformance(tenantId, user.id, { safe: true });
           if (myPerf) {
             setPerf(myPerf);
             setRecs(insightsSvc.getRecommendations(myPerf));
           }
         } else {
-          const { data: myPerf, error: perfErr } = await insightsSvc.getUserPerformance(tenantId, user.id);
+          const { data: myPerf, error: perfErr } = await insightsSvc.getUserPerformance(tenantId, user.id, { safe: true });
           if (perfErr || !myPerf) { setError("Could not load your insights."); return; }
           setPerf(myPerf);
           setRecs(insightsSvc.getRecommendations(myPerf));

@@ -104,10 +104,25 @@ function pctScore(numerator, denominator) {
  * @param {{ windowDays?: number }} [opts]
  * @returns {Promise<{ data: UserPerformance|null, error: Object|null }>}
  */
-export async function getUserPerformance(tenantId, userId, { windowDays = 30 } = {}) {
+// `safe`: when true (a learner reading their OWN performance), quiz attempts are
+// sourced from the learner-safe SECURITY DEFINER RPC (list_my_quiz_attempts_safe
+// — own attempts, non-answer columns only) instead of a direct quiz_attempts
+// SELECT, so this keeps working after migration 057 revokes learner table reads.
+// point_events / lesson_completions are unaffected by 057 and stay direct.
+// The manager path (reading a rep by userId) keeps the direct read (safe:false).
+export async function getUserPerformance(tenantId, userId, { windowDays = 30, safe = false } = {}) {
   if (!tenantId || !userId) return { data: null, error: new Error("Missing params") };
 
   const since = new Date(Date.now() - windowDays * 24 * 60 * 60 * 1000).toISOString();
+
+  const quizAttemptsSource = safe
+    ? supabase.rpc("list_my_quiz_attempts_safe")   // own attempts, learner-safe
+    : supabase
+        .from("quiz_attempts")
+        .select("quiz_id, score, passed, attempt_num, created_at")
+        .eq("tenant_id", tenantId)
+        .eq("user_id", userId)
+        .order("created_at", { ascending: false });
 
   // Fetch in parallel
   const [
@@ -120,12 +135,7 @@ export async function getUserPerformance(tenantId, userId, { windowDays = 30 } =
       .select("source_type, source_id, points, created_at")
       .eq("tenant_id", tenantId)
       .eq("user_id", userId),
-    supabase
-      .from("quiz_attempts")
-      .select("quiz_id, score, passed, attempt_num, created_at")
-      .eq("tenant_id", tenantId)
-      .eq("user_id", userId)
-      .order("created_at", { ascending: false }),
+    quizAttemptsSource,
     supabase
       .from("lesson_completions")
       .select("lesson_id, completed_at")
@@ -649,21 +659,30 @@ export async function getTopicHeatmap(tenantId, { threshold = DEFAULT_READINESS_
  * @param {string} userId
  * @returns {Promise<Array>}
  */
-export async function getRepTopicScores(tenantId, userId) {
+// `safe`: when true (a learner reading their OWN topic scores), both sources come
+// from learner-safe SECURITY DEFINER RPCs — list_quiz_tags_for_learner ({id,tags},
+// no questions) and list_my_quiz_attempts_safe (own attempts, no answers) — so it
+// survives migration 057. Manager drilldown (reading a rep by userId) keeps the
+// direct reads (safe:false, unchanged).
+export async function getRepTopicScores(tenantId, userId, { safe = false } = {}) {
   if (!tenantId || !userId) return [];
 
   const [{ data: quizzes, error: qErr }, { data: attempts, error: aErr }] =
     await Promise.all([
-      supabase
-        .from("tenant_quizzes")
-        .select("id, tags")
-        .eq("tenant_id", tenantId)
-        .eq("status", "active"),
-      supabase
-        .from("quiz_attempts")
-        .select("quiz_id, score, passed, created_at")
-        .eq("tenant_id", tenantId)
-        .eq("user_id", userId),
+      safe
+        ? supabase.rpc("list_quiz_tags_for_learner")
+        : supabase
+            .from("tenant_quizzes")
+            .select("id, tags")
+            .eq("tenant_id", tenantId)
+            .eq("status", "active"),
+      safe
+        ? supabase.rpc("list_my_quiz_attempts_safe")
+        : supabase
+            .from("quiz_attempts")
+            .select("quiz_id, score, passed, created_at")
+            .eq("tenant_id", tenantId)
+            .eq("user_id", userId),
     ]);
 
   if (qErr || aErr || !quizzes?.length || !attempts?.length) return [];
