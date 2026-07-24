@@ -115,3 +115,38 @@ pass; reveal only from immutable snapshot after an official pass); migration **0
 direct SELECT on `tenant_quizzes`/`quiz_attempts` — closing both the RPC-payload leak and the
 raw-REST direct-read bypass. Managers/org admins/ralli admins retain required tenant-scoped access;
 inserts, grading, and snapshot immutability are unchanged.
+
+## 2026-07-24 — Quiz Taxonomy backend foundation (058 + 059)
+
+Branch `feature/quiz-taxonomy` @ `f5af83f` ("feat(quiz-taxonomy): normalized tenant tag taxonomy +
+attempt-time snapshots (backend foundation)"), branched from `main` @ `cca6c57`. Backend only — no
+UI, no Heatmap aggregation. Applied as two controlled `apply_migration` calls (Strategy A), 058 then
+059, each SHA-256 re-confirmed against the committed blob immediately before application.
+
+| Order | Prod version (ledger) | Prod name | Git file | Commit | SQL SHA-256 | Applied (UTC) | Verification |
+|---|---|---|---|---|---|---|---|
+| 9  | `20260724222803` | 058_quiz_taxonomy | supabase/migrations/058_quiz_taxonomy.sql | f5af83f | 48a88f25a0eea4813741afc4a3e4a2374f6bc46d25ba5076f68bb1d840a71203 | 2026-07-24 22:28:03 | PASS |
+| 10 | `20260724223007` | 059_attempt_taxonomy_snapshots | supabase/migrations/059_attempt_taxonomy_snapshots.sql | f5af83f | 8fbebb5566a40ec5d4bd03fb6490cc4edbc49e8aa606a303ec29f7795b5a9938 | 2026-07-24 22:30:07 | PASS |
+
+**058 verification (read-only, post-apply):**
+- Tables `tenant_quiz_tags` + `quiz_tag_map` created (0 rows). `tenant_quizzes.tags_classified_at` added; `normalized_label` is GENERATED ALWAYS.
+- Constraints present: full-status `UNIQUE(tenant_id, normalized_label)` (`uq_tenant_quiz_tags_norm`), `UNIQUE(id,tenant_id)` on both new tags and `tenant_quizzes` (`uq_tenant_quizzes_id_tenant`), label-not-blank, no-self-merge, merged⇒archived, status check, composite tenant-consistency FKs on `quiz_tag_map`.
+- RLS enabled; exactly 2 SELECT policies (`tenant_quiz_tags_select`, `quiz_tag_map_select`) gated `is_ralli_admin() OR (tenant match AND role IN {orgAdmin,manager})`; **no write policies** (all mutations via SECURITY DEFINER RPCs).
+- Grants: managers/orgAdmin/ralli_admin get SELECT (default table privilege) + pass RLS → can read; learners hold the table grant but RLS excludes them (0 rows) and no write policy → no direct read/write. RPC EXECUTE = authenticated only; anon denied.
+- RPCs (all `SECURITY DEFINER`, `search_path=''`): `create_quiz_tag(text)`, `rename_quiz_tag(uuid,text)`, `archive_quiz_tag(uuid)`, `restore_quiz_tag(uuid)`, `merge_quiz_tags(uuid,uuid)`, `set_quiz_tags(uuid,uuid[],boolean)`, `list_quiz_tags_for_learner()`.
+- Data unchanged: 4 quizzes (all `tags='[]'`, all `tags_classified_at IS NULL` = awaiting), 28 attempts, 2 solution snapshots.
+
+**059 verification (read-only, post-apply):**
+- Tables `quiz_attempt_tag_snapshots` (envelope) + `quiz_attempt_tags` (links) created (0 rows). FKs: envelope.attempt_id→`quiz_attempts(id)` CASCADE; links.attempt_id→envelope CASCADE; links.tag_id→`tenant_quiz_tags(id)` **RESTRICT** (history-referenced tag can never be hard-deleted).
+- RLS enabled; 2 SELECT-only policies (manager gate); **0 write policies** (immutable, matching `quiz_attempt_solutions`).
+- `submit_quiz_attempt_atomic_v2` retains grading, idempotency (`idempotency_key` guard), XP economy (25/75/40/25), pass cutoff (`COALESCE(passing_score,100)`), answer sanitization (returns whitelist `v_stored`; **no `'correct'` key built** — verified), and the immutable solution-snapshot insert. Only added: the taxonomy-snapshot block, **gated by `tags_classified_at IS NOT NULL`** (a no-op while all quizzes are unclassified).
+- `set_quiz_tags(uuid,uuid[],boolean)` explicit-classify contract present (three states awaiting/tagged/uncategorized).
+- **056 intact** (`get_quiz_review` still sanitizes via `_quiz_answers_learner_safe`); **057 intact** (`tenant_quizzes_select`, `quiz_attempts_tenant_read` policies present).
+- No data auto-classified or rewritten: all 4 quizzes remain awaiting (`tags_classified_at IS NULL`); **0** attempt snapshot envelopes; 28 attempts / 2 solutions unchanged; `quiz_tag_map` + `tenant_quiz_tags` = 0 rows (no test tags created); no triggers on `quiz_attempts`.
+
+Operator: applied by Claude Code via the controlled Supabase `apply_migration` tool, under explicit
+user production approval. Ledger rows 22–23. (Recorded uncommitted at apply time; committed on `feature/quiz-taxonomy` during the backend repository closeout.)
+
+**Status:** Quiz Taxonomy backend foundation is live in production (versions `20260724222803`,
+`20260724223007`), dormant until the Manager Quiz Tags UI ships (no product writer yet; learner-safe
+RPC returns today's data unchanged). Migrations 056/057 remain intact.
