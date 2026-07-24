@@ -82,5 +82,36 @@ against the committed HEAD blob immediately before application.
 Operator: applied by Claude Code via the controlled Supabase `apply_migration` tool, under explicit
 user production approval. Ledger row 20.
 
-**Not done:** RLS lockdown migration **057** not created/applied; frontend not merged/deployed to
-production; nothing else committed or pushed. Migration 055 unmodified.
+**Update (2026-07-24, later):** the learner-safe frontend was merged to `main`
+(`445bbef`) and deployed to production (Vercel READY), and migration **057** was
+subsequently authored and applied — see below.
+
+## 2026-07-24 — Answer confidentiality Stage B (learner RLS lockdown 057)
+
+Branch `fix/quiz-learner-rls` @ `f00cff4` ("feat: migration 057 — learner RLS lockdown on
+answer-bearing quiz tables"), branched from `main` @ `445bbef` (the deployed learner-safe app).
+Applied via one controlled `apply_migration` (Strategy A). SHA-256 re-confirmed against the
+committed blob immediately before application.
+
+| Order | Prod version (ledger) | Prod name | Git file | Commit | SQL SHA-256 | Applied (UTC) | Verification |
+|---|---|---|---|---|---|---|---|
+| 8 | `20260724205419` | 057_quiz_learner_rls_lockdown | supabase/migrations/057_quiz_learner_rls_lockdown.sql | f00cff4 | 7f86da8ba21b5125109b198be7087a56113a5b9e058025c7ff745f02bd33d93f | 2026-07-24 20:54:19 | PASS — see below |
+
+**Verification (all read-only, post-apply):**
+- Policies after apply — both locked to `get_my_role() = ANY('{ralli_admin,orgAdmin,manager}') AND (ralli_admin OR tenant_id = get_my_tenant_id())`:
+  - `tenant_quizzes_select`, `quiz_attempts_tenant_read`.
+- Learner (role `user`, `SET ROLE authenticated`): direct SELECT `tenant_quizzes` = **0 rows**; `quiz_attempts` = **0** (own **and** others').
+- Learner-safe RPCs still work: `list_quizzes_for_learner`=4 (catalog), `list_my_quiz_attempts_safe`=27 (Home/History/To-Do), `list_quiz_tags_for_learner`=4 (Knowledge by Topic), `get_quiz_for_attempt` returns sanitized questions (taking), `get_quiz_review` reveal=false + **0** canonical keys (failed review). Passed-review reveal is snapshot-only (structural — no official pass exists in production to exercise live).
+- Manager (orgAdmin): direct SELECT `tenant_quizzes`=4, `quiz_attempts`=28 (tenant-scoped analytics/drilldowns retained); 0 other-tenant rows (isolation). Ralli admin: cross-tenant read retained (4 quizzes).
+- Unchanged: `quiz_attempts_own_insert`, `tenant_quizzes_{insert,update,delete}`, `quiz_attempt_solutions.qas_select_manager` (manager-only, immutable). `submit_quiz_attempt_atomic_v2` (grading) + legacy `submit_quiz_attempt_atomic` intact. **056 `get_quiz_review` sanitization intact** (still uses `_quiz_answers_learner_safe`).
+- No side effects: 0 rows changed (28/4/2; 057 has no DML), 9 table SELECT grants unchanged, 0 non-internal triggers, 7 total policies (2 replaced + 5 unchanged), no schema change.
+
+Operator: applied by Claude Code via the controlled Supabase `apply_migration` tool, under explicit
+user production approval. Ledger row 21.
+
+**Security status — Quiz answer confidentiality is now FULLY CLOSED:** the learner-safe app is live
+in production (main `445bbef`); migration **056** sanitizes `get_quiz_review` (no canonical keys pre
+pass; reveal only from immutable snapshot after an official pass); migration **057** revokes learner
+direct SELECT on `tenant_quizzes`/`quiz_attempts` — closing both the RPC-payload leak and the
+raw-REST direct-read bypass. Managers/org admins/ralli admins retain required tenant-scoped access;
+inserts, grading, and snapshot immutability are unchanged.
