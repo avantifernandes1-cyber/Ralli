@@ -1,26 +1,26 @@
 // ─────────────────────────────────────────────────────────────────────────────
 // quizTagsUi — PURE (no React, no network) logic for the Manager Quiz Tags UI.
 //
-// The classification model is server-authoritative (migrations 058/059):
-//   • awaiting       — tags_classified_at IS NULL (no decision made yet)
-//   • tagged         — classified AND ≥1 current tag
-//   • uncategorized  — classified AND zero current tags (an intentional choice)
-// These helpers only DERIVE display state and decide which setQuizTags call (if
-// any) a save should make. They never invent tags and never revert a classified
-// quiz to awaiting. All identity is by stable tag id — never display label.
+// Product decision: Ralli requires every saved quiz to carry at least one ACTIVE
+// tag. There is no "intentionally Uncategorized" state. Display collapses to:
+//   • tagged    — has ≥1 current tag
+//   • untagged  — has no current tag (legacy/unclassified — "No tag assigned")
+// These helpers DERIVE display state and decide which setQuizTags call a save
+// makes. They never invent/auto-assign a tag and never revert a classified quiz.
+// All identity is by stable tag id — never display label. Backend zero-tag
+// historical envelopes (058/059) are untouched; this only governs create/edit.
 // ─────────────────────────────────────────────────────────────────────────────
 import { isRalliAdmin } from "./permissions.js";
 
 export const CLASSIFICATION = {
-  awaiting:      { key: "awaiting",      label: "Awaiting classification" },
-  tagged:        { key: "tagged",        label: "Tagged" },
-  uncategorized: { key: "uncategorized", label: "Uncategorized" },
+  tagged:   { key: "tagged",   label: "Tagged" },
+  untagged: { key: "untagged", label: "No tag assigned" },
 };
 
-// Derive the classification state from the two server-authoritative signals.
-export function deriveClassificationState(tagsClassifiedAt, currentTagIds) {
-  if (!tagsClassifiedAt) return "awaiting";
-  return (currentTagIds && currentTagIds.length > 0) ? "tagged" : "uncategorized";
+// Display state depends only on whether the quiz currently has any tag. The
+// tags_classified_at watermark no longer affects display (Uncategorized removed).
+export function deriveClassificationState(_tagsClassifiedAt, currentTagIds) {
+  return (currentTagIds && currentTagIds.length > 0) ? "tagged" : "untagged";
 }
 
 // Order-independent id-set equality (tag identity is the stable id).
@@ -81,32 +81,43 @@ export function buildBuilderTagRows(catalog, selectedIds) {
   return { selected, assignable };
 }
 
-// Decide the setQuizTags call a save should make — the ONLY place that intent is
-// computed. Never classifies an untouched/legacy quiz; never reverts to awaiting.
+// Active subset of a selection (archived attached tags never count toward the
+// requirement and are never submitted — set_quiz_tags accepts active ids only).
+export function selectedActiveTagIds(catalog, selectedIds = []) {
+  const byId = new Map(catalog.map((t) => [t.id, t]));
+  return selectedIds.filter((id) => byId.get(id)?.status === "active");
+}
+export function hasActiveSelection(catalog, selectedIds = []) {
+  return selectedActiveTagIds(catalog, selectedIds).length > 0;
+}
+
+// The hard save gate: every saved quiz needs ≥1 ACTIVE tag. Returns a message
+// string when the requirement is unmet (block save before phase-1), else null.
+export function tagRequirementError(catalog, selectedIds = []) {
+  return hasActiveSelection(catalog, selectedIds) ? null : "Select at least one tag.";
+}
+
+// Decide the setQuizTags call a save should make — the ONLY place intent is
+// computed. Submits ACTIVE ids only. First classification of an untagged quiz
+// uses classify:true; later changes use classify:false. Never auto-invents tags.
 //   returns { action:'none' } | { action:'classify'|'update', classify, tagIds }
-export function computeSaveTagIntent({ wasClassified, initialTagIds = [], selectedTagIds = [], markedUncategorized = false }) {
-  if (wasClassified) {
-    // Already classified: only tag membership changes; never re-classify, never
-    // revert to awaiting. Detaching all tags is a valid (classify:false) update
-    // to Uncategorized. No-op when the set is unchanged.
-    if (sameIdSet(initialTagIds, selectedTagIds)) return { action: "none" };
-    return { action: "update", classify: false, tagIds: [...selectedTagIds] };
-  }
-  // Not yet classified: the FIRST explicit decision classifies (once).
-  if (markedUncategorized) return { action: "classify", classify: true, tagIds: [] };
-  if (selectedTagIds.length > 0) return { action: "classify", classify: true, tagIds: [...selectedTagIds] };
-  // Untouched, or tags added then all removed without an explicit Uncategorized
-  // decision → no call; the quiz stays Awaiting classification.
+export function computeSaveTagIntent({ wasClassified, initialTagIds = [], selectedTagIds = [], catalog = [] }) {
+  const submit = selectedActiveTagIds(catalog, selectedTagIds);
+  // No change at all (including untouched archived attachments) → no call, so an
+  // existing archived association is preserved until the manager changes tags.
+  if (sameIdSet(initialTagIds, selectedTagIds)) return { action: "none" };
+  if (wasClassified) return { action: "update", classify: false, tagIds: submit };
+  // First time this quiz is classified.
+  if (submit.length > 0) return { action: "classify", classify: true, tagIds: submit };
   return { action: "none" };
 }
 
-// Whether the tag section has an actionable, unsaved change (drives "unsaved
-// tags" hinting; independent of the quiz-content dirty state).
-export function tagSectionTouched({ wasClassified, initialTagIds = [], selectedTagIds = [], markedUncategorized = false }) {
-  return computeSaveTagIntent({ wasClassified, initialTagIds, selectedTagIds, markedUncategorized }).action !== "none";
+// Whether the tag section has an actionable, unsaved change.
+export function tagSectionTouched({ wasClassified, initialTagIds = [], selectedTagIds = [], catalog = [] }) {
+  return computeSaveTagIntent({ wasClassified, initialTagIds, selectedTagIds, catalog }).action !== "none";
 }
 
-// Per-quiz classification/tag model, defaulting a quiz with no row to awaiting
+// Per-quiz classification/tag model, defaulting a quiz with no row to untagged
 // (existing quizzes are Awaiting until a manager classifies them).
 export function quizTagModel(modelByQuiz, quizId) {
   const m = modelByQuiz.get(quizId);
@@ -115,13 +126,12 @@ export function quizTagModel(modelByQuiz, quizId) {
   return { classifiedAt, tagIds, state: deriveClassificationState(classifiedAt, tagIds) };
 }
 
-// Stable-ID library filtering. filter = {kind:'all'|'awaiting'|'uncategorized'|'tag', tagId?}
+// Stable-ID library filtering. filter = {kind:'all'|'untagged'|'tag', tagId?}
 export function filterQuizzesByTag(quizzes, modelByQuiz, filter) {
   if (!filter || filter.kind === "all") return quizzes;
   return quizzes.filter((quiz) => {
-    const { state, tagIds } = quizTagModel(modelByQuiz, quiz.id);
-    if (filter.kind === "awaiting") return state === "awaiting";
-    if (filter.kind === "uncategorized") return state === "uncategorized";
+    const { tagIds } = quizTagModel(modelByQuiz, quiz.id);
+    if (filter.kind === "untagged") return tagIds.length === 0; // "No tag assigned"
     if (filter.kind === "tag") return tagIds.includes(filter.tagId); // stable id, never label
     return true;
   });
@@ -145,6 +155,15 @@ export function tagUsageCounts(quizTagMapRows = []) {
   const counts = new Map();
   for (const r of quizTagMapRows) counts.set(r.tag_id, (counts.get(r.tag_id) || 0) + 1);
   return counts;
+}
+
+// Outcome of a governance RPC (create/rename/archive/restore/merge): refresh the
+// shared catalog ONLY on success (never optimistically show a failed action);
+// otherwise surface a normalized, retryable error. Used by the Tag manager so
+// every action goes through one refresh path and a failure never appears.
+export function governanceOutcome(result, ctx) {
+  if (result && result.error) return { refresh: false, error: normalizeTagError(result.error, ctx) };
+  return { refresh: true, error: null };
 }
 
 // Map a Supabase/Postgres RPC error to an honest, actionable message. Never

@@ -97,7 +97,7 @@ import { provisionTenant, buildInviteUrl, normalizeProvisionedOrg, createMemberI
 import { awardLessonPoints, awardCoursePoints, awardGamePointsForSession, getLeaderboard, computeUserMeta, getUserStreak } from "./src/lib/scoringService.js";
 import { triggerReadinessUpdate, getTopicHeatmap, getOrgMetrics, getRepTopicScores, getUserPerformance, getRecommendations } from "./src/lib/insightsService.js";
 import { listTenantQuizTags, listQuizTagMap, listQuizClassification, getQuizTagState, createQuizTag, renameQuizTag, archiveQuizTag, restoreQuizTag, mergeQuizTags, setQuizTags } from "./src/lib/taxonomyService.js";
-import { CLASSIFICATION, deriveClassificationState, tagCapabilities, buildBuilderTagRows, computeSaveTagIntent, tagSectionTouched, quizTagModel, filterQuizzesByTag, tagUsageCounts, resolveTag, normalizeTagError, savePayloadId } from "./src/lib/quizTagsUi.js";
+import { CLASSIFICATION, deriveClassificationState, tagCapabilities, buildBuilderTagRows, computeSaveTagIntent, quizTagModel, filterQuizzesByTag, tagUsageCounts, resolveTag, normalizeTagError, savePayloadId, hasActiveSelection, selectedActiveTagIds, tagRequirementError, governanceOutcome } from "./src/lib/quizTagsUi.js";
 
 // ── MOBILE HOOK ────────────────────────────────────────────
 function useMobile() {
@@ -8034,21 +8034,20 @@ function NewSessionScreen({ onNav, quizzes, onCreateSession }) {
 // ═══════════════════════════════════════════════════════════════════════════
 // Quiz Tags UI (Manager) — normalized taxonomy from migrations 058/059.
 // Never reads the deprecated tenant_quizzes.tags JSONB; identity is the stable
-// tag id. Classification is explicit (awaiting / tagged / uncategorized).
+// tag id. Every saved quiz requires ≥1 active tag (no Uncategorized state).
 // ═══════════════════════════════════════════════════════════════════════════
 const TAG_STATE_STYLE = {
-  awaiting:      { bg: C.muted,       fg: C.textMuted,  dot: C.textMuted },
-  tagged:        { bg: C.greenBg,     fg: C.trueGreen,  dot: C.trueGreen },
-  uncategorized: { bg: C.blueBg,      fg: C.blue,       dot: C.blue },
+  tagged:   { bg: C.greenBg, fg: C.trueGreen, dot: C.trueGreen },
+  untagged: { bg: C.muted,   fg: C.textMuted, dot: C.textMuted },
 };
 
 function ClassificationBadge({ state, suffix }) {
-  const s = TAG_STATE_STYLE[state] ?? TAG_STATE_STYLE.awaiting;
+  const s = TAG_STATE_STYLE[state] ?? TAG_STATE_STYLE.untagged;
   return (
     <span style={{ display: "inline-flex", alignItems: "center", gap: 6, fontSize: 11, fontWeight: 700,
       padding: "3px 9px", borderRadius: 999, background: s.bg, color: s.fg }}>
       <span style={{ width: 6, height: 6, borderRadius: 999, background: s.dot }} />
-      {CLASSIFICATION[state]?.label ?? "Awaiting classification"}{suffix ? ` · ${suffix}` : ""}
+      {CLASSIFICATION[state]?.label ?? "No tag assigned"}{suffix ? ` · ${suffix}` : ""}
     </span>
   );
 }
@@ -8083,22 +8082,31 @@ function QuizTagChips({ model, catalogById }) {
 }
 
 // Builder tag section — presentational; the builder owns state + save orchestration.
-function QuizTagsSection({ caps, catalog, loading, wasClassified, initialTagIds,
-                           selectedTagIds, onAddTag, onRemoveTag,
-                           markedUncategorized, onToggleUncategorized, onOpenManager, tagError }) {
+function QuizTagsSection({ caps, catalog, loading, selectedTagIds, onAddTag, onRemoveTag, onOpenManager, tagError }) {
   const rows = buildBuilderTagRows(catalog, selectedTagIds);
-  const pendingState = wasClassified
-    ? deriveClassificationState(true, selectedTagIds)
-    : (markedUncategorized ? "uncategorized" : (selectedTagIds.length > 0 ? "tagged" : "awaiting"));
-  const touched = tagSectionTouched({ wasClassified, initialTagIds, selectedTagIds, markedUncategorized });
-  const suffix = !wasClassified && pendingState !== "awaiting" ? "applies on Save" : (touched ? "unsaved" : "");
+  const hasActive = hasActiveSelection(catalog, selectedTagIds);
+  const activeInCatalog = catalog.filter(t => t.status === "active").length;
+  const badgeState = hasActive ? "tagged" : "untagged";
+
+  // One guidance line only (no duplicate warnings): validation when no active
+  // tag is selected; catalog-empty guidance when the tenant genuinely has none.
+  let guidance = null;
+  if (activeInCatalog === 0) {
+    guidance = { tone: "muted", text: caps.canGovern
+      ? "No tags exist yet. Create one in Manage tags to classify this quiz."
+      : "No tags available yet — ask an admin to create one before saving." };
+  } else if (!hasActive) {
+    guidance = { tone: "error", text: selectedTagIds.length > 0
+      ? "Select at least one active tag (archived tags don’t count)."
+      : "Select at least one tag." };
+  }
 
   return (
     <div style={{ border: `1px solid ${C.border}`, borderRadius: 12, padding: 16, background: C.white, marginTop: 16 }}>
       <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", gap: 12, flexWrap: "wrap" }}>
         <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
           <span style={{ fontSize: 13, fontWeight: 800, color: C.text }}>Topic Tags</span>
-          <ClassificationBadge state={pendingState} suffix={suffix} />
+          <ClassificationBadge state={badgeState} />
         </div>
         <button type="button" onClick={onOpenManager} style={{ background: "none", border: "none", cursor: "pointer",
           color: C.orange, fontSize: 12, fontWeight: 700 }}>{caps.canGovern ? "Manage tags →" : "View tags →"}</button>
@@ -8108,14 +8116,13 @@ function QuizTagsSection({ caps, catalog, loading, wasClassified, initialTagIds,
         <div style={{ fontSize: 12, color: C.textMuted, marginTop: 10 }}>Loading tags…</div>
       ) : (
         <>
-          <div style={{ display: "flex", flexWrap: "wrap", gap: 8, marginTop: 12 }}>
-            {rows.selected.length === 0 && (
-              <span style={{ fontSize: 12, color: C.textMuted }}>No tags assigned.</span>
-            )}
-            {rows.selected.map(r => (
-              <TagChip key={r.id} label={r.label} archived={r.archived} onRemove={() => onRemoveTag(r.id)} />
-            ))}
-          </div>
+          {rows.selected.length > 0 && (
+            <div style={{ display: "flex", flexWrap: "wrap", gap: 8, marginTop: 12 }}>
+              {rows.selected.map(r => (
+                <TagChip key={r.id} label={r.label} archived={r.archived} onRemove={() => onRemoveTag(r.id)} />
+              ))}
+            </div>
+          )}
 
           <div style={{ display: "flex", alignItems: "center", gap: 10, marginTop: 12, flexWrap: "wrap" }}>
             <select value="" onChange={(e) => { if (e.target.value) onAddTag(e.target.value); }}
@@ -8124,25 +8131,12 @@ function QuizTagsSection({ caps, catalog, loading, wasClassified, initialTagIds,
               <option value="">+ Add a tag…</option>
               {rows.assignable.map(a => <option key={a.id} value={a.id}>{a.label}</option>)}
             </select>
-            {rows.assignable.length === 0 && (
-              <span style={{ fontSize: 11, color: C.textMuted }}>
-                {caps.canGovern ? "No active tags yet — create some in Manage tags." : "No active tags available."}
-              </span>
-            )}
-            {!wasClassified && (
-              <button type="button" onClick={onToggleUncategorized}
-                style={{ padding: "8px 12px", borderRadius: 8, fontSize: 12, fontWeight: 700, cursor: "pointer",
-                  border: `1px solid ${markedUncategorized ? C.blue : C.border}`,
-                  background: markedUncategorized ? C.blueBg : C.white,
-                  color: markedUncategorized ? C.blue : C.textSub }}>
-                {markedUncategorized ? "✓ Marked Uncategorized" : "Mark as Uncategorized"}
-              </button>
-            )}
           </div>
 
-          {!wasClassified && pendingState === "awaiting" && (
-            <div style={{ fontSize: 11, color: C.textMuted, marginTop: 10 }}>
-              This quiz is <b>Awaiting classification</b>. Add a tag or Mark as Uncategorized to classify it — saving without a decision leaves it awaiting.
+          {guidance && (
+            <div style={{ fontSize: 12, marginTop: 10, fontWeight: guidance.tone === "error" ? 700 : 400,
+              color: guidance.tone === "error" ? C.red : C.textMuted }}>
+              {guidance.text}
             </div>
           )}
           {tagError && (
@@ -8158,10 +8152,13 @@ function QuizTagsSection({ caps, catalog, loading, wasClassified, initialTagIds,
 }
 
 // Shared taxonomy management surface (one place, under Quizzes).
-function TagManagerModal({ tenantId, caps, onClose, onChanged }) {
-  const [catalog, setCatalog]   = useState([]);
+// Controlled: the CATALOG is owned by the parent surface (one shared store) and
+// passed in; every successful governance action calls onRefresh() (the single
+// authoritative reload) so the modal, quiz-builder picker and Library filters
+// all update immediately — no duplicate local tag stores, no reopen needed.
+// Only usage counts (display-only) are loaded here.
+function TagManagerModal({ tenantId, caps, catalog = [], catalogLoading = false, onRefresh, onClose }) {
   const [usage,   setUsage]     = useState(new Map());
-  const [loading, setLoading]   = useState(true);
   const [newLabel, setNewLabel] = useState("");
   const [busy,    setBusy]      = useState(false);
   const [renameId, setRenameId] = useState(null);
@@ -8171,30 +8168,27 @@ function TagManagerModal({ tenantId, caps, onClose, onChanged }) {
   const [mergeTgt, setMergeTgt] = useState("");
   const [err,     setErr]       = useState(null);
 
-  const load = async () => {
-    setLoading(true);
-    const [{ data: tags }, { data: mapRows }] = await Promise.all([
-      listTenantQuizTags(tenantId, { includeArchived: true }),
-      listQuizTagMap(tenantId),
-    ]);
-    setCatalog(tags ?? []);
+  const loadUsage = async () => {
+    const { data: mapRows } = await listQuizTagMap(tenantId);
     setUsage(tagUsageCounts(mapRows ?? []));
-    setLoading(false);
   };
-  useEffect(() => { if (tenantId) load(); /* eslint-disable-next-line */ }, [tenantId]);
+  useEffect(() => { if (tenantId) loadUsage(); /* eslint-disable-next-line */ }, [tenantId]);
 
-  const byId = new Map(catalog.map(t => [t.id, t]));
+  const loading  = catalogLoading;
+  const byId     = new Map(catalog.map(t => [t.id, t]));
   const active   = catalog.filter(t => t.status === "active");
   const archived = catalog.filter(t => t.status === "archived");
 
+  // Never show a failed action optimistically: governanceOutcome refreshes only
+  // on success, through the single shared onRefresh path.
   const run = async (fn, okMsg, ctx) => {
     setBusy(true); setErr(null);
-    const { error } = await fn();
+    const outcome = governanceOutcome(await fn(), ctx);
+    if (!outcome.refresh) { setBusy(false); setErr(outcome.error); return false; }
+    await onRefresh?.();   // ONE authoritative reload of the shared catalog
+    await loadUsage();
     setBusy(false);
-    if (error) { setErr(normalizeTagError(error, ctx)); return false; }
     toast.success(okMsg);
-    await load();
-    onChanged?.();
     return true;
   };
 
@@ -8385,7 +8379,6 @@ function QuizBuilderScreen({ onNav, onSave, onDone, initialQuiz, isReal = false,
   const [wasClassified, setWasClassified]   = useState(false);
   const [initialTagIds, setInitialTagIds]   = useState([]);
   const [selectedTagIds, setSelectedTagIds] = useState([]);
-  const [markedUncat, setMarkedUncat]       = useState(false);
   const [showTagManager, setShowTagManager] = useState(false);
   const [saving, setSaving]                 = useState(false);
   const [tagError, setTagError]             = useState(null);
@@ -8418,9 +8411,10 @@ function QuizBuilderScreen({ onNav, onSave, onDone, initialQuiz, isReal = false,
     const { data: catalog } = await listTenantQuizTags(tenantId, { includeArchived: true });
     setTagCatalog(catalog ?? []);
   };
-  const addTag    = (id) => { setSelectedTagIds(prev => prev.includes(id) ? prev : [...prev, id]); setMarkedUncat(false); setTagError(null); };
+  const addTag    = (id) => { setSelectedTagIds(prev => prev.includes(id) ? prev : [...prev, id]); setTagError(null); };
   const removeTag = (id) => { setSelectedTagIds(prev => prev.filter(x => x !== id)); setTagError(null); };
-  const toggleUncat = () => { setMarkedUncat(prev => { const next = !prev; if (next) setSelectedTagIds([]); return next; }); setTagError(null); };
+  // The hard save requirement: at least one ACTIVE selected tag (archived don't count).
+  const tagReqError = showTags ? tagRequirementError(tagCatalog, selectedTagIds) : null;
 
   const updateQ  = (updates) => setQs(prev => prev.map((q, i) => i === activeIdx ? { ...q, ...updates } : q));
   // Switching a question's type has to discard type-specific fields (options,
@@ -8459,6 +8453,10 @@ function QuizBuilderScreen({ onNav, onSave, onDone, initialQuiz, isReal = false,
 
   const handleSave = async () => {
     if (!canSave || saving) return;
+    // Tag requirement is validated BEFORE any persistence: an empty (or archived-
+    // only) tag selection blocks the save entirely — quiz content is never
+    // persisted first, so an empty selection can never cause a partial save.
+    if (showTags && tagReqError) { setTagError(tagReqError); return; }
     setSaving(true); setTagError(null);
     // Phase 1 — persist quiz content. Reuse the single content-save path
     // (onSave → handleSaveQuiz → upsertQuiz). Using savedQuizId once known makes
@@ -8476,10 +8474,11 @@ function QuizBuilderScreen({ onNav, onSave, onDone, initialQuiz, isReal = false,
     setSavedQuizId(canonicalId);
 
     // Phase 2 — tag assignment / classification (real backend + assign role only).
-    // Report tag success ONLY after setQuizTags succeeds; a failure keeps the
-    // manager here in a retryable state and never claims the whole save worked.
+    // First classification of an untagged quiz → classify:true; later changes →
+    // classify:false. Success is reported ONLY after setQuizTags succeeds; a
+    // failure keeps the manager here in a retryable state (no false success).
     if (showTags) {
-      const intent = computeSaveTagIntent({ wasClassified, initialTagIds, selectedTagIds, markedUncategorized: markedUncat });
+      const intent = computeSaveTagIntent({ wasClassified, initialTagIds, selectedTagIds, catalog: tagCatalog });
       if (intent.action !== "none") {
         const { error } = await setQuizTags(canonicalId, intent.tagIds, { classify: intent.classify });
         if (error) {
@@ -8488,7 +8487,7 @@ function QuizBuilderScreen({ onNav, onSave, onDone, initialQuiz, isReal = false,
           setSaving(false);
           return;
         }
-        setWasClassified(true); setInitialTagIds(intent.tagIds); setSelectedTagIds(intent.tagIds); setMarkedUncat(false);
+        setWasClassified(true); setInitialTagIds(intent.tagIds); setSelectedTagIds(intent.tagIds);
       }
     }
     setSaving(false);
@@ -8714,7 +8713,12 @@ function QuizBuilderScreen({ onNav, onSave, onDone, initialQuiz, isReal = false,
         <div style={{ fontSize:12, color: canSave ? "#059669" : C.textMuted, fontWeight:600, flexShrink:0 }}>
           {canSave ? `✓ ${qs.length} q${qs.length!==1?"s":""} ready` : `${qs.filter(isQComplete).length} / ${qs.length} complete`}
         </div>
-        <button onClick={handleSave} disabled={!canSave || saving} style={{ padding:"10px 24px", borderRadius:12, border:"none", cursor:(!canSave||saving)?"not-allowed":"pointer", fontSize:14, fontWeight:700, color:"#fff", background:(!canSave||saving)?C.muted:C.orange, flexShrink:0 }}>{saving ? "Saving…" : "Save Quiz"}</button>
+        {(() => { const blocked = !canSave || saving || (showTags && !!tagReqError);
+          return (
+        <button onClick={handleSave} disabled={blocked}
+          title={showTags && tagReqError ? tagReqError : undefined}
+          style={{ padding:"10px 24px", borderRadius:12, border:"none", cursor:blocked?"not-allowed":"pointer", fontSize:14, fontWeight:700, color:"#fff", background:blocked?C.muted:C.orange, flexShrink:0 }}>{saving ? "Saving…" : "Save Quiz"}</button>
+          ); })()}
       </div>
 
       {/* Topic Tags (managers/orgAdmin; real backend only) */}
@@ -8724,13 +8728,9 @@ function QuizBuilderScreen({ onNav, onSave, onDone, initialQuiz, isReal = false,
             caps={caps}
             catalog={tagCatalog}
             loading={tagsLoading}
-            wasClassified={wasClassified}
-            initialTagIds={initialTagIds}
             selectedTagIds={selectedTagIds}
             onAddTag={addTag}
             onRemoveTag={removeTag}
-            markedUncategorized={markedUncat}
-            onToggleUncategorized={toggleUncat}
             onOpenManager={() => setShowTagManager(true)}
             tagError={tagError}
           />
@@ -8740,8 +8740,10 @@ function QuizBuilderScreen({ onNav, onSave, onDone, initialQuiz, isReal = false,
         <TagManagerModal
           tenantId={tenantId}
           caps={caps}
+          catalog={tagCatalog}
+          catalogLoading={tagsLoading}
+          onRefresh={reloadTagCatalog}
           onClose={() => setShowTagManager(false)}
-          onChanged={reloadTagCatalog}
         />
       )}
 
@@ -14668,30 +14670,33 @@ function QuizzesScreen({ role, onNav, quizzes, onEditQuiz, onDeleteQuiz, onToggl
   const [tagModelByQuiz, setTagModel]   = useState(new Map());
   const [tagFilter, setTagFilter]       = useState({ kind: "all" });
   const [showTagManager, setShowTagManager] = useState(false);
-  const [tagRefreshKey, setTagRefreshKey]   = useState(0);
+  const [tagLoading, setTagLoading]     = useState(false);
 
-  useEffect(() => {
+  // ONE shared loader for the whole surface (catalog + per-quiz model). Used by
+  // the mount effect AND passed to the Tag manager as its authoritative refresh,
+  // so a create/rename/archive/restore/merge updates cards, filters and the
+  // modal from a single store — no duplicate tag state, no reopen needed.
+  const loadTagData = useCallback(async () => {
     if (!tagsEnabled) return;
-    let alive = true;
-    (async () => {
-      const [{ data: catalog }, { data: mapRows }, { data: cls }] = await Promise.all([
-        listTenantQuizTags(tenantId, { includeArchived: true }),
-        listQuizTagMap(tenantId),
-        listQuizClassification(tenantId),
-      ]);
-      if (!alive) return;
-      setTagCatalog(catalog ?? []);
-      const byQuiz = new Map();
-      for (const q of (cls ?? [])) byQuiz.set(q.id, { classifiedAt: q.tags_classified_at ?? null, tagIds: [] });
-      for (const r of (mapRows ?? [])) {
-        const e = byQuiz.get(r.quiz_id) ?? { classifiedAt: null, tagIds: [] };
-        e.tagIds = [...e.tagIds, r.tag_id];
-        byQuiz.set(r.quiz_id, e);
-      }
-      setTagModel(byQuiz);
-    })();
-    return () => { alive = false; };
-  }, [tagsEnabled, tenantId, tagRefreshKey, quizzes.length]);
+    setTagLoading(true);
+    const [{ data: catalog }, { data: mapRows }, { data: cls }] = await Promise.all([
+      listTenantQuizTags(tenantId, { includeArchived: true }),
+      listQuizTagMap(tenantId),
+      listQuizClassification(tenantId),
+    ]);
+    setTagCatalog(catalog ?? []);
+    const byQuiz = new Map();
+    for (const q of (cls ?? [])) byQuiz.set(q.id, { classifiedAt: q.tags_classified_at ?? null, tagIds: [] });
+    for (const r of (mapRows ?? [])) {
+      const e = byQuiz.get(r.quiz_id) ?? { classifiedAt: null, tagIds: [] };
+      e.tagIds = [...e.tagIds, r.tag_id];
+      byQuiz.set(r.quiz_id, e);
+    }
+    setTagModel(byQuiz);
+    setTagLoading(false);
+  }, [tagsEnabled, tenantId]);
+
+  useEffect(() => { loadTagData(); }, [loadTagData, quizzes.length]);
 
   const tagCatalogById = new Map(tagCatalog.map(t => [t.id, t]));
   const tagUsage = tagUsageCounts([...tagModelByQuiz.values()].flatMap(m => m.tagIds.map(id => ({ tag_id: id }))));
@@ -14758,9 +14763,8 @@ function QuizzesScreen({ role, onNav, quizzes, onEditQuiz, onDeleteQuiz, onToggl
             {tagsEnabled && (
               <div style={{ display: "flex", flexWrap: "wrap", alignItems: "center", gap: 6 }}>
                 {[
-                  { key: "all",           label: `All (${quizzes.length})`,                                                filter: { kind: "all" } },
-                  { key: "awaiting",      label: `Awaiting`,      filter: { kind: "awaiting" } },
-                  { key: "uncategorized", label: `Uncategorized`, filter: { kind: "uncategorized" } },
+                  { key: "all",      label: `All (${quizzes.length})`, filter: { kind: "all" } },
+                  { key: "untagged", label: `No tag`,                  filter: { kind: "untagged" } },
                 ].map(chip => {
                   const on = tagFilter.kind === chip.filter.kind && !tagFilter.tagId;
                   return (
@@ -14859,8 +14863,10 @@ function QuizzesScreen({ role, onNav, quizzes, onEditQuiz, onDeleteQuiz, onToggl
         <TagManagerModal
           tenantId={tenantId}
           caps={tagCaps}
+          catalog={tagCatalog}
+          catalogLoading={tagLoading}
+          onRefresh={loadTagData}
           onClose={() => setShowTagManager(false)}
-          onChanged={() => setTagRefreshKey(k => k + 1)}
         />
       )}
     </div>

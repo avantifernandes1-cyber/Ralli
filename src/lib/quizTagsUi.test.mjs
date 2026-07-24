@@ -5,55 +5,62 @@ import {
   buildBuilderTagRows, computeSaveTagIntent, tagSectionTouched,
   quizTagModel, filterQuizzesByTag, tagUsageCounts, normalizeTagError,
   wouldInsertNewQuiz, savePayloadId,
+  selectedActiveTagIds, hasActiveSelection, tagRequirementError,
+  governanceOutcome,
 } from "./quizTagsUi.js";
+
+// Catalog helpers for the requirement/intent tests
+const CAT = [
+  { id: "a", label: "Discovery",  status: "active",   merged_into: null },
+  { id: "b", label: "Objections", status: "active",   merged_into: null },
+  { id: "z", label: "OldTopic",   status: "archived", merged_into: null },
+];
 
 let passed = 0;
 const t = (name, fn) => { fn(); passed++; console.log("  ok:", name); };
 
-// ── classification state derivation ──────────────────────────────────────────
-t("legacy quiz (no watermark) is Awaiting", () => {
-  assert.equal(deriveClassificationState(null, []), "awaiting");
-  assert.equal(deriveClassificationState(null, ["t1"]), "awaiting"); // watermark dominates
+// ── classification state derivation (tagged / untagged only) ─────────────────
+t("no tags → untagged (No tag assigned)", () => {
+  assert.equal(deriveClassificationState(null, []), "untagged");
+  assert.equal(deriveClassificationState("2026-01-01T00:00:00Z", []), "untagged"); // classified-but-zero also untagged now
 });
-t("classified with tags is Tagged", () => {
-  assert.equal(deriveClassificationState("2026-01-01T00:00:00Z", ["t1"]), "tagged");
-});
-t("classified with zero tags is Uncategorized", () => {
-  assert.equal(deriveClassificationState("2026-01-01T00:00:00Z", []), "uncategorized");
+t("has tags → tagged", () => {
+  assert.equal(deriveClassificationState(null, ["t1"]), "tagged");
 });
 
-// ── save intent: the heart of the classify contract ──────────────────────────
-t("untouched legacy quiz → no setQuizTags call (stays Awaiting)", () => {
-  const i = computeSaveTagIntent({ wasClassified: false, initialTagIds: [], selectedTagIds: [], markedUncategorized: false });
-  assert.deepEqual(i, { action: "none" });
-  assert.equal(tagSectionTouched({ wasClassified: false, initialTagIds: [], selectedTagIds: [], markedUncategorized: false }), false);
+// ── save requirement: every quiz needs ≥1 ACTIVE tag ─────────────────────────
+t("zero selected → one clear validation message", () => {
+  assert.equal(tagRequirementError(CAT, []), "Select at least one tag.");
 });
-t("first tagged classification → classify:true with the selected ids", () => {
-  const i = computeSaveTagIntent({ wasClassified: false, initialTagIds: [], selectedTagIds: ["a", "b"], markedUncategorized: false });
+t("archived-only selection does NOT satisfy the requirement", () => {
+  assert.equal(hasActiveSelection(CAT, ["z"]), false);
+  assert.equal(tagRequirementError(CAT, ["z"]), "Select at least one tag.");
+  assert.deepEqual(selectedActiveTagIds(CAT, ["z"]), []);
+});
+t("≥1 active selected satisfies the requirement (archived alongside is fine)", () => {
+  assert.equal(hasActiveSelection(CAT, ["a", "z"]), true);
+  assert.equal(tagRequirementError(CAT, ["a", "z"]), null);
+});
+
+// ── save intent (no Uncategorized; submits ACTIVE ids only) ──────────────────
+t("new quiz first valid classification → classify:true with active ids", () => {
+  const i = computeSaveTagIntent({ wasClassified: false, initialTagIds: [], selectedTagIds: ["a", "b"], catalog: CAT });
   assert.deepEqual(i, { action: "classify", classify: true, tagIds: ["a", "b"] });
 });
-t("first explicit Uncategorized → classify:true with []", () => {
-  const i = computeSaveTagIntent({ wasClassified: false, initialTagIds: [], selectedTagIds: [], markedUncategorized: true });
-  assert.deepEqual(i, { action: "classify", classify: true, tagIds: [] });
-});
-t("unclassified: tags added then all removed WITHOUT explicit Uncategorized → no call", () => {
-  const i = computeSaveTagIntent({ wasClassified: false, initialTagIds: [], selectedTagIds: [], markedUncategorized: false });
-  assert.equal(i.action, "none"); // never accidentally classify
-});
 t("already-classified tag edit → update classify:false (future attempts only)", () => {
-  const i = computeSaveTagIntent({ wasClassified: true, initialTagIds: ["a"], selectedTagIds: ["a", "b"], markedUncategorized: false });
+  const i = computeSaveTagIntent({ wasClassified: true, initialTagIds: ["a"], selectedTagIds: ["a", "b"], catalog: CAT });
   assert.deepEqual(i, { action: "update", classify: false, tagIds: ["a", "b"] });
 });
-t("already-classified unchanged set → no call", () => {
-  assert.deepEqual(computeSaveTagIntent({ wasClassified: true, initialTagIds: ["b", "a"], selectedTagIds: ["a", "b"] }), { action: "none" });
+t("already-classified unchanged set → no call (archived attachment preserved)", () => {
+  assert.deepEqual(computeSaveTagIntent({ wasClassified: true, initialTagIds: ["a", "z"], selectedTagIds: ["z", "a"], catalog: CAT }), { action: "none" });
 });
-t("already-classified detach-all → update classify:false [] (Uncategorized, never Awaiting)", () => {
-  const i = computeSaveTagIntent({ wasClassified: true, initialTagIds: ["a"], selectedTagIds: [], markedUncategorized: false });
-  assert.deepEqual(i, { action: "update", classify: false, tagIds: [] });
+t("intent submits only ACTIVE ids (archived dropped from the submitted set)", () => {
+  const i = computeSaveTagIntent({ wasClassified: true, initialTagIds: ["a"], selectedTagIds: ["a", "b", "z"], catalog: CAT });
+  assert.deepEqual(i.tagIds, ["a", "b"]); // z (archived) not submitted
 });
-t("multi-tag assignment preserves all selected ids", () => {
-  const i = computeSaveTagIntent({ wasClassified: false, initialTagIds: [], selectedTagIds: ["x", "y", "z"], markedUncategorized: false });
-  assert.deepEqual(i.tagIds, ["x", "y", "z"]);
+t("multi-tag assignment preserves all active selected ids", () => {
+  const i = computeSaveTagIntent({ wasClassified: false, initialTagIds: [], selectedTagIds: ["a", "b"], catalog: CAT });
+  assert.deepEqual(i.tagIds, ["a", "b"]);
 });
 
 // ── builder rows: archived visible-but-not-assignable, merged resolves ───────
@@ -94,23 +101,22 @@ t("manager assigns but does NOT govern", () => {
 });
 
 // ── stable-id filtering ──────────────────────────────────────────────────────
-t("filters by All / Awaiting / Uncategorized / specific tag id", () => {
+t("filters by All / No-tag (untagged) / specific tag id (stable id)", () => {
   const quizzes = [{ id: "q1" }, { id: "q2" }, { id: "q3" }, { id: "q4" }];
   const model = new Map([
-    ["q1", { classifiedAt: null, tagIds: [] }],                 // awaiting
-    ["q2", { classifiedAt: "t", tagIds: [] }],                  // uncategorized
+    ["q1", { classifiedAt: null, tagIds: [] }],                 // untagged (legacy)
+    ["q2", { classifiedAt: "t", tagIds: [] }],                  // untagged (classified-empty)
     ["q3", { classifiedAt: "t", tagIds: ["a", "b"] }],          // tagged a,b
     ["q4", { classifiedAt: "t", tagIds: ["b"] }],               // tagged b
   ]);
   assert.equal(filterQuizzesByTag(quizzes, model, { kind: "all" }).length, 4);
-  assert.deepEqual(filterQuizzesByTag(quizzes, model, { kind: "awaiting" }).map((q) => q.id), ["q1"]);
-  assert.deepEqual(filterQuizzesByTag(quizzes, model, { kind: "uncategorized" }).map((q) => q.id), ["q2"]);
+  assert.deepEqual(filterQuizzesByTag(quizzes, model, { kind: "untagged" }).map((q) => q.id), ["q1", "q2"]);
   assert.deepEqual(filterQuizzesByTag(quizzes, model, { kind: "tag", tagId: "b" }).map((q) => q.id), ["q3", "q4"]);
   assert.deepEqual(filterQuizzesByTag(quizzes, model, { kind: "tag", tagId: "a" }).map((q) => q.id), ["q3"]);
 });
-t("quiz with no model row defaults to Awaiting (no invented tags)", () => {
+t("quiz with no model row defaults to untagged (no invented tags)", () => {
   const m = quizTagModel(new Map(), "qX");
-  assert.equal(m.state, "awaiting");
+  assert.equal(m.state, "untagged");
   assert.deepEqual(m.tagIds, []);
 });
 t("usage counts from map rows", () => {
@@ -151,6 +157,46 @@ t("editing an existing quiz always UPDATEs (never inserts a duplicate)", () => {
   const existing = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee";
   assert.equal(wouldInsertNewQuiz(existing), false);
   assert.equal(savePayloadId({ savedQuizId: null, initialQuizId: existing, fallbackId: "x" }), existing);
+});
+
+// ── #1 stale-state: one shared store, refresh only on success ────────────────
+t("governanceOutcome: success → refresh; failure → no refresh + error (never optimistic)", () => {
+  assert.deepEqual(governanceOutcome({ data: { id: "x" }, error: null }), { refresh: true, error: null });
+  const fail = governanceOutcome({ data: null, error: { code: "23505", message: 'a active tag named "X" already exists' } }, { label: "X" });
+  assert.equal(fail.refresh, false);
+  assert.match(fail.error, /already exists/);
+});
+t("create appears immediately in ALL consumers via one shared reload (no reopen)", async () => {
+  // Single canonical store; every consumer reads THIS array (no duplicate stores).
+  let store = [{ id: "a", label: "Discovery", status: "active", merged_into: null }];
+  const server = [...store];
+  const onRefresh = async () => { store = [...server]; };            // the one authoritative reload
+  const builderPicker = () => buildBuilderTagRows(store, []).assignable.map(x => x.label);
+  const libraryFilters = () => store.filter(t => t.status === "active").map(t => t.label);
+
+  // Simulate the modal's run(): create succeeds → outcome.refresh → onRefresh().
+  const createResult = { data: { id: "b", label: "Objections", status: "active", merged_into: null }, error: null };
+  server.push(createResult.data);                                     // server now has it
+  const outcome = governanceOutcome(createResult);
+  assert.equal(outcome.refresh, true);
+  if (outcome.refresh) await onRefresh();
+
+  assert.deepEqual(builderPicker(), ["Discovery", "Objections"], "builder picker updated immediately");
+  assert.deepEqual(libraryFilters(), ["Discovery", "Objections"], "library filters updated immediately");
+});
+t("failed create does not appear (no optimistic add)", async () => {
+  let store = [{ id: "a", label: "Discovery", status: "active", merged_into: null }];
+  const onRefresh = async () => { throw new Error("should not refresh on failure"); };
+  const outcome = governanceOutcome({ data: null, error: { code: "23505", message: "duplicate" } });
+  assert.equal(outcome.refresh, false);
+  if (outcome.refresh) await onRefresh();                            // not called
+  assert.deepEqual(store.map(t => t.label), ["Discovery"], "store unchanged after failed create");
+});
+t("all available tags selected → assignable empty but NO 'no tags' claim (has active in catalog)", () => {
+  const rows = buildBuilderTagRows(CAT, ["a", "b"]); // both active selected
+  assert.equal(rows.assignable.length, 0);
+  const activeInCatalog = CAT.filter(t => t.status === "active").length;
+  assert.ok(activeInCatalog > 0, "tenant DOES have active tags → UI must not say 'no tags'");
 });
 
 t("sameIdSet order-independent", () => {
