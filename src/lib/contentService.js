@@ -941,16 +941,22 @@ export async function createAssignments(tenantId, assignment, assignedByUserId) 
 }
 
 /**
- * Delete an assignment by id.
+ * Unassign one learner's assignment (soft, history-preserving cancellation).
+ *
+ * Replaces the former hard-delete `deleteAssignment`. Delegates to the
+ * unassign_assignment RPC (064), which is the ONLY assignment-removal path
+ * available to the app: it cancels exactly this one row (server-controlled
+ * reason 'manager_unassigned', cancelled_by = the acting manager), never
+ * deletes, refuses a completed assignment, and is idempotent. The raw DELETE
+ * capability on tenant_assignments is closed at the policy/grant level by 064,
+ * so there is no client hard-delete path to fall back to.
+ *
  * @param {string} assignmentId
- * @returns {Promise<{ error: Object|null }>}
+ * @returns {Promise<{ data: Object|null, error: Object|null }>}
  */
-export async function deleteAssignment(assignmentId) {
-  const { error } = await supabase
-    .from("tenant_assignments")
-    .delete()
-    .eq("id", assignmentId);
-  return { error };
+export async function unassignAssignment(assignmentId) {
+  const { data, error } = await supabase.rpc("unassign_assignment", { p_assignment_id: assignmentId });
+  return { data, error };
 }
 
 

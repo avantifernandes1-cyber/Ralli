@@ -53,7 +53,7 @@ import {
   getTenantAssignments,
   createAssignments as dbCreateAssignments,
   getActiveAssignmentsByUser,
-  deleteAssignment as dbDeleteAssignment,
+  unassignAssignment as dbUnassignAssignment,
   archiveCourse as archiveCourseService,
   archiveLesson as archiveLessonService,
   restoreCourse as restoreCourseService,
@@ -9063,6 +9063,10 @@ function LearnScreen({ role, user, orgUsers = [], orgs = [], onNav, onAwardXp, p
   const [selectedRowKey, setSelectedRowKey] = useState(null); // manager per-rep drill-down (Task 11)
   const [assignTimeframe,  setAssignTimeframe]  = useState("all"); // "all" | "week" | "month" | "custom"
   const [assignDateRange,  setAssignDateRange]  = useState({ start: "", end: "" }); // ISO date strings for custom range
+  // One canonical Manager Assignment History (064). Defaults to "all"; the other
+  // filters map to the shared engine's resolved status (+ cancelled reason for
+  // the two ended states). Never a separate status calculation.
+  const [assignStatusFilter, setAssignStatusFilter] = useState("all"); // all|not_started|in_progress|completed|overdue|unassigned|content_archived
   // Assignment Experience Priority 1 — assignment removal. confirmRemove
   // holds the row pending confirmation (null = no dialog open);
   // removingId guards against a double-click firing two deletes for the
@@ -9070,37 +9074,47 @@ function LearnScreen({ role, user, orgUsers = [], orgs = [], onNav, onAwardXp, p
   const [confirmRemoveAssignment, setConfirmRemoveAssignment] = useState(null);
   const [removingAssignmentId, setRemovingAssignmentId] = useState(null);
 
-  // Assignment Experience Priority 1 — reuses the existing deleteAssignment()
-  // infrastructure (src/lib/contentService.js) rather than a new delete path.
-  // deleteAssignment() only removes the one tenant_assignments row by id —
-  // it never touches quiz_attempts, lesson_completions, or any other table,
-  // so historical completions/attempts are preserved by construction, not by
-  // anything this handler has to do. Scoped to `assignedTo.type ===
-  // "individual"` rows only (enforced by only ever being invoked from rows
-  // where the confirm dialog was allowed to open — see renderTable below) —
-  // legacy team/group aggregate rows are never offered a remove action here,
-  // since one such row can represent many reps at once and deleting it would
-  // silently unassign all of them, not just the one being viewed.
-  const handleRemoveAssignment = async () => {
+  // Unassign — soft, history-preserving cancellation via the unassign_assignment
+  // RPC (064). NOT a delete: the server cancels exactly this one row
+  // (cancelled_reason='manager_unassigned', cancelled_by=the manager), preserves
+  // all completions/attempts/scores/XP, refuses a COMPLETED assignment, and is
+  // idempotent. The old hard-delete path (deleteAssignment) is gone AND closed at
+  // the DB policy/grant level, so there is no destructive fallback. Offered only
+  // on active/in-progress/overdue individual rows (see canUnassign in renderTable);
+  // a legacy team/group aggregate row is never offered it, since one such row can
+  // represent many reps and unassigning it would affect all of them.
+  const handleUnassign = async () => {
     const row = confirmRemoveAssignment;
     if (!row) return;
     const { a, u } = row;
     setRemovingAssignmentId(a.id);
     try {
-      const { error } = await dbDeleteAssignment(a.id);
+      const { data, error } = await dbUnassignAssignment(a.id);
       if (error) {
-        console.error("[ralli] deleteAssignment failed:", error);
-        toast.error("Failed to remove assignment. Please try again.");
+        console.error("[ralli] unassignAssignment failed:", error);
+        // The RPC raises a precise reason; surface the completed-guard verbatim,
+        // otherwise a generic retry message. Reload truth either way.
+        const msg = String(error.message ?? "");
+        toast.error(
+          /completed assignment/i.test(msg)
+            ? `${u.name} has already completed this — a completed assignment can't be unassigned.`
+            : "Couldn't unassign. Please try again."
+        );
+        sharedAssignmentData?.retry?.();
         return;
       }
-      // Optimistic — Home/Learn/Quizzes (all fed by the same shared hook)
-      // update immediately; the realtime subscription is the backstop for
-      // any other open tab/session (Leadership Dashboard, Rep Drill-down,
-      // Quizzes' own tracking panel all have their own subscriptions).
+      // Optimistic — Home/Learn/Quizzes (all fed by the same shared hook) drop
+      // the now-cancelled assignment from active views immediately; a refetch
+      // brings it back as "Unassigned" history. Realtime backs up other tabs.
       sharedAssignmentData?.applyLocalAssignmentsRemoved?.(a.id);
+      sharedAssignmentData?.retry?.();
       if (selectedAssignmentId === a.id) setSelectedAssignmentId(null);
       if (selectedRowKey === `${a.id}-${u.id}`) setSelectedRowKey(null);
-      toast.success(`Assignment removed for ${u.name}.`);
+      toast.success(
+        data?.status === "already_cancelled"
+          ? `${u.name}'s assignment was already ended.`
+          : `Unassigned for ${u.name}. Their progress is kept in history.`
+      );
     } finally {
       setRemovingAssignmentId(null);
       setConfirmRemoveAssignment(null);
@@ -10166,12 +10180,6 @@ function LearnScreen({ role, user, orgUsers = [], orgs = [], onNav, onAwardXp, p
           // manager_unassigned (a deliberate Unassign) vs archive/removal.
           cancelled:   { label: "Unassigned",  bg: C.muted,    text: C.textMuted },
         };
-        // Honest reason phrasing for the Ended-assignments history — never a
-        // fabricated cause. manager_unassigned = a manager explicitly removed
-        // this one learner's assignment; anything else came from the content
-        // being archived/removed (063 archive RPCs + backfill).
-        const endedReasonLabel = (reason) =>
-          reason === "manager_unassigned" ? "Unassigned by manager" : "Content archived or removed";
 
         // Expand assignments into per-rep rows
         const allRows = uniqueAssignments.flatMap(a => {
@@ -10234,6 +10242,37 @@ function LearnScreen({ role, user, orgUsers = [], orgs = [], onNav, onAwardXp, p
           });
         });
 
+        // ENDED rows — cancelled assignments (Unassigned via 064, or Content
+        // Archived via 063) folded into the SAME dataset so the history is one
+        // canonical list, not a separate table. Status comes from the shared
+        // engine (resolveAssignmentStatus → 'cancelled' for a cancelled row);
+        // the reason splits the two ended filters. Missing/archived content
+        // degrades to an honest "(removed)" label, never a fabricated title.
+        const cancelledRows = (cancelledAssignments ?? []).map(ca => {
+          const isCourse = ca.contentType === "course";
+          const isQuiz   = ca.contentType === "quiz";
+          const found = isCourse
+            ? (courses.find(c => c.id === ca.contentId) ?? archivedCourses.find(c => c.id === ca.contentId))
+            : isQuiz
+              ? quizzes.find(q => q.id === ca.contentId)
+              : (lessons.find(l => l.id === ca.contentId) ?? archivedLessons.find(l => l.id === ca.contentId));
+          const content = found ?? { title: `${isCourse ? "Course" : isQuiz ? "Quiz" : "Lesson"} (removed)`, _missing: true };
+          const foundUser = orgUsers.find(x => x.id === ca.assignedTo?.userId);
+          const u = foundUser ?? { id: ca.assignedTo?.userId ?? "__ended__", name: ca.assignedTo?.userName ?? "—", initials: (ca.assignedTo?.userName?.[0] ?? "?").toUpperCase(), color: C.textMuted };
+          const engineResult = resolveAssignmentStatus(ca.contentType, ca, { completedAt: null, lessonIds: [], attempts: [], completedAtByLesson: new Map() });
+          return {
+            a: ca, content, isCourse, isQuiz, u,
+            progress: engineResult.progress, status: engineResult.status, completedAt: null,
+            courseLessons: [], completedAtByLesson: null, userAttempts: [],
+            _cancelSub: ca.cancelledReason === "manager_unassigned" ? "unassigned" : "content_archived",
+            _missingContent: !found,
+          };
+        });
+        // Cancelled rows never overwrite an active one for the same (assignment,
+        // rep): they carry distinct (cancelled) assignment ids, so concatenation
+        // keeps one row per instance — active instances AND ended history.
+        allRows.push(...cancelledRows);
+
         if (allRows.length === 0 && !sq) {
           return (
             <div style={{ padding: 60, textAlign: "center", background: C.white, borderRadius: 12, border: `1px solid ${C.border}` }}>
@@ -10266,16 +10305,38 @@ function LearnScreen({ role, user, orgUsers = [], orgs = [], onNav, onAwardXp, p
           return true;
         };
 
-        const filteredRows = allRows.filter(timeframeFilter);
+        const timeframeRows = allRows.filter(timeframeFilter);
 
-        // Summary stats — computed from timeframe-filtered rows (not raw assignment count).
-        // "Active" = not_started + in_progress + overdue (excludes completed).
+        // Status-filter tabs (one canonical dataset). Each maps to the shared
+        // engine's resolved status; the two ended states additionally split on
+        // the cancellation reason. No separate status math.
+        const isUnassigned      = (r) => r.status === "cancelled" && r._cancelSub === "unassigned";
+        const isContentArchived = (r) => r.status === "cancelled" && r._cancelSub === "content_archived";
+        const statusMatch = (r) => {
+          switch (assignStatusFilter) {
+            case "not_started":      return r.status === "not_started";
+            case "in_progress":      return r.status === "in_progress";
+            case "completed":        return r.status === "completed";
+            case "overdue":          return r.status === "overdue";
+            case "unassigned":       return isUnassigned(r);
+            case "content_archived": return isContentArchived(r);
+            default:                 return true; // "all"
+          }
+        };
+        const filteredRows = timeframeRows.filter(statusMatch);
+
+        // Tab counts — from the timeframe-filtered set (not the status-filtered
+        // one), so each tab shows its own total. "Active" excludes completed AND
+        // ended rows.
         const statCounts = {
-          active:      filteredRows.filter(r => r.status !== "completed").length,
-          not_started: filteredRows.filter(r => r.status === "not_started").length,
-          in_progress: filteredRows.filter(r => r.status === "in_progress").length,
-          completed:   filteredRows.filter(r => r.status === "completed").length,
-          overdue:     filteredRows.filter(r => r.status === "overdue").length,
+          all:              timeframeRows.length,
+          active:           timeframeRows.filter(r => r.status !== "completed" && r.status !== "cancelled").length,
+          not_started:      timeframeRows.filter(r => r.status === "not_started").length,
+          in_progress:      timeframeRows.filter(r => r.status === "in_progress").length,
+          completed:        timeframeRows.filter(r => r.status === "completed").length,
+          overdue:          timeframeRows.filter(r => r.status === "overdue").length,
+          unassigned:       timeframeRows.filter(isUnassigned).length,
+          content_archived: timeframeRows.filter(isContentArchived).length,
         };
 
         // Detail view when an assignment is selected
@@ -10284,7 +10345,7 @@ function LearnScreen({ role, user, orgUsers = [], orgs = [], onNav, onAwardXp, p
           ? (detailAssignment.contentType === "course" ? courses.find(c => c.id === detailAssignment.contentId) : lessons.find(l => l.id === detailAssignment.contentId))
           : null;
 
-        // Rows to show: timeframe + search filtered, or detail-drilled
+        // Rows to show: timeframe + status + search filtered, or detail-drilled
         const searchedRows = sq
           ? filteredRows.filter(r => r.content?.title.toLowerCase().includes(sq) || r.u?.name?.toLowerCase().includes(sq))
           : filteredRows;
@@ -10325,7 +10386,12 @@ function LearnScreen({ role, user, orgUsers = [], orgs = [], onNav, onAwardXp, p
             </div>
             {rows.map((row, i) => {
               const { a, content, isCourse, isQuiz, u, progress, status, completedAt, userAttempts } = row;
+              const isEnded = status === "cancelled";
               const sc     = STATUS_CONFIG[status] ?? STATUS_CONFIG.not_started;
+              // Ended rows read their true reason: Unassigned vs Content Archived.
+              const statusLabel = isEnded
+                ? (row._cancelSub === "unassigned" ? "Unassigned" : "Content Archived")
+                : sc.label;
               const tColor = isCourse ? (content.color ?? C.orange) : isQuiz ? C.purple : (LESSON_TYPE_COLORS[content.type] ?? C.orange);
               const contentLabel = isCourse ? "Course" : isQuiz ? "Quiz" : "Lesson";
               const contentIcon  = isCourse ? content.emoji : isQuiz ? "📋" : LESSON_TYPE_ICONS[content.type];
@@ -10338,17 +10404,16 @@ function LearnScreen({ role, user, orgUsers = [], orgs = [], onNav, onAwardXp, p
               const sortedAttempts = isQuiz ? [...userAttempts].sort((x, y) => new Date(y.created_at) - new Date(x.created_at)) : [];
               const latestAttempt  = sortedAttempts[0] ?? null;
               const bestScore      = sortedAttempts.length ? Math.max(...sortedAttempts.map(at => at.score ?? 0)) : null;
-              const canDrilldown   = !u._isAggregate;
+              const canDrilldown   = !u._isAggregate && !isEnded;  // ended rows are history, no drill-in
               const rowKey = `${a.id}-${u.id}`;
-              // Assignment Experience Priority 1 — remove is offered only for
-              // true per-user assignment rows (the current, default shape
-              // every new assignment now takes — see contentService.js's
-              // ASSIGNMENTS header). A legacy assigned_to.type === "team"/
-              // "group" aggregate row can still expand to multiple reps
-              // sharing one row id; deleting that id would unassign all of
-              // them, not just the one in this row, so those rows don't get a
-              // remove control here.
-              const canRemove = canDrilldown && a.assignedTo?.type === "individual";
+              // Unassign is offered only for true per-user rows that are still
+              // actionable — active / in-progress / overdue. A COMPLETED row is
+              // never unassignable (the RPC also refuses it server-side), and a
+              // cancelled row is already ended. A legacy team/group aggregate
+              // row (one id → many reps) is excluded so we never cancel a whole
+              // group by accident.
+              const canUnassign = canDrilldown && a.assignedTo?.type === "individual"
+                && status !== "completed" && status !== "cancelled";
               const isRemoving = removingAssignmentId === a.id;
               return (
                 <div
@@ -10384,15 +10449,19 @@ function LearnScreen({ role, user, orgUsers = [], orgs = [], onNav, onAwardXp, p
                   <span style={{ fontSize: 13, color: C.textSub }}>{assignedLabel}</span>
                   {/* Due */}
                   <span style={{ fontSize: 13, color: status === "overdue" ? C.red : C.textSub, fontWeight: status === "overdue" ? 700 : 400 }}>{dueLabel}</span>
-                  {/* Status badge */}
-                  <div><span style={{ fontSize: 11, fontWeight: 700, padding: "3px 8px", borderRadius: 6, background: sc.bg, color: sc.text }}>{sc.label}</span></div>
-                  {/* Progress bar */}
+                  {/* Status badge — reason-aware for ended rows */}
+                  <div><span style={{ fontSize: 11, fontWeight: 700, padding: "3px 8px", borderRadius: 6, background: sc.bg, color: sc.text }}>{statusLabel}</span></div>
+                  {/* Progress bar — an ended row shows its dash, not a stale % */}
+                  {isEnded ? (
+                    <span style={{ fontSize: 12, color: C.textMuted }}>—</span>
+                  ) : (
                   <div style={{ display: "flex", alignItems: "center", gap: 5 }}>
                     <div style={{ flex: 1, height: 5, background: C.muted, borderRadius: 3, overflow: "hidden" }}>
                       <div style={{ height: "100%", width: `${progress}%`, background: status === "completed" ? C.green : status === "overdue" ? C.red : C.orange, borderRadius: 3 }} />
                     </div>
                     <span style={{ fontSize: 11, fontWeight: 700, color: C.textSub, flexShrink: 0 }}>{progress}%</span>
                   </div>
+                  )}
                   {/* Score — quiz only */}
                   <div style={{ fontSize: 11, color: C.textSub, lineHeight: 1.4 }}>
                     {isQuiz && latestAttempt ? (
@@ -10402,25 +10471,29 @@ function LearnScreen({ role, user, orgUsers = [], orgs = [], onNav, onAwardXp, p
                       </>
                     ) : "—"}
                   </div>
-                  {/* Completed at */}
-                  <span style={{ fontSize: 12, color: C.textSub }}>{completedAt ? fmtShort(completedAt) : "—"}</span>
-                  {/* Assignment Experience Priority 1 — Remove action.
-                      Individual rows only (see canRemove above); legacy
-                      team/group aggregate rows show nothing here rather than
-                      a control that would silently remove the whole group. */}
+                  {/* DONE — completion date, or the ended date for a cancelled row */}
+                  <span style={{ fontSize: 12, color: C.textSub }}>
+                    {isEnded
+                      ? (a.cancelledAt ? `Ended ${fmtShort(a.cancelledAt)}` : "Ended")
+                      : (completedAt ? fmtShort(completedAt) : "—")}
+                  </span>
+                  {/* Unassign action — cancels only THIS learner's active
+                      assignment (soft, history-preserving via 064's RPC). Not
+                      Archive: archiving is a content action on the Courses/
+                      Lessons cards. Individual, still-actionable rows only. */}
                   <div onClick={e => e.stopPropagation()}>
-                    {canRemove ? (
+                    {canUnassign ? (
                       <button
                         onClick={() => setConfirmRemoveAssignment(row)}
                         disabled={isRemoving}
-                        title={`Remove this assignment for ${u.name}`}
+                        title={`Unassign this from ${u.name} (keeps their history)`}
                         style={{
                           padding: "5px 10px", borderRadius: 7, border: "1px solid #fca5a5",
                           background: "#fef2f2", color: "#ef4444", fontSize: 11, fontWeight: 600,
                           cursor: isRemoving ? "default" : "pointer", opacity: isRemoving ? 0.6 : 1,
                         }}
                       >
-                        {isRemoving ? "…" : "Remove"}
+                        {isRemoving ? "…" : "Unassign"}
                       </button>
                     ) : null}
                   </div>
@@ -10468,20 +10541,33 @@ function LearnScreen({ role, user, orgUsers = [], orgs = [], onNav, onAwardXp, p
                   )}
                 </div>
 
-                {/* Summary stat cards */}
-                <div style={{ display: "grid", gridTemplateColumns: "repeat(5, 1fr)", gap: 10, marginBottom: 20 }}>
+                {/* One canonical history — status filter tabs (defaults to All).
+                    Every tab maps to the shared engine's resolved status; the two
+                    ended tabs split on cancellation reason. */}
+                <div style={{ display: "flex", flexWrap: "wrap", gap: 8, marginBottom: 20 }}>
                   {[
-                    { label: "Active",      count: statCounts.active,       color: C.text,    title: "Not started + in progress + overdue" },
-                    { label: "Not Started", count: statCounts.not_started,  color: C.textSub, title: "Assigned, no progress yet" },
-                    { label: "In Progress", count: statCounts.in_progress,  color: C.blue,    title: "Started but not complete" },
-                    { label: "Completed",   count: statCounts.completed,    color: C.green,   title: "Finished" },
-                    { label: "Overdue",     count: statCounts.overdue,      color: C.red,     title: "Past due date, not complete" },
-                  ].map(({ label, count, color, title }) => (
-                    <div key={label} title={title} style={{ background: C.white, borderRadius: 10, padding: "14px 16px", border: `1px solid ${C.border}` }}>
-                      <div style={{ fontSize: 22, fontWeight: 800, color, marginBottom: 3 }}>{count}</div>
-                      <div style={{ fontSize: 11, fontWeight: 600, color: C.textSub, lineHeight: 1.3 }}>{label}</div>
-                    </div>
-                  ))}
+                    { id: "all",              label: "All",              count: statCounts.all,              color: C.text,    title: "Everything — active and ended" },
+                    { id: "not_started",      label: "Not Started",      count: statCounts.not_started,      color: C.textSub, title: "Assigned, no progress yet" },
+                    { id: "in_progress",      label: "In Progress",      count: statCounts.in_progress,      color: C.blue,    title: "Started but not complete" },
+                    { id: "completed",        label: "Completed",        count: statCounts.completed,        color: C.green,   title: "Finished" },
+                    { id: "overdue",          label: "Overdue",          count: statCounts.overdue,          color: C.red,     title: "Past due date, not complete" },
+                    { id: "unassigned",       label: "Unassigned",       count: statCounts.unassigned,       color: C.textMuted, title: "Manager unassigned — kept for history" },
+                    { id: "content_archived", label: "Content Archived", count: statCounts.content_archived, color: C.textMuted, title: "Ended because the content was archived/removed" },
+                  ].map(({ id, label, count, color, title }) => {
+                    const on = assignStatusFilter === id;
+                    return (
+                      <button key={id} title={title} onClick={() => setAssignStatusFilter(id)} style={{
+                        display: "flex", alignItems: "center", gap: 7,
+                        padding: "7px 13px", borderRadius: 99,
+                        border: `1.5px solid ${on ? C.orange : C.border}`,
+                        background: on ? C.orangeLight : C.white,
+                        fontSize: 12, fontWeight: 700, color: on ? C.orange : C.textSub, cursor: "pointer",
+                      }}>
+                        <span>{label}</span>
+                        <span style={{ fontSize: 11, fontWeight: 800, color: on ? C.orange : color, background: on ? "transparent" : C.pageBg, borderRadius: 99, padding: on ? 0 : "1px 7px" }}>{count}</span>
+                      </button>
+                    );
+                  })}
                 </div>
               </>
             )}
@@ -10505,62 +10591,6 @@ function LearnScreen({ role, user, orgUsers = [], orgs = [], onNav, onAwardXp, p
             {!selectedAssignmentId && (
               <p style={{ margin: "0 0 14px", fontSize: 13, color: C.textSub }}>{visibleRows.length} rep assignment{visibleRows.length !== 1 ? "s" : ""}</p>
             )}
-
-            {/* Learn lifecycle integrity (063/064): ENDED ASSIGNMENTS history.
-                A row lands here when a manager Unassigns one learner
-                (manager_unassigned) or the content was archived/removed. These
-                are never active/overdue/pending — but they stay visible as
-                honest history so the manager can see who was assigned, why it
-                ended, and when. Completions/attempts/scores behind these rows
-                are preserved (nothing is deleted); a fresh reassignment starts
-                a new instance and does not reactivate a cancelled row. Content
-                that no longer resolves degrades to an honest "(removed)" label,
-                never a fabricated title. */}
-            {!selectedAssignmentId && cancelledAssignments.length > 0 && (() => {
-              // Search + timeframe honesty: filter ended rows by the same search
-              // box as active rows (assignee/title), and always show most-recent
-              // first by cancelled date so the newest Unassign is at the top.
-              const ended = cancelledAssignments
-                .map(ca => {
-                  const c = ca.contentType === "course" ? courses.find(x => x.id === ca.contentId) : lessons.find(x => x.id === ca.contentId);
-                  const title = c?.title ?? c?.name ?? `${ca.contentType === "course" ? "Course" : "Lesson"} (removed)`;
-                  return { ca, title, assignee: ca.assignedTo?.userName ?? "—" };
-                })
-                .filter(r => !sq || r.title.toLowerCase().includes(sq) || r.assignee.toLowerCase().includes(sq))
-                .sort((a, b) => new Date(b.ca.cancelledAt ?? 0) - new Date(a.ca.cancelledAt ?? 0));
-              if (ended.length === 0) return null;
-              return (
-                <div style={{ marginBottom: 20 }}>
-                  <div style={{ fontSize: 12, fontWeight: 800, color: C.textMuted, letterSpacing: "0.05em", marginBottom: 8 }}>
-                    ENDED ASSIGNMENTS ({ended.length}) · KEPT FOR HISTORY
-                  </div>
-                  <div style={{ borderRadius: 12, overflow: "hidden", border: `1px dashed ${C.border}`, background: C.pageBg }}>
-                    <div style={{ overflowX: "auto", WebkitOverflowScrolling: "touch" }}>
-                      <div style={{ minWidth: 620, display: "grid", gridTemplateColumns: "1.6fr 1.1fr 1.4fr 0.8fr", gap: 10, padding: "9px 16px", fontSize: 11, fontWeight: 700, color: C.textMuted, letterSpacing: "0.05em" }}>
-                        <span>CONTENT</span><span>REP</span><span>REASON</span><span>ENDED</span>
-                      </div>
-                      {ended.slice(0, 50).map(({ ca, title, assignee }) => {
-                        const missing = title.endsWith("(removed)");
-                        return (
-                          <div key={ca.id} style={{ minWidth: 620, display: "grid", gridTemplateColumns: "1.6fr 1.1fr 1.4fr 0.8fr", gap: 10, padding: "11px 16px", borderTop: `1px solid ${C.border}`, alignItems: "center" }}>
-                            <div style={{ display: "flex", alignItems: "center", gap: 8, minWidth: 0 }}>
-                              <span style={{ fontSize: 11, fontWeight: 700, padding: "3px 8px", borderRadius: 6, background: STATUS_CONFIG.cancelled.bg, color: STATUS_CONFIG.cancelled.text, flexShrink: 0 }}>
-                                {ca.cancelledReason === "manager_unassigned" ? "Unassigned" : "Ended"}
-                              </span>
-                              <span style={{ fontSize: 13, fontWeight: 600, color: missing ? C.textMuted : C.text, fontStyle: missing ? "italic" : "normal", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{title}</span>
-                              <span style={{ fontSize: 11, color: C.textMuted, flexShrink: 0 }}>{ca.contentType === "course" ? "Course" : "Lesson"}</span>
-                            </div>
-                            <span style={{ fontSize: 13, color: C.textSub, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{assignee}</span>
-                            <span style={{ fontSize: 12, color: C.textSub }}>{endedReasonLabel(ca.cancelledReason)}</span>
-                            <span style={{ fontSize: 12, color: C.textSub }}>{ca.cancelledAt ? fmtShort(ca.cancelledAt) : "—"}</span>
-                          </div>
-                        );
-                      })}
-                    </div>
-                  </div>
-                </div>
-              );
-            })()}
 
             {visibleRows.length === 0
               ? <div style={{ padding: 40, textAlign: "center", color: C.textMuted, fontSize: 14 }}>No matching assignments</div>
@@ -10780,11 +10810,11 @@ function LearnScreen({ role, user, orgUsers = [], orgs = [], onNav, onAwardXp, p
         >
           <div style={{ background: C.white, borderRadius: 16, padding: 28, width: "100%", maxWidth: 420, boxShadow: "0 24px 60px rgba(0,0,0,0.2)", boxSizing: "border-box" }}>
             <h3 style={{ margin: "0 0 8px", fontSize: 17, fontWeight: 800, color: C.text, textAlign: "center" }}>
-              Remove this assignment?
+              Unassign from {confirmRemoveAssignment.u?.name ?? "this rep"}?
             </h3>
             <p style={{ margin: "0 0 20px", fontSize: 13, color: C.textSub, textAlign: "center", lineHeight: 1.6 }}>
-              {(confirmRemoveAssignment.content?.title ?? confirmRemoveAssignment.content?.name ?? "This content")} will no longer be assigned to {confirmRemoveAssignment.u?.name ?? "this rep"}.
-              Their completed quiz attempts, lesson completions, and course progress are never deleted — only the assignment itself is removed. This cannot be undone, but the content can be reassigned at any time.
+              This unassigns <strong>{confirmRemoveAssignment.content?.title ?? confirmRemoveAssignment.content?.name ?? "this content"}</strong> from {confirmRemoveAssignment.u?.name ?? "this rep"} only — no one else is affected, and the content itself is not archived.
+              Their completed quiz attempts, lesson completions, and course progress are kept; the assignment stays in history as <em>Unassigned</em>. You can reassign it later, which starts a fresh assignment.
             </p>
             <div style={{ display: "flex", gap: 10 }}>
               <button
@@ -10793,11 +10823,11 @@ function LearnScreen({ role, user, orgUsers = [], orgs = [], onNav, onAwardXp, p
                 style={{ flex: 1, padding: "11px", borderRadius: 10, border: `1px solid ${C.border}`, background: C.white, color: C.text, fontSize: 13, fontWeight: 700, cursor: removingAssignmentId ? "default" : "pointer" }}
               >Cancel</button>
               <button
-                onClick={handleRemoveAssignment}
+                onClick={handleUnassign}
                 disabled={!!removingAssignmentId}
                 style={{ flex: 1, padding: "11px", borderRadius: 10, border: "none", background: "#ef4444", color: "#fff", fontSize: 13, fontWeight: 700, cursor: removingAssignmentId ? "not-allowed" : "pointer", opacity: removingAssignmentId ? 0.7 : 1 }}
               >
-                {removingAssignmentId ? "Removing…" : "Yes, remove"}
+                {removingAssignmentId ? "Unassigning…" : "Yes, unassign"}
               </button>
             </div>
           </div>

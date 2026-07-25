@@ -1,7 +1,46 @@
-# Migration 064 — Manager Unassign (DESIGN — awaiting approval)
+# Migration 064 — Manager Unassign (AS BUILT — awaiting production apply)
 
-Status: **NOT WRITTEN, NOT APPLIED.** This is the design the Learn correction
-task must return before creating 064. 063 stays exactly as applied.
+Status: **WRITTEN + LOCALLY VALIDATED, NOT APPLIED TO PRODUCTION.** Approved in
+concept with corrections; this doc is updated to match the shipped
+`supabase/migrations/064_manager_unassign.sql` and its test harness. 063 stays
+exactly as applied. Do not apply 064 to production without explicit approval.
+
+## As-built summary (supersedes the pre-approval draft below)
+
+- **Authorization** uses the CANONICAL assignment-management rule (017/026/034
+  and 063 archive_*): `is_ralli_admin() OR get_my_role() IN ('orgAdmin','manager')`.
+  `manager` is included (required). No invented `superadmin` literal — ralli_admin
+  AND superadmin are both handled by `is_ralli_admin()`.
+- **No free-form reason.** Signature is `unassign_assignment(p_assignment_id uuid)`;
+  the server sets `cancelled_reason='manager_unassigned'`, `cancelled_at=now()`,
+  `cancelled_by=auth.uid()`. Archive-driven cancellation keeps its own server
+  reason (`content_archived`) and leaves `cancelled_by` NULL (a content action,
+  not an individual — no false attribution).
+- **Hard-delete closed.** 064 drops the 017 `tenant_assignments_delete` RLS policy
+  and REVOKEs DELETE from authenticated/anon. Tenant offboarding still cascades
+  via the tenants FK; service_role retains privileged maintenance (bypasses RLS).
+- **cancelled_by uuid NULL REFERENCES profiles(id) ON DELETE SET NULL** — the same
+  retention model 017 uses for `assigned_by`: deleting a profile clears attribution
+  but never destroys the history row.
+- **Completion check (instance-aware, per THIS row's assigned_at):** lesson —
+  no `lesson_completions` at/after assigned_at ⇒ active (unassignable); course —
+  fewer than all member lessons completed at/after assigned_at ⇒ active; quiz —
+  a PASSING attempt at/after assigned_at ⇒ completed (a failed attempt is
+  in_progress and remains unassignable). Completed ⇒ refused.
+- **Concurrency:** `SELECT … FOR UPDATE` locks the one row; a second concurrent
+  unassign serializes and returns the idempotent `already_cancelled` (original
+  ender preserved). Team/group and not-found are refused with honest errors.
+- **Local validation:** `supabase/tests/064_manager_unassign.test.sql` — 13 groups
+  PASS (manager authority incl. role 'manager', learner refused, cross-tenant
+  refused, completed lesson/course/quiz refused, predate + failed-quiz allowed,
+  idempotent, other learner untouched, team refused, not-found, hard-delete
+  blocked, DELETE policy gone, FK SET NULL). 063 harness still PASSES (no regression).
+
+---
+
+## Pre-approval draft (kept for provenance — see as-built above for what shipped)
+
+Status: **NOT WRITTEN, NOT APPLIED.** This was the design returned before creating 064.
 
 ---
 
