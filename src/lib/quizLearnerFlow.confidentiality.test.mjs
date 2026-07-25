@@ -99,9 +99,18 @@ function body(src, decl) {
   const attemptSelects = insights.match(/\.from\("quiz_attempts"\)\s*\.select\(([^)]*)\)/g) || [];
   ok("8a insights has quiz_attempts selects to check", attemptSelects.length > 0);
   ok("8b no insights quiz_attempts select includes answers", attemptSelects.every(s => !s.includes("answers")));
-  // Learner-reachable insights fns (getUserPerformance/getRepTopicScores) are user-scoped.
+  // getUserPerformance still reads own attempts directly, user-scoped.
   ok("8c getUserPerformance is user-scoped", body(insights, "export async function getUserPerformance(").includes('.eq("user_id"'));
-  ok("8d getRepTopicScores is user-scoped", body(insights, "export async function getRepTopicScores(").includes('.eq("user_id"'));
+  // Knowledge Heatmap (062): getRepTopicScores / getTopicHeatmap now delegate to
+  // the canonical get_knowledge_heatmap RPC, which derives the caller's role and
+  // tenant SERVER-side and returns only the caller's own scope for a learner —
+  // strictly stronger than a client-side user_id filter, and it never does a raw
+  // cross-user quiz_attempts read from the client.
+  const repBody = body(insights, "export async function getRepTopicScores(");
+  ok("8d getRepTopicScores uses the server-scoped canonical RPC", repBody.includes('rpc("get_knowledge_heatmap")'));
+  ok("8e getRepTopicScores does no raw quiz_attempts read", !repBody.includes('.from("quiz_attempts")'));
+  ok("8f getTopicHeatmap uses the server-scoped canonical RPC",
+     body(insights, "export async function getTopicHeatmap(").includes('rpc("get_knowledge_heatmap")'));
 }
 
 console.log(`\n${pass} passed, ${fail} failed`);
