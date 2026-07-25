@@ -97,7 +97,7 @@ import { provisionTenant, buildInviteUrl, normalizeProvisionedOrg, createMemberI
 import { awardLessonPoints, awardCoursePoints, awardGamePointsForSession, getLeaderboard, computeUserMeta, getUserStreak } from "./src/lib/scoringService.js";
 import { triggerReadinessUpdate, getTopicHeatmap, getOrgMetrics, getRepTopicScores, getUserPerformance, getRecommendations } from "./src/lib/insightsService.js";
 import { listTenantQuizTags, listQuizTagMap, listQuizClassification, getQuizTagState, createQuizTag, renameQuizTag, archiveQuizTag, restoreQuizTag, mergeQuizTags, setQuizTags } from "./src/lib/taxonomyService.js";
-import { activeMappedTagIds, classificationFromActiveCount, tagCapabilities, buildBuilderTagRows, computeSaveTagIntent, quizTagModel, filterQuizzesByTag, tagUsageCounts, resolveTag, normalizeTagError, savePayloadId, hasActiveSelection, selectedActiveTagIds, tagRequirementError, governanceOutcome, quizSaveSuccessMessage, canBeginSave } from "./src/lib/quizTagsUi.js";
+import { activeMappedTagIds, classificationFromActiveCount, tagCapabilities, buildBuilderTagRows, quizTagModel, filterQuizzesByTag, tagUsageCounts, resolveTag, normalizeTagError, savePayloadId, hasActiveSelection, selectedActiveTagIds, tagRequirementError, governanceOutcome, quizSaveSuccessMessage, canBeginSave, runQuizSave } from "./src/lib/quizTagsUi.js";
 
 // ── MOBILE HOOK ────────────────────────────────────────────
 function useMobile() {
@@ -8354,6 +8354,10 @@ const QUIZ_UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{
 
 function QuizBuilderScreen({ onNav, onSave, onDone, initialQuiz, isReal = false, tenantId = null, role = null }) {
   const mobile  = useMobile();
+  // toast is a component-local hook (module-level `toast` does not exist); the
+  // builder MUST bind it, or the save-completion toast.success/toast.error throw
+  // ReferenceError after persistence and swallow the toast + navigation.
+  const toast   = useToast();
   const makeBlank = (type = "mc") => {
     const base = { id: `q_${Date.now()}_${Math.random().toString(36).slice(2)}`, q: "", type, timeLimit: 20 };
     switch (type) {
@@ -8481,44 +8485,32 @@ function QuizBuilderScreen({ onNav, onSave, onDone, initialQuiz, isReal = false,
     // persisted first, so an empty selection can never cause a partial save.
     if (showTags && tagReqError) { setTagError(tagReqError); return; }
     setSaving(true); setTagError(null);
-    // Phase 1 — persist quiz content. Reuse the single content-save path
-    // (onSave → handleSaveQuiz → upsertQuiz). Using savedQuizId once known makes
-    // every retry an UPDATE, never a duplicate INSERT.
-    const res = await onSave({
-      ...(initialQuiz ?? {}),
-      id: savePayloadId({ savedQuizId, initialQuizId: initialQuiz?.id, fallbackId: Date.now().toString() }),
-      name: name.trim(),
-      questions: qs,
-      passingScore: Math.max(0, Math.min(100, Math.round(Number(passingScore) || 0))),
-      createdAt: initialQuiz?.createdAt ?? new Date().toLocaleDateString("en-US", { month: "short", day: "numeric" }),
+    // Single orchestration (create + edit share this exact path). Reuses onSave →
+    // handleSaveQuiz → upsertQuiz for content; adopts the canonical id so retries
+    // never duplicate. On BOTH phases succeeding: one create/update success toast
+    // + onDone (route back to Quizzes → Library). Any failure stays in the editor.
+    const result = await runQuizSave({
+      payload: {
+        ...(initialQuiz ?? {}),
+        id: savePayloadId({ savedQuizId, initialQuizId: initialQuiz?.id, fallbackId: Date.now().toString() }),
+        name: name.trim(),
+        questions: qs,
+        passingScore: Math.max(0, Math.min(100, Math.round(Number(passingScore) || 0))),
+        createdAt: initialQuiz?.createdAt ?? new Date().toLocaleDateString("en-US", { month: "short", day: "numeric" }),
+      },
+      existingQuizId, showTags,
+      wasClassified, initialTagIds, selectedTagIds, catalog: tagCatalog,
+      onSave, setQuizTags,
+      onSavedId:    (id) => setSavedQuizId(id),
+      onClassified: (intent) => { setWasClassified(true); setInitialTagIds(intent.tagIds); setSelectedTagIds(intent.tagIds); },
+      onContentError: () => {},   // onSave already surfaced the content error
+      onTagError:   (error) => { setTagError(normalizeTagError(error)); toast.error("Quiz saved, but tags didn’t save. Press Save again to retry."); },
+      onSuccess:    (message) => toast.success(message),
+      onDone:       () => (onDone ?? (() => onNav("quizzes")))(),
     });
-    if (!res?.ok || !res.quiz) { setSaving(false); return; } // onSave surfaced the content error
-    const canonicalId = res.quiz.id;
-    setSavedQuizId(canonicalId);
-
-    // Phase 2 — tag assignment / classification (real backend + assign role only).
-    // First classification of an untagged quiz → classify:true; later changes →
-    // classify:false. Success is reported ONLY after setQuizTags succeeds; a
-    // failure keeps the manager here in a retryable state (no false success).
-    if (showTags) {
-      const intent = computeSaveTagIntent({ wasClassified, initialTagIds, selectedTagIds, catalog: tagCatalog });
-      if (intent.action !== "none") {
-        const { error } = await setQuizTags(canonicalId, intent.tagIds, { classify: intent.classify });
-        if (error) {
-          setTagError(normalizeTagError(error));
-          toast.error("Quiz saved, but tags didn’t save. Press Save again to retry.");
-          setSaving(false);
-          return;
-        }
-        setWasClassified(true); setInitialTagIds(intent.tagIds); setSelectedTagIds(intent.tagIds);
-      }
-    }
-    // Both phases succeeded → ONE success toast (create vs update by whether this
-    // editor opened on an existing quiz) + route back to Quizzes → Library (the
-    // admin default tab). The saved quiz + its active tags are already in state.
-    setSaving(false);
-    toast.success(quizSaveSuccessMessage(existingQuizId));
-    (onDone ?? (() => onNav("quizzes")))();
+    // Re-enable Save only when we stayed in the editor (failure/partial). On
+    // success the builder is navigating away, so avoid a setState-after-unmount.
+    if (!result?.navigated) setSaving(false);
   };
 
   const optLetters = ["A","B","C","D"];

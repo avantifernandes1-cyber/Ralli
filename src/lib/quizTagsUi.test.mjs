@@ -7,7 +7,7 @@ import {
   wouldInsertNewQuiz, savePayloadId,
   selectedActiveTagIds, hasActiveSelection, tagRequirementError,
   governanceOutcome,
-  quizSaveSuccessMessage, canBeginSave, saveFlowResult,
+  quizSaveSuccessMessage, canBeginSave, saveFlowResult, runQuizSave,
 } from "./quizTagsUi.js";
 
 // Catalog helpers for the requirement/intent tests
@@ -178,6 +178,76 @@ t("save flow: both succeed (create/edit/retry) → one success + navigate to Lib
   assert.deepEqual(saveFlowResult({ contentOk: true, tagRequired: true, tagFailed: false }), { success: true, navigate: true, stayInEditor: false, reason: "ok" });
   // successful retry is the same terminal outcome
   assert.equal(saveFlowResult({ contentOk: true, tagRequired: true, tagFailed: false }).navigate, true);
+});
+
+// ── REAL save orchestration/callback contract (runQuizSave) ──────────────────
+// Exercises the actual builder path with injected callbacks — this is what would
+// have caught the "toast/onDone never reached after persistence" regression.
+const CATr = [{ id: "a", label: "Discovery", status: "active", merged_into: null }];
+function harness(overrides = {}) {
+  const calls = { onSavedId: [], onClassified: [], contentErr: 0, tagErr: 0, success: [], done: 0 };
+  const deps = {
+    payload: { id: "temp" }, existingQuizId: overrides.existingQuizId ?? null, showTags: true,
+    wasClassified: overrides.wasClassified ?? false, initialTagIds: overrides.initialTagIds ?? [],
+    selectedTagIds: overrides.selectedTagIds ?? ["a"], catalog: CATr,
+    onSave: overrides.onSave ?? (async () => ({ ok: true, quiz: { id: "UUID-1" } })),
+    setQuizTags: overrides.setQuizTags ?? (async () => ({ data: {}, error: null })),
+    onSavedId: (id) => calls.onSavedId.push(id),
+    onClassified: (i) => calls.onClassified.push(i),
+    onContentError: () => { calls.contentErr++; },
+    onTagError: () => { calls.tagErr++; },
+    onSuccess: (m) => calls.success.push(m),
+    onDone: () => { calls.done++; },
+  };
+  return { deps, calls };
+}
+t("runQuizSave create success → one create toast + onDone (navigate)", async () => {
+  const { deps, calls } = harness({ existingQuizId: null });
+  const r = await runQuizSave(deps);
+  assert.equal(r.navigated, true);
+  assert.deepEqual(calls.success, ["Quiz created successfully."]);
+  assert.equal(calls.done, 1);
+  assert.deepEqual(calls.onSavedId, ["UUID-1"]);   // canonical id adopted (retry won't duplicate)
+  assert.equal(calls.contentErr + calls.tagErr, 0);
+});
+t("runQuizSave edit success → one update toast + onDone", async () => {
+  const { deps, calls } = harness({ existingQuizId: "UUID-1", wasClassified: true, initialTagIds: ["a"], selectedTagIds: ["a"] });
+  // unchanged set → intent 'none' → still success + navigate
+  const r = await runQuizSave(deps);
+  assert.equal(r.navigated, true);
+  assert.deepEqual(calls.success, ["Quiz updated successfully."]);
+  assert.equal(calls.done, 1);
+});
+t("runQuizSave content failure → no success, no onDone (stay)", async () => {
+  const { deps, calls } = harness({ onSave: async () => ({ ok: false }) });
+  const r = await runQuizSave(deps);
+  assert.equal(r.navigated, false);
+  assert.equal(calls.success.length, 0);
+  assert.equal(calls.done, 0);
+  assert.equal(calls.contentErr, 1);
+});
+t("runQuizSave tag failure → no success, no onDone, id preserved (retry no dup)", async () => {
+  const { deps, calls } = harness({ setQuizTags: async () => ({ data: null, error: { message: "boom" } }) });
+  const r = await runQuizSave(deps);
+  assert.equal(r.navigated, false);
+  assert.equal(r.quizId, "UUID-1");             // canonical id kept for retry
+  assert.equal(calls.success.length, 0);
+  assert.equal(calls.done, 0);
+  assert.equal(calls.tagErr, 1);
+});
+t("runQuizSave successful retry after a partial failure → success + onDone, no duplicate", async () => {
+  // First attempt: content ok, tags fail. Retry: onSave receives the adopted UUID
+  // (UPDATE, not INSERT) and tags succeed.
+  let saveCalls = 0;
+  const okQuiz = { ok: true, quiz: { id: "UUID-1" } };
+  const h1 = harness({ setQuizTags: async () => ({ error: { message: "x" } }) });
+  await runQuizSave(h1.deps);
+  const h2 = harness({ onSave: async (p) => { saveCalls++; assert.ok(p, "payload present"); return okQuiz; } });
+  const r2 = await runQuizSave(h2.deps);
+  assert.equal(r2.navigated, true);
+  assert.deepEqual(h2.calls.success, ["Quiz created successfully."]);
+  assert.equal(h2.calls.done, 1);
+  assert.equal(saveCalls, 1);                    // one content save on the retry (no duplicate loop)
 });
 t("usage counts from map rows", () => {
   const c = tagUsageCounts([{ tag_id: "a" }, { tag_id: "a" }, { tag_id: "b" }]);

@@ -161,6 +161,41 @@ export function saveFlowResult({ contentOk, tagRequired = false, tagFailed = fal
   return { success: true, navigate: true, stayInEditor: false, reason: "ok" };
 }
 
+// The ACTUAL two-phase save orchestration used by QuizBuilderScreen.handleSave —
+// extracted so the create/edit completion contract is exercised end-to-end with
+// injected callbacks (the builder passes its real onSave/setQuizTags/toast/onDone).
+// Contract: persist content (phase 1); adopt the canonical id (retry never
+// duplicates); classify/assign tags (phase 2); ONLY when both succeed → one
+// create/update success toast + onDone (navigate). Any failure stays in the
+// editor with the honest error and no success/navigation. Reuses one save path.
+export async function runQuizSave({
+  payload, existingQuizId, showTags,
+  wasClassified, initialTagIds, selectedTagIds, catalog,
+  onSave, setQuizTags,
+  onSavedId, onClassified, onContentError, onTagError, onSuccess, onDone,
+}) {
+  // Phase 1 — content.
+  const res = await onSave(payload);
+  if (!res?.ok || !res.quiz) { onContentError?.(res?.error); return { reason: "content_error", navigated: false }; }
+  const canonicalId = res.quiz.id;
+  onSavedId?.(canonicalId);
+
+  // Phase 2 — tags (real backend + assign role only).
+  if (showTags) {
+    const intent = computeSaveTagIntent({ wasClassified, initialTagIds, selectedTagIds, catalog });
+    if (intent.action !== "none") {
+      const { error } = await setQuizTags(canonicalId, intent.tagIds, { classify: intent.classify });
+      if (error) { onTagError?.(error, canonicalId); return { reason: "tag_error", quizId: canonicalId, navigated: false }; }
+      onClassified?.(intent);
+    }
+  }
+
+  // Both succeeded → ONE success toast + navigate.
+  onSuccess?.(quizSaveSuccessMessage(existingQuizId), canonicalId);
+  onDone?.();
+  return { reason: "ok", quizId: canonicalId, navigated: true };
+}
+
 // Mirrors upsertQuiz's new-vs-existing detection: a non-UUID id (temp Date.now(),
 // "quiz_*", missing) INSERTs; a UUID UPDATEs. The builder adopts the canonical
 // UUID after the first successful save so any retry UPDATEs (never duplicates).
