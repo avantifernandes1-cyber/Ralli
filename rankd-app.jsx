@@ -9164,8 +9164,60 @@ function LearnScreen({ role, user, orgUsers = [], orgs = [], onNav, onAwardXp, p
   const learnDataError = isReal ? (catalogError ?? sharedAssignmentData?.error ?? null) : catalogError;
   const loadLearnData  = useCallback(() => { loadLearnCatalog(); sharedAssignmentData?.retry?.(); }, [loadLearnCatalog, sharedAssignmentData?.retry]);
 
+  // Issue 1 (live QA after 063) — instance-aware "is this lesson done for the
+  // learner's CURRENT assignment?" A lesson completed BEFORE a later
+  // reassignment must be re-completable: the new instance only resolves once a
+  // completion dated >= its assigned_at exists (the same rule the shared engine
+  // and _lesson_assignment_active_user_ids() enforce). `completedLessons` is
+  // ever-completed *membership*, so gating on it alone wrongly treats a
+  // reassigned lesson as already done — the learner's "Done" click no-ops,
+  // mark_lesson_complete (ON CONFLICT → completed_at = now()) never fires, and
+  // the assignment stays Due forever. This helper defers to the engine, so it
+  // does NOT introduce a second status rule — it just asks the engine whether
+  // THIS user's latest lesson-assignment instance is resolved.
+  // The learner's most recent assignment instance that this lesson counts
+  // toward: its own latest lesson assignment, OR the latest course assignment
+  // for any course containing it (a course reassignment is the same instance
+  // boundary — every member lesson must be re-completed after assigned_at for
+  // the course to resolve). Returns the assigned_at (ms) of that instance, or
+  // null when the learner has no active assignment driving this lesson.
+  const latestLessonInstanceAssignedAtMs = (lessonId) => {
+    const userTeamId = orgUsers.find(u => u.id === user?.id)?.teamId ?? null;
+    const mineFor = (a) => (
+      (a.assignedTo?.type === "group"      && a.assignedTo.orgId === user?.orgId) ||
+      (a.assignedTo?.type === "individual" && a.assignedTo.userId === user?.id)   ||
+      (a.assignedTo?.type === "team"       && userTeamId && a.assignedTo.teamId === userTeamId)
+    );
+    let latest = -Infinity;
+    assignments.forEach(a => {
+      if (a.cancelledAt || !mineFor(a)) return;
+      let relevant = false;
+      if (a.contentType === "lesson" && a.contentId === lessonId) relevant = true;
+      else if (a.contentType === "course") {
+        const course = courses.find(c => c.id === a.contentId);
+        if (course?.lessonIds?.includes(lessonId)) relevant = true;
+      }
+      if (!relevant) return;
+      const t = new Date(a.assignedAtRaw ?? a.assignedAt ?? 0).getTime();
+      if (!Number.isNaN(t) && t > latest) latest = t;
+    });
+    return latest === -Infinity ? null : latest;
+  };
+  const isLessonResolvedForCurrentInstance = (lessonId) => {
+    const lastCompletedIso = completedLessonsAt.get(lessonId) ?? null;
+    const instanceMs = latestLessonInstanceAssignedAtMs(lessonId);
+    // With an active assignment, "done" means the completion qualifies for THAT
+    // instance — evaluated by the engine's own gate isQualifyingEvent
+    // (completed_at >= assigned_at), the exact rule the SQL helpers and status
+    // resolvers use. Without one, fall back to ever-completed membership (free
+    // browsing: no reassignment to chase, so don't offer a pointless re-complete).
+    return instanceMs === null
+      ? completedLessons.has(lessonId)
+      : isQualifyingEvent(lastCompletedIso, new Date(instanceMs).toISOString());
+  };
+
   const handleCompleteLesson = (id) => {
-    if (completedLessons.has(id)) return;
+    if (isLessonResolvedForCurrentInstance(id)) return;
     const completedAtNow = new Date().toISOString();
     if (isReal) {
       // Shared hook owns the data — patch it optimistically so this screen
@@ -9451,7 +9503,7 @@ function LearnScreen({ role, user, orgUsers = [], orgs = [], onNav, onAwardXp, p
             if (activeLesson.course) { setActiveCourse(activeLesson.course); }
             setActiveLesson(null);
           }}
-          completed={completedLessons.has(activeLesson.lesson.id)}
+          completed={isLessonResolvedForCurrentInstance(activeLesson.lesson.id)}
           onComplete={handleCompleteLesson}
           nextLesson={activeLesson.nextLesson}
           onNextLesson={(next) => openLesson(next, activeLesson.course)}
@@ -10109,7 +10161,17 @@ function LearnScreen({ role, user, orgUsers = [], orgs = [], onNav, onAwardXp, p
           in_progress: { label: "In Progress", bg: C.blueBg,   text: C.blue     },
           completed:   { label: "Completed",   bg: C.greenBg,  text: C.green    },
           overdue:     { label: "Overdue",     bg: C.redBg,    text: C.red      },
+          // 063/064 lifecycle: a cancelled row is history only — never active.
+          // The reason distinguishes the two ways an assignment ends:
+          // manager_unassigned (a deliberate Unassign) vs archive/removal.
+          cancelled:   { label: "Unassigned",  bg: C.muted,    text: C.textMuted },
         };
+        // Honest reason phrasing for the Ended-assignments history — never a
+        // fabricated cause. manager_unassigned = a manager explicitly removed
+        // this one learner's assignment; anything else came from the content
+        // being archived/removed (063 archive RPCs + backfill).
+        const endedReasonLabel = (reason) =>
+          reason === "manager_unassigned" ? "Unassigned by manager" : "Content archived or removed";
 
         // Expand assignments into per-rep rows
         const allRows = uniqueAssignments.flatMap(a => {
@@ -10444,28 +10506,61 @@ function LearnScreen({ role, user, orgUsers = [], orgs = [], onNav, onAwardXp, p
               <p style={{ margin: "0 0 14px", fontSize: 13, color: C.textSub }}>{visibleRows.length} rep assignment{visibleRows.length !== 1 ? "s" : ""}</p>
             )}
 
-            {/* Learn lifecycle integrity (063): cancelled assignments — content was
-                archived/removed. Not active/overdue, but kept for history so the
-                manager can see the assignment became unavailable. */}
-            {!selectedAssignmentId && cancelledAssignments.length > 0 && (
-              <div style={{ marginBottom: 16, padding: "12px 16px", background: C.pageBg, borderRadius: 10, border: `1px dashed ${C.border}` }}>
-                <div style={{ fontSize: 12, fontWeight: 700, color: C.textSub, marginBottom: 6 }}>
-                  {cancelledAssignments.length} cancelled assignment{cancelledAssignments.length !== 1 ? "s" : ""} · content archived or removed
+            {/* Learn lifecycle integrity (063/064): ENDED ASSIGNMENTS history.
+                A row lands here when a manager Unassigns one learner
+                (manager_unassigned) or the content was archived/removed. These
+                are never active/overdue/pending — but they stay visible as
+                honest history so the manager can see who was assigned, why it
+                ended, and when. Completions/attempts/scores behind these rows
+                are preserved (nothing is deleted); a fresh reassignment starts
+                a new instance and does not reactivate a cancelled row. Content
+                that no longer resolves degrades to an honest "(removed)" label,
+                never a fabricated title. */}
+            {!selectedAssignmentId && cancelledAssignments.length > 0 && (() => {
+              // Search + timeframe honesty: filter ended rows by the same search
+              // box as active rows (assignee/title), and always show most-recent
+              // first by cancelled date so the newest Unassign is at the top.
+              const ended = cancelledAssignments
+                .map(ca => {
+                  const c = ca.contentType === "course" ? courses.find(x => x.id === ca.contentId) : lessons.find(x => x.id === ca.contentId);
+                  const title = c?.title ?? c?.name ?? `${ca.contentType === "course" ? "Course" : "Lesson"} (removed)`;
+                  return { ca, title, assignee: ca.assignedTo?.userName ?? "—" };
+                })
+                .filter(r => !sq || r.title.toLowerCase().includes(sq) || r.assignee.toLowerCase().includes(sq))
+                .sort((a, b) => new Date(b.ca.cancelledAt ?? 0) - new Date(a.ca.cancelledAt ?? 0));
+              if (ended.length === 0) return null;
+              return (
+                <div style={{ marginBottom: 20 }}>
+                  <div style={{ fontSize: 12, fontWeight: 800, color: C.textMuted, letterSpacing: "0.05em", marginBottom: 8 }}>
+                    ENDED ASSIGNMENTS ({ended.length}) · KEPT FOR HISTORY
+                  </div>
+                  <div style={{ borderRadius: 12, overflow: "hidden", border: `1px dashed ${C.border}`, background: C.pageBg }}>
+                    <div style={{ overflowX: "auto", WebkitOverflowScrolling: "touch" }}>
+                      <div style={{ minWidth: 620, display: "grid", gridTemplateColumns: "1.6fr 1.1fr 1.4fr 0.8fr", gap: 10, padding: "9px 16px", fontSize: 11, fontWeight: 700, color: C.textMuted, letterSpacing: "0.05em" }}>
+                        <span>CONTENT</span><span>REP</span><span>REASON</span><span>ENDED</span>
+                      </div>
+                      {ended.slice(0, 50).map(({ ca, title, assignee }) => {
+                        const missing = title.endsWith("(removed)");
+                        return (
+                          <div key={ca.id} style={{ minWidth: 620, display: "grid", gridTemplateColumns: "1.6fr 1.1fr 1.4fr 0.8fr", gap: 10, padding: "11px 16px", borderTop: `1px solid ${C.border}`, alignItems: "center" }}>
+                            <div style={{ display: "flex", alignItems: "center", gap: 8, minWidth: 0 }}>
+                              <span style={{ fontSize: 11, fontWeight: 700, padding: "3px 8px", borderRadius: 6, background: STATUS_CONFIG.cancelled.bg, color: STATUS_CONFIG.cancelled.text, flexShrink: 0 }}>
+                                {ca.cancelledReason === "manager_unassigned" ? "Unassigned" : "Ended"}
+                              </span>
+                              <span style={{ fontSize: 13, fontWeight: 600, color: missing ? C.textMuted : C.text, fontStyle: missing ? "italic" : "normal", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{title}</span>
+                              <span style={{ fontSize: 11, color: C.textMuted, flexShrink: 0 }}>{ca.contentType === "course" ? "Course" : "Lesson"}</span>
+                            </div>
+                            <span style={{ fontSize: 13, color: C.textSub, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{assignee}</span>
+                            <span style={{ fontSize: 12, color: C.textSub }}>{endedReasonLabel(ca.cancelledReason)}</span>
+                            <span style={{ fontSize: 12, color: C.textSub }}>{ca.cancelledAt ? fmtShort(ca.cancelledAt) : "—"}</span>
+                          </div>
+                        );
+                      })}
+                    </div>
+                  </div>
                 </div>
-                <div style={{ display: "flex", flexWrap: "wrap", gap: 6 }}>
-                  {cancelledAssignments.slice(0, 12).map(ca => {
-                    const c = ca.contentType === "course" ? courses.find(x => x.id === ca.contentId) : lessons.find(x => x.id === ca.contentId);
-                    const label = c?.title ?? `${ca.contentType === "course" ? "Course" : "Lesson"} (removed)`;
-                    return (
-                      <span key={ca.id} title={`${ca.assignedTo?.userName ?? "rep"} · cancelled (${ca.cancelledReason ?? "content unavailable"})`}
-                        style={{ fontSize: 11, fontWeight: 600, color: C.textMuted, background: C.white, border: `1px solid ${C.border}`, borderRadius: 6, padding: "3px 8px" }}>
-                        {label} · Unavailable
-                      </span>
-                    );
-                  })}
-                </div>
-              </div>
-            )}
+              );
+            })()}
 
             {visibleRows.length === 0
               ? <div style={{ padding: 40, textAlign: "center", color: C.textMuted, fontSize: 14 }}>No matching assignments</div>
@@ -13949,8 +14044,31 @@ function ContentAssignmentDrilldown({ row, onBack }) {
         // Course — per-lesson breakdown, so a manager can see exactly which
         // lessons are blocking completion, same "progress" data the table's
         // percentage is built from.
+        (() => {
+        // Durable "Next lesson" + remaining, derived only from persisted
+        // completions gated on THIS instance's assigned_at (same rule as the
+        // rows below). Honest by construction: it's the first course member
+        // with no qualifying completion — never a "current lesson" / live
+        // position, which we do not persist (see durable-data audit).
+        const isDone = (l) => {
+          const lc = completedAtByLesson?.get(l.id);
+          return !!lc && (!a.assignedAtRaw || new Date(lc) >= new Date(a.assignedAtRaw));
+        };
+        const nextLesson = status === "completed" ? null : courseLessons.find(l => !isDone(l)) ?? null;
+        const remaining  = courseLessons.filter(l => !isDone(l)).length;
+        return (
         <div>
           <div style={{ fontWeight: 700, fontSize: 13, color: C.text, marginBottom: 10 }}>Lesson Breakdown ({progress}% complete)</div>
+          {status !== "completed" && courseLessons.length > 0 && (
+            <div style={{ display: "flex", flexWrap: "wrap", gap: 8, marginBottom: 12, fontSize: 12 }}>
+              <span style={{ padding: "6px 12px", background: C.orangeLight, border: `1px solid ${C.orange}30`, borderRadius: 8, color: C.text }}>
+                <strong style={{ color: C.orange }}>Next lesson:</strong> {nextLesson ? nextLesson.title : "—"}
+              </span>
+              <span style={{ padding: "6px 12px", background: C.pageBg, borderRadius: 8, color: C.textSub }}>
+                {remaining} of {courseLessons.length} lesson{courseLessons.length !== 1 ? "s" : ""} remaining
+              </span>
+            </div>
+          )}
           <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
             {courseLessons.map(l => {
               const lc = completedAtByLesson?.get(l.id);
@@ -13966,6 +14084,8 @@ function ContentAssignmentDrilldown({ row, onBack }) {
             })}
           </div>
         </div>
+        );
+        })()
       )}
     </div>
   );
