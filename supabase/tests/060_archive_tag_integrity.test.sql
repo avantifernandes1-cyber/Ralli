@@ -164,5 +164,22 @@ DO $$ DECLARE t2 uuid; BEGIN
   RAISE NOTICE '9. later valid edit still works: PASS';
 END $$;
 
+-- ── 10. STATIC: all three mutators take the SAME tenant-scoped advisory lock ──
+-- Static source assertion only — this proves each function acquires the identical
+-- per-tenant lock key; it does NOT exercise true two-session interleaving (that
+-- needs a real concurrent test with two connections).
+DO $$
+DECLARE lock_expr text := 'pg_advisory_xact_lock(hashtextextended(''quiz_taxonomy:''';
+        src_archive text; src_set text; src_merge text;
+BEGIN
+  src_archive := pg_get_functiondef('public.archive_quiz_tag(uuid)'::regprocedure);
+  src_set     := pg_get_functiondef('public.set_quiz_tags(uuid,uuid[],boolean)'::regprocedure);
+  src_merge   := pg_get_functiondef('public.merge_quiz_tags(uuid,uuid)'::regprocedure);
+  ASSERT position(lock_expr IN src_archive) > 0, 'archive_quiz_tag takes the tenant advisory lock';
+  ASSERT position(lock_expr IN src_set)     > 0, 'set_quiz_tags takes the tenant advisory lock';
+  ASSERT position(lock_expr IN src_merge)   > 0, 'merge_quiz_tags takes the tenant advisory lock';
+  RAISE NOTICE '10. all three mutators acquire the same tenant-scoped advisory lock (static): PASS';
+END $$;
+
 ROLLBACK;
 \echo '060 ALL TESTS PASSED'

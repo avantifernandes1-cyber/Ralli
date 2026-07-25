@@ -175,9 +175,77 @@ END $$;
 REVOKE ALL ON FUNCTION public.set_quiz_tags(uuid, uuid[], boolean) FROM PUBLIC, anon;
 GRANT  EXECUTE ON FUNCTION public.set_quiz_tags(uuid, uuid[], boolean) TO authenticated;
 
+-- ── 4. merge_quiz_tags — 058 body VERBATIM + shared per-tenant advisory lock ──
+-- merge also mutates current mappings (repoint source→target) and tag status
+-- (archives source), so it MUST serialize with archive_quiz_tag and set_quiz_tags
+-- on the same per-tenant lock. Behavior is otherwise byte-identical to 058: same-
+-- tenant, both active + unmerged, no self-merge, no cycles (target must be active
+-- & non-merged so it points nowhere), mappings moved atomically with safe dedupe
+-- (ON CONFLICT DO NOTHING), source archived + merged_into=target, immutable
+-- attempt snapshots left on the source id (never hard-deleted). The tenant is read
+-- first (tenant_id is immutable), the lock is taken, then the mutable status/
+-- merged_into are re-read UNDER the lock so a concurrent archive cannot flip the
+-- source or target between the guard and the write.
+CREATE OR REPLACE FUNCTION public.merge_quiz_tags(p_source uuid, p_target uuid)
+RETURNS jsonb LANGUAGE plpgsql SECURITY DEFINER SET search_path = ''
+AS $$
+DECLARE v_uid uuid := auth.uid(); v_role text; v_tenant uuid;
+        v_src_tenant uuid; v_tgt_tenant uuid;
+        v_src_status text; v_tgt_status text; v_src_merged uuid; v_tgt_merged uuid;
+BEGIN
+  IF v_uid IS NULL THEN RAISE EXCEPTION 'merge_quiz_tags: must be authenticated'; END IF;
+  v_role := public.get_my_role();
+  v_tenant := public.get_my_tenant_id();
+  IF NOT (public.is_ralli_admin() OR v_role = 'orgAdmin') THEN
+    RAISE EXCEPTION 'merge_quiz_tags: only orgAdmin may manage the quiz tag taxonomy';
+  END IF;
+  IF p_source IS NULL OR p_target IS NULL THEN RAISE EXCEPTION 'merge_quiz_tags: source and target required'; END IF;
+  IF p_source = p_target THEN RAISE EXCEPTION 'merge_quiz_tags: cannot merge a tag into itself'; END IF;
+  -- tenant_id is immutable; read it (for the lock key + tenant checks) before locking.
+  SELECT tenant_id INTO v_src_tenant FROM public.tenant_quiz_tags WHERE id = p_source;
+  SELECT tenant_id INTO v_tgt_tenant FROM public.tenant_quiz_tags WHERE id = p_target;
+  IF v_src_tenant IS NULL OR v_tgt_tenant IS NULL THEN RAISE EXCEPTION 'merge_quiz_tags: source or target not found'; END IF;
+  IF v_src_tenant <> v_tgt_tenant THEN RAISE EXCEPTION 'merge_quiz_tags: cross-tenant merge rejected'; END IF;
+  IF NOT (public.is_ralli_admin() OR v_src_tenant = v_tenant) THEN
+    RAISE EXCEPTION 'merge_quiz_tags: tags not in caller tenant';
+  END IF;
+
+  -- SHARED lock: serialize with archive_quiz_tag + set_quiz_tags in this tenant.
+  PERFORM pg_advisory_xact_lock(hashtextextended('quiz_taxonomy:' || v_src_tenant::text, 0));
+
+  -- Re-read the mutable state UNDER the lock.
+  SELECT status, merged_into INTO v_src_status, v_src_merged FROM public.tenant_quiz_tags WHERE id = p_source;
+  SELECT status, merged_into INTO v_tgt_status, v_tgt_merged FROM public.tenant_quiz_tags WHERE id = p_target;
+  -- Source must be a live tag; target must be a live, non-merged tag. Because the
+  -- target is required to be ACTIVE and NON-MERGED (merged_into IS NULL), it never
+  -- points anywhere — so archiving the source into it cannot create a merge cycle
+  -- or chain (a merged/archived tag can never be a merge target).
+  IF v_src_status <> 'active' THEN RAISE EXCEPTION 'merge_quiz_tags: source must be an active tag'; END IF;
+  IF v_tgt_status <> 'active' THEN RAISE EXCEPTION 'merge_quiz_tags: target must be an active tag'; END IF;
+  IF v_src_merged IS NOT NULL OR v_tgt_merged IS NOT NULL THEN
+    RAISE EXCEPTION 'merge_quiz_tags: cannot merge an already-merged tag';
+  END IF;
+
+  -- Repoint current mappings: attach target wherever source is mapped, then drop
+  -- the source mappings. (attempt-time snapshots are NOT touched — immutable.)
+  INSERT INTO public.quiz_tag_map (quiz_id, tag_id, tenant_id, created_by)
+    SELECT m.quiz_id, p_target, m.tenant_id, v_uid
+    FROM public.quiz_tag_map m
+    WHERE m.tag_id = p_source
+    ON CONFLICT (quiz_id, tag_id) DO NOTHING;
+  DELETE FROM public.quiz_tag_map WHERE tag_id = p_source;
+
+  UPDATE public.tenant_quiz_tags
+    SET status = 'archived', merged_into = p_target, updated_at = now()
+    WHERE id = p_source;
+  RETURN jsonb_build_object('source', p_source, 'target', p_target, 'merged', true);
+END $$;
+REVOKE ALL ON FUNCTION public.merge_quiz_tags(uuid, uuid) FROM PUBLIC, anon;
+GRANT  EXECUTE ON FUNCTION public.merge_quiz_tags(uuid, uuid) TO authenticated;
+
 -- ── ROLLBACK (forward corrective migration only) ──────────────────────────────
--- Restore the 058 archive_quiz_tag body (status-only) and the 059 set_quiz_tags
--- body (allowed empty/uncategorized). The conditional cleanup is not reversible
--- (deleted archived mappings would have to be re-derived from history); it only
--- removed archived mappings from quizzes that still have an active tag, so no
--- active classification is lost. Never weaken 056/057.
+-- Restore the 058 archive_quiz_tag + merge_quiz_tags bodies and the 059
+-- set_quiz_tags body. The conditional cleanup is not reversible (deleted archived
+-- mappings would have to be re-derived from history); it only removed archived
+-- mappings from quizzes that still have an active tag, so no active classification
+-- is lost. Never weaken 056/057.
