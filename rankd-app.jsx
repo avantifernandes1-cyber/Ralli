@@ -9182,12 +9182,28 @@ function LearnScreen({ role, user, orgUsers = [], orgs = [], onNav, onAwardXp, p
     }
     const lessonXp = lessons.find(l => l.id === id)?.xp ?? 0;
     if (lessonXp) onAwardXp?.(lessonXp);
-    // Persist to Supabase for real users (fire-and-forget)
+    // Persist to Supabase for real users. NOT fire-and-forget: a failed
+    // completion (e.g. a transient RPC/permission error) must NOT be left showing
+    // a false optimistic "complete" that silently reverts on the next refetch and
+    // never reaches the manager. On failure, surface an error and reload the
+    // authoritative completion state (which removes the optimistic entry) so the
+    // learner sees the true "still Due" state instead of a phantom completion.
     if (isReal && user?.id) {
       const uid = user.id;
       const tid = tenantId ?? null;
       markLessonComplete(uid, id, tid)
-        .then(({ error }) => { if (error) console.error("[ralli] markLessonComplete failed:", error); });
+        .then(({ error }) => {
+          if (error) {
+            console.error("[ralli] markLessonComplete failed:", error);
+            toast.error("We couldn't save your progress. Please try again.");
+            sharedAssignmentData?.retry?.();  // reload truth → drops the optimistic completion
+          }
+        })
+        .catch((e) => {
+          console.error("[ralli] markLessonComplete threw:", e);
+          toast.error("We couldn't save your progress. Please try again.");
+          sharedAssignmentData?.retry?.();
+        });
 
       // Award lesson XP — find any assignment for this lesson to check dueAt
       const userTeamId = orgUsers.find(u => u.id === uid)?.teamId ?? null;
@@ -9313,7 +9329,16 @@ function LearnScreen({ role, user, orgUsers = [], orgs = [], onNav, onAwardXp, p
     setArchiveInFlight(prev => new Set([...prev, courseId]));
     const { error } = await archiveCourseService(courseId);
     setArchiveInFlight(prev => { const s = new Set(prev); s.delete(courseId); return s; });
-    if (error) { console.error("[ralli] archiveCourse failed:", error); toast.error("Failed to archive course. Please try again."); return; }
+    if (error) {
+      console.error("[ralli] archiveCourse failed:", error);
+      // Surface a real, actionable message rather than a generic failure — an
+      // authority/tenant rejection reads differently from a transient error.
+      const msg = /not in caller tenant|only managers/i.test(error.message ?? "")
+        ? "You don't have permission to archive this course."
+        : "Couldn't archive the course. Please try again.";
+      toast.error(msg);
+      return;
+    }
     // archive_course() also cancelled this course's active assignments server-side;
     // the tenant_assignments subscription refreshes the affected lists automatically.
     setCourses(prev => prev.filter(c => c.id !== courseId));
@@ -9339,7 +9364,7 @@ function LearnScreen({ role, user, orgUsers = [], orgs = [], onNav, onAwardXp, p
       // course — surface that specific reason so the manager knows to remove it
       // from the course first, rather than a generic failure.
       const msg = /active course/i.test(error.message ?? "")
-        ? "Can't archive: this lesson belongs to an active course. Remove it from the course first."
+        ? "This lesson is being used in an active course, so it can't be archived. Remove it from the course first."
         : "Failed to archive lesson. Please try again.";
       toast.error(msg);
       return;
