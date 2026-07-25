@@ -13,14 +13,18 @@
 import { isRalliAdmin } from "./permissions.js";
 
 export const CLASSIFICATION = {
-  tagged:   { key: "tagged",   label: "Tagged" },
-  untagged: { key: "untagged", label: "No tag assigned" },
+  tagged: { key: "tagged", label: "Tagged" },
 };
 
-// Display state depends only on whether the quiz currently has any tag. The
-// tags_classified_at watermark no longer affects display (Uncategorized removed).
-export function deriveClassificationState(_tagsClassifiedAt, currentTagIds) {
-  return (currentTagIds && currentTagIds.length > 0) ? "tagged" : "untagged";
+// ACTIVE-only classification. A quiz is "tagged" (green) iff it has ≥1 ACTIVE
+// mapped tag. Archived mappings never make a quiz tagged. A quiz with zero
+// active mapped tags is an invalid legacy exception ("tag_required") — NOT a
+// normal category (there is no "No tag"/Uncategorized product state).
+export function activeMappedTagIds(tagIds = [], catalogById) {
+  return tagIds.filter((id) => catalogById.get(id)?.status === "active");
+}
+export function classificationFromActiveCount(activeCount) {
+  return activeCount > 0 ? "tagged" : "tag_required";
 }
 
 // Order-independent id-set equality (tag identity is the stable id).
@@ -117,21 +121,20 @@ export function tagSectionTouched({ wasClassified, initialTagIds = [], selectedT
   return computeSaveTagIntent({ wasClassified, initialTagIds, selectedTagIds, catalog }).action !== "none";
 }
 
-// Per-quiz classification/tag model, defaulting a quiz with no row to untagged
-// (existing quizzes are Awaiting until a manager classifies them).
+// Per-quiz tag model (raw current mappings). Callers derive the active-only
+// display via activeMappedTagIds(model.tagIds, catalogById).
 export function quizTagModel(modelByQuiz, quizId) {
   const m = modelByQuiz.get(quizId);
-  const classifiedAt = m ? m.classifiedAt : null;
-  const tagIds = m ? m.tagIds : [];
-  return { classifiedAt, tagIds, state: deriveClassificationState(classifiedAt, tagIds) };
+  return { classifiedAt: m ? m.classifiedAt : null, tagIds: m ? m.tagIds : [] };
 }
 
-// Stable-ID library filtering. filter = {kind:'all'|'untagged'|'tag', tagId?}
+// Stable-ID library filtering. filter = {kind:'all'|'tag', tagId?}. There is no
+// "No tag"/untagged category — untagged quizzes are invalid exceptions, not a
+// filterable product state. Filtering by an active tag id matches mapped quizzes.
 export function filterQuizzesByTag(quizzes, modelByQuiz, filter) {
   if (!filter || filter.kind === "all") return quizzes;
   return quizzes.filter((quiz) => {
     const { tagIds } = quizTagModel(modelByQuiz, quiz.id);
-    if (filter.kind === "untagged") return tagIds.length === 0; // "No tag assigned"
     if (filter.kind === "tag") return tagIds.includes(filter.tagId); // stable id, never label
     return true;
   });
@@ -191,8 +194,15 @@ export function normalizeTagError(error, context = {}) {
   if (msg.includes("insufficient role") || msg.includes("only orgadmin") || msg.includes("only ralli")) {
     return `You don't have permission for that action.`;
   }
+  if (msg.includes("only active tag on")) {
+    // archive_quiz_tag block — keep the count-bearing wording (strip the fn prefix).
+    return String(error.message).replace(/^[a-z_]+:\s*/i, "");
+  }
+  if (msg.includes("at least one active tag is required")) {
+    return `Select at least one active tag before saving.`;
+  }
   if (msg.includes("cannot assign tags to an unclassified quiz")) {
-    return `Make an explicit classification decision (add a tag or Mark as Uncategorized) first.`;
+    return `Add at least one active tag to classify this quiz.`;
   }
   // Fall back to the server message (trimmed of the SQL function prefix).
   const raw = String(error.message || "Something went wrong. Please try again.");

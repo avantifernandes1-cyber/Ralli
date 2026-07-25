@@ -38,22 +38,24 @@ DO $$ BEGIN
 END $$;
 
 -- ── 1. AWAITING: no envelope; passive calls never finalize an untouched quiz ──
-DO $$ DECLARE rev text; res jsonb; t1 uuid; err boolean := false; BEGIN
+DO $$ DECLARE rev text; res jsonb; t1 uuid; err boolean := false; e2 boolean := false; BEGIN
   ASSERT (SELECT count(*) FROM public.quiz_attempt_tag_snapshots)=0, 'pre-taxonomy attempts have no envelope';
   SELECT question_revision INTO rev FROM public.tenant_quizzes WHERE id='00000000-0000-0000-0000-0000000000f1';
   PERFORM set_config('request.jwt.claims','{"sub":"00000000-0000-0000-0000-0000000000a1","role":"authenticated"}',true);
   res := public.submit_quiz_attempt_atomic_v2('00000000-0000-0000-0000-0000000000a0','00000000-0000-0000-0000-0000000000f1','[{"questionId":"q1","selected":1}]'::jsonb, rev, gen_random_uuid());
   ASSERT (res->>'server_score')='100' AND (res->>'server_passed')='true', 'grading unchanged';
   ASSERT (SELECT count(*) FROM public.quiz_attempt_tag_snapshots WHERE quiz_id='00000000-0000-0000-0000-0000000000f1')=0, 'new attempt on UNCLASSIFIED quiz stays awaiting';
-  -- Passive no-op: empty + p_classify=false must NOT finalize.
+  -- Post-060: a zero-tag classification is rejected (no Uncategorized state), so
+  -- an untouched quiz cannot be accidentally finalized empty.
   SELECT id INTO t1 FROM public.tenant_quiz_tags WHERE normalized_label='discovery';
   PERFORM set_config('request.jwt.claims','{"sub":"00000000-0000-0000-0000-0000000000a9","role":"authenticated"}',true);
-  ASSERT (public.set_quiz_tags('00000000-0000-0000-0000-0000000000f2', ARRAY[]::uuid[], false)->>'classification')='awaiting', 'empty+no-classify = stays awaiting';
-  ASSERT (SELECT tags_classified_at IS NULL FROM public.tenant_quizzes WHERE id='00000000-0000-0000-0000-0000000000f2'), 'passive call did not finalize';
-  -- Assigning tags without classifying is rejected.
+  BEGIN PERFORM public.set_quiz_tags('00000000-0000-0000-0000-0000000000f2', ARRAY[]::uuid[], true); EXCEPTION WHEN others THEN e2 := true; END;
+  ASSERT e2, 'zero-tag classification rejected';
+  ASSERT (SELECT tags_classified_at IS NULL FROM public.tenant_quizzes WHERE id='00000000-0000-0000-0000-0000000000f2'), 'rejected call did not finalize';
+  -- Assigning tags to an unclassified quiz without p_classify is rejected.
   BEGIN PERFORM public.set_quiz_tags('00000000-0000-0000-0000-0000000000f2', ARRAY[t1], false); EXCEPTION WHEN others THEN err := true; END;
   ASSERT err, 'tags without p_classify rejected';
-  RAISE NOTICE '1. awaiting: no envelope; passive no-op; tags-without-classify rejected: PASS';
+  RAISE NOTICE '1. awaiting: no envelope; zero-tag classify rejected; tags-without-classify rejected: PASS';
 END $$;
 
 -- ── 2. TAGGED initial classification inherits initial set once to awaiting ───
@@ -90,29 +92,37 @@ DO $$ DECLARE rev text; res jsonb; aid uuid; BEGIN
   RAISE NOTICE '4. post-classification attempt snapshots current set: PASS';
 END $$;
 
--- ── 5. Detach ALL on classified quiz -> genuinely untagged future attempts ───
+-- ── 5. Classified quiz with ZERO current mappings -> grading envelope, 0 links ─
+-- Post-060, set_quiz_tags cannot empty a quiz and archive blocks the last active
+-- tag, so a classified quiz reaches zero current mappings only via archive-detach
+-- or legacy state. Simulate that directly (owner delete), then a new attempt still
+-- records an envelope with ZERO tag links (059 grading-path behavior intact).
 DO $$ DECLARE rev text; res jsonb; aid uuid; BEGIN
-  PERFORM set_config('request.jwt.claims','{"sub":"00000000-0000-0000-0000-0000000000a9","role":"authenticated"}',true);
-  ASSERT (public.set_quiz_tags('00000000-0000-0000-0000-0000000000f1', ARRAY[]::uuid[], false)->>'classification')='uncategorized', 'classified quiz detached to zero = uncategorized (still classified)';
-  ASSERT (SELECT tags_classified_at IS NOT NULL FROM public.tenant_quizzes WHERE id='00000000-0000-0000-0000-0000000000f1'), 'stays classified after full detach';
+  DELETE FROM public.quiz_tag_map WHERE quiz_id='00000000-0000-0000-0000-0000000000f1';
+  ASSERT (SELECT tags_classified_at IS NOT NULL FROM public.tenant_quizzes WHERE id='00000000-0000-0000-0000-0000000000f1'), 'still classified with zero current mappings';
   SELECT question_revision INTO rev FROM public.tenant_quizzes WHERE id='00000000-0000-0000-0000-0000000000f1';
   PERFORM set_config('request.jwt.claims','{"sub":"00000000-0000-0000-0000-0000000000a1","role":"authenticated"}',true);
   res := public.submit_quiz_attempt_atomic_v2('00000000-0000-0000-0000-0000000000a0','00000000-0000-0000-0000-0000000000f1','[{"questionId":"q1","selected":1}]'::jsonb, rev, gen_random_uuid());
   aid := (res->'attempt'->>'id')::uuid;
-  ASSERT EXISTS (SELECT 1 FROM public.quiz_attempt_tag_snapshots WHERE attempt_id=aid), 'genuinely-untagged HAS an envelope';
-  ASSERT (SELECT count(*) FROM public.quiz_attempt_tags WHERE attempt_id=aid)=0, 'genuinely-untagged has ZERO tag links';
-  RAISE NOTICE '5. genuinely-untagged (envelope, 0 links) vs awaiting (no envelope): PASS';
+  ASSERT EXISTS (SELECT 1 FROM public.quiz_attempt_tag_snapshots WHERE attempt_id=aid), 'classified+zero-mappings attempt HAS an envelope';
+  ASSERT (SELECT count(*) FROM public.quiz_attempt_tags WHERE attempt_id=aid)=0, 'envelope has ZERO tag links';
+  RAISE NOTICE '5. classified + zero current mappings -> envelope, 0 links: PASS';
 END $$;
 
--- ── 6. INTENTIONALLY UNCATEGORIZED initial classification (zero-tag) ─────────
-DO $$ DECLARE res jsonb; BEGIN
+-- ── 6. Zero-tag classification rejected; valid first classification inherits ──
+DO $$ DECLARE t2 uuid; e boolean := false; res jsonb; BEGIN
+  SELECT id INTO t2 FROM public.tenant_quiz_tags WHERE normalized_label='objections';
   PERFORM set_config('request.jwt.claims','{"sub":"00000000-0000-0000-0000-0000000000a9","role":"authenticated"}',true);
-  res := public.set_quiz_tags('00000000-0000-0000-0000-0000000000f2', ARRAY[]::uuid[], true);   -- explicit Uncategorized
-  ASSERT (res->>'classification')='uncategorized', 'explicit zero-tag classification';
-  ASSERT (SELECT tags_classified_at IS NOT NULL FROM public.tenant_quizzes WHERE id='00000000-0000-0000-0000-0000000000f2'), 'watermark set on Uncategorized';
-  ASSERT (SELECT count(*) FROM public.quiz_attempt_tag_snapshots WHERE quiz_id='00000000-0000-0000-0000-0000000000f2' AND snapshot_source='initial_classification')=1, 'awaiting attempt enveloped';
-  ASSERT (SELECT count(*) FROM public.quiz_attempt_tags qt JOIN public.quiz_attempt_tag_snapshots s ON s.attempt_id=qt.attempt_id WHERE s.quiz_id='00000000-0000-0000-0000-0000000000f2')=0, 'Uncategorized inheritance = ZERO links';
-  RAISE NOTICE '6. intentionally-Uncategorized initial classification (envelope, 0 links): PASS';
+  BEGIN PERFORM public.set_quiz_tags('00000000-0000-0000-0000-0000000000f2', ARRAY[]::uuid[], true); EXCEPTION WHEN others THEN e := true; END;
+  ASSERT e, 'zero-tag initial classification rejected (no Uncategorized state)';
+  ASSERT (SELECT tags_classified_at IS NULL FROM public.tenant_quizzes WHERE id='00000000-0000-0000-0000-0000000000f2')
+     AND (SELECT count(*) FROM public.quiz_attempt_tag_snapshots WHERE quiz_id='00000000-0000-0000-0000-0000000000f2')=0, 'f2 still awaiting, no envelope';
+  -- A VALID (non-empty) first classification inherits to f2's awaiting attempt once.
+  res := public.set_quiz_tags('00000000-0000-0000-0000-0000000000f2', ARRAY[t2], true);
+  ASSERT (res->>'classification')='tagged', 'valid first classification';
+  ASSERT (SELECT count(*) FROM public.quiz_attempt_tag_snapshots WHERE quiz_id='00000000-0000-0000-0000-0000000000f2' AND snapshot_source='initial_classification')=1, 'f2 attempt enveloped';
+  ASSERT (SELECT count(*) FROM public.quiz_attempt_tags qt JOIN public.quiz_attempt_tag_snapshots s ON s.attempt_id=qt.attempt_id WHERE s.quiz_id='00000000-0000-0000-0000-0000000000f2')=1, 'inherited 1 tag';
+  RAISE NOTICE '6. zero-tag classification rejected; valid first classification inherits: PASS';
 END $$;
 
 -- ── 7. Stored answers stay learner-safe (confidentiality unchanged by 059) ───

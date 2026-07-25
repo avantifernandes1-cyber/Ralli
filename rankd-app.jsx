@@ -97,7 +97,7 @@ import { provisionTenant, buildInviteUrl, normalizeProvisionedOrg, createMemberI
 import { awardLessonPoints, awardCoursePoints, awardGamePointsForSession, getLeaderboard, computeUserMeta, getUserStreak } from "./src/lib/scoringService.js";
 import { triggerReadinessUpdate, getTopicHeatmap, getOrgMetrics, getRepTopicScores, getUserPerformance, getRecommendations } from "./src/lib/insightsService.js";
 import { listTenantQuizTags, listQuizTagMap, listQuizClassification, getQuizTagState, createQuizTag, renameQuizTag, archiveQuizTag, restoreQuizTag, mergeQuizTags, setQuizTags } from "./src/lib/taxonomyService.js";
-import { CLASSIFICATION, deriveClassificationState, tagCapabilities, buildBuilderTagRows, computeSaveTagIntent, quizTagModel, filterQuizzesByTag, tagUsageCounts, resolveTag, normalizeTagError, savePayloadId, hasActiveSelection, selectedActiveTagIds, tagRequirementError, governanceOutcome } from "./src/lib/quizTagsUi.js";
+import { activeMappedTagIds, classificationFromActiveCount, tagCapabilities, buildBuilderTagRows, computeSaveTagIntent, quizTagModel, filterQuizzesByTag, tagUsageCounts, resolveTag, normalizeTagError, savePayloadId, hasActiveSelection, selectedActiveTagIds, tagRequirementError, governanceOutcome } from "./src/lib/quizTagsUi.js";
 
 // ── MOBILE HOOK ────────────────────────────────────────────
 function useMobile() {
@@ -8037,17 +8037,19 @@ function NewSessionScreen({ onNav, quizzes, onCreateSession }) {
 // tag id. Every saved quiz requires ≥1 active tag (no Uncategorized state).
 // ═══════════════════════════════════════════════════════════════════════════
 const TAG_STATE_STYLE = {
-  tagged:   { bg: C.greenBg, fg: C.trueGreen, dot: C.trueGreen },
-  untagged: { bg: C.muted,   fg: C.textMuted, dot: C.textMuted },
+  tagged:       { bg: C.greenBg, fg: C.trueGreen, dot: C.trueGreen, label: "Tagged" },
+  // Not a normal classification category — an exceptional "fix me" warning.
+  tag_required: { bg: C.redBg,   fg: C.red,       dot: C.red,       label: "Tag required" },
 };
 
-function ClassificationBadge({ state, suffix }) {
-  const s = TAG_STATE_STYLE[state] ?? TAG_STATE_STYLE.untagged;
+// Green "Tagged" appears ONLY for state==='tagged' (≥1 active mapped tag).
+function ClassificationBadge({ state }) {
+  const s = TAG_STATE_STYLE[state] ?? TAG_STATE_STYLE.tag_required;
   return (
     <span style={{ display: "inline-flex", alignItems: "center", gap: 6, fontSize: 11, fontWeight: 700,
       padding: "3px 9px", borderRadius: 999, background: s.bg, color: s.fg }}>
       <span style={{ width: 6, height: 6, borderRadius: 999, background: s.dot }} />
-      {CLASSIFICATION[state]?.label ?? "No tag assigned"}{suffix ? ` · ${suffix}` : ""}
+      {s.label}
     </span>
   );
 }
@@ -8067,16 +8069,19 @@ function TagChip({ label, archived, onRemove }) {
   );
 }
 
-// Read-only tag/classification display for Library cards.
+// Read-only Library card display — ACTIVE mapped tags only. Archived mappings
+// never render (they're not a current classification) and never show green.
 function QuizTagChips({ model, catalogById }) {
-  const chips = (model.tagIds ?? []).map(id => {
+  const activeIds = activeMappedTagIds(model.tagIds ?? [], catalogById);
+  const state = classificationFromActiveCount(activeIds.length);
+  const chips = activeIds.map(id => {
     const t = resolveTag(id, catalogById) || catalogById.get(id);
-    return { id, label: t ? t.label : "(unknown)", archived: !t || t.status === "archived" };
+    return { id, label: t ? t.label : "(unknown)" };
   });
   return (
     <div style={{ display: "flex", flexWrap: "wrap", alignItems: "center", gap: 6, marginTop: 8 }}>
-      <ClassificationBadge state={model.state} />
-      {chips.map(c => <TagChip key={c.id} label={c.label} archived={c.archived} />)}
+      <ClassificationBadge state={state} />
+      {chips.map(c => <TagChip key={c.id} label={c.label} />)}
     </div>
   );
 }
@@ -8084,9 +8089,10 @@ function QuizTagChips({ model, catalogById }) {
 // Builder tag section — presentational; the builder owns state + save orchestration.
 function QuizTagsSection({ caps, catalog, loading, selectedTagIds, onAddTag, onRemoveTag, onOpenManager, tagError }) {
   const rows = buildBuilderTagRows(catalog, selectedTagIds);
+  const activeSelected = rows.selected.filter(r => !r.archived); // ACTIVE mapped only
   const hasActive = hasActiveSelection(catalog, selectedTagIds);
   const activeInCatalog = catalog.filter(t => t.status === "active").length;
-  const badgeState = hasActive ? "tagged" : "untagged";
+  const badgeState = hasActive ? "tagged" : "tag_required";
 
   // One guidance line only (no duplicate warnings): validation when no active
   // tag is selected; catalog-empty guidance when the tenant genuinely has none.
@@ -8116,10 +8122,10 @@ function QuizTagsSection({ caps, catalog, loading, selectedTagIds, onAddTag, onR
         <div style={{ fontSize: 12, color: C.textMuted, marginTop: 10 }}>Loading tags…</div>
       ) : (
         <>
-          {rows.selected.length > 0 && (
+          {activeSelected.length > 0 && (
             <div style={{ display: "flex", flexWrap: "wrap", gap: 8, marginTop: 12 }}>
-              {rows.selected.map(r => (
-                <TagChip key={r.id} label={r.label} archived={r.archived} onRemove={() => onRemoveTag(r.id)} />
+              {activeSelected.map(r => (
+                <TagChip key={r.id} label={r.label} onRemove={() => onRemoveTag(r.id)} />
               ))}
             </div>
           )}
@@ -8400,8 +8406,13 @@ function QuizBuilderScreen({ onNav, onSave, onDone, initialQuiz, isReal = false,
         cls = !!st?.classifiedAt; ids = st?.tagIds ?? [];
       }
       if (!alive) return;
-      setTagCatalog(catalog ?? []);
-      setWasClassified(cls); setInitialTagIds(ids); setSelectedTagIds(ids);
+      const cat = catalog ?? [];
+      // Builder works with ACTIVE mapped tags only. Any lingering archived mapping
+      // (legacy exception) is hidden here and is dropped on the next save, which
+      // replaces the quiz's mapping with the selected active set.
+      const activeIds = activeMappedTagIds(ids, new Map(cat.map(t => [t.id, t])));
+      setTagCatalog(cat);
+      setWasClassified(cls); setInitialTagIds(activeIds); setSelectedTagIds(activeIds);
       setTagsLoading(false);
     })();
     return () => { alive = false; };
@@ -14720,7 +14731,7 @@ function QuizzesScreen({ role, onNav, quizzes, onEditQuiz, onDeleteQuiz, onToggl
               display: "flex", alignItems: "center", gap: 6, padding: "10px 16px",
               borderRadius: 12, border: `1px solid ${C.border}`, cursor: "pointer",
               fontSize: 13, fontWeight: 700, color: C.text, background: C.white,
-            }}>🏷 {tagCaps.canGovern ? "Manage Tags" : "View Tags"}</button>
+            }}>{tagCaps.canGovern ? "Manage Tags" : "View Tags"}</button>
           )}
           {canCreate && adminTab === "library" && (
             <button onClick={() => { onEditQuiz(null); onNav("rankd-quiz-builder"); }} style={{
@@ -14763,8 +14774,7 @@ function QuizzesScreen({ role, onNav, quizzes, onEditQuiz, onDeleteQuiz, onToggl
             {tagsEnabled && (
               <div style={{ display: "flex", flexWrap: "wrap", alignItems: "center", gap: 6 }}>
                 {[
-                  { key: "all",      label: `All (${quizzes.length})`, filter: { kind: "all" } },
-                  { key: "untagged", label: `No tag`,                  filter: { kind: "untagged" } },
+                  { key: "all", label: `All (${quizzes.length})`, filter: { kind: "all" } },
                 ].map(chip => {
                   const on = tagFilter.kind === chip.filter.kind && !tagFilter.tagId;
                   return (

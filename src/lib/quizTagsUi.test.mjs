@@ -1,7 +1,7 @@
 // Focused unit tests for quizTagsUi pure logic. Run: node src/lib/quizTagsUi.test.mjs
 import assert from "node:assert";
 import {
-  deriveClassificationState, sameIdSet, tagCapabilities, resolveTag,
+  activeMappedTagIds, classificationFromActiveCount, sameIdSet, tagCapabilities, resolveTag,
   buildBuilderTagRows, computeSaveTagIntent, tagSectionTouched,
   quizTagModel, filterQuizzesByTag, tagUsageCounts, normalizeTagError,
   wouldInsertNewQuiz, savePayloadId,
@@ -15,17 +15,24 @@ const CAT = [
   { id: "b", label: "Objections", status: "active",   merged_into: null },
   { id: "z", label: "OldTopic",   status: "archived", merged_into: null },
 ];
+const CAT_BY_ID = new Map(CAT.map((t) => [t.id, t]));
 
 let passed = 0;
 const t = (name, fn) => { fn(); passed++; console.log("  ok:", name); };
 
-// ── classification state derivation (tagged / untagged only) ─────────────────
-t("no tags → untagged (No tag assigned)", () => {
-  assert.equal(deriveClassificationState(null, []), "untagged");
-  assert.equal(deriveClassificationState("2026-01-01T00:00:00Z", []), "untagged"); // classified-but-zero also untagged now
+// ── ACTIVE-only classification (green Tagged iff ≥1 active mapped tag) ────────
+t("archived-only mapping is NOT rendered Tagged (tag_required)", () => {
+  const active = activeMappedTagIds(["z"], CAT_BY_ID); // z is archived
+  assert.deepEqual(active, []);
+  assert.equal(classificationFromActiveCount(active.length), "tag_required");
 });
-t("has tags → tagged", () => {
-  assert.equal(deriveClassificationState(null, ["t1"]), "tagged");
+t("≥1 active mapped tag → tagged; archived alongside is ignored", () => {
+  const active = activeMappedTagIds(["a", "z"], CAT_BY_ID);
+  assert.deepEqual(active, ["a"]);
+  assert.equal(classificationFromActiveCount(active.length), "tagged");
+});
+t("no mapping → tag_required (not a normal category)", () => {
+  assert.equal(classificationFromActiveCount(activeMappedTagIds([], CAT_BY_ID).length), "tag_required");
 });
 
 // ── save requirement: every quiz needs ≥1 ACTIVE tag ─────────────────────────
@@ -101,23 +108,31 @@ t("manager assigns but does NOT govern", () => {
 });
 
 // ── stable-id filtering ──────────────────────────────────────────────────────
-t("filters by All / No-tag (untagged) / specific tag id (stable id)", () => {
-  const quizzes = [{ id: "q1" }, { id: "q2" }, { id: "q3" }, { id: "q4" }];
+t("filters by All / specific tag id only — NO untagged category", () => {
+  const quizzes = [{ id: "q1" }, { id: "q3" }, { id: "q4" }];
   const model = new Map([
-    ["q1", { classifiedAt: null, tagIds: [] }],                 // untagged (legacy)
-    ["q2", { classifiedAt: "t", tagIds: [] }],                  // untagged (classified-empty)
-    ["q3", { classifiedAt: "t", tagIds: ["a", "b"] }],          // tagged a,b
-    ["q4", { classifiedAt: "t", tagIds: ["b"] }],               // tagged b
+    ["q1", { classifiedAt: null, tagIds: [] }],
+    ["q3", { classifiedAt: "t", tagIds: ["a", "b"] }],
+    ["q4", { classifiedAt: "t", tagIds: ["b"] }],
   ]);
-  assert.equal(filterQuizzesByTag(quizzes, model, { kind: "all" }).length, 4);
-  assert.deepEqual(filterQuizzesByTag(quizzes, model, { kind: "untagged" }).map((q) => q.id), ["q1", "q2"]);
+  assert.equal(filterQuizzesByTag(quizzes, model, { kind: "all" }).length, 3);
   assert.deepEqual(filterQuizzesByTag(quizzes, model, { kind: "tag", tagId: "b" }).map((q) => q.id), ["q3", "q4"]);
-  assert.deepEqual(filterQuizzesByTag(quizzes, model, { kind: "tag", tagId: "a" }).map((q) => q.id), ["q3"]);
+  // An 'untagged' kind is not supported → treated as no-op (returns all), proving
+  // there is no No-tag filter category.
+  assert.equal(filterQuizzesByTag(quizzes, model, { kind: "untagged" }).length, 3);
 });
-t("quiz with no model row defaults to untagged (no invented tags)", () => {
+t("quiz with no model row → empty tagIds (no invented tags)", () => {
   const m = quizTagModel(new Map(), "qX");
-  assert.equal(m.state, "untagged");
   assert.deepEqual(m.tagIds, []);
+});
+t("archive-block error surfaces the count-bearing message", () => {
+  const msg = normalizeTagError({ message: "archive_quiz_tag: This tag is the only active tag on 3 quiz(zes). Assign a replacement tag or merge it before archiving." });
+  assert.match(msg, /only active tag on 3 quiz/);
+  assert.match(msg, /Assign a replacement tag or merge/);
+  assert.ok(!/archive_quiz_tag:/.test(msg), "fn prefix stripped");
+});
+t("zero-active set_quiz_tags server error surfaced honestly", () => {
+  assert.match(normalizeTagError({ message: "set_quiz_tags: at least one active tag is required" }), /at least one active tag/i);
 });
 t("usage counts from map rows", () => {
   const c = tagUsageCounts([{ tag_id: "a" }, { tag_id: "a" }, { tag_id: "b" }]);
