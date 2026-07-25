@@ -107,10 +107,10 @@ function body(src, decl) {
   // strictly stronger than a client-side user_id filter, and it never does a raw
   // cross-user quiz_attempts read from the client.
   const repBody = body(insights, "export async function getRepTopicScores(");
-  ok("8d getRepTopicScores uses the server-scoped canonical RPC", repBody.includes('rpc("get_knowledge_heatmap")'));
+  ok("8d getRepTopicScores uses the server-scoped canonical RPC", repBody.includes('rpc("get_knowledge_heatmap"'));
   ok("8e getRepTopicScores does no raw quiz_attempts read", !repBody.includes('.from("quiz_attempts")'));
   ok("8f getTopicHeatmap uses the server-scoped canonical RPC",
-     body(insights, "export async function getTopicHeatmap(").includes('rpc("get_knowledge_heatmap")'));
+     body(insights, "export async function getTopicHeatmap(").includes('rpc("get_knowledge_heatmap"'));
 }
 
 console.log(`\n${pass} passed, ${fail} failed`);

@@ -34,7 +34,9 @@ export function shapeHeatmap(rpc) {
         passed: int0(r.passed),
       })),
     })),
-    learners: learners.map(l => ({ userId: l.userId })),
+    // Authorized display name comes from the RPC (no readiness dependence); the
+    // genuine missing-name fallback is applied at render, never fabricated here.
+    learners: learners.map(l => ({ userId: l.userId, name: l.name ?? null })),
     meta: {
       totalActiveLearners:    int0(meta.totalActiveLearners),
       measuredLearners:       int0(meta.measuredLearners),
@@ -48,10 +50,10 @@ export function shapeHeatmap(rpc) {
   };
 }
 
-// True when at least one trusted attempt was attributed to a topic.
+// True when at least one trusted attempt was attributed. Topic presence alone no
+// longer implies evidence (no-data topics are listed too), so this keys on meta.
 export function hasVerifiedEvidence(shaped) {
-  return (shaped?.topics?.length ?? 0) > 0
-      && (shaped?.meta?.verifiedAttributed ?? 0) > 0;
+  return (shaped?.meta?.verifiedAttributed ?? 0) > 0;
 }
 
 // A single learner's cell score for a topic, or null (renders "—", never 0).
@@ -81,16 +83,22 @@ export function repTopicsFromHeatmap(shaped, userId) {
 // each topic's single cell is the learner's own). [{ tagId, topic, avgScore,
 // attempts, passed }].
 export function ownTopicsFromHeatmap(shaped) {
-  return (shaped?.topics ?? []).map(t => {
-    const own = t.repScores[0] ?? null;
-    return {
-      tagId:    t.tagId,
-      topic:    t.label,
-      avgScore: typeof t.avgScore === "number" ? t.avgScore : (own?.score ?? null),
-      attempts: own?.n ?? 0,
-      passed:   own?.passed ?? 0,
-    };
-  }).sort((a, b) => (a.avgScore ?? 0) - (b.avgScore ?? 0));
+  return (shaped?.topics ?? [])
+    // Learner-scoped payload puts the learner's own cell first; a relevant topic
+    // with no verified evidence has an empty repScores — skip it so the learner's
+    // "Knowledge by Topic" shows only real scores (no 0%/empty bars).
+    .filter(t => typeof (t.repScores?.[0]?.score) === "number")
+    .map(t => {
+      const own = t.repScores[0];
+      return {
+        tagId:    t.tagId,
+        topic:    t.label,
+        avgScore: typeof t.avgScore === "number" ? t.avgScore : own.score,
+        attempts: own.n ?? 0,
+        passed:   own.passed ?? 0,
+      };
+    })
+    .sort((a, b) => (a.avgScore ?? 0) - (b.avgScore ?? 0));
 }
 
 // Concise, honest coverage string from live meta values.
@@ -116,5 +124,6 @@ export function thresholdNote(meta) {
 }
 
 function int0(v) { const n = Number(v); return Number.isFinite(n) ? Math.round(n) : 0; }
-function numOrNull(v) { const n = Number(v); return Number.isFinite(n) ? n : null; }
+// null/undefined stay null (a no-data topic score must never become 0).
+function numOrNull(v) { if (v == null) return null; const n = Number(v); return Number.isFinite(n) ? n : null; }
 function plural(n, w) { return n === 1 ? w : `${w}s`; }

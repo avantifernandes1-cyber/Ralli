@@ -17388,7 +17388,10 @@ function LeadershipDashboardScreen({ currentOrg, orgUsers = [], isReal = false, 
     // still appears in the topic matrix.
     const heatmapPeople = heatmapLearners.map((l, i) => {
       const member = orgUsers.find(u => u.id === l.userId);
-      const name = member?.name ?? "Team Member";
+      // Identity: authorized display name from the canonical RPC first (never
+      // readiness-driven), orgUsers only to enrich title; genuine "Team Member"
+      // fallback when a profile has no name — never fabricated.
+      const name = l.name ?? member?.name ?? "Team Member";
       return {
         id:       l.userId,
         name,
@@ -17897,9 +17900,12 @@ function LeadershipDashboardScreen({ currentOrg, orgUsers = [], isReal = false, 
   const coachingReps   = data.people.filter(p => p.tag === "coaching").length;
   const topRep         = data.people.find(p => p.tag === "top");
   const mostImproved   = [...data.people].sort((a, b) => delta(b.score, b.prev) - delta(a.score, a.prev))[0];
-  // Fix 1: use getTopicScore() so real data (avgScore) and seed data (score) both work
-  const weakestTopic   = data.heatmap.length > 0 ? [...data.heatmap].sort((a, b) => getTopicScore(a) - getTopicScore(b))[0] : null;
-  const strongestTopic = data.heatmap.length > 0 ? [...data.heatmap].sort((a, b) => getTopicScore(b) - getTopicScore(a))[0] : null;
+  // Fix 1: use getTopicScore() so real data (avgScore) and seed data (score) both
+  // work. Knowledge Heatmap (062): only SCORED topics qualify — a no-verified-
+  // evidence topic (avgScore null) is never the weakest/strongest.
+  const scoredHeatmap  = data.heatmap.filter(t => (t.avgScore ?? t.score) != null);
+  const weakestTopic   = scoredHeatmap.length > 0 ? [...scoredHeatmap].sort((a, b) => getTopicScore(a) - getTopicScore(b))[0] : null;
+  const strongestTopic = scoredHeatmap.length > 0 ? [...scoredHeatmap].sort((a, b) => getTopicScore(b) - getTopicScore(a))[0] : null;
 
   // section header style
   const SH = (title, sub) => (
@@ -18316,7 +18322,15 @@ function LeadershipDashboardScreen({ currentOrg, orgUsers = [], isReal = false, 
               const TOPIC_W = 164;
               const CELL_W  = 54;
               const CELL_H  = 38;
-              const sortedTopics = [...data.heatmap].sort((a, b) => (b.avgScore ?? b.score ?? 0) - (a.avgScore ?? a.score ?? 0));
+              // Scored topics weakest-first; no-verified-evidence topics after them
+              // (label order). Mirrors the RPC's canonical ordering.
+              const sortedTopics = [...data.heatmap].sort((a, b) => {
+                const av = a.avgScore ?? a.score ?? null, bv = b.avgScore ?? b.score ?? null;
+                const an = av == null, bn = bv == null;
+                if (an !== bn) return an ? 1 : -1;
+                if (an && bn) return String(a.label ?? a.topic ?? "").localeCompare(String(b.label ?? b.topic ?? ""));
+                return av - bv;
+              });
               const cellBg    = (s) => s == null ? C.pageBg      : s >= 85 ? C.trueGreenBg : s >= readinessThreshold ? C.orangeLight : C.redBg;
               const cellClr   = (s) => s == null ? C.textMuted   : s >= 85 ? C.trueGreen   : s >= readinessThreshold ? C.orangeDeep  : C.red;
               const cellBdr   = (s) => s == null ? C.border      : s >= 85 ? "#86EFAC"     : s >= readinessThreshold ? C.orangeBorder : "#FECACA";
@@ -18346,7 +18360,9 @@ function LeadershipDashboardScreen({ currentOrg, orgUsers = [], isReal = false, 
                     </div>
                     {/* Topic rows (keyed by stable tagId, 062) */}
                     {sortedTopics.map(topic => {
-                      const avgScore   = topic.avgScore ?? topic.score ?? 0;
+                      const rawAvg     = topic.avgScore ?? topic.score ?? null;
+                      const hasData    = rawAvg != null;
+                      const avgScore   = hasData ? rawAvg : 0;
                       const isSelected = topicFilter === topic.tagId;
                       return (
                         <div key={topic.tagId} style={{ display: "flex", alignItems: "center", gap: 4, marginBottom: 4 }}>
@@ -18363,9 +18379,13 @@ function LeadershipDashboardScreen({ currentOrg, orgUsers = [], isReal = false, 
                             }}
                           >
                             <div style={{ fontSize: 12, fontWeight: 600, color: C.text }}>{topic.label ?? topic.topic}</div>
-                            <div style={{ fontSize: 10, color: scoreColor(avgScore), fontWeight: 700, marginTop: 1 }}>
-                              {avgScore}% avg · {topic.measuredLearners ?? topic.repScores?.length ?? 0}/{data.heatmapPeople.length}
-                            </div>
+                            {hasData ? (
+                              <div style={{ fontSize: 10, color: scoreColor(avgScore), fontWeight: 700, marginTop: 1 }}>
+                                {avgScore}% avg · {topic.measuredLearners ?? topic.repScores?.length ?? 0}/{data.heatmapPeople.length}
+                              </div>
+                            ) : (
+                              <div style={{ fontSize: 10, color: C.textMuted, fontWeight: 600, marginTop: 1 }}>No verified evidence</div>
+                            )}
                           </div>
                           {/* Score cells — "—" for no verified evidence (never 0); tooltip shows n */}
                           {data.heatmapPeople.map(rep => {
@@ -18411,6 +18431,7 @@ function LeadershipDashboardScreen({ currentOrg, orgUsers = [], isReal = false, 
             {/* Weak Topic Summary — bottom 3 topics */}
             {(() => {
               const weak = [...data.heatmap]
+                .filter(t => (t.avgScore ?? t.score) != null)   // scored topics only (no-data never "weak")
                 .sort((a, b) => (a.avgScore ?? a.score ?? 0) - (b.avgScore ?? b.score ?? 0))
                 .slice(0, 3)
                 .filter(t => (t.avgScore ?? t.score ?? 0) < 75);

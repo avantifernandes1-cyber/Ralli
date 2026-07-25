@@ -589,7 +589,10 @@ export function triggerReadinessUpdate(tenantId, userId) {
 // and its source); the parameter is kept for call-site compatibility.
 export async function getTopicHeatmap(tenantId, _opts = {}) {
   if (!tenantId) return emptyHeatmap();
-  const { data, error } = await supabase.rpc("get_knowledge_heatmap");
+  // Pass the canonical selected tenantId. The RPC enforces authorization: a
+  // learner/orgAdmin/manager may only read their own tenant (foreign input is
+  // rejected server-side); a ralli-admin may read an explicitly selected tenant.
+  const { data, error } = await supabase.rpc("get_knowledge_heatmap", { p_tenant_id: tenantId });
   if (error || !data) return emptyHeatmap();
   return shapeHeatmap(data);
 }
@@ -622,7 +625,7 @@ function emptyHeatmap() {
 // picks out that rep's cells.
 export async function getRepTopicScores(tenantId, userId, { safe = false } = {}) {
   if (!tenantId || !userId) return [];
-  const { data, error } = await supabase.rpc("get_knowledge_heatmap");
+  const { data, error } = await supabase.rpc("get_knowledge_heatmap", { p_tenant_id: tenantId });
   if (error || !data) return [];
   const shaped = shapeHeatmap(data);
   return safe ? ownTopicsFromHeatmap(shaped) : repTopicsFromHeatmap(shaped, userId);

@@ -12,15 +12,18 @@ const ok = (name, cond) => { assert.ok(cond, name); passed++; };
 //  Discovery(A): L1=90 n2, L2=50 n1  · Pricing(B): L1=40  · Objection(C): L1=100
 const RPC = {
   topics: [
-    { tagId: "B", label: "Pricing",   avgScore: 40,  measuredLearners: 1, learnersNoData: 1, repsBelow: 1, repsAbove: 0,
+    { tagId: "B", label: "Pricing",   avgScore: 40,  measuredLearners: 1, learnersNoData: 2, repsBelow: 1, repsAbove: 0,
       repScores: [{ userId: "L1", score: 40, n: 1, passed: 0 }] },
-    { tagId: "A", label: "Discovery", avgScore: 70,  measuredLearners: 2, learnersNoData: 0, repsBelow: 1, repsAbove: 1,
+    { tagId: "A", label: "Discovery", avgScore: 70,  measuredLearners: 2, learnersNoData: 1, repsBelow: 1, repsAbove: 1,
       repScores: [{ userId: "L2", score: 50, n: 1, passed: 0 }, { userId: "L1", score: 90, n: 2, passed: 2 }] },
-    { tagId: "C", label: "Objection", avgScore: 100, measuredLearners: 1, learnersNoData: 1, repsBelow: 0, repsAbove: 1,
+    { tagId: "C", label: "Objection", avgScore: 100, measuredLearners: 1, learnersNoData: 2, repsBelow: 0, repsAbove: 1,
       repScores: [{ userId: "L1", score: 100, n: 1, passed: 1 }] },
+    // No-verified-evidence active topic: null score, empty repScores.
+    { tagId: "D", label: "Retention", avgScore: null, measuredLearners: 0, learnersNoData: 3, repsBelow: 0, repsAbove: 0,
+      repScores: [] },
   ],
-  learners: [{ userId: "L1" }, { userId: "L2" }],
-  meta: { totalActiveLearners: 2, measuredLearners: 2, totalAttempts: 7,
+  learners: [{ userId: "L1", name: "L1" }, { userId: "L2", name: "L2" }, { userId: "L4", name: "L4" }],
+  meta: { tenantId: "TA", totalActiveLearners: 3, measuredLearners: 2, totalAttempts: 7,
           verifiedAttributed: 5, legacyExcluded: 1, awaitingClassification: 1,
           threshold: 70, thresholdSource: "tenant_settings" },
 };
@@ -29,16 +32,25 @@ test("heatmapModel", () => {
   const s = shapeHeatmap(RPC);
 
   // shapeHeatmap keeps tagId identity and mirrors label into `topic`
-  ok("topic count", s.topics.length === 3);
+  ok("topic count", s.topics.length === 4);
   const A = s.topics.find(t => t.tagId === "A");
   ok("A topic mirrors label", A.topic === "Discovery" && A.label === "Discovery");
   ok("A avg", A.avgScore === 70);
   ok("meta threshold + source", s.meta.threshold === 70 && s.meta.thresholdSource === "tenant_settings");
   ok("meta coverage numbers", s.meta.verifiedAttributed === 5 && s.meta.legacyExcluded === 1 && s.meta.awaitingClassification === 1);
 
-  // hasVerifiedEvidence
+  // No-data topic: avgScore stays null (never coerced to 0), empty repScores.
+  const D = s.topics.find(t => t.tagId === "D");
+  ok("no-data topic avgScore null", D.avgScore === null);
+  ok("no-data topic measured 0 + empty repScores", D.measuredLearners === 0 && D.repScores.length === 0);
+
+  // learners carry a truthful name from the RPC (incl. the no-data learner L4)
+  ok("learner L4 present with name", s.learners.find(l => l.userId === "L4")?.name === "L4");
+
+  // hasVerifiedEvidence keys on meta, not topic presence (no-data topics exist)
   ok("has evidence true", hasVerifiedEvidence(s) === true);
-  ok("no evidence when empty", hasVerifiedEvidence(shapeHeatmap({ topics: [], learners: [{ userId: "L1" }], meta: { verifiedAttributed: 0 } })) === false);
+  ok("no evidence when verified=0 even if topics exist",
+     hasVerifiedEvidence(shapeHeatmap({ topics: [D], learners: [{ userId: "L1", name: "x" }], meta: { verifiedAttributed: 0 } })) === false);
 
   // cellScore: present → number; absent → null (renders — never 0)
   ok("cell L1/A = 90", cellScore(A, "L1") === 90);
@@ -46,6 +58,7 @@ test("heatmapModel", () => {
   ok("cell missing → null", cellScore(A, "GHOST") === null);
   const B = s.topics.find(t => t.tagId === "B");
   ok("cell L2/B missing → null (not 0)", cellScore(B, "L2") === null);
+  ok("no-data cell → null", cellScore(D, "L1") === null);
   ok("cellEntry has n", cellEntry(A, "L1").n === 2);
 
   // rep drill-down for L1 (manager matrix → one rep), sorted weakest-first
@@ -67,11 +80,14 @@ test("heatmapModel", () => {
     topics: [
       { tagId: "A", label: "Discovery", avgScore: 90, repScores: [{ userId: "L1", score: 90, n: 2, passed: 2 }] },
       { tagId: "B", label: "Pricing",   avgScore: 40, repScores: [{ userId: "L1", score: 40, n: 1, passed: 0 }] },
+      // relevant-to-learner but no verified evidence → must be skipped in the card
+      { tagId: "E", label: "Legacyish", avgScore: null, repScores: [] },
     ],
-    learners: [{ userId: "L1" }],
+    learners: [{ userId: "L1", name: "L1" }],
     meta: { threshold: 70, thresholdSource: "tenant_settings", verifiedAttributed: 4 },
   };
   const own = ownTopicsFromHeatmap(shapeHeatmap(ownRpc));
+  ok("own skips no-verified-evidence topic", own.length === 2 && !own.find(t => t.tagId === "E"));
   ok("own topics sorted weakest-first", own[0].topic === "Pricing" && own[1].topic === "Discovery");
   ok("own Discovery avg 90 n2 (parity with manager cell)", own.find(t => t.tagId === "A").avgScore === 90 && own.find(t => t.tagId === "A").attempts === 2);
 
