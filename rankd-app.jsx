@@ -17568,6 +17568,28 @@ function LeadershipDashboardScreen({ currentOrg, orgUsers = [], isReal = false, 
     };
   }, [rawFetch, orgUsers, readinessThreshold]);
 
+  // Knowledge Heatmap (062): the demo seed predates the canonical shape, so give
+  // the fallback the same fields the live matrix reads — heatmapPeople (columns),
+  // heatmapMeta (null → no coverage line in demo), and tagId/label/avgScore on
+  // each topic. Purely for demo mode; this seed never reaches a real tenant.
+  // MUST be declared BEFORE the loading/error/empty early returns below so this
+  // hook runs unconditionally in the same order on every render (loading →
+  // loaded). Previously it sat after the returns and changed the hook count once
+  // loading resolved — React "Rendered more hooks than during the previous
+  // render." (minified #310). Deps [] — depends only on the constant seed.
+  const demoLeadershipData = useMemo(() => ({
+    ...LEADERSHIP_SEED,
+    heatmap: (LEADERSHIP_SEED.heatmap ?? []).map(t => ({
+      ...t, tagId: t.topic, label: t.topic, avgScore: t.avgScore ?? t.score,
+    })),
+    heatmapPeople: (LEADERSHIP_SEED.people ?? []).map(p => ({
+      id: p.id, name: p.name, title: p.title ?? p.role ?? "Rep",
+      initials: p.initials ?? ((p.name ?? "").split(" ").map(w => w[0] ?? "").join("").slice(0, 2).toUpperCase() || "TM"),
+      color: p.color,
+    })),
+    heatmapMeta: null,
+  }), []);
+
   // Loading / empty guards — real users only. Demo always falls through to LEADERSHIP_SEED.
   if (loading) {
     return (
@@ -17601,24 +17623,9 @@ function LeadershipDashboardScreen({ currentOrg, orgUsers = [], isReal = false, 
     );
   }
 
-  // Knowledge Heatmap (062): the demo seed predates the canonical shape, so give
-  // the fallback the same fields the live matrix reads — heatmapPeople (columns),
-  // heatmapMeta (null → no coverage line in demo), and tagId/label/avgScore on
-  // each topic. Purely for demo mode; this seed never reaches a real tenant.
-  const demoLeadershipData = useMemo(() => ({
-    ...LEADERSHIP_SEED,
-    heatmap: (LEADERSHIP_SEED.heatmap ?? []).map(t => ({
-      ...t, tagId: t.topic, label: t.topic, avgScore: t.avgScore ?? t.score,
-    })),
-    heatmapPeople: (LEADERSHIP_SEED.people ?? []).map(p => ({
-      id: p.id, name: p.name, title: p.title ?? p.role ?? "Rep",
-      initials: p.initials ?? ((p.name ?? "").split(" ").map(w => w[0] ?? "").join("").slice(0, 2).toUpperCase() || "TM"),
-      color: p.color,
-    })),
-    heatmapMeta: null,
-  }), []);
-
-  // Use live data when available; fall back to the demo seed for demo / no data yet
+  // Use live data when available; fall back to the demo seed for demo / no data yet.
+  // demoLeadershipData is memoized ABOVE all early returns (see near liveData) so
+  // hook order is identical on every render.
   const data = liveData ?? demoLeadershipData;
 
   // Blocking Fix 1 — whether we have any real per-rep readiness scores to
