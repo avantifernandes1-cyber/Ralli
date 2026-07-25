@@ -1,13 +1,17 @@
 -- Repeatable tests for migration 064 (Manager Unassign).
 -- Proves: a MANAGER (role 'manager', the required authority) can unassign an
--- active lesson/course/quiz; a learner cannot; cross-tenant is refused; a
--- COMPLETED assignment cannot be unassigned while a pre-reassignment completion
--- (predating assigned_at) and a FAILED (in_progress) quiz still can; unassign is
--- idempotent and never overwrites the original ender; another learner's row is
--- untouched; the hard-delete path is closed (grant revoked); server-controlled
--- reason + actor attribution; team/group and not-found are refused.
--- Two tenants for isolation. One rolled-back transaction. Local only.
--- Expect "064 ALL TESTS PASSED".
+-- active lesson/course/quiz; a learner cannot; cross-tenant is refused.
+-- State transitions — CAN be unassigned: not_started, in_progress (a FAILED
+-- quiz, a PARTIALLY-complete course), overdue, and a lesson whose only
+-- completion predates the current assigned_at. CANNOT: completed (lesson done,
+-- course fully done, quiz passed). A TEAM-ORIGINATED individual row (fanned out
+-- by create_assignments_atomic, origin in source_*) IS unassignable per learner
+-- without touching a teammate or the team; only a genuine SHARED aggregate row
+-- (assigned_to.type team/group) is refused. Unassign is idempotent and never
+-- overwrites the original ender; reassignment creates a fresh row while the old
+-- stays cancelled in history; the hard-delete path is closed (grant revoked);
+-- reason + actor are server-set. Two tenants for isolation. One rolled-back
+-- transaction. Local only. Expect "064 ALL TESTS PASSED".
 \set ON_ERROR_STOP on
 BEGIN;
 
@@ -75,6 +79,24 @@ INSERT INTO public.lesson_completions (profile_id, tenant_id, lesson_id, complet
 INSERT INTO public.quiz_attempts (tenant_id, user_id, quiz_id, score, passed, created_at) VALUES
  ('00000000-0000-0000-0000-0000000000d0','00000000-0000-0000-0000-0000000000d1','00000000-0000-0000-0000-0000000df002', 40, false, now() - interval '1 hour'),  -- QZ2: failed → in_progress
  ('00000000-0000-0000-0000-0000000000d0','00000000-0000-0000-0000-0000000000d1','00000000-0000-0000-0000-0000000df003', 90, true,  now() - interval '1 hour');  -- QZ3: passed → complete
+
+-- Extra fixtures for the corrected state-transition + team-origin coverage.
+INSERT INTO public.tenant_lessons (id, tenant_id, title, status) VALUES
+ ('00000000-0000-0000-0000-0000000d0008','00000000-0000-0000-0000-0000000000d0','C3 lesson a','active'),
+ ('00000000-0000-0000-0000-0000000d0009','00000000-0000-0000-0000-0000000000d0','C3 lesson b','active'),
+ ('00000000-0000-0000-0000-0000000d000a','00000000-0000-0000-0000-0000000000d0','LES_TEAM','active');
+INSERT INTO public.tenant_courses (id, tenant_id, title, lesson_ids, status) VALUES
+ ('00000000-0000-0000-0000-0000000dc003','00000000-0000-0000-0000-0000000000d0','CRS3',
+  '["00000000-0000-0000-0000-0000000d0008","00000000-0000-0000-0000-0000000d0009"]'::jsonb,'active');
+INSERT INTO public.tenant_assignments (id, tenant_id, content_type, content_id, assigned_to, assigned_at, source_type, source_id, source_label) VALUES
+ -- PARTIALLY complete course (1 of 2 member lessons done after assigned) → allow
+ ('00000000-0000-0000-0000-0000000da012','00000000-0000-0000-0000-0000000000d0','course','00000000-0000-0000-0000-0000000dc003','{"type":"individual","userId":"00000000-0000-0000-0000-0000000000d1","userName":"L1"}'::jsonb, now() - interval '2 hours', 'individual', NULL, NULL),
+ -- TEAM-ORIGINATED individual rows (fan-out): one per learner, origin in source_*
+ ('00000000-0000-0000-0000-0000000da013','00000000-0000-0000-0000-0000000000d0','lesson','00000000-0000-0000-0000-0000000d000a','{"type":"individual","userId":"00000000-0000-0000-0000-0000000000d1","userName":"L1"}'::jsonb, now(), 'team', '00000000-0000-0000-0000-0000000dd001', 'Team A'),
+ ('00000000-0000-0000-0000-0000000da014','00000000-0000-0000-0000-0000000000d0','lesson','00000000-0000-0000-0000-0000000d000a','{"type":"individual","userId":"00000000-0000-0000-0000-0000000000d2","userName":"L2"}'::jsonb, now(), 'team', '00000000-0000-0000-0000-0000000dd001', 'Team A');
+-- Only C3 lesson a is completed (after assigned) → CRS3 is partial for L1.
+INSERT INTO public.lesson_completions (profile_id, tenant_id, lesson_id, completed_at) VALUES
+ ('00000000-0000-0000-0000-0000000000d1','00000000-0000-0000-0000-0000000000d0','00000000-0000-0000-0000-0000000d0008', now() - interval '1 hour');
 
 -- Helper to set the acting identity for a SECURITY DEFINER RPC call.
 -- (auth.uid() reads request.jwt.claims.sub; the RPC runs as owner.)
@@ -180,9 +202,9 @@ END $$;
 DO $$ DECLARE msg text := ''; BEGIN
   PERFORM set_config('request.jwt.claims','{"sub":"00000000-0000-0000-0000-0000000000d9","role":"authenticated"}',true);
   BEGIN PERFORM public.unassign_assignment('00000000-0000-0000-0000-0000000da008'); EXCEPTION WHEN others THEN msg := SQLERRM; END;
-  ASSERT msg LIKE '%individual%', '9. team row refused: '||msg;
-  ASSERT (SELECT cancelled_at FROM public.tenant_assignments WHERE id='00000000-0000-0000-0000-0000000da008') IS NULL, '9. team row untouched';
-  RAISE NOTICE '9. team/group aggregate row refused: PASS';
+  ASSERT msg LIKE '%shared team/group%', '9. shared aggregate row refused: '||msg;
+  ASSERT (SELECT cancelled_at FROM public.tenant_assignments WHERE id='00000000-0000-0000-0000-0000000da008') IS NULL, '9. shared row untouched';
+  RAISE NOTICE '9. genuine SHARED team/group aggregate row refused: PASS';
 END $$;
 
 -- ── 10. Not found → honest error ─────────────────────────────────────────────
@@ -224,6 +246,50 @@ DO $$ DECLARE v_action char; BEGIN
                     WHERE attrelid='public.tenant_assignments'::regclass AND attname='cancelled_by');
   ASSERT v_action = 'n', '13. cancelled_by FK ON DELETE SET NULL (n): got '||COALESCE(v_action,'<null>');
   RAISE NOTICE '13. cancelled_by FK ON DELETE SET NULL — history retained on profile removal: PASS';
+END $$;
+
+-- ── 14. PARTIALLY complete course CAN be unassigned (in_progress) ────────────
+DO $$ DECLARE r jsonb; BEGIN
+  PERFORM set_config('request.jwt.claims','{"sub":"00000000-0000-0000-0000-0000000000d9","role":"authenticated"}',true);
+  r := public.unassign_assignment('00000000-0000-0000-0000-0000000da012');
+  ASSERT r->>'status' = 'unassigned', '14. partial course unassignable: '||r::text;
+  RAISE NOTICE '14. partially-complete course CAN be unassigned: PASS';
+END $$;
+
+-- ── 15. TEAM-ORIGINATED individual row: one learner unassignable, teammate
+--       untouched, and the team origin (source_*) preserved for audit ─────────
+DO $$ DECLARE r jsonb; BEGIN
+  PERFORM set_config('request.jwt.claims','{"sub":"00000000-0000-0000-0000-0000000000d9","role":"authenticated"}',true);
+  r := public.unassign_assignment('00000000-0000-0000-0000-0000000da013');   -- L1's team-fanned row
+  ASSERT r->>'status' = 'unassigned', '15. team-originated individual row unassignable: '||r::text;
+  -- teammate L2's own fanned row is untouched
+  ASSERT (SELECT cancelled_at FROM public.tenant_assignments WHERE id='00000000-0000-0000-0000-0000000da014') IS NULL, '15. teammate row untouched';
+  -- origin metadata preserved on the cancelled row (audit history)
+  ASSERT (SELECT source_type  FROM public.tenant_assignments WHERE id='00000000-0000-0000-0000-0000000da013') = 'team', '15. source_type preserved';
+  ASSERT (SELECT source_label FROM public.tenant_assignments WHERE id='00000000-0000-0000-0000-0000000da013') = 'Team A', '15. source_label preserved';
+  RAISE NOTICE '15. team-originated learner unassigned; teammate untouched; origin kept: PASS';
+END $$;
+
+-- ── 16. Reassignment creates a FRESH row; the old (unassigned) row remains in
+--       history — reused create_assignments_atomic, no duplicate/reactivation ─
+DO $$ DECLARE r jsonb; v_created int; BEGIN
+  PERFORM set_config('request.jwt.claims','{"sub":"00000000-0000-0000-0000-0000000000d9","role":"authenticated"}',true);
+  -- L1's LES1 assignment (da001) was unassigned in test 1 → L1 is now eligible again.
+  r := public.create_assignments_atomic(
+        '00000000-0000-0000-0000-0000000000d0', 'lesson', '00000000-0000-0000-0000-0000000d0001',
+        '[{"userId":"00000000-0000-0000-0000-0000000000d1","userName":"L1"}]'::jsonb,
+        'Open', false, '00000000-0000-0000-0000-0000000000d9', 'individual', NULL, NULL);
+  v_created := (r->>'assignedCount')::int;
+  ASSERT v_created = 1, '16. reassignment created exactly one fresh row: '||r::text;
+  -- old row still present AND still cancelled (history preserved, not reactivated)
+  ASSERT (SELECT cancelled_at FROM public.tenant_assignments WHERE id='00000000-0000-0000-0000-0000000da001') IS NOT NULL, '16. old row still cancelled (history)';
+  -- exactly one ACTIVE (non-cancelled) LES1 row for L1 now — the fresh one
+  ASSERT (SELECT count(*) FROM public.tenant_assignments
+          WHERE tenant_id='00000000-0000-0000-0000-0000000000d0' AND content_type='lesson'
+            AND content_id='00000000-0000-0000-0000-0000000d0001'
+            AND assigned_to->>'userId'='00000000-0000-0000-0000-0000000000d1'
+            AND cancelled_at IS NULL) = 1, '16. exactly one active reassigned row';
+  RAISE NOTICE '16. reassignment creates a fresh row; old stays cancelled in history: PASS';
 END $$;
 
 DO $$ BEGIN RAISE NOTICE '064 ALL TESTS PASSED'; END $$;

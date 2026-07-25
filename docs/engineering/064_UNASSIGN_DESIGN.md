@@ -22,19 +22,34 @@ exactly as applied. Do not apply 064 to production without explicit approval.
 - **cancelled_by uuid NULL REFERENCES profiles(id) ON DELETE SET NULL** — the same
   retention model 017 uses for `assigned_by`: deleting a profile clears attribution
   but never destroys the history row.
-- **Completion check (instance-aware, per THIS row's assigned_at):** lesson —
-  no `lesson_completions` at/after assigned_at ⇒ active (unassignable); course —
-  fewer than all member lessons completed at/after assigned_at ⇒ active; quiz —
-  a PASSING attempt at/after assigned_at ⇒ completed (a failed attempt is
-  in_progress and remains unassignable). Completed ⇒ refused.
+- **State transitions — CAN be unassigned:** not_started; in_progress
+  (a **failed** quiz, a **partially-complete** course); overdue; a lesson whose
+  only completion **predates** the current `assigned_at`. **CANNOT:** completed
+  — lesson done, course **fully** done, or quiz **passed**. Already cancelled ⇒
+  idempotent no-op. (Completion is evaluated instance-aware against THIS row's
+  `assigned_at`: lesson — a `lesson_completions` row at/after assigned_at; course
+  — ALL member lessons completed at/after assigned_at; quiz — a PASSING attempt
+  at/after assigned_at.)
+- **Team/group is per-learner, not shared.** `create_assignments_atomic` (034)
+  fans out every team/group/all-users assignment into ONE individual row per
+  learner (`assigned_to.type='individual'`, its own id/userId/assigned_at), with
+  the origin kept in `source_type/source_id/source_label`. So a team-ORIGINATED
+  row IS unassignable per learner — cancelling it touches only that row, leaves
+  teammates untouched, preserves the origin for audit, and never mutates the
+  team. The RPC refuses ONLY a genuine SHARED aggregate row (`assigned_to.type`
+  = team/group/all — one row for many learners), which the engine no longer
+  creates and the UI hides Unassign on.
 - **Concurrency:** `SELECT … FOR UPDATE` locks the one row; a second concurrent
   unassign serializes and returns the idempotent `already_cancelled` (original
-  ender preserved). Team/group and not-found are refused with honest errors.
-- **Local validation:** `supabase/tests/064_manager_unassign.test.sql` — 13 groups
+  ender preserved). Shared-aggregate and not-found are refused with honest errors.
+- **Local validation:** `supabase/tests/064_manager_unassign.test.sql` — 16 groups
   PASS (manager authority incl. role 'manager', learner refused, cross-tenant
-  refused, completed lesson/course/quiz refused, predate + failed-quiz allowed,
-  idempotent, other learner untouched, team refused, not-found, hard-delete
-  blocked, DELETE policy gone, FK SET NULL). 063 harness still PASSES (no regression).
+  refused, completed lesson/course/quiz refused, predate + failed-quiz +
+  partially-complete-course ALLOWED, team-originated individual unassignable with
+  teammate untouched + origin preserved, reassignment creates a fresh row while
+  the old stays cancelled, idempotent, other learner untouched, shared-aggregate
+  refused, not-found, hard-delete blocked, DELETE policy gone, FK SET NULL). 063
+  harness still PASSES (no regression).
 
 ---
 

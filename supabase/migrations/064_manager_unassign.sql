@@ -48,14 +48,18 @@ COMMENT ON COLUMN public.tenant_assignments.cancelled_by IS
 --     the instance''s assigned_at. Not active ⇒ completed ⇒ refuse.
 --   • course — reuses public._course_assignment_active_user_ids(): active iff
 --     fewer than all member lessons are completed at/after assigned_at. A
---     partially-done course stays active (in_progress) and is unassignable;
+--     partially-done course is still active (in_progress) and CAN be unassigned;
 --     only a fully-complete course is refused.
 --   • quiz   — the _quiz_..._active helper treats ANY attempt (pass OR fail) as
 --     resolving active state, which is correct for reassignment eligibility but
---     would wrongly refuse an in_progress (failed) quiz. So the completed-gate
---     uses the canonical PASS predicate (matching resolveQuizAssignment''s
---     "completed"): completed iff a PASSING attempt exists at/after assigned_at.
--- Active / in_progress / overdue ⇒ allowed; completed ⇒ refused.
+--     would wrongly treat an in_progress (failed) quiz as done. So the
+--     completed-gate uses the canonical PASS predicate (matching
+--     resolveQuizAssignment''s "completed"): completed iff a PASSING attempt
+--     exists at/after assigned_at. A failed-only quiz is in_progress and CAN be
+--     unassigned.
+-- CAN be unassigned: not_started / in_progress (incl. failed quiz, partial
+-- course) / overdue. CANNOT: completed (lesson done, course fully done, quiz
+-- passed). Already cancelled ⇒ idempotent no-op.
 CREATE OR REPLACE FUNCTION public.unassign_assignment(p_assignment_id uuid)
 RETURNS jsonb
 LANGUAGE plpgsql
@@ -109,12 +113,19 @@ BEGIN
     );
   END IF;
 
-  -- Per-user rows only. Unassign targets ONE learner; a legacy team/group
-  -- aggregate row would cancel many at once, so refuse it (the UI also only
-  -- offers Unassign on individual rows). (9) Never affect another learner.
+  -- Per-learner rows only. create_assignments_atomic (034) fans out EVERY
+  -- team/group/all-users assignment into one individual row per learner
+  -- (assigned_to.type='individual', its own id/userId/assigned_at), preserving
+  -- the origin in source_type/source_id/source_label. So a team-ORIGINATED row
+  -- is type='individual' and IS unassignable here — cancelling it touches only
+  -- that learner and never mutates the team or a teammate's row. What we refuse
+  -- is a genuine SHARED aggregate row (assigned_to.type in 'team'/'group'/'all'),
+  -- where one row represents many learners and cancelling it would unassign all
+  -- of them. (Such rows are legacy — the engine no longer creates them; the UI
+  -- also hides Unassign on them.) (9) Never affect another learner.
   IF COALESCE(v_row.assigned_to->>'type', '') <> 'individual'
      OR (v_row.assigned_to->>'userId') IS NULL THEN
-    RAISE EXCEPTION 'unassign_assignment: only individual (per-learner) assignments can be unassigned';
+    RAISE EXCEPTION 'unassign_assignment: this is a shared team/group assignment row; only individual per-learner assignments can be unassigned';
   END IF;
   v_user_id := (v_row.assigned_to->>'userId')::uuid;
 
