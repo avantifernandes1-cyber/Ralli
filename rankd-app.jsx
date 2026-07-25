@@ -97,7 +97,7 @@ import { provisionTenant, buildInviteUrl, normalizeProvisionedOrg, createMemberI
 import { awardLessonPoints, awardCoursePoints, awardGamePointsForSession, getLeaderboard, computeUserMeta, getUserStreak } from "./src/lib/scoringService.js";
 import { triggerReadinessUpdate, getTopicHeatmap, getOrgMetrics, getRepTopicScores, getUserPerformance, getRecommendations } from "./src/lib/insightsService.js";
 import { listTenantQuizTags, listQuizTagMap, listQuizClassification, getQuizTagState, createQuizTag, renameQuizTag, archiveQuizTag, restoreQuizTag, mergeQuizTags, setQuizTags } from "./src/lib/taxonomyService.js";
-import { activeMappedTagIds, classificationFromActiveCount, tagCapabilities, buildBuilderTagRows, computeSaveTagIntent, quizTagModel, filterQuizzesByTag, tagUsageCounts, resolveTag, normalizeTagError, savePayloadId, hasActiveSelection, selectedActiveTagIds, tagRequirementError, governanceOutcome } from "./src/lib/quizTagsUi.js";
+import { activeMappedTagIds, classificationFromActiveCount, tagCapabilities, buildBuilderTagRows, computeSaveTagIntent, quizTagModel, filterQuizzesByTag, tagUsageCounts, resolveTag, normalizeTagError, savePayloadId, hasActiveSelection, selectedActiveTagIds, tagRequirementError, governanceOutcome, quizSaveSuccessMessage, canBeginSave } from "./src/lib/quizTagsUi.js";
 
 // ── MOBILE HOOK ────────────────────────────────────────────
 function useMobile() {
@@ -8302,9 +8302,15 @@ function TagManagerModal({ tenantId, caps, catalog = [], catalogLoading = false,
                 </div>
                 {mergeSrc && mergeTgt && (
                   <div style={{ marginTop: 10, fontSize: 12, color: C.textSub }}>
-                    Merge <b>{byId.get(mergeSrc)?.label}</b> into <b>{byId.get(mergeTgt)?.label}</b>? The source is archived; its quiz assignments move to the target. History is preserved.
+                    Merge <b>{byId.get(mergeSrc)?.label}</b> into <b>{byId.get(mergeTgt)?.label}</b>?
+                    <ul style={{ margin: "6px 0 0", paddingLeft: 18, lineHeight: 1.5 }}>
+                      <li>This is <b>permanent</b> and cannot be unmerged.</li>
+                      <li>The name “{byId.get(mergeSrc)?.label}” stays reserved — it cannot be restored or recreated.</li>
+                      <li>Current quiz mappings move to <b>{byId.get(mergeTgt)?.label}</b>.</li>
+                      <li>Historical attribution is preserved.</li>
+                    </ul>
                     <div style={{ marginTop: 8 }}>
-                      <button onClick={doMerge} disabled={busy} style={{ padding: "7px 14px", borderRadius: 8, border: "none", cursor: "pointer", fontSize: 12, fontWeight: 700, color: "#fff", background: C.orange }}>Confirm merge</button>
+                      <button onClick={doMerge} disabled={busy} style={{ padding: "7px 14px", borderRadius: 8, border: "none", cursor: "pointer", fontSize: 12, fontWeight: 700, color: "#fff", background: C.orange }}>Confirm permanent merge</button>
                     </div>
                   </div>
                 )}
@@ -8318,14 +8324,20 @@ function TagManagerModal({ tenantId, caps, catalog = [], catalogLoading = false,
                 const merged = !!t.merged_into;
                 return (
                   <div key={t.id} style={{ display: "flex", alignItems: "center", gap: 8, padding: "8px 10px", borderRadius: 8, border: `1px solid ${C.border}`, background: C.muted }}>
-                    <span style={{ flex: 1, fontSize: 13, fontWeight: 600, color: C.textSub }}>
-                      {t.label}{merged ? <span style={{ fontSize: 11, color: C.textMuted }}> · merged into {byId.get(t.merged_into)?.label ?? "another tag"}</span> : ""}
-                    </span>
-                    {caps.canGovern && !merged && (
-                      <button onClick={() => doRestore(t.id)} disabled={busy} style={{ fontSize: 12, fontWeight: 700, color: C.orange, background: "none", border: "none", cursor: "pointer" }}>Restore</button>
+                    <span style={{ fontSize: 13, fontWeight: 600, color: C.textSub }}>{t.label}</span>
+                    {/* Visual status distinction: Archived vs Merged into <target> */}
+                    {merged ? (
+                      <span style={{ fontSize: 10, fontWeight: 700, padding: "2px 8px", borderRadius: 999, background: C.blueBg, color: C.blue }}>
+                        Merged → {byId.get(t.merged_into)?.label ?? "another tag"}
+                      </span>
+                    ) : (
+                      <span style={{ fontSize: 10, fontWeight: 700, padding: "2px 8px", borderRadius: 999, background: C.border, color: C.textMuted }}>Archived</span>
                     )}
-                    {caps.canGovern && merged && (
-                      <span style={{ fontSize: 11, color: C.textMuted }}>merged — cannot restore</span>
+                    <span style={{ flex: 1 }} />
+                    {/* Restore ONLY for plain archived tags; merged tags never show Restore. */}
+                    {caps.canGovern && (merged
+                      ? <span style={{ fontSize: 11, color: C.textMuted }}>can’t be restored</span>
+                      : <button onClick={() => doRestore(t.id)} disabled={busy} style={{ fontSize: 12, fontWeight: 700, color: C.orange, background: "none", border: "none", cursor: "pointer" }}>Restore</button>
                     )}
                   </div>
                 );
@@ -8463,7 +8475,7 @@ function QuizBuilderScreen({ onNav, onSave, onDone, initialQuiz, isReal = false,
   const canSave = name.trim() && qs.length > 0 && qs.every(isQComplete);
 
   const handleSave = async () => {
-    if (!canSave || saving) return;
+    if (!canBeginSave({ canSave, saving })) return;   // one save sequence per double-click
     // Tag requirement is validated BEFORE any persistence: an empty (or archived-
     // only) tag selection blocks the save entirely — quiz content is never
     // persisted first, so an empty selection can never cause a partial save.
@@ -8501,8 +8513,11 @@ function QuizBuilderScreen({ onNav, onSave, onDone, initialQuiz, isReal = false,
         setWasClassified(true); setInitialTagIds(intent.tagIds); setSelectedTagIds(intent.tagIds);
       }
     }
+    // Both phases succeeded → ONE success toast (create vs update by whether this
+    // editor opened on an existing quiz) + route back to Quizzes → Library (the
+    // admin default tab). The saved quiz + its active tags are already in state.
     setSaving(false);
-    toast.success("Quiz saved.");
+    toast.success(quizSaveSuccessMessage(existingQuizId));
     (onDone ?? (() => onNav("quizzes")))();
   };
 

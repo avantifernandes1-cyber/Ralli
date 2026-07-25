@@ -140,6 +140,27 @@ export function filterQuizzesByTag(quizzes, modelByQuiz, filter) {
   });
 }
 
+// ── Quiz-save completion flow (shared, tested) ───────────────────────────────
+// One success message, create vs update by whether the editor opened on an
+// existing quiz.
+export function quizSaveSuccessMessage(existingQuizId) {
+  return existingQuizId ? "Quiz updated successfully." : "Quiz created successfully.";
+}
+// Re-entrancy guard: a second Save while one is in flight is ignored (one save
+// sequence per double-click).
+export function canBeginSave({ canSave, saving }) {
+  return !!canSave && !saving;
+}
+// Pure model of the two-phase save outcome — mirrors the builder's handleSave so
+// the routing rules are unit-testable: navigate + one success ONLY when content
+// AND (required) tags both saved; any failure stays in the editor with no
+// success and no navigation.
+export function saveFlowResult({ contentOk, tagRequired = false, tagFailed = false }) {
+  if (!contentOk)              return { success: false, navigate: false, stayInEditor: true, reason: "content_error" };
+  if (tagRequired && tagFailed) return { success: false, navigate: false, stayInEditor: true, reason: "tag_error" };
+  return { success: true, navigate: true, stayInEditor: false, reason: "ok" };
+}
+
 // Mirrors upsertQuiz's new-vs-existing detection: a non-UUID id (temp Date.now(),
 // "quiz_*", missing) INSERTs; a UUID UPDATEs. The builder adopts the canonical
 // UUID after the first successful save so any retry UPDATEs (never duplicates).
@@ -175,6 +196,13 @@ export function normalizeTagError(error, context = {}) {
   if (!error) return null;
   const msg = String(error.message || error.msg || "").toLowerCase();
   const code = error.code || error.errorCode;
+  // Merged-tag collision is checked FIRST — a merged tag is archived, but it must
+  // point the user to the merge target (it can never be restored/recreated),
+  // never to Restore. The server (migration 061) sends the honest, label-bearing
+  // sentence; surface it verbatim (minus the SQL function prefix).
+  if (msg.includes("was merged into") && msg.includes("cannot be recreated")) {
+    return String(error.message).replace(/^[a-z_]+:\s*/i, "");
+  }
   const isDup = code === "23505" || msg.includes("already exists") || msg.includes("duplicate");
   if (isDup) {
     if (msg.includes("archived")) {

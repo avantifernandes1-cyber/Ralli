@@ -7,6 +7,7 @@ import {
   wouldInsertNewQuiz, savePayloadId,
   selectedActiveTagIds, hasActiveSelection, tagRequirementError,
   governanceOutcome,
+  quizSaveSuccessMessage, canBeginSave, saveFlowResult,
 } from "./quizTagsUi.js";
 
 // Catalog helpers for the requirement/intent tests
@@ -133,6 +134,50 @@ t("archive-block error surfaces the count-bearing message", () => {
 });
 t("zero-active set_quiz_tags server error surfaced honestly", () => {
   assert.match(normalizeTagError({ message: "set_quiz_tags: at least one active tag is required" }), /at least one active tag/i);
+});
+
+// ── merged vs plain-archived collision messaging (061) ───────────────────────
+t("plain archived collision → Restore message", () => {
+  const m = normalizeTagError({ code: "23505", message: 'create_quiz_tag: A tag with this name is archived. Restore it instead of creating a duplicate.' });
+  assert.match(m, /is archived\. Restore it instead/);
+  assert.ok(!/merged/i.test(m), "plain-archived must not mention merge");
+});
+t("merged collision → merged-target message, NOT Restore", () => {
+  const m = normalizeTagError({ code: "23505", message: 'create_quiz_tag: Testing was merged into Avanti and cannot be recreated. Use Avanti instead.' });
+  assert.match(m, /Testing was merged into Avanti and cannot be recreated\. Use Avanti instead\./);
+  assert.ok(!/Restore/i.test(m), "merged message must not say Restore");
+});
+t("rename merged collision also → merged-target message", () => {
+  const m = normalizeTagError({ code: "23505", message: 'rename_quiz_tag: Testing was merged into Avanti and cannot be recreated. Use Avanti instead.' });
+  assert.match(m, /merged into Avanti/);
+  assert.ok(!/Restore/i.test(m));
+});
+t("active duplicate → plain already-exists", () => {
+  const m = normalizeTagError({ code: "23505", message: 'create_quiz_tag: A tag named "Sales" already exists.' }, { label: "Sales" });
+  assert.match(m, /already exists/);
+  assert.ok(!/archived|merged|Restore/i.test(m));
+});
+
+// ── quiz-save completion flow (routing + one toast) ──────────────────────────
+t("success message: create vs update", () => {
+  assert.equal(quizSaveSuccessMessage(null), "Quiz created successfully.");
+  assert.equal(quizSaveSuccessMessage("11111111-2222-3333-4444-555555555555"), "Quiz updated successfully.");
+});
+t("double-click guarded: second Save while in flight is ignored", () => {
+  assert.equal(canBeginSave({ canSave: true, saving: false }), true);  // first begins
+  assert.equal(canBeginSave({ canSave: true, saving: true }), false);  // second ignored
+  assert.equal(canBeginSave({ canSave: false, saving: false }), false);
+});
+t("save flow: content failure → stay, no success, no navigation", () => {
+  assert.deepEqual(saveFlowResult({ contentOk: false }), { success: false, navigate: false, stayInEditor: true, reason: "content_error" });
+});
+t("save flow: content ok but tag save fails → stay, no success, no navigation", () => {
+  assert.deepEqual(saveFlowResult({ contentOk: true, tagRequired: true, tagFailed: true }), { success: false, navigate: false, stayInEditor: true, reason: "tag_error" });
+});
+t("save flow: both succeed (create/edit/retry) → one success + navigate to Library", () => {
+  assert.deepEqual(saveFlowResult({ contentOk: true, tagRequired: true, tagFailed: false }), { success: true, navigate: true, stayInEditor: false, reason: "ok" });
+  // successful retry is the same terminal outcome
+  assert.equal(saveFlowResult({ contentOk: true, tagRequired: true, tagFailed: false }).navigate, true);
 });
 t("usage counts from map rows", () => {
   const c = tagUsageCounts([{ tag_id: "a" }, { tag_id: "a" }, { tag_id: "b" }]);
