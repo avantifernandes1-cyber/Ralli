@@ -28,7 +28,7 @@
 
 ## Knowledge Heatmap
 
-- [ ] Analytics cutover to normalized taxonomy + attempt snapshots
+- [x] Analytics cutover to normalized taxonomy + attempt snapshots
 
 ---
 

@@ -233,3 +233,57 @@ and cannot be recreated. Use <Target> instead.`
 
 Operator: applied by Claude Code via the controlled Supabase `apply_migration` tool, under explicit
 user production approval. Ledger row 25. This ledger update (rows 24–25) is intentionally left uncommitted.
+
+## 2026-07-25 — Knowledge Heatmap canonical aggregation RPC (062)
+
+Branch `feature/knowledge-heatmap` @ `e2cb621c809dceaf4a12b536c947d616e27f4aea`. Applied via one
+controlled `apply_migration` (Strategy A); SHA-256 re-confirmed against the committed blob
+immediately before application. Additive read-only forward migration — does NOT edit applied
+migrations 056–061.
+
+| Order | Prod version (ledger) | Prod name | Git file | Commit | SQL SHA-256 | Applied (UTC) | Verification |
+|---|---|---|---|---|---|---|---|
+| 26 | `20260725034117` | 062_knowledge_heatmap_rpc | supabase/migrations/062_knowledge_heatmap_rpc.sql | e2cb621 | d678b7c211f2bfe6a932fea491aa83b5e09be0d167528d24f4ba4a4ffc5703ec | 2026-07-25 03:41:17 | PASS |
+
+**What 062 adds (ONE `SECURITY DEFINER` function; `search_path=''`; EXECUTE=authenticated only,
+anon/PUBLIC revoked):**
+- `get_knowledge_heatmap(p_tenant_id uuid DEFAULT NULL)` — the single canonical topic-readiness
+  aggregation for the manager Heatmap, learner Knowledge-by-Topic and rep drill-down. Attribution is
+  ONLY the immutable attempt-time snapshots (`quiz_attempt_tag_snapshots` + `quiz_attempt_tags`); the
+  mutable `quiz_tag_map` never rewrites history. Scores only from trusted attempts (`server_v2` +
+  non-null score + snapshot envelope + active same-tenant learner); latest eligible attempt per
+  learner×quiz; merged tags resolved transitively (cycle-safe, depth<32) + deduped on
+  `(attempt, resolvedTag)`; multi-tag contributes once per topic, never summed into readiness.
+- Full topic population: every ACTIVE tag is a manager row (no-evidence → `avgScore=null`, cells "—",
+  never 0); plain-archived excluded; merged sources fold into their active target. Learners see only
+  tags relevant via their own history/accessible quizzes. Every active learner is a column with the
+  RPC-supplied authorized name (no `readiness_scores` dependence).
+- Multi-tenant authorization: learner/orgAdmin/manager own-tenant only (foreign `p_tenant_id`
+  rejected); ralli-admin may pass an explicit tenant; unknown/missing tenant rejected. Learners are
+  self-scoped (no peer identities/metrics). Threshold from `tenant_settings.learning_settings`
+  (`thresholdSource='tenant_settings'`) else 80 default (`'default'`), returned explicitly.
+
+**Post-apply verification (read-only; production RPC invoked with `request.jwt.claims` impersonation,
+raised-and-caught — no mutation):**
+- Recorded version `20260725034117` / name `062_knowledge_heatmap_rpc`; exactly one 060/061/062 row
+  each. Function present, `SECURITY DEFINER`, EXECUTE granted to `authenticated` (anon = 0).
+- **Manager (orgAdmin DeAndre, own tenant)** output matched the preflight prediction exactly: topics
+  `avanti` (avgScore 60, measured 1, learnersNoData 1, repsBelow 1) then `dre` (avgScore **null**,
+  measured 0, learnersNoData 2, repScores []); learners **Amanda** + **avanti** with names; meta
+  tenantId `0abdfcb1…`, totalActiveLearners 2, measuredLearners 1, totalAttempts 28,
+  verifiedAttributed 3, legacyExcluded 19, awaitingClassification 6, threshold 93, thresholdSource
+  `tenant_settings`.
+- **Learner (avanti)**: self-only identity (`learners:[avanti]`, no peer), self-scoped meta
+  (27/3/18/6); `avanti` topic avgScore 60 — **parity** with the manager cell for avanti.
+- **ralli-admin (Avanti Fernandes, tenant NULL)** explicit `p_tenant_id=deandre-test` → the same
+  2-topic / 2-learner TA matrix. **Rejections**: ralli-admin unknown tenant → `tenant not found`;
+  orgAdmin and learner foreign tenant → `not authorized for the requested tenant`.
+- No questions/answers/solutions/quiz content in any output (tag ids/labels/scores/counts/names only).
+- **No data/objects changed by 062**: quiz_attempts 28, snapshots 22 / links 22, active tags 2,
+  quiz_tag_map 3 — all unchanged. **056–061 intact**: `get_quiz_review` still sanitizes via
+  `_quiz_answers_learner_safe`; `submit_quiz_attempt_atomic_v2` present; `tenant_quizzes_select` +
+  `quiz_attempts_tenant_read` (057) present; snapshot-table RLS (059, manager/orgAdmin-only) present.
+  No new policies/triggers; no unrelated schema change.
+
+Operator: applied by Claude Code via the controlled Supabase `apply_migration` tool, under explicit
+user production approval. Ledger row 26. This ledger update is intentionally left uncommitted.
