@@ -35,6 +35,43 @@ export async function getQuizTagIds(quizId) {
   return { data: (data ?? []).map(r => r.tag_id), error };
 }
 
+// All quiz→tag mappings for a tenant (one round trip for the whole Library).
+// RLS restricts rows to the caller's tenant (managers/orgAdmin only).
+export async function listQuizTagMap(tenantId) {
+  const { data, error } = await supabase
+    .from("quiz_tag_map")
+    .select("quiz_id, tag_id")
+    .eq("tenant_id", tenantId);
+  return { data: data ?? [], error };
+}
+
+// Classification watermark per quiz (id + tags_classified_at). Managers can read
+// tenant_quizzes directly (057). Used to derive awaiting/tagged/uncategorized.
+export async function listQuizClassification(tenantId) {
+  const { data, error } = await supabase
+    .from("tenant_quizzes")
+    .select("id, tags_classified_at")
+    .eq("tenant_id", tenantId);
+  return { data: data ?? [], error };
+}
+
+// The builder's per-quiz tag state on edit: current tag ids + whether the quiz
+// has been classified. For a brand-new (unsaved) quiz, callers pass no id and
+// treat it as awaiting with no tags.
+export async function getQuizTagState(quizId) {
+  const [{ data: idsRow, error: idsErr }, { data: clsRow, error: clsErr }] = await Promise.all([
+    supabase.from("quiz_tag_map").select("tag_id").eq("quiz_id", quizId),
+    supabase.from("tenant_quizzes").select("tags_classified_at").eq("id", quizId).maybeSingle(),
+  ]);
+  return {
+    data: {
+      tagIds: (idsRow ?? []).map(r => r.tag_id),
+      classifiedAt: clsRow?.tags_classified_at ?? null,
+    },
+    error: idsErr || clsErr || null,
+  };
+}
+
 // ── Governance RPCs (orgAdmin / ralli_admin only — server-enforced) ──────────
 
 export async function createQuizTag(label) {
@@ -71,9 +108,11 @@ export async function mergeQuizTags(sourceId, targetId) {
 //   • Classify as Uncategorized:   setQuizTags(quiz, [], true)
 //   • Update an already-classified quiz (attach/detach, incl. to zero):
 //                                  setQuizTags(quiz, [...], false)   (never reverts to awaiting)
-//   • Passive/no-op (do NOT finalize an untouched quiz): setQuizTags(quiz, [], false)
+//   • Passive/no-op (do NOT finalize an untouched quiz): setQuizTags(quiz, [], { classify:false })
 // The first classification (tagged or Uncategorized) inherits envelopes to the
 // quiz's awaiting attempts once (migration 059). Returns { classification }.
-export async function setQuizTags(quizId, tagIds, classify = false) {
+// `opts.classify` may also be passed as a bare boolean for convenience.
+export async function setQuizTags(quizId, tagIds, opts = {}) {
+  const classify = typeof opts === "boolean" ? opts : !!opts.classify;
   return supabase.rpc("set_quiz_tags", { p_quiz_id: quizId, p_tag_ids: tagIds, p_classify: classify });
 }

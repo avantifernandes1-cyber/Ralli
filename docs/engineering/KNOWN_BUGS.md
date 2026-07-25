@@ -14,6 +14,14 @@ Priority: High
 
 ---
 
+Knowledge Heatmap still reads legacy free-text tags.
+
+Quiz Taxonomy authoring, governance, and attempt-time snapshots now exist, but the Heatmap has not yet been cut over to the normalized taxonomy and attempt snapshots. Not fixed.
+
+Priority: Medium
+
+---
+
 ## Fixed
 
 Emoji persistence.

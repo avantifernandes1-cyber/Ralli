@@ -150,3 +150,86 @@ user production approval. Ledger rows 22–23. (Recorded uncommitted at apply ti
 **Status:** Quiz Taxonomy backend foundation is live in production (versions `20260724222803`,
 `20260724223007`), dormant until the Manager Quiz Tags UI ships (no product writer yet; learner-safe
 RPC returns today's data unchanged). Migrations 056/057 remain intact.
+
+## 2026-07-25 — Archived-tag integrity + shared taxonomy lock (060)
+
+Branch `feature/quiz-tags-ui` @ `e1bab954581cbaf6fc2995ed1261d199c1d938e6`. Applied via one
+controlled `apply_migration` (Strategy A); SHA-256 re-confirmed against the committed blob
+immediately before application. Forward migration — does NOT edit applied 058/059.
+
+| Order | Prod version (ledger) | Prod name | Git file | Commit | SQL SHA-256 | Applied (UTC) | Verification |
+|---|---|---|---|---|---|---|---|
+| 24 | `20260725002148` | 060_archive_tag_integrity | supabase/migrations/060_archive_tag_integrity.sql | e1bab95 | c0e14a06a14b7b4cd72d007f3589495e38fe4f2bf8bcbc0bc72fffbeed161848 | 2026-07-25 00:21:48 | PASS |
+
+**What 060 changes (three SECURITY DEFINER RPCs replaced; `search_path=''`; grants unchanged =
+authenticated only):**
+- `archive_quiz_tag` — atomic block-or-detach: rejects with a count-bearing error when the tag is
+  the only active tag on ≥1 currently-mapped quiz; otherwise archives + detaches its current
+  `quiz_tag_map` rows. Immutable attempt snapshots untouched (RESTRICT FK; tag archived not deleted).
+- `set_quiz_tags` — server-authoritative ≥1-active-tag invariant: rejects empty / archived-only /
+  foreign-tenant / merged-source sets; no "uncategorized" outcome. First-classification inheritance +
+  grading preserved verbatim.
+- `merge_quiz_tags` — 058 body verbatim + the shared lock (repoint source→active target, dedupe,
+  source archived + merged_into=target).
+- Conditional one-time cleanup: deletes an archived mapping only when the quiz keeps another active
+  tag (never strands a quiz).
+- All three mutators take the identical per-tenant advisory lock
+  `pg_advisory_xact_lock(hashtextextended('quiz_taxonomy:'||tenant,0))`, serializing archive/assign/
+  merge in a tenant.
+
+**Post-apply verification (read-only):**
+- Recorded version `20260725002148` / name `060_archive_tag_integrity`; migration rows 24.
+- Lock present in all three (archive/set/merge); archive block+detach present; set requires active +
+  no "uncategorized"; merge source→target present. (Behavioral execution proven by the local
+  `060_archive_tag_integrity` harness — 11 sections; production RPCs were NOT invoked so no production
+  data was mutated during verification.)
+- **Conditional cleanup changed 0 production rows** (`quiz_tag_map` count 1 before and after — the
+  only archived mapping, `dre`, was already removed by preview remediation). 0 archived current
+  mappings; 0 stranded quizzes.
+- Dre's Quiz keeps its active `testing` mapping; archived `dre` has 0 current mappings; all **17**
+  historical `dre` attempt-tag snapshot links intact. Snapshots 17 envelopes / 17 links, attempts 28,
+  solutions 2 — unchanged.
+- **056/057 intact**: `get_quiz_review` still sanitizes via `_quiz_answers_learner_safe`;
+  `submit_quiz_attempt_atomic_v2` keeps the immutable solution snapshot and builds no `correct` key;
+  `tenant_quizzes_select` + `quiz_attempts_tenant_read` policies present. Grading/XP/passing/answer
+  sanitization unchanged. No unrelated schema/RLS/grant/trigger/worker/Heatmap changes; 0 taxonomy
+  triggers.
+
+Operator: applied by Claude Code via the controlled Supabase `apply_migration` tool, under explicit
+user production approval. Ledger row 24. This ledger update is intentionally left uncommitted.
+
+## 2026-07-25 — Honest merged-tag collision messages (061)
+
+Branch `feature/quiz-tags-ui` @ `7fe7f43cec1706fb03a207faa1de5848ee251405`. Applied via one
+controlled `apply_migration` (Strategy A); SHA-256 re-confirmed against the committed blob
+immediately before application. Error-handling ONLY — does NOT edit applied migrations 058/059/060.
+
+| Order | Prod version (ledger) | Prod name | Git file | Commit | SQL SHA-256 | Applied (UTC) | Verification |
+|---|---|---|---|---|---|---|---|
+| 25 | `20260725004220` | 061_merged_tag_error_messages | supabase/migrations/061_merged_tag_error_messages.sql | 7fe7f43 | 3ba62ec5baa11bf699d74eae10be7666d1e190686aa28436cd3bca27074bc9ec | 2026-07-25 00:42:20 | PASS |
+
+**What 061 changes:** `create_quiz_tag` + `rename_quiz_tag` collision error text ONLY (both are
+`SECURITY DEFINER`, `search_path=''`, EXECUTE=authenticated). Reservation-across-all-statuses,
+insert/update, returns, role/tenant checks and grants are byte-identical to 058. Three honest
+branches: active → `A tag named "X" already exists.`; plain archived → `A tag with this name is
+archived. Restore it instead of creating a duplicate.`; merged → `<Source> was merged into <Target>
+and cannot be recreated. Use <Target> instead.`
+
+**Post-apply verification (read-only):**
+- Recorded version `20260725004220` / name `061_merged_tag_error_messages`; migration rows 25.
+- All three branches present in both `create_quiz_tag` and `rename_quiz_tag`.
+- LIVE check against production `testing → avanti` (raised-and-caught, no mutation): both create and
+  rename surface `testing was merged into avanti and cannot be recreated. Use avanti instead.`
+- Merged `testing` still has `merged_into` set → not restorable/recreatable; plain archived tags stay
+  restorable (restore logic untouched).
+- **061 performs no DML**; the verification mutated nothing. Current production counts (3 tags [2
+  active, 1 archived/merged], 2 `quiz_tag_map` rows, 22 snapshot envelopes / 22 links, 28 attempts, 2
+  solutions) reflect ongoing preview QA between preflights, NOT this migration.
+- **056–060 intact**: `get_quiz_review` sanitized via `_quiz_answers_learner_safe`;
+  `submit_quiz_attempt_atomic_v2` keeps the solution snapshot; `archive_quiz_tag` retains the per-tenant
+  advisory lock (060); `tenant_quizzes_select` + `quiz_attempts_tenant_read` policies present. Grants,
+  RLS, tenant isolation and safe search_path unchanged; no unrelated schema/policy/trigger/data change;
+  0 taxonomy triggers.
+
+Operator: applied by Claude Code via the controlled Supabase `apply_migration` tool, under explicit
+user production approval. Ledger row 25. This ledger update (rows 24–25) is intentionally left uncommitted.
