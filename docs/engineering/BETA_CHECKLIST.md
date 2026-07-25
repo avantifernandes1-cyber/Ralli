@@ -18,7 +18,17 @@
 
 - [x] Retakes
 
+- [x] Tagging (authoring + governance)
+
+- [x] Tag library filtering
+
 - [ ] Last Updated
+
+---
+
+## Knowledge Heatmap
+
+- [ ] Analytics cutover to normalized taxonomy + attempt snapshots
 
 ---
 
