@@ -5,8 +5,8 @@
 -- quiz, a PARTIALLY-complete course), overdue, and a lesson whose only
 -- completion predates the current assigned_at. CANNOT: completed (lesson done,
 -- course fully done, quiz passed). A TEAM-ORIGINATED individual row (fanned out
--- by create_assignments_atomic, origin in source_*) IS unassignable per learner
--- without touching a teammate or the team; only a genuine SHARED aggregate row
+-- by create_assignments_atomic, origin in source_*) can already be unassigned
+-- per learner without touching a teammate or the team; only a genuine SHARED aggregate row
 -- (assigned_to.type team/group) is refused. Unassign is idempotent and never
 -- overwrites the original ender; reassignment creates a fresh row while the old
 -- stays cancelled in history; the hard-delete path is closed (grant revoked);

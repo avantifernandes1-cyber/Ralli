@@ -34,8 +34,8 @@ exactly as applied. Do not apply 064 to production without explicit approval.
   fans out every team/group/all-users assignment into ONE individual row per
   learner (`assigned_to.type='individual'`, its own id/userId/assigned_at), with
   the origin kept in `source_type/source_id/source_label`. So a team-ORIGINATED
-  row IS unassignable per learner — cancelling it touches only that row, leaves
-  teammates untouched, preserves the origin for audit, and never mutates the
+  row can already be unassigned per learner — cancelling it touches only that row,
+  leaves teammates untouched, preserves the origin for audit, and never mutates the
   team. The RPC refuses ONLY a genuine SHARED aggregate row (`assigned_to.type`
   = team/group/all — one row for many learners), which the engine no longer
   creates and the UI hides Unassign on.
@@ -45,8 +45,8 @@ exactly as applied. Do not apply 064 to production without explicit approval.
 - **Local validation:** `supabase/tests/064_manager_unassign.test.sql` — 16 groups
   PASS (manager authority incl. role 'manager', learner refused, cross-tenant
   refused, completed lesson/course/quiz refused, predate + failed-quiz +
-  partially-complete-course ALLOWED, team-originated individual unassignable with
-  teammate untouched + origin preserved, reassignment creates a fresh row while
+  partially-complete-course ALLOWED, team-originated individual can be unassigned
+  with teammate untouched + origin preserved, reassignment creates a fresh row while
   the old stays cancelled, idempotent, other learner untouched, shared-aggregate
   refused, not-found, hard-delete blocked, DELETE policy gone, FK SET NULL). 063
   harness still PASSES (no regression).
