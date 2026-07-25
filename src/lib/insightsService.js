@@ -20,6 +20,7 @@
  */
 
 import { supabase } from "./supabase.js";
+import { shapeHeatmap, repTopicsFromHeatmap, ownTopicsFromHeatmap } from "./heatmapModel.js";
 
 // ── Scoring weights (must sum to 1.0) ─────────────────────────────────────────
 const WEIGHTS = {
@@ -576,76 +577,28 @@ export function triggerReadinessUpdate(tenantId, userId) {
  * @param {{ threshold?: number }} [opts] — readiness threshold cutoff (default 80)
  * @returns {Promise<Array>}
  */
-export async function getTopicHeatmap(tenantId, { threshold = DEFAULT_READINESS_THRESHOLD } = {}) {
-  if (!tenantId) return [];
+// Knowledge Heatmap — canonical, snapshot-based (migration 062).
+//
+// Reads the ONE canonical aggregation source, public.get_knowledge_heatmap(),
+// instead of bucketing the mutable legacy tenant_quizzes.tags. Attribution comes
+// only from immutable attempt-time snapshots; only trusted server_v2 attempts
+// score; merged tags resolve to their active target; every active learner is a
+// column. Returns the full shaped payload { topics, learners, meta } — the
+// caller renders the matrix from `learners` and coverage/threshold from `meta`.
+// The `threshold` option is ignored (the RPC returns the authoritative threshold
+// and its source); the parameter is kept for call-site compatibility.
+export async function getTopicHeatmap(tenantId, _opts = {}) {
+  if (!tenantId) return emptyHeatmap();
+  // Pass the canonical selected tenantId. The RPC enforces authorization: a
+  // learner/orgAdmin/manager may only read their own tenant (foreign input is
+  // rejected server-side); a ralli-admin may read an explicitly selected tenant.
+  const { data, error } = await supabase.rpc("get_knowledge_heatmap", { p_tenant_id: tenantId });
+  if (error || !data) return emptyHeatmap();
+  return shapeHeatmap(data);
+}
 
-  const [{ data: quizzes, error: qErr }, { data: attempts, error: aErr }] =
-    await Promise.all([
-      supabase
-        .from("tenant_quizzes")
-        .select("id, tags")
-        .eq("tenant_id", tenantId)
-        .eq("status", "active"),
-      supabase
-        .from("quiz_attempts")
-        .select("user_id, quiz_id, score, passed, created_at")
-        .eq("tenant_id", tenantId),
-    ]);
-
-  if (qErr || aErr || !quizzes?.length || !attempts?.length) return [];
-
-  // Build quiz → tags[] map (normalize JSONB which may be string array or null)
-  const quizTags = {};
-  for (const q of quizzes) {
-    const tags = Array.isArray(q.tags)
-      ? q.tags
-      : typeof q.tags === "string"
-      ? JSON.parse(q.tags)
-      : [];
-    // Normalize: trim + lowercase so "Discovery" and "discovery" aggregate together
-    quizTags[q.id] = tags.filter(Boolean).map(t => String(t).trim().toLowerCase());
-  }
-
-  // Keep only the latest attempt per (user, quiz) pair
-  const latestAttempts = {};
-  for (const a of attempts) {
-    const key = `${a.user_id}::${a.quiz_id}`;
-    if (
-      !latestAttempts[key] ||
-      new Date(a.created_at) > new Date(latestAttempts[key].created_at)
-    ) {
-      latestAttempts[key] = a;
-    }
-  }
-
-  // Bucket scores by topic
-  const topicMap = {}; // topic → { scores: [{ userId, score, passed }] }
-  for (const a of Object.values(latestAttempts)) {
-    const tags = quizTags[a.quiz_id] ?? [];
-    if (!tags.length) continue;
-    const score = typeof a.score === "number" ? a.score : parseFloat(a.score) || 0;
-    for (const tag of tags) {
-      if (!topicMap[tag]) topicMap[tag] = { scores: [] };
-      topicMap[tag].scores.push({ userId: a.user_id, score, passed: !!a.passed });
-    }
-  }
-
-  // Aggregate per topic
-  const result = Object.entries(topicMap).map(([topic, { scores }]) => {
-    const avg = scores.reduce((s, r) => s + r.score, 0) / scores.length;
-    const below = scores.filter(r => r.score < threshold);
-    return {
-      topic,
-      avgScore:  Math.round(avg),
-      repsTotal: scores.length,
-      repsBelow: below.length,
-      repsAbove: scores.length - below.length,
-      repScores: scores,
-    };
-  });
-
-  // Weakest first
-  return result.sort((a, b) => a.avgScore - b.avgScore);
+function emptyHeatmap() {
+  return shapeHeatmap({ topics: [], learners: [], meta: {} });
 }
 
 /**
@@ -659,75 +612,23 @@ export async function getTopicHeatmap(tenantId, { threshold = DEFAULT_READINESS_
  * @param {string} userId
  * @returns {Promise<Array>}
  */
-// `safe`: when true (a learner reading their OWN topic scores), both sources come
-// from learner-safe SECURITY DEFINER RPCs — list_quiz_tags_for_learner ({id,tags},
-// no questions) and list_my_quiz_attempts_safe (own attempts, no answers) — so it
-// survives migration 057. Manager drilldown (reading a rep by userId) keeps the
-// direct reads (safe:false, unchanged).
+// Per-topic scores for a single rep, from the canonical get_knowledge_heatmap()
+// RPC (migration 062) — one aggregation source shared with the manager matrix
+// and learner Knowledge-by-Topic, so a rep's numbers can never drift between
+// surfaces. Attribution is attempt-time snapshot truth; only trusted server_v2
+// attempts contribute. Returns [{ tagId, topic, avgScore, attempts, passed }].
+//
+// `safe`: when true (a learner reading their OWN topic scores) the RPC restricts
+// output to the caller — no other learner's data is returned — so it needs no
+// direct table reads and survives migration 057. When false (a manager drill-down
+// reading a specific rep by userId) the RPC returns the tenant matrix and this
+// picks out that rep's cells.
 export async function getRepTopicScores(tenantId, userId, { safe = false } = {}) {
   if (!tenantId || !userId) return [];
-
-  const [{ data: quizzes, error: qErr }, { data: attempts, error: aErr }] =
-    await Promise.all([
-      safe
-        ? supabase.rpc("list_quiz_tags_for_learner")
-        : supabase
-            .from("tenant_quizzes")
-            .select("id, tags")
-            .eq("tenant_id", tenantId)
-            .eq("status", "active"),
-      safe
-        ? supabase.rpc("list_my_quiz_attempts_safe")
-        : supabase
-            .from("quiz_attempts")
-            .select("quiz_id, score, passed, created_at")
-            .eq("tenant_id", tenantId)
-            .eq("user_id", userId),
-    ]);
-
-  if (qErr || aErr || !quizzes?.length || !attempts?.length) return [];
-
-  const quizTags = {};
-  for (const q of quizzes) {
-    const tags = Array.isArray(q.tags)
-      ? q.tags
-      : typeof q.tags === "string"
-      ? JSON.parse(q.tags)
-      : [];
-    // Normalize: trim + lowercase so "Discovery" and "discovery" aggregate together
-    quizTags[q.id] = tags.filter(Boolean).map(t => String(t).trim().toLowerCase());
-  }
-
-  // Latest attempt per quiz
-  const latestByQuiz = {};
-  for (const a of attempts) {
-    if (
-      !latestByQuiz[a.quiz_id] ||
-      new Date(a.created_at) > new Date(latestByQuiz[a.quiz_id].created_at)
-    ) {
-      latestByQuiz[a.quiz_id] = a;
-    }
-  }
-
-  const topicMap = {};
-  for (const a of Object.values(latestByQuiz)) {
-    const tags = quizTags[a.quiz_id] ?? [];
-    const score = typeof a.score === "number" ? a.score : parseFloat(a.score) || 0;
-    for (const tag of tags) {
-      if (!topicMap[tag]) topicMap[tag] = { scores: [], passed: 0 };
-      topicMap[tag].scores.push(score);
-      if (a.passed) topicMap[tag].passed++;
-    }
-  }
-
-  const result = Object.entries(topicMap).map(([topic, { scores, passed }]) => ({
-    topic,
-    avgScore: Math.round(scores.reduce((s, v) => s + v, 0) / scores.length),
-    attempts: scores.length,
-    passed,
-  }));
-
-  return result.sort((a, b) => a.avgScore - b.avgScore);
+  const { data, error } = await supabase.rpc("get_knowledge_heatmap", { p_tenant_id: tenantId });
+  if (error || !data) return [];
+  const shaped = shapeHeatmap(data);
+  return safe ? ownTopicsFromHeatmap(shaped) : repTopicsFromHeatmap(shaped, userId);
 }
 
 /**

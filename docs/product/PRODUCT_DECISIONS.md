@@ -103,3 +103,33 @@ Merge is permanent. A merged source's name is reserved and cannot be restored or
 Historical snapshots are never rewritten. Archive, merge, and rename never alter attempt-time tag snapshots; past analytics remain fixed.
 
 Learners cannot author or govern tags. Tag management is unavailable to the learner role in every surface.
+
+---
+
+## Knowledge Heatmap
+
+Immutable attempt-time taxonomy snapshots are historical truth. Topic attribution comes only from the snapshot captured at submission — never re-derived.
+
+Current quiz mappings never rewrite historical attribution. Re-tagging, renaming, archiving, or merging a tag changes future attempts only; past attempts keep their original topics.
+
+Only trusted attempts contribute to scores: `grading_provenance = 'server_v2'` with a non-null score and an attempt-time taxonomy snapshot. Nothing else is scored.
+
+The latest eligible trusted attempt per learner × quiz is the scored value.
+
+Legacy (non-`server_v2` / null-provenance) attempts are excluded from scores and disclosed in coverage as `legacyExcluded` — never silently trusted or regraded.
+
+Awaiting-classification attempts (no snapshot) are excluded from scores and disclosed as `awaitingClassification`.
+
+All active learners remain visible as columns even with no verified evidence; a missing cell renders `—`, never zero.
+
+All active tags remain visible as topics; a topic with no verified evidence is null / "No verified evidence", never zero. Plain-archived tags are not topics.
+
+Merged tags resolve to their active target (transitively, cycle-safe) without rewriting any snapshot; the source's history still counts under the target.
+
+Multi-tag attempts contribute once per resolved topic (deduplicated), and topic cells are never summed into a Readiness score.
+
+The tenant threshold and its source are explicit: `tenant_settings.learning_settings.readinessThreshold` when set (`thresholdSource = tenant_settings`), otherwise the documented 80 default (`thresholdSource = default`) — the fallback is never hidden.
+
+Manager and learner views share one canonical aggregation source (`get_knowledge_heatmap`); an overlapping learner × topic score is identical in both. Learners are self-scoped and never see peer identities or metrics.
+
+Demo data never enters real-tenant analytics; the demo seed is used only in demo mode.

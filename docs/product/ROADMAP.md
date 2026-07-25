@@ -10,8 +10,23 @@ Remaining:
 
 - Last Updated timestamps
 - Content metadata
-- Knowledge Heatmap analytics cutover (depends on Quiz Taxonomy)
 - Final QA
+
+---
+
+### Knowledge Heatmap
+
+Status: Beta Complete
+
+Completed:
+
+- Analytics cutover off legacy free-text tags onto the normalized taxonomy + immutable attempt-time snapshots (migration 062, canonical `get_knowledge_heatmap` RPC)
+- Trusted `server_v2`-only scoring with legacy/awaiting disclosed in coverage
+- All active learners + all active topics visible; missing evidence shown honestly (`—` / null)
+- Merged-tag resolution, multi-tag dedupe, explicit threshold source
+- One canonical aggregation source shared by manager Heatmap, learner Knowledge by Topic and rep drill-down
+
+(No longer a Leadership Dashboard dependency.)
 
 ---
 
@@ -26,10 +41,6 @@ Completed:
 - Quiz tagging + library filtering
 - Required active tag on save
 - Attempt-time tag snapshots
-
-Next:
-
-- Knowledge Heatmap analytics cutover to the normalized taxonomy + attempt snapshots (Leadership Dashboard dependency)
 
 ---
 

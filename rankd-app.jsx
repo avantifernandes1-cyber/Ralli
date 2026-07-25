@@ -96,6 +96,7 @@ import { sendInviteEmail } from "./src/lib/emailService.js";
 import { provisionTenant, buildInviteUrl, normalizeProvisionedOrg, createMemberInvite } from "./src/lib/provisioningService.js";
 import { awardLessonPoints, awardCoursePoints, awardGamePointsForSession, getLeaderboard, computeUserMeta, getUserStreak } from "./src/lib/scoringService.js";
 import { triggerReadinessUpdate, getTopicHeatmap, getOrgMetrics, getRepTopicScores, getUserPerformance, getRecommendations } from "./src/lib/insightsService.js";
+import { cellScore as heatmapCellScore, coverageLine as heatmapCoverageLine, thresholdNote as heatmapThresholdNote, hasVerifiedEvidence as heatmapHasEvidence } from "./src/lib/heatmapModel.js";
 import { listTenantQuizTags, listQuizTagMap, listQuizClassification, getQuizTagState, createQuizTag, renameQuizTag, archiveQuizTag, restoreQuizTag, mergeQuizTags, setQuizTags } from "./src/lib/taxonomyService.js";
 import { activeMappedTagIds, classificationFromActiveCount, tagCapabilities, buildBuilderTagRows, quizTagModel, filterQuizzesByTag, tagUsageCounts, resolveTag, normalizeTagError, savePayloadId, hasActiveSelection, selectedActiveTagIds, tagRequirementError, governanceOutcome, quizSaveSuccessMessage, canBeginSave, runQuizSave } from "./src/lib/quizTagsUi.js";
 
@@ -1600,7 +1601,7 @@ function PersonalDashboardScreen({
 
         {/* Personal Topic Heatmap */}
         <Card>
-          {SH("Knowledge by Topic", "Based on your quiz attempts")}
+          {SH("Knowledge by Topic", "Based on your verified quiz attempts")}
           {displayTopicScores.length === 0 ? (
             <div style={{ padding: "20px 0", textAlign: "center", color: C.textSub, fontSize: 13 }}>
               Complete tagged quizzes to see your topic-by-topic breakdown.
@@ -1611,7 +1612,7 @@ function PersonalDashboardScreen({
                 const s = t.avgScore ?? 0;
                 const barColor = s >= 85 ? C.trueGreen : s >= readinessThreshold ? C.orange : C.red;
                 return (
-                  <div key={t.topic}>
+                  <div key={t.tagId ?? t.topic}>
                     <div style={{ display: "flex", justifyContent: "space-between", marginBottom: 5 }}>
                       <span style={{ fontSize: 12, fontWeight: 600, color: C.text, textTransform: "capitalize" }}>{t.topic}</span>
                       <span style={{ fontSize: 12, fontWeight: 800, color: barColor }}>{s}%</span>
@@ -16995,7 +16996,7 @@ function RepDrillDownModal({ rep, tenantId, onClose, isReal = false, readinessTh
                   {topicScores.map(t => {
                     const tColor = t.avgScore >= 85 ? C.trueGreen : t.avgScore >= readinessThreshold ? C.blue : C.red;
                     return (
-                      <div key={t.topic}>
+                      <div key={t.tagId ?? t.topic}>
                         <div style={{ display: "flex", justifyContent: "space-between", marginBottom: 4 }}>
                           <span style={{ fontSize: 13, color: C.text, textTransform: "capitalize" }}>{t.topic}</span>
                           <span style={{ fontSize: 13, fontWeight: 700, color: tColor }}>{t.avgScore}%</span>
@@ -17007,11 +17008,10 @@ function RepDrillDownModal({ rep, tenantId, onClose, isReal = false, readinessTh
                   })}
                 </div>
               ) : (
-                // Rep Drill-Down Final Polish Part 2 — same honest copy as the
-                // Knowledge Heatmap fix: this is a tagging gap, not an
-                // activity gap. Never say "no data" when quizzes have simply
-                // never been tagged.
-                <div style={{ fontSize: 13, color: C.textMuted }}>Skill-level detail is not available yet because completed quizzes have not been tagged.</div>
+                // Knowledge Heatmap (062): topic detail is attempt-time snapshot +
+                // trusted (server_v2) scoring only. Absence means no VERIFIED
+                // tagged attempts yet — not a missing-tags gap and never "no data".
+                <div style={{ fontSize: 13, color: C.textMuted }}>Topic readiness will appear once this rep completes tagged quizzes with verified scoring.</div>
               )}
             </div>
 
@@ -17266,7 +17266,7 @@ function LeadershipDashboardScreen({ currentOrg, orgUsers = [], isReal = false, 
       // with the summary number on the card that opens it.
       supabase.from("user_point_events").select("user_id, created_at").eq("tenant_id", tid),
     ]).then(([
-      { data: rows }, heatmap, metrics,
+      { data: rows }, heatmapResult, metrics,
       { data: assignments }, { data: quizAttempts }, { data: lessonCompletions }, { data: courses },
       { data: lessons }, { data: quizzes },
       { data: pointEvents },
@@ -17298,7 +17298,12 @@ function LeadershipDashboardScreen({ currentOrg, orgUsers = [], isReal = false, 
       setRawFetch({
         hasReadinessScores,
         rows: unique,
-        heatmap: heatmap ?? [],
+        // Knowledge Heatmap (062): canonical snapshot-based payload. topics =
+        // matrix rows, learners = every active learner (matrix columns), meta =
+        // coverage + authoritative threshold/source.
+        heatmap:         heatmapResult?.topics ?? [],
+        heatmapLearners: heatmapResult?.learners ?? [],
+        heatmapMeta:     heatmapResult?.meta ?? null,
         assignments: assignments ?? [],
         quizAttempts: quizAttempts ?? [],
         lessonCompletions: lessonCompletions ?? [],
@@ -17346,7 +17351,7 @@ function LeadershipDashboardScreen({ currentOrg, orgUsers = [], isReal = false, 
   // from before this fix — only *when* orgUsers gets applied changed.
   const liveData = useMemo(() => {
     if (!rawFetch) return null;
-    const { hasReadinessScores, rows, heatmap, assignments, quizAttempts, lessonCompletions, courses, lessons, quizzes, pointEvents } = rawFetch;
+    const { hasReadinessScores, rows, heatmap, heatmapLearners, heatmapMeta, assignments, quizAttempts, lessonCompletions, courses, lessons, quizzes, pointEvents } = rawFetch;
 
     // Actionable KPI Cards — content-name lookups for the Active Assignments
     // detail view. Reuses the already-correct getTenantLessons/getTenantCourses/
@@ -17375,15 +17380,26 @@ function LeadershipDashboardScreen({ currentOrg, orgUsers = [], isReal = false, 
     for (const c of lessonCompletions) noteActivity(c.profileId, c.completedAt);
     for (const e of pointEvents) noteActivity(e.user_id, e.created_at);
 
-    // Knowledge Heatmap empty-state diagnosis — getTopicHeatmap (called in
-    // the fetch effect above) returns [] for three different underlying
-    // reasons (no active quizzes, no attempts yet, or quizzes exist/have
-    // attempts but none carry skill tags) and doesn't distinguish them in
-    // its return value. quizAttempts is already fetched tenant-wide for the
-    // Active/Overdue Assignments calc below, so we get this diagnosis for
-    // free, no new query: if attempts exist tenant-wide but the heatmap
-    // still came back empty, tags — not missing activity — are the reason.
-    const heatmapNeedsTags = heatmap.length === 0 && quizAttempts.length > 0;
+    // Knowledge Heatmap (062) — matrix columns are EVERY active learner
+    // (heatmapLearners from the canonical RPC), resolved to display identity via
+    // orgUsers. A learner with no verified evidence still gets a column; their
+    // cells render "—" (never 0). This is the canonical population — not the
+    // readiness-scored `people` array — so a learner missing a readiness score
+    // still appears in the topic matrix.
+    const heatmapPeople = heatmapLearners.map((l, i) => {
+      const member = orgUsers.find(u => u.id === l.userId);
+      // Identity: authorized display name from the canonical RPC first (never
+      // readiness-driven), orgUsers only to enrich title; genuine "Team Member"
+      // fallback when a profile has no name — never fabricated.
+      const name = l.name ?? member?.name ?? "Team Member";
+      return {
+        id:       l.userId,
+        name,
+        title:    member?.title ?? member?.role ?? "Rep",
+        initials: name.split(" ").map(w => w[0] ?? "").join("").slice(0, 2).toUpperCase() || "TM",
+        color:    ["#6366f1","#f59e0b","#10b981","#ec4899","#3b82f6"][i % 5],
+      };
+    });
 
     // Build people array from orgUsers + readiness_scores rows.
     // Beta Cleanup — `tag` is now computed from the real score (reusing the
@@ -17493,7 +17509,9 @@ function LeadershipDashboardScreen({ currentOrg, orgUsers = [], isReal = false, 
 
     return {
       hasReadinessScores,
-      heatmapNeedsTags,
+      // Knowledge Heatmap (062) canonical column population + coverage/threshold.
+      heatmapPeople,
+      heatmapMeta,
       company: { readinessScore: avg, previousScore: avg, targetScore: 90, trend: [], period: "Current" },
       // BETA NOTE:
       // Hidden until supporting infrastructure is production-ready.
@@ -17550,6 +17568,28 @@ function LeadershipDashboardScreen({ currentOrg, orgUsers = [], isReal = false, 
     };
   }, [rawFetch, orgUsers, readinessThreshold]);
 
+  // Knowledge Heatmap (062): the demo seed predates the canonical shape, so give
+  // the fallback the same fields the live matrix reads — heatmapPeople (columns),
+  // heatmapMeta (null → no coverage line in demo), and tagId/label/avgScore on
+  // each topic. Purely for demo mode; this seed never reaches a real tenant.
+  // MUST be declared BEFORE the loading/error/empty early returns below so this
+  // hook runs unconditionally in the same order on every render (loading →
+  // loaded). Previously it sat after the returns and changed the hook count once
+  // loading resolved — React "Rendered more hooks than during the previous
+  // render." (minified #310). Deps [] — depends only on the constant seed.
+  const demoLeadershipData = useMemo(() => ({
+    ...LEADERSHIP_SEED,
+    heatmap: (LEADERSHIP_SEED.heatmap ?? []).map(t => ({
+      ...t, tagId: t.topic, label: t.topic, avgScore: t.avgScore ?? t.score,
+    })),
+    heatmapPeople: (LEADERSHIP_SEED.people ?? []).map(p => ({
+      id: p.id, name: p.name, title: p.title ?? p.role ?? "Rep",
+      initials: p.initials ?? ((p.name ?? "").split(" ").map(w => w[0] ?? "").join("").slice(0, 2).toUpperCase() || "TM"),
+      color: p.color,
+    })),
+    heatmapMeta: null,
+  }), []);
+
   // Loading / empty guards — real users only. Demo always falls through to LEADERSHIP_SEED.
   if (loading) {
     return (
@@ -17583,8 +17623,10 @@ function LeadershipDashboardScreen({ currentOrg, orgUsers = [], isReal = false, 
     );
   }
 
-  // Use live data when available; fall back to LEADERSHIP_SEED for demo / no data yet
-  const data = liveData ?? LEADERSHIP_SEED;
+  // Use live data when available; fall back to the demo seed for demo / no data yet.
+  // demoLeadershipData is memoized ABOVE all early returns (see near liveData) so
+  // hook order is identical on every render.
+  const data = liveData ?? demoLeadershipData;
 
   // Blocking Fix 1 — whether we have any real per-rep readiness scores to
   // summarize. Demo data always has a full people[] from LEADERSHIP_SEED,
@@ -17829,10 +17871,15 @@ function LeadershipDashboardScreen({ currentOrg, orgUsers = [], isReal = false, 
   const trendPoints = data.trends?.[trendPeriod] ?? [];
   const maxTrendVal = 100;
 
+  // Knowledge Heatmap (062): topicFilter holds a STABLE tagId (not a label), so a
+  // rename never breaks the active filter. Resolve to a label for display only.
+  const topicFilterEntry  = topicFilter ? data.heatmap.find(t => t.tagId === topicFilter) : null;
+  const topicFilterLabel  = topicFilterEntry?.label ?? topicFilterEntry?.topic ?? "";
+
   // Fix 4: topic filter — when active, show below-threshold reps; if none, show all measured reps
   const topicFilterOnTrack = (() => {
     if (!topicFilter || !data.heatmap.length) return false;
-    const entry = data.heatmap.find(t => t.topic === topicFilter);
+    const entry = topicFilterEntry;
     if (!entry?.repScores?.length) return false;
     return entry.repScores.filter(r => r.score < readinessThreshold).length === 0;
   })();
@@ -17840,7 +17887,7 @@ function LeadershipDashboardScreen({ currentOrg, orgUsers = [], isReal = false, 
   const filteredPeople = (() => {
     let list = peopleFilter === "all" ? data.people : data.people.filter(p => p.tag === peopleFilter);
     if (topicFilter && data.heatmap.length > 0) {
-      const topicEntry = data.heatmap.find(t => t.topic === topicFilter);
+      const topicEntry = topicFilterEntry;
       if (topicEntry?.repScores?.length) {
         const belowIds = new Set(topicEntry.repScores.filter(r => r.score < readinessThreshold).map(r => r.userId));
         if (belowIds.size > 0) {
@@ -17860,9 +17907,12 @@ function LeadershipDashboardScreen({ currentOrg, orgUsers = [], isReal = false, 
   const coachingReps   = data.people.filter(p => p.tag === "coaching").length;
   const topRep         = data.people.find(p => p.tag === "top");
   const mostImproved   = [...data.people].sort((a, b) => delta(b.score, b.prev) - delta(a.score, a.prev))[0];
-  // Fix 1: use getTopicScore() so real data (avgScore) and seed data (score) both work
-  const weakestTopic   = data.heatmap.length > 0 ? [...data.heatmap].sort((a, b) => getTopicScore(a) - getTopicScore(b))[0] : null;
-  const strongestTopic = data.heatmap.length > 0 ? [...data.heatmap].sort((a, b) => getTopicScore(b) - getTopicScore(a))[0] : null;
+  // Fix 1: use getTopicScore() so real data (avgScore) and seed data (score) both
+  // work. Knowledge Heatmap (062): only SCORED topics qualify — a no-verified-
+  // evidence topic (avgScore null) is never the weakest/strongest.
+  const scoredHeatmap  = data.heatmap.filter(t => (t.avgScore ?? t.score) != null);
+  const weakestTopic   = scoredHeatmap.length > 0 ? [...scoredHeatmap].sort((a, b) => getTopicScore(a) - getTopicScore(b))[0] : null;
+  const strongestTopic = scoredHeatmap.length > 0 ? [...scoredHeatmap].sort((a, b) => getTopicScore(b) - getTopicScore(a))[0] : null;
 
   // section header style
   const SH = (title, sub) => (
@@ -18261,10 +18311,17 @@ function LeadershipDashboardScreen({ currentOrg, orgUsers = [], isReal = false, 
               onClick={() => setTopicFilter(null)}
               style={{ fontSize: 12, fontWeight: 600, color: C.orange, background: C.orangeLight, border: `1px solid ${C.orange}44`, borderRadius: 8, padding: "4px 10px", cursor: "pointer" }}
             >
-              Clear filter: {topicFilter} ✕
+              Clear filter: {topicFilterLabel} ✕
             </button>
           )}
         </div>
+        {/* Knowledge Heatmap (062): honest coverage line — live values, never hardcoded. */}
+        {data.heatmapMeta && (data.heatmapMeta.totalAttempts ?? 0) > 0 && (
+          <div style={{ fontSize: 11, color: C.textSub, marginBottom: 12 }}>
+            {heatmapCoverageLine(data.heatmapMeta)}
+            {heatmapThresholdNote(data.heatmapMeta) ? ` · ${heatmapThresholdNote(data.heatmapMeta)}` : ""}
+          </div>
+        )}
         {data.heatmap.length > 0 ? (
           <>
             {/* True topic × rep matrix */}
@@ -18272,16 +18329,24 @@ function LeadershipDashboardScreen({ currentOrg, orgUsers = [], isReal = false, 
               const TOPIC_W = 164;
               const CELL_W  = 54;
               const CELL_H  = 38;
-              const sortedTopics = [...data.heatmap].sort((a, b) => (b.avgScore ?? b.score ?? 0) - (a.avgScore ?? a.score ?? 0));
+              // Scored topics weakest-first; no-verified-evidence topics after them
+              // (label order). Mirrors the RPC's canonical ordering.
+              const sortedTopics = [...data.heatmap].sort((a, b) => {
+                const av = a.avgScore ?? a.score ?? null, bv = b.avgScore ?? b.score ?? null;
+                const an = av == null, bn = bv == null;
+                if (an !== bn) return an ? 1 : -1;
+                if (an && bn) return String(a.label ?? a.topic ?? "").localeCompare(String(b.label ?? b.topic ?? ""));
+                return av - bv;
+              });
               const cellBg    = (s) => s == null ? C.pageBg      : s >= 85 ? C.trueGreenBg : s >= readinessThreshold ? C.orangeLight : C.redBg;
               const cellClr   = (s) => s == null ? C.textMuted   : s >= 85 ? C.trueGreen   : s >= readinessThreshold ? C.orangeDeep  : C.red;
               const cellBdr   = (s) => s == null ? C.border      : s >= 85 ? "#86EFAC"     : s >= readinessThreshold ? C.orangeBorder : "#FECACA";
               return (
                 <div style={{ overflowX: "auto", WebkitOverflowScrolling: "touch", margin: "0 -2px" }}>
-                  <div style={{ minWidth: TOPIC_W + data.people.length * (CELL_W + 4) }}>
-                    {/* Header row — rep avatars */}
+                  <div style={{ minWidth: TOPIC_W + data.heatmapPeople.length * (CELL_W + 4) }}>
+                    {/* Header row — rep avatars (EVERY active learner, 062) */}
                     <div style={{ display: "flex", alignItems: "flex-end", gap: 4, marginBottom: 8, paddingLeft: TOPIC_W + 4 }}>
-                      {data.people.map(rep => (
+                      {data.heatmapPeople.map(rep => (
                         <div
                           key={rep.id}
                           title={`${rep.name} · ${rep.title}`}
@@ -18300,15 +18365,17 @@ function LeadershipDashboardScreen({ currentOrg, orgUsers = [], isReal = false, 
                         </div>
                       ))}
                     </div>
-                    {/* Topic rows */}
+                    {/* Topic rows (keyed by stable tagId, 062) */}
                     {sortedTopics.map(topic => {
-                      const avgScore   = topic.avgScore ?? topic.score ?? 0;
-                      const isSelected = topicFilter === topic.topic;
+                      const rawAvg     = topic.avgScore ?? topic.score ?? null;
+                      const hasData    = rawAvg != null;
+                      const avgScore   = hasData ? rawAvg : 0;
+                      const isSelected = topicFilter === topic.tagId;
                       return (
-                        <div key={topic.topic} style={{ display: "flex", alignItems: "center", gap: 4, marginBottom: 4 }}>
+                        <div key={topic.tagId} style={{ display: "flex", alignItems: "center", gap: 4, marginBottom: 4 }}>
                           {/* Topic label */}
                           <div
-                            onClick={() => setTopicFilter(isSelected ? null : topic.topic)}
+                            onClick={() => setTopicFilter(isSelected ? null : topic.tagId)}
                             title="Click to filter People Insights"
                             style={{
                               width: TOPIC_W, flexShrink: 0, cursor: "pointer",
@@ -18318,17 +18385,25 @@ function LeadershipDashboardScreen({ currentOrg, orgUsers = [], isReal = false, 
                               transition: "background 0.15s",
                             }}
                           >
-                            <div style={{ fontSize: 12, fontWeight: 600, color: C.text }}>{topic.topic}</div>
-                            <div style={{ fontSize: 10, color: scoreColor(avgScore), fontWeight: 700, marginTop: 1 }}>{avgScore}% avg</div>
+                            <div style={{ fontSize: 12, fontWeight: 600, color: C.text }}>{topic.label ?? topic.topic}</div>
+                            {hasData ? (
+                              <div style={{ fontSize: 10, color: scoreColor(avgScore), fontWeight: 700, marginTop: 1 }}>
+                                {avgScore}% avg · {topic.measuredLearners ?? topic.repScores?.length ?? 0}/{data.heatmapPeople.length}
+                              </div>
+                            ) : (
+                              <div style={{ fontSize: 10, color: C.textMuted, fontWeight: 600, marginTop: 1 }}>No verified evidence</div>
+                            )}
                           </div>
-                          {/* Score cells */}
-                          {data.people.map(rep => {
+                          {/* Score cells — "—" for no verified evidence (never 0); tooltip shows n */}
+                          {data.heatmapPeople.map(rep => {
                             const rs    = topic.repScores?.find(r => r.userId === rep.id);
-                            const score = rs?.score ?? null;
+                            const score = heatmapCellScore(topic, rep.id);
                             return (
                               <div
                                 key={rep.id}
-                                title={score != null ? `${rep.name}: ${score}%` : `${rep.name}: no data`}
+                                title={score != null
+                                  ? `${rep.name}: ${score}% · ${rs?.n ?? 0} quiz${(rs?.n ?? 0) === 1 ? "" : "zes"}`
+                                  : `${rep.name}: no verified data`}
                                 style={{
                                   width: CELL_W, height: CELL_H, flexShrink: 0,
                                   display: "flex", alignItems: "center", justifyContent: "center",
@@ -18363,6 +18438,7 @@ function LeadershipDashboardScreen({ currentOrg, orgUsers = [], isReal = false, 
             {/* Weak Topic Summary — bottom 3 topics */}
             {(() => {
               const weak = [...data.heatmap]
+                .filter(t => (t.avgScore ?? t.score) != null)   // scored topics only (no-data never "weak")
                 .sort((a, b) => (a.avgScore ?? a.score ?? 0) - (b.avgScore ?? b.score ?? 0))
                 .slice(0, 3)
                 .filter(t => (t.avgScore ?? t.score ?? 0) < 75);
@@ -18375,15 +18451,15 @@ function LeadershipDashboardScreen({ currentOrg, orgUsers = [], isReal = false, 
                       const s = t.avgScore ?? t.score ?? 0;
                       return (
                         <div
-                          key={t.topic}
-                          onClick={() => setTopicFilter(topicFilter === t.topic ? null : t.topic)}
+                          key={t.tagId}
+                          onClick={() => setTopicFilter(topicFilter === t.tagId ? null : t.tagId)}
                           style={{
                             padding: "12px 14px", borderRadius: C.radiusSm, cursor: "pointer",
                             background: s < readinessThreshold ? C.redBg : C.orangeLight,
                             border: `1px solid ${s < readinessThreshold ? C.red + "33" : C.orange + "44"}`,
                           }}
                         >
-                          <div style={{ fontSize: 12, fontWeight: 700, color: s < readinessThreshold ? C.red : C.orangeDeep, textTransform: "capitalize" }}>{t.topic}</div>
+                          <div style={{ fontSize: 12, fontWeight: 700, color: s < readinessThreshold ? C.red : C.orangeDeep, textTransform: "capitalize" }}>{t.label ?? t.topic}</div>
                           <div style={{ fontSize: 20, fontWeight: 900, color: s < readinessThreshold ? C.red : C.orange, margin: "4px 0" }}>{s}%</div>
                           {t.repsBelow > 0 && <div style={{ fontSize: 11, color: C.textMuted }}>{t.repsBelow} rep{t.repsBelow !== 1 ? "s" : ""} need coaching</div>}
                         </div>
@@ -18396,18 +18472,20 @@ function LeadershipDashboardScreen({ currentOrg, orgUsers = [], isReal = false, 
           </>
         ) : (
           <div style={{ padding: "24px 0", textAlign: "center", color: C.textSub, fontSize: 13 }}>
-            {/* Knowledge Heatmap Verification — data.heatmapNeedsTags (real
-                tenants only; undefined for demo, where the seed heatmap is
-                never empty) distinguishes "reps just haven't attempted
-                tagged quizzes yet" from the actual live-verified cause on
-                the DeAndre Test tenant: quiz attempts already exist, but the
-                tenant's quiz has no skill tags set, so getTopicHeatmap has
-                nothing to bucket them into. Telling a manager to wait for
-                more quiz activity would be wrong in that case — the fix is
-                adding tags to the quiz, not more attempts. */}
-            {data.heatmapNeedsTags
-              ? "No skill tags are set on this tenant's quizzes yet. Add tags to your quizzes (Quizzes → Edit) to see topic-by-topic readiness here — attempts already exist, they just aren't tagged."
-              : "Skill data will appear here after reps complete tagged quizzes."}
+            {/* Knowledge Heatmap (062): honest unavailable state. Attribution is
+                attempt-time snapshots + trusted (server_v2) scores only. When
+                nothing qualifies yet, say why using live coverage — never invent
+                a "no tags" reason (tags may exist; the gap is verified attempts)
+                and never restore an Uncategorized/No-tag category. */}
+            {(() => {
+              const m = data.heatmapMeta;
+              const awaiting = m?.awaitingClassification ?? 0;
+              const legacy   = m?.legacyExcluded ?? 0;
+              if (m && (awaiting > 0 || legacy > 0)) {
+                return `Topic readiness will appear once reps complete tagged quizzes with verified scoring. ${heatmapCoverageLine(m)}.`;
+              }
+              return "Topic readiness will appear here after reps complete tagged quizzes.";
+            })()}
           </div>
         )}
       </Card>
@@ -18513,7 +18591,7 @@ function LeadershipDashboardScreen({ currentOrg, orgUsers = [], isReal = false, 
       <Card id="people-insights-section">
         <div style={{ display: "flex", justifyContent: "space-between", alignItems: "flex-start", marginBottom: 16 }}>
           <div>
-            {SH("People Insights", topicFilter ? `Filtered: reps below threshold on "${topicFilter}"` : "Individual readiness scores. Click a rep to view details.")}
+            {SH("People Insights", topicFilter ? `Filtered: reps below threshold on "${topicFilterLabel}"` : "Individual readiness scores. Click a rep to view details.")}
             {topicFilter && (
               <button
                 onClick={() => setTopicFilter(null)}
@@ -18526,7 +18604,7 @@ function LeadershipDashboardScreen({ currentOrg, orgUsers = [], isReal = false, 
             {topicFilterOnTrack && (
               <div style={{ marginTop: 8, fontSize: 13, color: C.trueGreen, fontWeight: 600, display: "flex", alignItems: "center", gap: 6 }}>
                 <span style={{ fontSize: 15 }}>✓</span>
-                Everyone measured for <strong>"{topicFilter}"</strong> is on track.
+                Everyone measured for <strong>"{topicFilterLabel}"</strong> is on track.
               </div>
             )}
           </div>
