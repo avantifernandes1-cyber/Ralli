@@ -8977,6 +8977,16 @@ const INITIAL_ASSIGNMENTS = [
 const LESSON_TYPE_ICONS  = { video:"", text:"", image:"", flipcard:"", quiz:"", recording:"", interactive:"" };
 const LESSON_TYPE_COLORS = { video:C.blue, text:C.green, image:C.blue, flipcard:C.purple, quiz:C.purple, recording:C.red, interactive:C.orange };
 
+// "Last Updated" (063): format the authoritative tenant_lessons/tenant_courses
+// updated_at (ISO) for content cards. Returns "" for missing/invalid values so
+// we never display an invented date.
+function fmtUpdated(iso) {
+  if (!iso) return "";
+  const d = new Date(iso);
+  if (isNaN(d)) return "";
+  return d.toLocaleDateString("en-US", { month: "short", day: "numeric", year: "numeric" });
+}
+
 function LearnScreen({ role, user, orgUsers = [], orgs = [], onNav, onAwardXp, pendingLessonId, onClearPendingLesson, pendingCourseId, onClearPendingCourse, canCreate = true, canEdit = true, canDelete = true, canAssign = true, tenantId = null, isReal = false, quizzes = [], sharedAssignmentData = null }) {
   const isAdmin = role === "admin";
   const toast   = useToast();
@@ -9002,6 +9012,22 @@ function LearnScreen({ role, user, orgUsers = [], orgs = [], onNav, onAwardXp, p
     } catch { return new Set(); }
   });
   const [demoCompletedLessonsAt, setDemoCompletedLessonsAt] = useState(new Map());
+
+  // Learn lifecycle integrity (063): cancelled assignments (content archived/
+  // removed) are excluded from all active views. Managers can still SEE them as
+  // historical "Unavailable" items — loaded here with includeCancelled and shown
+  // in the Assignments tab. Refreshes with the tenant_assignments subscription
+  // (loadedAt bumps when the shared data reloads).
+  const [cancelledAssignments, setCancelledAssignments] = useState([]);
+  const cancelledLoadKey = sharedAssignmentData?.loadedAt ?? 0;
+  useEffect(() => {
+    if (!isReal || !tenantId || !isAdmin) { setCancelledAssignments([]); return; }
+    let alive = true;
+    getTenantAssignments(tenantId, { includeCancelled: true }).then(({ data }) => {
+      if (alive && data) setCancelledAssignments(data.filter(a => a.cancelledAt));
+    });
+    return () => { alive = false; };
+  }, [isReal, tenantId, isAdmin, cancelledLoadKey]);
 
   const sharedCompletedLessonsAt = sharedAssignmentData?.lessonCompletionsAt ?? new Map();
   // lesson_id → completed_at (ISO), used only for assignment-instance-aware
@@ -9288,8 +9314,11 @@ function LearnScreen({ role, user, orgUsers = [], orgs = [], onNav, onAwardXp, p
     const { error } = await archiveCourseService(courseId);
     setArchiveInFlight(prev => { const s = new Set(prev); s.delete(courseId); return s; });
     if (error) { console.error("[ralli] archiveCourse failed:", error); toast.error("Failed to archive course. Please try again."); return; }
+    // archive_course() also cancelled this course's active assignments server-side;
+    // the tenant_assignments subscription refreshes the affected lists automatically.
     setCourses(prev => prev.filter(c => c.id !== courseId));
     setArchivedCourses(prev => [{ ...course, status: "archived" }, ...prev]);
+    toast.success("Course archived. Its active assignments were cancelled.");
   };
 
   const handleArchiveLesson = async (lessonId) => {
@@ -9304,9 +9333,22 @@ function LearnScreen({ role, user, orgUsers = [], orgs = [], onNav, onAwardXp, p
     setArchiveInFlight(prev => new Set([...prev, lessonId]));
     const { error } = await archiveLessonService(lessonId);
     setArchiveInFlight(prev => { const s = new Set(prev); s.delete(lessonId); return s; });
-    if (error) { console.error("[ralli] archiveLesson failed:", error); toast.error("Failed to archive lesson. Please try again."); return; }
+    if (error) {
+      console.error("[ralli] archiveLesson failed:", error);
+      // archive_lesson() blocks archival while the lesson belongs to an active
+      // course — surface that specific reason so the manager knows to remove it
+      // from the course first, rather than a generic failure.
+      const msg = /active course/i.test(error.message ?? "")
+        ? "Can't archive: this lesson belongs to an active course. Remove it from the course first."
+        : "Failed to archive lesson. Please try again.";
+      toast.error(msg);
+      return;
+    }
+    // Its active assignments were cancelled server-side; the tenant_assignments
+    // subscription refreshes the affected lists automatically.
     setLessons(prev => prev.filter(l => l.id !== lessonId));
     setArchivedLessons(prev => [{ ...lesson, status: "archived" }, ...prev]);
+    toast.success("Lesson archived. Its active assignments were cancelled.");
   };
 
   const handleRestoreCourse = async (courseId) => {
@@ -9959,10 +10001,11 @@ function LearnScreen({ role, user, orgUsers = [], orgs = [], onNav, onAwardXp, p
                 <div style={{ padding: 20, display: "flex", flexDirection: "column", flex: 1 }}>
                   <h3 style={{ margin: "0 0 6px", fontSize: 15, fontWeight: 700, color: C.text, lineHeight: 1.3 }}>{course.title}</h3>
                   <p style={{ margin: "0 0 12px", fontSize: 12, color: C.textMuted, lineHeight: 1.55 }}>{course.description}</p>
-                  <div style={{ display: "flex", gap: 12, fontSize: 12, color: C.textSub, marginBottom: 14 }}>
+                  <div style={{ display: "flex", gap: 12, fontSize: 12, color: C.textSub, marginBottom: 14, flexWrap: "wrap" }}>
                     <span>{courseLessons.length} lessons</span>
                     <span>{totalMin} min</span>
                     <span>{courseLessons.reduce((s, l) => s + (l.xp || 0), 0)} XP</span>
+                    {course.updatedAt && <span title="Last updated">Updated {fmtUpdated(course.updatedAt)}</span>}
                   </div>
                   {/* Lesson list preview */}
                   <div style={{ display: "flex", flexDirection: "column", gap: 5, marginBottom: 16 }}>
@@ -10005,9 +10048,10 @@ function LearnScreen({ role, user, orgUsers = [], orgs = [], onNav, onAwardXp, p
             <Card key={lesson.id} style={{ opacity: lesson.status === "inactive" ? 0.6 : 1, display: "flex", flexDirection: "column" }}>
               <h3 style={{ margin: "0 0 6px", fontSize: 14, fontWeight: 700, color: C.text, lineHeight: 1.3 }}>{lesson.title}</h3>
               <p style={{ margin: "0 0 12px", fontSize: 12, color: C.textMuted, lineHeight: 1.55, flex: 1 }}>{lesson.description}</p>
-              <div style={{ display: "flex", gap: 12, fontSize: 12, color: C.textSub, marginBottom: 14 }}>
+              <div style={{ display: "flex", gap: 12, fontSize: 12, color: C.textSub, marginBottom: 14, flexWrap: "wrap" }}>
                 <span>{lesson.duration}</span>
                 <span>{lesson.xp} XP</span>
+                {lesson.updatedAt && <span title="Last updated">Updated {fmtUpdated(lesson.updatedAt)}</span>}
               </div>
               {/* Actions — bottom aligned */}
               <div style={{ display: "flex", gap: 6 }}>
@@ -10373,6 +10417,29 @@ function LearnScreen({ role, user, orgUsers = [], orgs = [], onNav, onAwardXp, p
             {/* Row count label */}
             {!selectedAssignmentId && (
               <p style={{ margin: "0 0 14px", fontSize: 13, color: C.textSub }}>{visibleRows.length} rep assignment{visibleRows.length !== 1 ? "s" : ""}</p>
+            )}
+
+            {/* Learn lifecycle integrity (063): cancelled assignments — content was
+                archived/removed. Not active/overdue, but kept for history so the
+                manager can see the assignment became unavailable. */}
+            {!selectedAssignmentId && cancelledAssignments.length > 0 && (
+              <div style={{ marginBottom: 16, padding: "12px 16px", background: C.pageBg, borderRadius: 10, border: `1px dashed ${C.border}` }}>
+                <div style={{ fontSize: 12, fontWeight: 700, color: C.textSub, marginBottom: 6 }}>
+                  {cancelledAssignments.length} cancelled assignment{cancelledAssignments.length !== 1 ? "s" : ""} · content archived or removed
+                </div>
+                <div style={{ display: "flex", flexWrap: "wrap", gap: 6 }}>
+                  {cancelledAssignments.slice(0, 12).map(ca => {
+                    const c = ca.contentType === "course" ? courses.find(x => x.id === ca.contentId) : lessons.find(x => x.id === ca.contentId);
+                    const label = c?.title ?? `${ca.contentType === "course" ? "Course" : "Lesson"} (removed)`;
+                    return (
+                      <span key={ca.id} title={`${ca.assignedTo?.userName ?? "rep"} · cancelled (${ca.cancelledReason ?? "content unavailable"})`}
+                        style={{ fontSize: 11, fontWeight: 600, color: C.textMuted, background: C.white, border: `1px solid ${C.border}`, borderRadius: 6, padding: "3px 8px" }}>
+                        {label} · Unavailable
+                      </span>
+                    );
+                  })}
+                </div>
+              </div>
             )}
 
             {visibleRows.length === 0

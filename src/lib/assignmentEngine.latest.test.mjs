@@ -1,6 +1,6 @@
 // Focused tests for resolveLatestQuizAssignment (one card per user+quiz).
 // Run: node src/lib/assignmentEngine.latest.test.mjs   (no creds, no DB)
-import { resolveLatestQuizAssignment } from "./assignmentEngine.js";
+import { resolveLatestQuizAssignment, resolveAssignmentStatus } from "./assignmentEngine.js";
 let pass = 0, fail = 0;
 const eq = (n, got, want) => { const a=JSON.stringify(got), b=JSON.stringify(want);
   if (a===b){pass++;console.log("PASS  "+n);} else {fail++;console.log(`FAIL  ${n}\n  got ${a}\n  want ${b}`);} };
@@ -125,6 +125,22 @@ const at = (created_at, passed, score) => ({ created_at, passed, score });
   eq("manager: Done scoped = null", r.completedAt, null);
   eq("manager: history preserved (2 older instances)", r.older.length, 2);
   eq("manager: full attempt history available (2, not scoped 0)", allAttempts.length, 2);
+}
+
+// ── 10. Cancelled assignments (063): never active/overdue/resolved ───────────
+{
+  const cancelled = { cancelledAt: "2026-07-25T00:00:00Z", dueAt: "2026-01-01" }; // past due, but cancelled
+  const rL = resolveAssignmentStatus("lesson", cancelled, { completedAt: null });
+  eq("cancelled lesson → status cancelled", rL.status, "cancelled");
+  eq("cancelled lesson → not active", rL.isActive, false);
+  eq("cancelled lesson → not resolved (not reassignable-by-completion)", rL.isResolved, false);
+  eq("cancelled → no fabricated overdue despite past due date", rL.status !== "overdue", true);
+  const rC = resolveAssignmentStatus("course", cancelled, { lessonIds: ["a","b"], completedAtByLesson: new Map() });
+  eq("cancelled course → status cancelled", rC.status, "cancelled");
+  eq("cancelled course → progress 0", rC.progress, 0);
+  // A non-cancelled assignment is unaffected (regression guard)
+  const active = resolveAssignmentStatus("lesson", { dueAt: "Open" }, { completedAt: null });
+  eq("non-cancelled lesson still resolves normally", active.status, "not_started");
 }
 
 console.log(`\n${pass} passed, ${fail} failed`);

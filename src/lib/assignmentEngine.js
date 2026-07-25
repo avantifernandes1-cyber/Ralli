@@ -212,6 +212,13 @@ export function resolveCourseAssignment(assignment, lessonIds = [], completedAtB
  * @returns {{ isResolved: boolean, isActive: boolean, status: 'not_started'|'in_progress'|'completed'|'overdue', progress: number, completedAt: string|null }}
  */
 export function resolveAssignmentStatus(contentType, assignment, data = {}) {
+  // Cancelled assignments (063: content archived/removed) are history only —
+  // never active/overdue/pending, never resolved-for-reassignment. The data
+  // source already excludes them from active views; this is a defensive guard
+  // for any caller that passes a cancelled row (e.g. the manager historical view).
+  if (assignment?.cancelledAt) {
+    return { isResolved: false, isActive: false, status: "cancelled", progress: 0, completedAt: null };
+  }
   let result;
   if (contentType === "quiz") {
     result = resolveQuizAssignment(assignment, data.attempts ?? []);
