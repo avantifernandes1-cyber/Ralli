@@ -206,7 +206,16 @@ INSERT INTO public.tenant_courses (id, tenant_id, title, lesson_ids, status) VAL
 INSERT INTO public.tenant_quizzes (id, tenant_id, name, status) VALUES
  ('00000000-0000-0000-0000-0000000fa010','00000000-0000-0000-0000-0000000000f0','QZ_DRAFT','draft'),
  ('00000000-0000-0000-0000-0000000fa011','00000000-0000-0000-0000-0000000000f0','QZ_INACT','inactive'),
- ('00000000-0000-0000-0000-0000000fa012','00000000-0000-0000-0000-0000000000e7','QZ_XT','active');   -- other tenant
+ ('00000000-0000-0000-0000-0000000fa012','00000000-0000-0000-0000-0000000000e7','QZ_XT','active'),   -- other tenant
+ ('00000000-0000-0000-0000-0000000fa013','00000000-0000-0000-0000-0000000000f0','QZ_REASSIGN','active');
+-- Reassignment fixture: QL2 has an OLD (2h ago) QZR assignment RESOLVED by a
+-- passing attempt 1h ago. Explicit past timestamps avoid the constant-now() trap
+-- (now() is fixed for the whole test transaction).
+INSERT INTO public.tenant_assignments (id, tenant_id, content_type, content_id, assigned_to, assigned_at) VALUES
+ ('00000000-0000-0000-0000-0000000fb013','00000000-0000-0000-0000-0000000000f0','quiz','00000000-0000-0000-0000-0000000fa013',
+  '{"type":"individual","userId":"00000000-0000-0000-0000-0000000000f2","userName":"QL2"}'::jsonb, now() - interval '2 hours');
+INSERT INTO public.quiz_attempts (tenant_id, user_id, quiz_id, score, passed, created_at) VALUES
+ ('00000000-0000-0000-0000-0000000000f0','00000000-0000-0000-0000-0000000000f2','00000000-0000-0000-0000-0000000fa013', 92, true, now() - interval '1 hour');
 
 -- Helper: attempt a direct ACTIVE assignment INSERT; returns '' on success or SQLERRM.
 CREATE OR REPLACE FUNCTION pg_temp.try_assign(p_type text, p_content text) RETURNS text
@@ -246,36 +255,80 @@ DO $$ BEGIN
   RAISE NOTICE '16. quiz: active assignable; archived/draft/inactive/missing/cross-tenant blocked: PASS';
 END $$;
 
--- ── 17. History carve-out — a pre-CANCELLED row to archived/missing content is
---       insertable (controlled migration/history), never gated by the guard ───
-DO $$ BEGIN
-  INSERT INTO public.tenant_assignments (id, tenant_id, content_type, content_id, assigned_to, assigned_at, cancelled_at, cancelled_reason) VALUES
-   ('00000000-0000-0000-0000-0000000fb0c1','00000000-0000-0000-0000-0000000000f0','quiz','00000000-0000-0000-0000-0000000fa001',
-    '{"type":"individual","userId":"00000000-0000-0000-0000-0000000000f2","userName":"QL2"}'::jsonb, now(), now(), 'content_archived'),
-   ('00000000-0000-0000-0000-0000000fb0c2','00000000-0000-0000-0000-0000000000f0','quiz','00000000-0000-0000-0000-00000000beef',
-    '{"type":"individual","userId":"00000000-0000-0000-0000-0000000000f2","userName":"QL2"}'::jsonb, now(), now(), 'content_missing');
-  ASSERT (SELECT count(*) FROM public.tenant_assignments WHERE id IN ('00000000-0000-0000-0000-0000000fb0c1','00000000-0000-0000-0000-0000000fb0c2')) = 2, '17. pre-cancelled history rows inserted';
-  RAISE NOTICE '17. history carve-out: pre-cancelled rows to archived/missing content remain insertable: PASS';
+-- ── 17. NO carve-out — a pre-CANCELLED insert to non-active content is BLOCKED
+--       (cancelled_at is client-supplied; exempting it would be a fabrication path)
+DO $$ DECLARE msg1 text := ''; msg2 text := ''; BEGIN
+  BEGIN
+    INSERT INTO public.tenant_assignments (tenant_id, content_type, content_id, assigned_to, assigned_at, cancelled_at, cancelled_reason)
+     VALUES ('00000000-0000-0000-0000-0000000000f0','quiz','00000000-0000-0000-0000-0000000fa001',
+      '{"type":"individual","userId":"00000000-0000-0000-0000-0000000000f2","userName":"QL2"}'::jsonb, now(), now(), 'content_archived');  -- QZA archived
+  EXCEPTION WHEN others THEN msg1 := SQLERRM; END;
+  BEGIN
+    INSERT INTO public.tenant_assignments (tenant_id, content_type, content_id, assigned_to, assigned_at, cancelled_at, cancelled_reason)
+     VALUES ('00000000-0000-0000-0000-0000000000f0','quiz','00000000-0000-0000-0000-00000000beef',
+      '{"type":"individual","userId":"00000000-0000-0000-0000-0000000000f2","userName":"QL2"}'::jsonb, now(), now(), 'content_missing');   -- missing
+  EXCEPTION WHEN others THEN msg2 := SQLERRM; END;
+  ASSERT msg1 LIKE '%assignment blocked%', '17a. pre-cancelled insert to archived quiz blocked: '||msg1;
+  ASSERT msg2 LIKE '%assignment blocked%', '17b. pre-cancelled insert to missing quiz blocked: '||msg2;
+  RAISE NOTICE '17. no cancelled_at carve-out: pre-cancelled inserts to archived/missing content are BLOCKED: PASS';
 END $$;
 
--- ── 18. Engine path — create_assignments_atomic honours the guard ────────────
--- Active quiz via the RPC succeeds; archived quiz via the RPC is rejected (proves
--- the guard fires inside the assignment engine, not only on direct inserts).
-DO $$ DECLARE r jsonb; msg text := ''; BEGIN
+-- ── 18. Engine path — create_assignments_atomic: active ok; archived rejected;
+--       learner refused; cross-tenant refused (guard + canonical auth) ─────────
+DO $$ DECLARE r jsonb; m_arch text:=''; m_learn text:=''; m_xt text:=''; BEGIN
   PERFORM set_config('request.jwt.claims','{"sub":"00000000-0000-0000-0000-0000000000f9","role":"authenticated"}',true);
   r := public.create_assignments_atomic(
         '00000000-0000-0000-0000-0000000000f0','quiz','00000000-0000-0000-0000-0000000fa003',
         '[{"userId":"00000000-0000-0000-0000-0000000000f2","userName":"QL2"}]'::jsonb,
         'Open', false, '00000000-0000-0000-0000-0000000000f9', 'individual', NULL, NULL);   -- QZC active
   ASSERT (r->>'assignedCount')::int = 1, '18a. active quiz assigned via engine: '||r::text;
+  BEGIN PERFORM public.create_assignments_atomic('00000000-0000-0000-0000-0000000000f0','quiz','00000000-0000-0000-0000-0000000fa001',
+      '[{"userId":"00000000-0000-0000-0000-0000000000f2","userName":"QL2"}]'::jsonb,'Open',false,'00000000-0000-0000-0000-0000000000f9','individual',NULL,NULL);
+  EXCEPTION WHEN others THEN m_arch := SQLERRM; END;
+  ASSERT m_arch LIKE '%assignment blocked%', '18b. engine rejects archived quiz: '||m_arch;
+  -- learner (role user) cannot assign
+  PERFORM set_config('request.jwt.claims','{"sub":"00000000-0000-0000-0000-0000000000f1","role":"authenticated"}',true);
+  BEGIN PERFORM public.create_assignments_atomic('00000000-0000-0000-0000-0000000000f0','quiz','00000000-0000-0000-0000-0000000fa002',
+      '[{"userId":"00000000-0000-0000-0000-0000000000f2","userName":"QL2"}]'::jsonb,'Open',false,'00000000-0000-0000-0000-0000000000f1','individual',NULL,NULL);
+  EXCEPTION WHEN others THEN m_learn := SQLERRM; END;
+  ASSERT m_learn LIKE '%unauthorized role%', '18c. learner cannot assign: '||m_learn;
+  -- cross-tenant: QMgrB (tenant e7) targets QTA (f0) tenant
+  PERFORM set_config('request.jwt.claims','{"sub":"00000000-0000-0000-0000-0000000000e8","role":"authenticated"}',true);
+  BEGIN PERFORM public.create_assignments_atomic('00000000-0000-0000-0000-0000000000f0','quiz','00000000-0000-0000-0000-0000000fa002',
+      '[{"userId":"00000000-0000-0000-0000-0000000000f2","userName":"QL2"}]'::jsonb,'Open',false,'00000000-0000-0000-0000-0000000000e8','individual',NULL,NULL);
+  EXCEPTION WHEN others THEN m_xt := SQLERRM; END;
+  ASSERT m_xt LIKE '%tenant mismatch%', '18d. cross-tenant assign refused: '||m_xt;
+  RAISE NOTICE '18. engine: active ok; archived/learner/cross-tenant refused: PASS';
+END $$;
+
+-- ── 19. Raw client INSERT closed — authenticated direct INSERT denied at the
+--       grant level; the SECURITY DEFINER RPC still inserts (owner bypassrls) ──
+DO $$ DECLARE msg text := ''; BEGIN
+  SET LOCAL ROLE authenticated;
+  PERFORM set_config('request.jwt.claims','{"sub":"00000000-0000-0000-0000-0000000000f9","role":"authenticated"}',true);
   BEGIN
-    PERFORM public.create_assignments_atomic(
-      '00000000-0000-0000-0000-0000000000f0','quiz','00000000-0000-0000-0000-0000000fa001',
-      '[{"userId":"00000000-0000-0000-0000-0000000000f2","userName":"QL2"}]'::jsonb,
-      'Open', false, '00000000-0000-0000-0000-0000000000f9', 'individual', NULL, NULL);      -- QZA archived
+    INSERT INTO public.tenant_assignments (tenant_id, content_type, content_id, assigned_to, assigned_at)
+     VALUES ('00000000-0000-0000-0000-0000000000f0','quiz','00000000-0000-0000-0000-0000000fa002',
+      '{"type":"individual","userId":"00000000-0000-0000-0000-0000000000f2","userName":"QL2"}'::jsonb, now());
   EXCEPTION WHEN others THEN msg := SQLERRM; END;
-  ASSERT msg LIKE '%assignment blocked%', '18b. engine rejects archived quiz: '||msg;
-  RAISE NOTICE '18. create_assignments_atomic: active assigns, archived rejected (guard fires in-engine): PASS';
+  RESET ROLE;
+  ASSERT msg LIKE '%permission denied%', '19. authenticated direct INSERT denied at grant level: '||msg;
+  RAISE NOTICE '19. raw client INSERT closed (grant revoked); RPC remains the sole path: PASS';
+END $$;
+
+-- ── 20. Reassignment gated by canonical eligibility (QZR fixture: old assignment
+--       2h ago RESOLVED by a passing attempt 1h ago) ──────────────────────────
+DO $$ DECLARE r jsonb; BEGIN
+  PERFORM set_config('request.jwt.claims','{"sub":"00000000-0000-0000-0000-0000000000f9","role":"authenticated"}',true);
+  -- prior QZR instance is resolved (attempt 1h ago >= assigned 2h ago) → allow fresh
+  r := public.create_assignments_atomic('00000000-0000-0000-0000-0000000000f0','quiz','00000000-0000-0000-0000-0000000fa013',
+        '[{"userId":"00000000-0000-0000-0000-0000000000f2","userName":"QL2"}]'::jsonb,'Open',false,'00000000-0000-0000-0000-0000000000f9','individual',NULL,NULL);
+  ASSERT (r->>'assignedCount')::int = 1, '20a. reassignment allowed after resolved instance: '||r::text;
+  -- the FRESH instance (assigned now) has no later attempt → unresolved → re-assign skipped
+  r := public.create_assignments_atomic('00000000-0000-0000-0000-0000000000f0','quiz','00000000-0000-0000-0000-0000000fa013',
+        '[{"userId":"00000000-0000-0000-0000-0000000000f2","userName":"QL2"}]'::jsonb,'Open',false,'00000000-0000-0000-0000-0000000000f9','individual',NULL,NULL);
+  ASSERT (r->>'assignedCount')::int = 0 AND (r->>'skippedCount')::int = 1, '20b. re-assign of the unresolved fresh instance skipped: '||r::text;
+  RAISE NOTICE '20. reassignment gated by canonical eligibility (resolved→allow, unresolved→skip): PASS';
 END $$;
 
 DO $$ BEGIN RAISE NOTICE '065 ALL TESTS PASSED'; END $$;

@@ -59,9 +59,9 @@
 --      confidentiality otherwise reproduced verbatim; this only NARROWS results).
 --
 --   7. Canonical content-assignability guard: _assert_assignment_content_assignable()
---      + a BEFORE INSERT trigger on tenant_assignments. For every NEW, ACTIVE
---      (cancelled_at IS NULL) lesson/course/quiz assignment it row-locks the
---      referenced content FOR SHARE and requires it to EXIST, be in NEW.tenant_id,
+--      + a BEFORE INSERT trigger on tenant_assignments. For EVERY new lesson/course/
+--      quiz row (cancelled_at NULL or not — no client-column carve-out) it row-locks
+--      the referenced content FOR SHARE and requires it to EXIST, be in NEW.tenant_id,
 --      and be status='active' — else it rejects (missing/archived/inactive/draft/
 --      cross-tenant). FOR SHARE conflicts with the archive/restore row locks
 --      (archive_quiz/restore_quiz use FOR UPDATE; archive_lesson/archive_course
@@ -70,7 +70,13 @@
 --      (FOR SHARE vs FOR SHARE) don't block each other — preserving
 --      create_assignments_atomic's advisory-lock duplicate-active protection.
 --
---   8. One-time, idempotent, history-preserving cleanup: cancels active quiz
+--   8. Closes the raw client INSERT path on tenant_assignments: drops the 017 INSERT
+--      RLS policy and REVOKEs INSERT from authenticated/anon, so the ONLY assignment-
+--      creation path is create_assignments_atomic (SECURITY DEFINER, owner postgres/
+--      bypassrls) — which alone enforces instance-aware duplicate-active/eligibility
+--      rules. service_role keeps INSERT for controlled maintenance.
+--
+--   9. One-time, idempotent, history-preserving cleanup: cancels active quiz
 --      assignments whose quiz row no longer exists (reason 'content_missing').
 --      Rows are preserved (never deleted), no title is fabricated, and re-running
 --      is a no-op (only rows with cancelled_at IS NULL are touched).
@@ -255,26 +261,32 @@ END $$;
 -- the archive RPCs never take it, and the guard's FOR SHARE is only ever awaited
 -- behind the archive's content-row lock — there is no lock cycle.
 --
--- HISTORY CARVE-OUT (explicit rule). The guard fires ONLY for rows inserted with
--- cancelled_at IS NULL (a live assignment). A row inserted ALREADY cancelled
--- (cancelled_at IS NOT NULL) is history, not live work: a controlled migration /
--- history backfill may legitimately record a cancelled row against content that
--- is already archived or gone, and that must remain insertable. This is NOT a
--- client bypass: the application never inserts a pre-cancelled row (cancellation
--- is always an UPDATE via archive_*/unassign_*), and the tenant_assignments
--- INSERT RLS policy (managers/admins, in-tenant) still applies on top. A normal
--- client creating a LIVE assignment always has cancelled_at NULL and is fully
--- guarded.
+-- NO cancelled_at CARVE-OUT. The guard fires for EVERY inserted row regardless of
+-- cancelled_at, because that column is client-supplied: exempting pre-cancelled
+-- rows would let anyone with INSERT fabricate "historical" assignments against
+-- missing/archived/inactive/draft/cross-tenant content. Audited: nothing legitimate
+-- inserts a pre-cancelled row (create_assignments_atomic inserts only live rows; the
+-- 063/065 cleanups are UPDATEs this INSERT-only trigger never sees). Combined with
+-- §8 (raw client INSERT closed), the sole assignment-creation path is the
+-- create_assignments_atomic RPC. A genuine future historical import is an explicitly
+-- privileged maintenance action (e.g. owner-level ALTER TABLE … DISABLE TRIGGER),
+-- never a client-controlled column value.
 CREATE OR REPLACE FUNCTION public._assert_assignment_content_assignable()
 RETURNS trigger LANGUAGE plpgsql SECURITY DEFINER SET search_path = ''
 AS $$
 DECLARE v_status text;
 BEGIN
-  -- History carve-out: only guard NEW, LIVE (uncancelled) assignments.
-  IF NEW.cancelled_at IS NOT NULL THEN
-    RETURN NEW;
-  END IF;
-
+  -- NO status/cancelled carve-out. EVERY new row — cancelled_at NULL or not — is
+  -- validated, because cancelled_at is a client-supplied column: a carve-out on it
+  -- would let anyone with INSERT fabricate "historical" assignment rows against
+  -- missing/archived/inactive/draft/cross-tenant content. (Audited: no migration or
+  -- RPC ever inserts a pre-cancelled row; create_assignments_atomic inserts only
+  -- cancelled_at NULL live rows, and the 063/065 cleanups are UPDATEs that this
+  -- INSERT-only trigger never sees, so nothing legitimate needs an exemption. A
+  -- genuine future historical import must use a separate, explicitly privileged
+  -- maintenance path — e.g. ALTER TABLE … DISABLE TRIGGER as owner — never a
+  -- client-controlled column value.)
+  --
   -- LOCK-THEN-CHECK. The FOR SHARE lock is taken on the content row by
   -- (id, tenant) with NO status predicate, so it matches — and therefore locks —
   -- the row whatever its CURRENT status. That is essential for serializing with
@@ -319,7 +331,27 @@ CREATE TRIGGER trg_assert_assignment_content_assignable
   BEFORE INSERT ON public.tenant_assignments
   FOR EACH ROW EXECUTE FUNCTION public._assert_assignment_content_assignable();
 
--- ── 8. One-time history-preserving cleanup of orphaned quiz assignments ──────
+-- ── 8. Close the raw client INSERT path on tenant_assignments ────────────────
+-- The section-7 trigger enforces CONTENT assignability, but the instance-aware
+-- duplicate-active / reassignment-eligibility rules live in create_assignments_atomic
+-- (034/036/037): advisory lock keyed on (tenant, content) + the _*_active_user_ids
+-- helpers. A raw client INSERT bypasses those, so a manager with direct INSERT
+-- could create duplicate active assignments the engine would have skipped. Since
+-- EVERY legitimate assignment write already goes through create_assignments_atomic
+-- (audited: no JS raw insert; the only INSERT INTO tenant_assignments in the schema
+-- is inside that RPC), we remove the raw path exactly as 064 did for DELETE:
+--   • drop the 017 INSERT RLS policy, and
+--   • REVOKE INSERT from authenticated/anon.
+-- create_assignments_atomic is SECURITY DEFINER owned by `postgres` (rolbypassrls),
+-- and the table does not FORCE row security, so the RPC keeps inserting unaffected
+-- by either change. service_role retains INSERT for controlled out-of-band
+-- maintenance (bypasses RLS). With RLS on and no INSERT policy, an authenticated
+-- direct INSERT is denied regardless of grant; the REVOKE is belt-and-suspenders.
+DROP POLICY IF EXISTS "tenant_assignments_insert" ON public.tenant_assignments;
+REVOKE INSERT ON public.tenant_assignments FROM authenticated;
+REVOKE INSERT ON public.tenant_assignments FROM anon;
+
+-- ── 9. One-time history-preserving cleanup of orphaned quiz assignments ──────
 -- Cancels active quiz assignments whose quiz row no longer exists. Idempotent
 -- (only untouched rows); rows are preserved, never deleted; no title fabricated.
 -- Runs as the migration owner (bypasses the section-7 trigger anyway, since it is
@@ -336,6 +368,12 @@ UPDATE public.tenant_assignments a
 --     DROP FUNCTION public._assert_assignment_content_assignable();
 --     (NOTE: dropping the guard re-opens the archive-vs-assign race — undo it only
 --      alongside a replacement guard, never on its own.)
+--   • to reopen the raw client INSERT (NOT recommended — reopens the duplicate-active
+--     bypass): GRANT INSERT ON public.tenant_assignments TO authenticated;
+--     CREATE POLICY "tenant_assignments_insert" ON public.tenant_assignments
+--       FOR INSERT TO authenticated WITH CHECK (
+--         get_my_role() IN ('ralli_admin','orgAdmin','manager')
+--         AND (get_my_role() = 'ralli_admin' OR tenant_id = get_my_tenant_id()));
 --   • DROP FUNCTION archive_quiz(uuid), restore_quiz(uuid), delete_quiz(uuid);
 --   • CREATE OR REPLACE list_quizzes_for_learner() with the 055 body (drop the
 --     `AND tq.status <> 'archived'` predicate);
