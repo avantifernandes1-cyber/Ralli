@@ -1,5 +1,6 @@
 -- ─────────────────────────────────────────────────────────────────────────────
--- Migration 065 — Quiz Archive / Restore (ADDITIVE forward migration)
+-- Migration 065 — Quiz Archive / Restore + canonical content-assignability guard
+-- (ADDITIVE forward migration)
 --
 -- Brings quizzes to lifecycle parity with lessons/courses (063): a quiz is
 -- ARCHIVED (soft, reversible) instead of hard-deleted. Archiving preserves every
@@ -10,8 +11,22 @@
 -- it, orphan assignments/attempts) is closed at both layers, exactly as 064 did
 -- for tenant_assignments.
 --
+-- It ALSO closes an authoritative-layer integrity gap that predates this work and
+-- affects ALL Learn content (lesson/course/quiz), not just quizzes: an assignment
+-- could be created against archived/missing/cross-tenant content, and — because
+-- archive_* and create_assignments_atomic take DIFFERENT locks (archive locks the
+-- content row; create_assignments_atomic takes only an advisory lock and never
+-- checks content status) — a concurrent assign could slip a NEW active assignment
+-- in AFTER an archive's cancellation update, defeating the archive. Section 7 adds
+-- ONE canonical BEFORE INSERT guard on tenant_assignments that verifies the
+-- referenced content exists, is in the assignment's tenant, and is 'active',
+-- taking the SAME content-row lock the archive/restore RPCs use so the two
+-- operations serialize. It applies to every insert path (create_assignments_atomic,
+-- direct authenticated insert, any future server path) without duplicating the
+-- assignment engine.
+--
 -- Does NOT edit any applied migration. All object changes are CREATE OR REPLACE
--- / additive constraint swap / policy+grant tightening. Changes:
+-- / additive constraint swap / policy+grant tightening / a new trigger. Changes:
 --
 --   1. tenant_quizzes.status CHECK gains 'archived' (was active|inactive|draft).
 --      Additive: no existing row changes; only a new legal value is permitted.
@@ -39,7 +54,23 @@
 --      the REVOKE is belt-and-suspenders. Tenant offboarding still cascades via
 --      the tenants FK; service_role retains privileged delete (bypasses RLS).
 --
---   6. One-time, idempotent, history-preserving cleanup: cancels active quiz
+--   6. Defense in depth: list_quizzes_for_learner() excludes archived quizzes so
+--      the learner-safe catalog RPC itself never surfaces one (055/057 answer
+--      confidentiality otherwise reproduced verbatim; this only NARROWS results).
+--
+--   7. Canonical content-assignability guard: _assert_assignment_content_assignable()
+--      + a BEFORE INSERT trigger on tenant_assignments. For every NEW, ACTIVE
+--      (cancelled_at IS NULL) lesson/course/quiz assignment it row-locks the
+--      referenced content FOR SHARE and requires it to EXIST, be in NEW.tenant_id,
+--      and be status='active' — else it rejects (missing/archived/inactive/draft/
+--      cross-tenant). FOR SHARE conflicts with the archive/restore row locks
+--      (archive_quiz/restore_quiz use FOR UPDATE; archive_lesson/archive_course
+--      issue an UPDATE = FOR NO KEY UPDATE), so an assign serializes with an
+--      in-flight archive/restore of the same content, while two concurrent assigns
+--      (FOR SHARE vs FOR SHARE) don't block each other — preserving
+--      create_assignments_atomic's advisory-lock duplicate-active protection.
+--
+--   8. One-time, idempotent, history-preserving cleanup: cancels active quiz
 --      assignments whose quiz row no longer exists (reason 'content_missing').
 --      Rows are preserved (never deleted), no title is fabricated, and re-running
 --      is a no-op (only rows with cancelled_at IS NULL are touched).
@@ -201,9 +232,98 @@ BEGIN
   RETURN v_out;
 END $$;
 
--- ── 7. One-time history-preserving cleanup of orphaned quiz assignments ──────
+-- ── 7. Canonical content-assignability guard (lesson / course / quiz) ────────
+-- ONE authoritative BEFORE INSERT check on tenant_assignments, so an active
+-- assignment can never be created against content that is missing, archived,
+-- inactive, draft, or in another tenant — no matter the insert path
+-- (create_assignments_atomic, a direct authenticated insert, or a future server
+-- path). This does NOT duplicate the assignment engine; it complements it.
+--
+-- CONCURRENCY CONTRACT. The guard takes a SHARED row lock (FOR SHARE) on the
+-- exact content row. The lifecycle RPCs take a conflicting lock on that same row
+-- (archive_quiz/restore_quiz: explicit FOR UPDATE; archive_lesson/archive_course:
+-- an UPDATE, i.e. FOR NO KEY UPDATE). FOR SHARE conflicts with both, so:
+--   • assign-first  → archive waits for the insert's txn, then its cancellation
+--                     UPDATE (WHERE cancelled_at IS NULL) sees and cancels the
+--                     just-created row — no active assignment survives an archive;
+--   • archive-first → the insert waits for the archive's txn, then re-reads the
+--                     content as non-active and is REJECTED;
+--   • restore-first → the insert waits, then sees status='active' and SUCCEEDS.
+-- Two concurrent assigns (FOR SHARE vs FOR SHARE) are compatible, so they don't
+-- block each other and create_assignments_atomic's advisory-lock + eligibility
+-- duplicate-active protection is unchanged. No deadlock with that advisory lock:
+-- the archive RPCs never take it, and the guard's FOR SHARE is only ever awaited
+-- behind the archive's content-row lock — there is no lock cycle.
+--
+-- HISTORY CARVE-OUT (explicit rule). The guard fires ONLY for rows inserted with
+-- cancelled_at IS NULL (a live assignment). A row inserted ALREADY cancelled
+-- (cancelled_at IS NOT NULL) is history, not live work: a controlled migration /
+-- history backfill may legitimately record a cancelled row against content that
+-- is already archived or gone, and that must remain insertable. This is NOT a
+-- client bypass: the application never inserts a pre-cancelled row (cancellation
+-- is always an UPDATE via archive_*/unassign_*), and the tenant_assignments
+-- INSERT RLS policy (managers/admins, in-tenant) still applies on top. A normal
+-- client creating a LIVE assignment always has cancelled_at NULL and is fully
+-- guarded.
+CREATE OR REPLACE FUNCTION public._assert_assignment_content_assignable()
+RETURNS trigger LANGUAGE plpgsql SECURITY DEFINER SET search_path = ''
+AS $$
+DECLARE v_status text;
+BEGIN
+  -- History carve-out: only guard NEW, LIVE (uncancelled) assignments.
+  IF NEW.cancelled_at IS NOT NULL THEN
+    RETURN NEW;
+  END IF;
+
+  -- LOCK-THEN-CHECK. The FOR SHARE lock is taken on the content row by
+  -- (id, tenant) with NO status predicate, so it matches — and therefore locks —
+  -- the row whatever its CURRENT status. That is essential for serializing with
+  -- a concurrent RESTORE (archived→active): a status='active' predicate would
+  -- match zero rows while the row is still archived in this reader's snapshot,
+  -- lock nothing, and let the assignment slip through. We read the status back
+  -- and evaluate it only AFTER the lock is granted (i.e. after any in-flight
+  -- archive/restore of this row has committed).
+  IF NEW.content_type = 'quiz' THEN
+    SELECT q.status INTO v_status FROM public.tenant_quizzes q
+      WHERE q.id::text = NEW.content_id AND q.tenant_id = NEW.tenant_id
+      FOR SHARE;
+  ELSIF NEW.content_type = 'lesson' THEN
+    SELECT l.status INTO v_status FROM public.tenant_lessons l
+      WHERE l.id::text = NEW.content_id AND l.tenant_id = NEW.tenant_id
+      FOR SHARE;
+  ELSIF NEW.content_type = 'course' THEN
+    SELECT c.status INTO v_status FROM public.tenant_courses c
+      WHERE c.id::text = NEW.content_id AND c.tenant_id = NEW.tenant_id
+      FOR SHARE;
+  ELSE
+    -- create_assignments_atomic already restricts content_type to the three Learn
+    -- types; any other value is a no-op passthrough until the guard is extended.
+    RETURN NEW;
+  END IF;
+
+  -- v_status IS NULL  → no row for (id, tenant): missing or cross-tenant.
+  -- v_status <> 'active' → archived / inactive / draft. Both are rejected.
+  IF v_status IS DISTINCT FROM 'active' THEN
+    RAISE EXCEPTION
+      'assignment blocked: % % is not an active in-tenant % (missing, archived, inactive, draft, or cross-tenant)',
+      NEW.content_type, NEW.content_id, NEW.content_type
+      USING ERRCODE = 'check_violation';
+  END IF;
+
+  RETURN NEW;
+END $$;
+REVOKE ALL ON FUNCTION public._assert_assignment_content_assignable() FROM PUBLIC, anon;
+
+DROP TRIGGER IF EXISTS trg_assert_assignment_content_assignable ON public.tenant_assignments;
+CREATE TRIGGER trg_assert_assignment_content_assignable
+  BEFORE INSERT ON public.tenant_assignments
+  FOR EACH ROW EXECUTE FUNCTION public._assert_assignment_content_assignable();
+
+-- ── 8. One-time history-preserving cleanup of orphaned quiz assignments ──────
 -- Cancels active quiz assignments whose quiz row no longer exists. Idempotent
 -- (only untouched rows); rows are preserved, never deleted; no title fabricated.
+-- Runs as the migration owner (bypasses the section-7 trigger anyway, since it is
+-- an UPDATE, not an INSERT).
 UPDATE public.tenant_assignments a
   SET cancelled_at = now(), cancelled_reason = 'content_missing'
   WHERE a.content_type = 'quiz'
@@ -212,6 +332,10 @@ UPDATE public.tenant_assignments a
 
 -- ── ROLLBACK (forward corrective migration only) ──────────────────────────────
 -- To undo 065 (and only 065):
+--   • DROP TRIGGER trg_assert_assignment_content_assignable ON public.tenant_assignments;
+--     DROP FUNCTION public._assert_assignment_content_assignable();
+--     (NOTE: dropping the guard re-opens the archive-vs-assign race — undo it only
+--      alongside a replacement guard, never on its own.)
 --   • DROP FUNCTION archive_quiz(uuid), restore_quiz(uuid), delete_quiz(uuid);
 --   • CREATE OR REPLACE list_quizzes_for_learner() with the 055 body (drop the
 --     `AND tq.status <> 'archived'` predicate);

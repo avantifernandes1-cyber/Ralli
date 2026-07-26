@@ -166,19 +166,23 @@ DO $$ BEGIN
   RAISE NOTICE '12. status CHECK now allows archived: PASS';
 END $$;
 
--- ── 13. One-time orphan cleanup logic cancels a missing-quiz assignment ──────
--- Insert an ACTIVE quiz assignment whose quiz id does not exist, then run the
--- SAME cleanup statement from the migration and assert content_missing.
+-- ── 13. One-time orphan cleanup cancels a missing-quiz assignment ────────────
+-- With the section-7 guard live, a NEW active assignment can't be inserted
+-- against a missing quiz, so we reproduce the orphan the way production got it:
+-- assign while the quiz is ACTIVE (guard passes), then remove the quiz (owner
+-- delete), leaving the assignment orphaned. Then run the migration's cleanup.
 DO $$ DECLARE v_cnt int; BEGIN
+  INSERT INTO public.tenant_quizzes (id, tenant_id, name, status) VALUES
+   ('00000000-0000-0000-0000-0000000fa0de','00000000-0000-0000-0000-0000000000f0','QZORPH','active');
   INSERT INTO public.tenant_assignments (id, tenant_id, content_type, content_id, assigned_to, assigned_at) VALUES
-   ('00000000-0000-0000-0000-0000000fb099','00000000-0000-0000-0000-0000000000f0','quiz','00000000-0000-0000-0000-00000000dead','{"type":"individual","userId":"00000000-0000-0000-0000-0000000000f1","userName":"QL1"}'::jsonb, now());
+   ('00000000-0000-0000-0000-0000000fb099','00000000-0000-0000-0000-0000000000f0','quiz','00000000-0000-0000-0000-0000000fa0de','{"type":"individual","userId":"00000000-0000-0000-0000-0000000000f1","userName":"QL1"}'::jsonb, now());
+  DELETE FROM public.tenant_quizzes WHERE id='00000000-0000-0000-0000-0000000fa0de';  -- quiz gone; assignment now orphaned
   UPDATE public.tenant_assignments a
     SET cancelled_at = now(), cancelled_reason = 'content_missing'
     WHERE a.content_type = 'quiz' AND a.cancelled_at IS NULL
       AND NOT EXISTS (SELECT 1 FROM public.tenant_quizzes q WHERE q.id::text = a.content_id);
   ASSERT (SELECT cancelled_reason FROM public.tenant_assignments WHERE id='00000000-0000-0000-0000-0000000fb099') = 'content_missing', '13. orphan cancelled content_missing';
   ASSERT (SELECT count(*) FROM public.tenant_assignments WHERE id='00000000-0000-0000-0000-0000000fb099') = 1, '13. orphan row preserved (not deleted)';
-  -- idempotent: re-running touches nothing new
   UPDATE public.tenant_assignments a
     SET cancelled_at = now(), cancelled_reason = 'content_missing'
     WHERE a.content_type = 'quiz' AND a.cancelled_at IS NULL
@@ -186,6 +190,92 @@ DO $$ DECLARE v_cnt int; BEGIN
   GET DIAGNOSTICS v_cnt = ROW_COUNT;
   ASSERT v_cnt = 0, '13. cleanup idempotent (no rows on re-run)';
   RAISE NOTICE '13. orphan cleanup cancels missing-quiz assignment (content_missing), preserved + idempotent: PASS';
+END $$;
+
+-- ── Guard fixtures: lesson/course/quiz in active + non-active + cross-tenant ──
+INSERT INTO auth.users (id, aud, role, email, created_at, updated_at) VALUES
+ ('00000000-0000-0000-0000-0000000000f2','authenticated','authenticated','ql2@t.test',now(),now());
+UPDATE public.profiles SET role='user', tenant_id='00000000-0000-0000-0000-0000000000f0', status='active', name='QL2' WHERE id='00000000-0000-0000-0000-0000000000f2';
+INSERT INTO public.tenant_lessons (id, tenant_id, title, status) VALUES
+ ('00000000-0000-0000-0000-0000000aa001','00000000-0000-0000-0000-0000000000f0','LES_ACT','active'),
+ ('00000000-0000-0000-0000-0000000aa002','00000000-0000-0000-0000-0000000000f0','LES_ARC','archived'),
+ ('00000000-0000-0000-0000-0000000aa003','00000000-0000-0000-0000-0000000000e7','LES_XT','active');   -- other tenant
+INSERT INTO public.tenant_courses (id, tenant_id, title, lesson_ids, status) VALUES
+ ('00000000-0000-0000-0000-0000000ca001','00000000-0000-0000-0000-0000000000f0','CRS_ACT','[]'::jsonb,'active'),
+ ('00000000-0000-0000-0000-0000000ca002','00000000-0000-0000-0000-0000000000f0','CRS_ARC','[]'::jsonb,'archived');
+INSERT INTO public.tenant_quizzes (id, tenant_id, name, status) VALUES
+ ('00000000-0000-0000-0000-0000000fa010','00000000-0000-0000-0000-0000000000f0','QZ_DRAFT','draft'),
+ ('00000000-0000-0000-0000-0000000fa011','00000000-0000-0000-0000-0000000000f0','QZ_INACT','inactive'),
+ ('00000000-0000-0000-0000-0000000fa012','00000000-0000-0000-0000-0000000000e7','QZ_XT','active');   -- other tenant
+
+-- Helper: attempt a direct ACTIVE assignment INSERT; returns '' on success or SQLERRM.
+CREATE OR REPLACE FUNCTION pg_temp.try_assign(p_type text, p_content text) RETURNS text
+LANGUAGE plpgsql AS $$
+DECLARE msg text := ''; BEGIN
+  INSERT INTO public.tenant_assignments (tenant_id, content_type, content_id, assigned_to, assigned_at)
+    VALUES ('00000000-0000-0000-0000-0000000000f0', p_type, p_content,
+            '{"type":"individual","userId":"00000000-0000-0000-0000-0000000000f2","userName":"QL2"}'::jsonb, now());
+  RETURN '';  -- inserted (guard allowed)
+EXCEPTION WHEN others THEN RETURN SQLERRM; END $$;
+
+-- ── 14. LESSON assignability ─────────────────────────────────────────────────
+DO $$ BEGIN
+  ASSERT pg_temp.try_assign('lesson','00000000-0000-0000-0000-0000000aa001') = '', '14a. active lesson assignable';
+  ASSERT pg_temp.try_assign('lesson','00000000-0000-0000-0000-0000000aa002') LIKE '%assignment blocked%', '14b. archived lesson blocked';
+  ASSERT pg_temp.try_assign('lesson','00000000-0000-0000-0000-00000000beef') LIKE '%assignment blocked%', '14c. missing lesson blocked';
+  ASSERT pg_temp.try_assign('lesson','00000000-0000-0000-0000-0000000aa003') LIKE '%assignment blocked%', '14d. cross-tenant lesson blocked';
+  RAISE NOTICE '14. lesson: active assignable; archived/missing/cross-tenant blocked: PASS';
+END $$;
+
+-- ── 15. COURSE assignability ─────────────────────────────────────────────────
+DO $$ BEGIN
+  ASSERT pg_temp.try_assign('course','00000000-0000-0000-0000-0000000ca001') = '', '15a. active course assignable';
+  ASSERT pg_temp.try_assign('course','00000000-0000-0000-0000-0000000ca002') LIKE '%assignment blocked%', '15b. archived course blocked';
+  ASSERT pg_temp.try_assign('course','00000000-0000-0000-0000-00000000beef') LIKE '%assignment blocked%', '15c. missing course blocked';
+  RAISE NOTICE '15. course: active assignable; archived/missing blocked: PASS';
+END $$;
+
+-- ── 16. QUIZ assignability (active / archived / draft / inactive / missing / xt)
+DO $$ BEGIN
+  ASSERT pg_temp.try_assign('quiz','00000000-0000-0000-0000-0000000fa002') = '', '16a. active quiz assignable';        -- QZB active
+  ASSERT pg_temp.try_assign('quiz','00000000-0000-0000-0000-0000000fa001') LIKE '%assignment blocked%', '16b. archived quiz blocked';  -- QZA archived
+  ASSERT pg_temp.try_assign('quiz','00000000-0000-0000-0000-0000000fa010') LIKE '%assignment blocked%', '16c. draft quiz blocked';
+  ASSERT pg_temp.try_assign('quiz','00000000-0000-0000-0000-0000000fa011') LIKE '%assignment blocked%', '16d. inactive quiz blocked';
+  ASSERT pg_temp.try_assign('quiz','00000000-0000-0000-0000-00000000beef') LIKE '%assignment blocked%', '16e. missing quiz blocked';
+  ASSERT pg_temp.try_assign('quiz','00000000-0000-0000-0000-0000000fa012') LIKE '%assignment blocked%', '16f. cross-tenant quiz blocked';
+  RAISE NOTICE '16. quiz: active assignable; archived/draft/inactive/missing/cross-tenant blocked: PASS';
+END $$;
+
+-- ── 17. History carve-out — a pre-CANCELLED row to archived/missing content is
+--       insertable (controlled migration/history), never gated by the guard ───
+DO $$ BEGIN
+  INSERT INTO public.tenant_assignments (id, tenant_id, content_type, content_id, assigned_to, assigned_at, cancelled_at, cancelled_reason) VALUES
+   ('00000000-0000-0000-0000-0000000fb0c1','00000000-0000-0000-0000-0000000000f0','quiz','00000000-0000-0000-0000-0000000fa001',
+    '{"type":"individual","userId":"00000000-0000-0000-0000-0000000000f2","userName":"QL2"}'::jsonb, now(), now(), 'content_archived'),
+   ('00000000-0000-0000-0000-0000000fb0c2','00000000-0000-0000-0000-0000000000f0','quiz','00000000-0000-0000-0000-00000000beef',
+    '{"type":"individual","userId":"00000000-0000-0000-0000-0000000000f2","userName":"QL2"}'::jsonb, now(), now(), 'content_missing');
+  ASSERT (SELECT count(*) FROM public.tenant_assignments WHERE id IN ('00000000-0000-0000-0000-0000000fb0c1','00000000-0000-0000-0000-0000000fb0c2')) = 2, '17. pre-cancelled history rows inserted';
+  RAISE NOTICE '17. history carve-out: pre-cancelled rows to archived/missing content remain insertable: PASS';
+END $$;
+
+-- ── 18. Engine path — create_assignments_atomic honours the guard ────────────
+-- Active quiz via the RPC succeeds; archived quiz via the RPC is rejected (proves
+-- the guard fires inside the assignment engine, not only on direct inserts).
+DO $$ DECLARE r jsonb; msg text := ''; BEGIN
+  PERFORM set_config('request.jwt.claims','{"sub":"00000000-0000-0000-0000-0000000000f9","role":"authenticated"}',true);
+  r := public.create_assignments_atomic(
+        '00000000-0000-0000-0000-0000000000f0','quiz','00000000-0000-0000-0000-0000000fa003',
+        '[{"userId":"00000000-0000-0000-0000-0000000000f2","userName":"QL2"}]'::jsonb,
+        'Open', false, '00000000-0000-0000-0000-0000000000f9', 'individual', NULL, NULL);   -- QZC active
+  ASSERT (r->>'assignedCount')::int = 1, '18a. active quiz assigned via engine: '||r::text;
+  BEGIN
+    PERFORM public.create_assignments_atomic(
+      '00000000-0000-0000-0000-0000000000f0','quiz','00000000-0000-0000-0000-0000000fa001',
+      '[{"userId":"00000000-0000-0000-0000-0000000000f2","userName":"QL2"}]'::jsonb,
+      'Open', false, '00000000-0000-0000-0000-0000000000f9', 'individual', NULL, NULL);      -- QZA archived
+  EXCEPTION WHEN others THEN msg := SQLERRM; END;
+  ASSERT msg LIKE '%assignment blocked%', '18b. engine rejects archived quiz: '||msg;
+  RAISE NOTICE '18. create_assignments_atomic: active assigns, archived rejected (guard fires in-engine): PASS';
 END $$;
 
 DO $$ BEGIN RAISE NOTICE '065 ALL TESTS PASSED'; END $$;

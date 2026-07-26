@@ -140,12 +140,20 @@ END $$;
 
 -- ── 8. Backfill cancels stranded assignments (archived/missing content) ──────
 DO $$ DECLARE v_cancelled int; BEGIN
-  -- A fresh active assignment pointing at an already-archived lesson (S1) + a missing lesson id.
+  -- Create the orphans the way production actually gets them (and the way the
+  -- 065 content-assignability guard requires): assign while the lesson is ACTIVE
+  -- (guard passes), THEN make the content unavailable — archive one, delete the
+  -- other — leaving stranded active assignment rows for the backfill to cancel.
+  INSERT INTO public.tenant_lessons (id, tenant_id, title, status) VALUES
+   ('00000000-0000-0000-0000-0000000d00a1','00000000-0000-0000-0000-0000000000d0','Strand-arch','active'),
+   ('00000000-0000-0000-0000-0000000d00a2','00000000-0000-0000-0000-0000000000d0','Strand-miss','active');
   INSERT INTO public.tenant_assignments (id, tenant_id, content_type, content_id, assigned_to, assigned_at) VALUES
-   ('00000000-0000-0000-0000-0000000da010','00000000-0000-0000-0000-0000000000d0','lesson','00000000-0000-0000-0000-0000000d0001',
+   ('00000000-0000-0000-0000-0000000da010','00000000-0000-0000-0000-0000000000d0','lesson','00000000-0000-0000-0000-0000000d00a1',
      '{"type":"individual","userId":"00000000-0000-0000-0000-0000000000d1","userName":"L1"}'::jsonb, now()),
-   ('00000000-0000-0000-0000-0000000da011','00000000-0000-0000-0000-0000000000d0','lesson','ll_missing_temp_id',
+   ('00000000-0000-0000-0000-0000000da011','00000000-0000-0000-0000-0000000000d0','lesson','00000000-0000-0000-0000-0000000d00a2',
      '{"type":"individual","userId":"00000000-0000-0000-0000-0000000000d1","userName":"L1"}'::jsonb, now());
+  UPDATE public.tenant_lessons SET status='archived' WHERE id='00000000-0000-0000-0000-0000000d00a1';  -- archived content
+  DELETE FROM public.tenant_lessons WHERE id='00000000-0000-0000-0000-0000000d00a2';                    -- missing content
   -- Re-run the migration's backfill predicate (idempotent).
   UPDATE public.tenant_assignments a
     SET cancelled_at = now(), cancelled_reason = 'content_unavailable_backfill'
