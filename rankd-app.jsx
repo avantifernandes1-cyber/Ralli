@@ -1469,11 +1469,11 @@ function PersonalDashboardScreen({
                     Your results will appear here after your first attempt.
                   </div>
                   <button
-                    onClick={() => onNav?.("quizzes")}
+                    onClick={() => onNav?.("learn")}
                     style={{ padding: "7px 14px", borderRadius: 8, border: `1px solid ${C.orangeBorder}`,
                       background: C.orangeLight, color: C.orange, fontSize: 12, fontWeight: 600, cursor: "pointer" }}
                   >
-                    Browse Quizzes →
+                    Go to Learn →
                   </button>
                 </div>
               ) : (isReal ? realQuizResults : demoQuizResults).map((q, i, arr) => (
@@ -8678,7 +8678,7 @@ function QuizBuilderScreen({ onNav, onSave, onDone, initialQuiz, isReal = false,
     <div style={{ display:"flex", flexDirection:"column", height:"100%", gap:0 }}>
       {/* Header */}
       <div style={{ display:"flex", alignItems:"center", gap:14, paddingBottom:20, marginBottom:20, borderBottom:`1px solid ${C.border}`, flexShrink:0 }}>
-        <button onClick={() => onNav("quizzes")} style={{ padding:"8px 14px", borderRadius:10, border:`1px solid ${C.border}`, background:C.white, color:C.textSub, fontSize:13, fontWeight:600, cursor:"pointer", flexShrink:0 }}>← Back</button>
+        <button onClick={() => (onDone ?? (() => onNav("quizzes")))()} style={{ padding:"8px 14px", borderRadius:10, border:`1px solid ${C.border}`, background:C.white, color:C.textSub, fontSize:13, fontWeight:600, cursor:"pointer", flexShrink:0 }}>← Back</button>
         <input value={name} onChange={e => setName(e.target.value)} placeholder="Quiz name…" style={{
           flex:1, fontSize:20, fontWeight:900, color:C.text, border:"none", background:"transparent", outline:"none", fontFamily:"inherit",
           borderBottom:`2px solid ${name.trim() ? C.orange : C.border}`, paddingBottom:4,
@@ -8951,7 +8951,7 @@ function fmtUpdated(iso) {
   return d.toLocaleDateString("en-US", { month: "short", day: "numeric", year: "numeric" });
 }
 
-function LearnScreen({ role, canManageLearn, user, orgUsers = [], orgs = [], onNav, onStartQuiz, onAwardXp, pendingLessonId, onClearPendingLesson, pendingCourseId, onClearPendingCourse, canCreate = true, canEdit = true, canDelete = true, canAssign = true, tenantId = null, isReal = false, quizzes = [], sharedAssignmentData = null }) {
+function LearnScreen({ role, canManageLearn, user, orgUsers = [], orgs = [], onNav, onStartQuiz, onAwardXp, pendingLessonId, onClearPendingLesson, pendingCourseId, onClearPendingCourse, canCreate = true, canEdit = true, canDelete = true, canAssign = true, tenantId = null, isReal = false, quizzes = [], sharedAssignmentData = null, quizzesPanel = null }) {
   // "Can manage Learn" (assignment tracking, assign/unassign, content CRUD/archive)
   // is a Learn-scoped authority derived from the canonical profile role — it now
   // includes the DB `manager` role, which the backend RLS/RPCs already authorize.
@@ -8966,7 +8966,7 @@ function LearnScreen({ role, canManageLearn, user, orgUsers = [], orgs = [], onN
     if (!isAdmin) return "assigned";
     try {
       const saved = sessionStorage.getItem("ralli_learn_admin_tab");
-      if (saved && ["courses", "lessons", "assignments", "archived"].includes(saved)) return saved;
+      if (saved && ["courses", "lessons", "quizzes", "assignments", "archived"].includes(saved)) return saved;
     } catch {}
     return "courses";
   });
@@ -9042,7 +9042,12 @@ function LearnScreen({ role, canManageLearn, user, orgUsers = [], orgs = [], onN
   const [archiveInFlight,  setArchiveInFlight]  = useState(new Set()); // IDs currently being archived/restored
   const [tenantCompletions, setTenantCompletions] = useState([]); // manager/admin only
   const [tenantQuizAttempts, setTenantQuizAttempts] = useState([]); // manager/admin only — real quiz_attempts rows, powers Assignments tab quiz status
-  const [selectedAssignmentId, setSelectedAssignmentId] = useState(null); // manager click-through
+  const [selectedAssignmentId, setSelectedAssignmentId] = useState(null); // manager click-through (legacy; drill states below)
+  // Drilldowns keyed on STABLE ids (never display name / array index):
+  //   drillContent = { contentType, contentId } → every learner instance of one content
+  //   drillRep     = learner userId             → one learner's history across all content
+  const [drillContent, setDrillContent] = useState(null);
+  const [drillRep, setDrillRep] = useState(null);
   const [selectedRowKey, setSelectedRowKey] = useState(null); // manager per-rep drill-down (Task 11)
   const [assignTimeframe,  setAssignTimeframe]  = useState("all"); // "all" | "week" | "month" | "custom"
   const [assignDateRange,  setAssignDateRange]  = useState({ start: "", end: "" }); // ISO date strings for custom range
@@ -10058,6 +10063,7 @@ function LearnScreen({ role, canManageLearn, user, orgUsers = [], orgs = [], onN
   const TABS = [
     { id: "courses",     label: "Courses",     count: filteredCourses.length },
     { id: "lessons",     label: "Lessons",     count: filteredLessons.length },
+    { id: "quizzes",     label: "Quizzes" },
     { id: "assignments", label: "Assignments", count: activeAssignmentCount },
     { id: "archived",    label: "Archived",    count: archivedCourses.length + archivedLessons.length },
   ];
@@ -10209,6 +10215,15 @@ function LearnScreen({ role, canManageLearn, user, orgUsers = [], orgs = [], onN
           )}
         </div>
       )}
+
+      {/* QUIZZES TAB — the existing canonical manager quiz library, embedded
+          here (Learn is now the unified area). App passes the ready-configured
+          <QuizzesScreen role="admin" …/> element as `quizzesPanel`, so there is
+          ONE quiz-manager implementation, mounted only when this tab is active —
+          no duplicated services/state/hooks, no second copy. */}
+      {tab === "quizzes" && (quizzesPanel ?? (
+        <div style={{ padding: 60, textAlign: "center", color: C.textMuted, fontSize: 14 }}>Quiz library unavailable.</div>
+      ))}
 
       {/* ASSIGNMENTS TAB — manager assignment portal.
           Honest states: error (retryable) → loading → data/empty. A refresh shows
@@ -10409,19 +10424,26 @@ function LearnScreen({ role, canManageLearn, user, orgUsers = [], orgs = [], onN
           content_archived: timeframeRows.filter(isContentArchived).length,
         };
 
-        // Detail view when an assignment is selected
-        const detailAssignment = selectedAssignmentId ? assignments.find(a => a.id === selectedAssignmentId) : null;
-        const detailContent = detailAssignment
-          ? (detailAssignment.contentType === "course" ? courses.find(c => c.id === detailAssignment.contentId) : lessons.find(l => l.id === detailAssignment.contentId))
+        // Content drilldown context (resolved by STABLE contentType+contentId).
+        const isDrilled = !!drillContent || !!drillRep;
+        const drillContentTitle = drillContent
+          ? ((drillContent.contentType === "course" ? courses.find(c => c.id === drillContent.contentId)
+             : drillContent.contentType === "quiz" ? quizzes.find(q => q.id === drillContent.contentId)
+             : lessons.find(l => l.id === drillContent.contentId))?.title
+             ?? (drillContent.contentType === "course" ? "Course" : drillContent.contentType === "quiz" ? "Quiz" : "Lesson") + " (removed)")
           : null;
+        const drillRepName = drillRep ? (timeframeRows.find(r => r.u?.id === drillRep)?.u?.name ?? "Learner") : null;
 
-        // Rows to show: timeframe + status + search filtered, or detail-drilled
+        // Rows to show: content drilldown (all learner instances of one content) →
+        // rep drilldown (one learner's history) → timeframe/status/search filtered.
         const searchedRows = sq
           ? filteredRows.filter(r => r.content?.title.toLowerCase().includes(sq) || r.u?.name?.toLowerCase().includes(sq))
           : filteredRows;
-        const visibleRows = selectedAssignmentId
-          ? filteredRows.filter(r => r.a.id === selectedAssignmentId)
-          : searchedRows;
+        const visibleRows = drillContent
+          ? filteredRows.filter(r => r.a.contentType === drillContent.contentType && r.a.contentId === drillContent.contentId)
+          : drillRep
+            ? filteredRows.filter(r => r.u?.id === drillRep)
+            : searchedRows;
 
         // Per-rep drill-down (Task 11) — reuses QuizAttemptDrilldown for
         // quizzes (same component QuizzesScreen's tracking panel uses) and
@@ -10492,7 +10514,8 @@ function LearnScreen({ role, canManageLearn, user, orgUsers = [], orgs = [], onN
                   onClick={canDrilldown ? () => setSelectedRowKey(rowKey) : undefined}
                   style={{ minWidth: 940, display: "grid", gridTemplateColumns: TRACKING_GRID, gap: 10, padding: "13px 16px", background: C.white, borderTop: `1px solid ${C.border}`, alignItems: "center", cursor: canDrilldown ? "pointer" : "default" }}
                 >
-                  {/* Content — also independently clickable to drill into this assignment across all reps */}
+                  {/* Content — clicking the title/type drills into this CONTENT
+                      (all learner instances), keyed on stable contentType+contentId. */}
                   <div style={{ display: "flex", alignItems: "center", gap: 10, minWidth: 0 }}>
                     {contentIcon && (
                       <div style={{ width: 30, height: 30, borderRadius: 7, background: tColor + "20", flexShrink: 0, display: "flex", alignItems: "center", justifyContent: "center", fontSize: 13 }}>
@@ -10501,8 +10524,10 @@ function LearnScreen({ role, canManageLearn, user, orgUsers = [], orgs = [], onN
                     )}
                     <div style={{ minWidth: 0 }}>
                       <button
-                        onClick={(e) => { e.stopPropagation(); setSelectedAssignmentId(selectedAssignmentId === a.id ? null : a.id); }}
-                        style={{ background: "none", border: "none", padding: 0, cursor: "pointer", textAlign: "left" }}
+                        onClick={(e) => { e.stopPropagation(); setDrillRep(null); setDrillContent(drillContent && drillContent.contentId === a.contentId && drillContent.contentType === a.contentType ? null : { contentType: a.contentType, contentId: a.contentId }); }}
+                        style={{ background: "none", border: "none", padding: 0, cursor: missingContent ? "default" : "pointer", textAlign: "left" }}
+                        disabled={missingContent}
+                        title={missingContent ? undefined : "See every learner assigned this"}
                       >
                         <div style={{ fontSize: 13, fontWeight: 700, color: missingContent ? C.textMuted : C.text, fontStyle: missingContent ? "italic" : "normal", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap", textDecoration: missingContent ? "none" : "underline", textDecorationColor: C.border }}>{contentTitle}</div>
                       </button>
@@ -10517,13 +10542,22 @@ function LearnScreen({ role, canManageLearn, user, orgUsers = [], orgs = [], onN
                     const originLabel = (a.source?.type && a.source.type !== "individual")
                       ? (a.source.label ?? (a.source.type === "group" ? "Everyone" : a.source.type === "all" ? "All users" : "Team"))
                       : (a.assignedTo?.type === "team" ? (a.assignedTo.teamName ?? "Team") : a.assignedTo?.type === "group" ? "Everyone" : null);
+                    // Clicking the learner drills into THAT learner's history
+                    // (all content), keyed on stable userId. Aggregate rows aren't
+                    // an individual, so they're not drillable.
+                    const canDrillRep = !u._isAggregate && !!u.id;
                     return (
                       <div style={{ display: "flex", alignItems: "center", gap: 7, minWidth: 0 }}>
                         <div style={{ width: 24, height: 24, borderRadius: "50%", background: u.color ?? C.orange, display: "flex", alignItems: "center", justifyContent: "center", fontSize: 10, fontWeight: 700, color: "#fff", flexShrink: 0 }}>
                           {(u.initials ?? u.name?.[0] ?? "?").toUpperCase()}
                         </div>
                         <div style={{ minWidth: 0 }}>
-                          <div style={{ fontSize: 13, fontWeight: 600, color: C.text, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{u.name}</div>
+                          <button
+                            onClick={(e) => { e.stopPropagation(); if (!canDrillRep) return; setDrillContent(null); setDrillRep(drillRep === u.id ? null : u.id); }}
+                            disabled={!canDrillRep}
+                            title={canDrillRep ? "See this learner's assignment history" : undefined}
+                            style={{ background: "none", border: "none", padding: 0, cursor: canDrillRep ? "pointer" : "default", textAlign: "left", fontSize: 13, fontWeight: 600, color: C.text, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap", maxWidth: "100%", textDecoration: canDrillRep ? "underline" : "none", textDecorationColor: C.border }}
+                          >{u.name}</button>
                           {originLabel && <div style={{ fontSize: 10, color: C.textMuted, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>via {originLabel}</div>}
                         </div>
                       </div>
@@ -10593,7 +10627,7 @@ function LearnScreen({ role, canManageLearn, user, orgUsers = [], orgs = [], onN
             {/* Compact dropdown filters (Status / Content Type / Rep / Timeframe)
                 — replaces the tab rows. All combine over the one canonical history
                 dataset; defaults show every row. Unassigned stays a Status option. */}
-            {!selectedAssignmentId && (() => {
+            {!isDrilled && (() => {
               const selStyle = { padding: "7px 10px", borderRadius: 8, border: `1px solid ${C.border}`, background: C.white, color: C.text, fontSize: 12, fontWeight: 600, cursor: "pointer" };
               const labelStyle = { fontSize: 10, fontWeight: 700, color: C.textMuted, letterSpacing: "0.04em", marginBottom: 4, display: "block" };
               const cnt = (n) => (n > 0 ? ` (${n})` : "");
@@ -10647,23 +10681,29 @@ function LearnScreen({ role, canManageLearn, user, orgUsers = [], orgs = [], onN
               );
             })()}
 
-            {/* Detail view header */}
-            {selectedAssignmentId && detailContent && (
+            {/* Drilldown header — content (all learners) or rep (all content) */}
+            {isDrilled && (
               <div style={{ display: "flex", alignItems: "center", gap: 12, marginBottom: 16, padding: "12px 16px", background: C.white, borderRadius: 10, border: `1px solid ${C.border}` }}>
-                <button onClick={() => setSelectedAssignmentId(null)} style={{ background: "none", border: "none", cursor: "pointer", color: C.textSub, fontSize: 13, fontWeight: 700, display: "flex", alignItems: "center", gap: 6, padding: 0, flexShrink: 0 }}>← All Assignments</button>
+                <button onClick={() => { setDrillContent(null); setDrillRep(null); }} style={{ background: "none", border: "none", cursor: "pointer", color: C.textSub, fontSize: 13, fontWeight: 700, display: "flex", alignItems: "center", gap: 6, padding: 0, flexShrink: 0 }}>← All Assignments</button>
                 <span style={{ color: C.border, fontSize: 18 }}>|</span>
-                {(detailAssignment?.contentType === "quiz" || (detailAssignment?.contentType === "course" && detailContent.emoji)) && (
-                  <span style={{ fontSize: 15 }}>{detailAssignment?.contentType === "course" ? detailContent.emoji : "📋"}</span>
-                )}
                 <div style={{ flex: 1, minWidth: 0 }}>
-                  <div style={{ fontSize: 14, fontWeight: 700, color: C.text }}>{detailContent.title ?? detailContent.name}</div>
-                  <div style={{ fontSize: 11, color: C.textSub }}>{detailAssignment?.contentType === "course" ? "Course" : detailAssignment?.contentType === "quiz" ? "Quiz" : "Lesson"} · {detailAssignment?.required ? "Required" : "Recommended"} · {visibleRows.length} rep{visibleRows.length !== 1 ? "s" : ""}</div>
+                  {drillContent ? (
+                    <>
+                      <div style={{ fontSize: 14, fontWeight: 700, color: C.text }}>{drillContentTitle}</div>
+                      <div style={{ fontSize: 11, color: C.textSub }}>{drillContent.contentType === "course" ? "Course" : drillContent.contentType === "quiz" ? "Quiz" : "Lesson"} · every learner assigned · {visibleRows.length} instance{visibleRows.length !== 1 ? "s" : ""}</div>
+                    </>
+                  ) : (
+                    <>
+                      <div style={{ fontSize: 14, fontWeight: 700, color: C.text }}>{drillRepName}</div>
+                      <div style={{ fontSize: 11, color: C.textSub }}>Learner assignment history · {visibleRows.length} item{visibleRows.length !== 1 ? "s" : ""}</div>
+                    </>
+                  )}
                 </div>
               </div>
             )}
 
             {/* Row count label */}
-            {!selectedAssignmentId && (
+            {!isDrilled && (
               <p style={{ margin: "0 0 14px", fontSize: 13, color: C.textSub }}>{visibleRows.length} rep assignment{visibleRows.length !== 1 ? "s" : ""}</p>
             )}
 
@@ -22930,7 +22970,8 @@ const NAV_ITEMS = [
   { id: "rankd",       label: "Ralli",   icon: "", badge: "LIVE", featureKey: "games", permKey: "games" },
   { id: "learn",       label: "Learn",        icon: "", featureKey: "learn",       permKey: "learn" },
   { id: "battlecards", label: "Battle Cards", icon: "", featureKey: "learn",       permKey: "battlecards" },
-  { id: "quizzes",     label: "Quizzes",      icon: "", featureKey: "learn",       permKey: "quizzes" },
+  // Quizzes is no longer a standalone nav item for ANY role — it lives under
+  // Learn (manager: Learn → Quizzes tab; learner: assigned quizzes in Learn/Home).
   { id: "settings",    label: "Settings",     icon: "", permKey: "settings" },
 ];
 
@@ -24524,7 +24565,12 @@ export default function App() {
 
   // Navigate away + clear the editing quiz once the builder's full save
   // (content + tags) has succeeded.
-  const handleQuizBuilderDone = () => { setEditingQuiz(null); setScreen("quizzes"); };
+  // Quiz authoring now lives under Learn → Quizzes. The builder is a focused
+  // full-screen editor; finishing/cancelling returns to Learn → Quizzes (not the
+  // retired standalone Quizzes screen). We seed the Learn admin subtab via the
+  // same sessionStorage key LearnScreen reads on mount.
+  const returnToLearnQuizzes = () => { setEditingQuiz(null); try { sessionStorage.setItem("ralli_learn_admin_tab", "quizzes"); } catch {} setScreen("learn"); };
+  const handleQuizBuilderDone = () => returnToLearnQuizzes();
 
   const handleEditQuiz = (quiz) => {
     setEditingQuiz(quiz);
@@ -25094,7 +25140,10 @@ export default function App() {
       }} />;
       case "rankd-game":        return <RankdGameScreen onNav={navigate} sessionName={lobbySessionName} role={gameRole} playerName={lobbyPlayerName ?? user.name} playerEmoji={lobbyPlayerEmoji} questions={gameQuestions ?? GAME_QUESTIONS} demoMode={gameRole === "admin" && activeGameIsDemo} pin={lobbyPin} sessionDbId={activeGameSessionDbId} tenantId={currentOrg?.id ?? user?.orgId ?? null} broadcast={broadcast} trackPlayerPresence={trackPlayerPresence} chMsg={chMsg} chStatus={chStatus} chAnswers={chAnswers} chPlayers={chPlayers} playerId={gamePlayerId} onGameEnd={handleGameEnd} setChAnswers={setChAnswers} />;
       case "rankd-results":     return <RankdResultsScreen onNav={navigate} sessionDbId={viewResultsDbId} sessionCode={viewResultsCode} sessions={[...sessions, ...pastSessions]} gameData={gameResultsData} />;
-      case "learn":             return <LearnScreen role={gameRole} canManageLearn={canManageLearn} user={user} orgUsers={orgUsers} orgs={orgs} onNav={navigate} onStartQuiz={(id) => { setPendingQuizId(id); navigate("quizzes"); }} onAwardXp={handleAwardXp} pendingLessonId={pendingLessonId} onClearPendingLesson={() => setPendingLessonId(null)} pendingCourseId={pendingCourseId} onClearPendingCourse={() => setPendingCourseId(null)} canCreate={perm("actions","create")} canEdit={perm("actions","edit")} canDelete={perm("actions","delete")} canAssign={perm("actions","assign")} tenantId={currentOrg?.id ?? null} isReal={!!user?._isReal} quizzes={quizzes} sharedAssignmentData={sharedAssignmentData} />;
+      case "learn":             return <LearnScreen role={gameRole} canManageLearn={canManageLearn} user={user} orgUsers={orgUsers} orgs={orgs} onNav={navigate} onStartQuiz={(id) => { setPendingQuizId(id); navigate("quizzes"); }} onAwardXp={handleAwardXp} pendingLessonId={pendingLessonId} onClearPendingLesson={() => setPendingLessonId(null)} pendingCourseId={pendingCourseId} onClearPendingCourse={() => setPendingCourseId(null)} canCreate={perm("actions","create")} canEdit={perm("actions","edit")} canDelete={perm("actions","delete")} canAssign={perm("actions","assign")} tenantId={currentOrg?.id ?? null} isReal={!!user?._isReal} quizzes={quizzes} sharedAssignmentData={sharedAssignmentData}
+        quizzesPanel={canManageLearn ? (
+          <QuizzesScreen role="admin" onNav={navigate} quizzes={quizzes} onEditQuiz={handleEditQuiz} onDeleteQuiz={handleDeleteQuiz} onToggleFavorite={handleToggleFavorite} onToggleActive={handleToggleActive} pendingQuizId={null} onClearPendingQuiz={() => {}} canCreate={perm("actions","create")} canEdit={perm("actions","edit")} canDelete={perm("actions","delete")} canLaunch={perm("actions","launch")} canAssign={perm("actions","assign")} onAssignQuiz={handleAssignQuiz} onLaunchQuiz={handleCreateSession} orgUsers={orgUsers} orgs={orgs} currentUser={currentUser} tenantId={currentOrg?.id ?? null} isReal={!!user?._isReal} quizzesReady={quizzesReady} sharedAssignmentData={sharedAssignmentData} onRefreshQuizzes={refreshQuizzes} />
+        ) : null} />;
       case "quizzes":           return <QuizzesScreen role={gameRole} onNav={navigate} quizzes={quizzes} onEditQuiz={handleEditQuiz} onDeleteQuiz={handleDeleteQuiz} onToggleFavorite={handleToggleFavorite} onToggleActive={handleToggleActive} pendingQuizId={pendingQuizId} onClearPendingQuiz={() => setPendingQuizId(null)} canCreate={perm("actions","create")} canEdit={perm("actions","edit")} canDelete={perm("actions","delete")} canLaunch={perm("actions","launch")} canAssign={perm("actions","assign")} onAssignQuiz={handleAssignQuiz} onLaunchQuiz={handleCreateSession} orgUsers={orgUsers} orgs={orgs} currentUser={currentUser} tenantId={currentOrg?.id ?? null} isReal={!!user?._isReal} quizzesReady={quizzesReady} sharedAssignmentData={sharedAssignmentData} onRefreshQuizzes={refreshQuizzes} />;
       case "battlecards":       return (isAdminType && perm("actions","edit"))
         ? <BattleCardsAdminScreen categories={bcCategories} cards={battleCards} onSaveCategory={handleSaveBcCategory} onDeleteCategory={handleDeleteBcCategory} onSaveCard={handleSaveBattleCard} onDeleteCard={handleDeleteBattleCard} />
@@ -25169,19 +25218,14 @@ export default function App() {
                 { id: "organizations", label: "Organizations", icon: "" },
                 { id: "rankd",         label: "Ralli",   icon: "", badge: "LIVE" },
                 { id: "learn",         label: "Learn",         icon: "" },
-                { id: "quizzes",       label: "Quizzes",       icon: "" },
                 { id: "battlecards",   label: "Battle Cards",  icon: "" },
                 { id: "settings",      label: "Settings",      icon: "" },
               ] : [
                 // Filter nav items by (1) subscription plan and (2) admin-controlled role permission.
+                // (Quizzes is not in NAV_ITEMS — it lives under Learn for every role.)
                 ...NAV_ITEMS.filter(item =>
                   (!item.featureKey || canAccessTenant(item.featureKey)) &&
-                  perm("features", item.permKey ?? item.id) &&
-                  // Learners have no standalone Quizzes nav — they reach assigned
-                  // quizzes through Home → Assigned Learning and Learn (deep-links
-                  // still auto-launch the exact quiz). Managers keep Quizzes for
-                  // authoring/tagging/assigning/reporting.
-                  !(item.id === "quizzes" && !canManageLearn)
+                  perm("features", item.permKey ?? item.id)
                 ),
                 // Team is managed inside Settings for org admins
               ]),
@@ -25396,13 +25440,11 @@ export default function App() {
             { id: "organizations", label: "Organizations", icon: "" },
             { id: "rankd",         label: "Ralli",    icon: "", badge: "LIVE" },
             { id: "learn",         label: "Learn",         icon: "" },
-            { id: "quizzes",       label: "Quizzes",       icon: "" },
             { id: "battlecards",   label: "Battle Cards",  icon: "" },
             { id: "settings",      label: "Settings",      icon: "" },
           ] : NAV_ITEMS.filter(item =>
             (!item.featureKey || canAccessTenant(item.featureKey)) &&
-            perm("features", item.permKey ?? item.id) &&
-            !(item.id === "quizzes" && !canManageLearn)  // learners: no standalone Quizzes nav (see desktop nav)
+            perm("features", item.permKey ?? item.id)
           )).map(item => {
             const active = screen === item.id || (screen.startsWith("rankd-") && item.id === "rankd");
             return (
