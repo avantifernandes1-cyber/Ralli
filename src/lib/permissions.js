@@ -134,6 +134,36 @@ export const DEFAULT_ROLE_PERMISSIONS = {
       manageSettings: false,
     },
   },
+  // manager — a tenant "Manager" (DB role `manager`). Backend RLS/RPCs authorize
+  // this role for Learn content + assignments EXACTLY like orgAdmin: tenant_lessons
+  // / tenant_courses INSERT/UPDATE/DELETE, create_assignments_atomic (034),
+  // archive_lesson/archive_course (063), unassign_assignment (064). So the Learn
+  // actions below mirror that authority. It intentionally does NOT gain the
+  // non-Learn admin surfaces (Battle Cards / Insights / Progress admin / tenant
+  // settings) — those stay gated by isAdminType (which excludes `manager`) and by
+  // manageSettings:false — so this does not grant unrelated admin capabilities.
+  manager: {
+    features: {
+      home:        true,
+      games:       true,
+      learn:       true,
+      quizzes:     true,
+      battlecards: true,
+      progress:    true,
+      leaderboard: true,
+      settings:    true,
+    },
+    actions: {
+      view:           true,
+      create:         true,
+      edit:           true,
+      delete:         true,
+      assign:         true,
+      launch:         true,
+      manageResults:  true,
+      manageSettings: false,
+    },
+  },
 };
 
 // Load saved role permissions for a tenant from localStorage.
@@ -161,6 +191,10 @@ export function loadRolePermissions(tenantId) {
         orgAdmin: {
           features: { ...DEFAULT_ROLE_PERMISSIONS.orgAdmin.features, ...parsed.orgAdmin?.features },
           actions:  { ...DEFAULT_ROLE_PERMISSIONS.orgAdmin.actions,  ...parsed.orgAdmin?.actions  },
+        },
+        manager: {
+          features: { ...DEFAULT_ROLE_PERMISSIONS.manager.features, ...parsed.manager?.features },
+          actions:  { ...DEFAULT_ROLE_PERMISSIONS.manager.actions,  ...parsed.manager?.actions  },
         },
       };
     }

@@ -966,6 +966,14 @@ function PersonalDashboardScreen({
   readinessThreshold = 80,
 }) {
   const mobile     = useMobile();
+  // Home "Assigned Learning" is lessons + courses ONLY (contradiction 1) — the
+  // same content types Learner Learn → Assigned shows, resolved from the same
+  // latest-instance dataset. Quiz assignments are a separate product area: they
+  // live in Quizzes → To Do (and the manager assignment history), never counted
+  // or previewed inside Home's learning section. These derived sets drive the
+  // Assigned Learning header count, preview cards, and "+ N more".
+  const learningPending   = pendingAssignments.filter(x => x.contentKind !== "quiz");
+  const learningCompleted = completedAssignments.filter(x => x.contentKind !== "quiz");
   const firstName  = (user.name ?? "").split(" ")[0];
   const hour       = new Date().getHours();
   const greeting   = hour < 12 ? "Good morning" : hour < 17 ? "Good afternoon" : "Good evening";
@@ -1363,7 +1371,9 @@ function PersonalDashboardScreen({
 
       {/* ── Continue Learning — in-progress assignments, resume where you left off ── */}
       {(() => {
-        const inProgress = pendingAssignments.filter(x => x.pct > 0);
+        // Lessons/courses only — quizzes are resumed from Quizzes → To Do, never
+        // a Home learning section (contradiction 1).
+        const inProgress = learningPending.filter(x => x.pct > 0);
         if (!inProgress.length) return null;
         return (
           <div>
@@ -1404,24 +1414,24 @@ function PersonalDashboardScreen({
         {/* Left — Assigned + In Progress ─────────────── */}
         <div style={{ display: "flex", flexDirection: "column", gap: 12 }}>
           {SH("Assigned Learning",
-            pendingAssignments.length > 0
-              ? `${pendingAssignments.length} pending · ${completedAssignments.length} complete`
+            learningPending.length > 0
+              ? `${learningPending.length} pending · ${learningCompleted.length} complete`
               : "All caught up"
           )}
 
           {homeLoading ? (
             <Card><p style={{ margin: 0, fontSize: 14, color: C.textSub }}>Loading assignments…</p></Card>
-          ) : pendingAssignments.length === 0 ? (
+          ) : learningPending.length === 0 ? (
             <Card>
               <div style={{ display: "flex", alignItems: "center", gap: 6, marginBottom: 8 }}>
                 <div style={{ width: 8, height: 8, borderRadius: 2, background: C.trueGreen }} />
                 <span style={{ fontSize: 11, fontWeight: 700, color: C.trueGreen, letterSpacing: "0.06em" }}>ALL CAUGHT UP</span>
               </div>
               <p style={{ margin: 0, fontSize: 14, color: C.textSub }}>
-                No outstanding assignments. Check the Learn or Quizzes tabs for more content.
+                No outstanding lessons or courses. Check the Learn or Quizzes tabs for more content.
               </p>
             </Card>
-          ) : pendingAssignments.slice(0, 3).map((item) => {
+          ) : learningPending.slice(0, 3).map((item) => {
             const { content, contentKind, pct, dueStatus } = item;
             const typeColor = contentKind === "course" ? (content.color ?? C.orange)
               : contentKind === "quiz" ? C.purple : LESSON_TYPE_COLORS[content.type] ?? C.blue;
@@ -1483,14 +1493,14 @@ function PersonalDashboardScreen({
             );
           })}
 
-          {pendingAssignments.length > 3 && (
+          {learningPending.length > 3 && (
             <button
               onClick={() => onNav?.("learn")}
               style={{ padding: "10px", borderRadius: 10, border: `1px solid ${C.border}`,
                 background: C.pageBg, color: C.orange, fontSize: 13, fontWeight: 600,
                 cursor: "pointer", textAlign: "center" }}
             >
-              +{pendingAssignments.length - 3} more — View all in Learn →
+              +{learningPending.length - 3} more — View all in Learn →
             </button>
           )}
         </div>
@@ -8991,8 +9001,12 @@ function fmtUpdated(iso) {
   return d.toLocaleDateString("en-US", { month: "short", day: "numeric", year: "numeric" });
 }
 
-function LearnScreen({ role, user, orgUsers = [], orgs = [], onNav, onAwardXp, pendingLessonId, onClearPendingLesson, pendingCourseId, onClearPendingCourse, canCreate = true, canEdit = true, canDelete = true, canAssign = true, tenantId = null, isReal = false, quizzes = [], sharedAssignmentData = null }) {
-  const isAdmin = role === "admin";
+function LearnScreen({ role, canManageLearn, user, orgUsers = [], orgs = [], onNav, onAwardXp, pendingLessonId, onClearPendingLesson, pendingCourseId, onClearPendingCourse, canCreate = true, canEdit = true, canDelete = true, canAssign = true, tenantId = null, isReal = false, quizzes = [], sharedAssignmentData = null }) {
+  // "Can manage Learn" (assignment tracking, assign/unassign, content CRUD/archive)
+  // is a Learn-scoped authority derived from the canonical profile role — it now
+  // includes the DB `manager` role, which the backend RLS/RPCs already authorize.
+  // Falls back to the old gameRole==="admin" signal for the demo/no-prop path.
+  const isAdmin = canManageLearn ?? (role === "admin");
   const toast   = useToast();
   const assignSkipPanel = useAssignmentSkipPanel(); // Sprint 2 Task 6 — "View details" on skipped users
   const [tab, setTab]           = useState(isAdmin ? "courses" : "assigned");
@@ -23628,6 +23642,13 @@ export default function App() {
   const isSuperAdmin = isRalliAdmin(role);
   const isOrgAdmin   = role === "orgAdmin";
   const isAdminType  = isSuperAdmin || isOrgAdmin; // any admin-type user
+  // Learn management authority — mirrors the canonical backend rule enforced by
+  // RLS/RPCs (017/026/034/063/064): is_ralli_admin() OR role IN ('orgAdmin','manager').
+  // A DB-role `manager` is authorized for Learn assignment tracking + assign/
+  // unassign + lesson/course CRUD/archive, but is deliberately NOT isAdminType, so
+  // this scopes their access to Learn without unlocking Battle Cards / Insights /
+  // Progress admin or tenant settings. Reuses the isRalliAdmin() helper.
+  const canManageLearn = isSuperAdmin || isOrgAdmin || role === "manager";
   const currentOrg   = orgs.find(o => o.id === user?.orgId) ?? null;
   // Normalized role for game/lobby screens — they only need "admin" vs "user"
   const gameRole = isAdminType ? "admin" : "user";
@@ -25015,7 +25036,7 @@ export default function App() {
       }} />;
       case "rankd-game":        return <RankdGameScreen onNav={navigate} sessionName={lobbySessionName} role={gameRole} playerName={lobbyPlayerName ?? user.name} playerEmoji={lobbyPlayerEmoji} questions={gameQuestions ?? GAME_QUESTIONS} demoMode={gameRole === "admin" && activeGameIsDemo} pin={lobbyPin} sessionDbId={activeGameSessionDbId} tenantId={currentOrg?.id ?? user?.orgId ?? null} broadcast={broadcast} trackPlayerPresence={trackPlayerPresence} chMsg={chMsg} chStatus={chStatus} chAnswers={chAnswers} chPlayers={chPlayers} playerId={gamePlayerId} onGameEnd={handleGameEnd} setChAnswers={setChAnswers} />;
       case "rankd-results":     return <RankdResultsScreen onNav={navigate} sessionDbId={viewResultsDbId} sessionCode={viewResultsCode} sessions={[...sessions, ...pastSessions]} gameData={gameResultsData} />;
-      case "learn":             return <LearnScreen role={gameRole} user={user} orgUsers={orgUsers} orgs={orgs} onNav={navigate} onAwardXp={handleAwardXp} pendingLessonId={pendingLessonId} onClearPendingLesson={() => setPendingLessonId(null)} pendingCourseId={pendingCourseId} onClearPendingCourse={() => setPendingCourseId(null)} canCreate={perm("actions","create")} canEdit={perm("actions","edit")} canDelete={perm("actions","delete")} canAssign={perm("actions","assign")} tenantId={currentOrg?.id ?? null} isReal={!!user?._isReal} quizzes={quizzes} sharedAssignmentData={sharedAssignmentData} />;
+      case "learn":             return <LearnScreen role={gameRole} canManageLearn={canManageLearn} user={user} orgUsers={orgUsers} orgs={orgs} onNav={navigate} onAwardXp={handleAwardXp} pendingLessonId={pendingLessonId} onClearPendingLesson={() => setPendingLessonId(null)} pendingCourseId={pendingCourseId} onClearPendingCourse={() => setPendingCourseId(null)} canCreate={perm("actions","create")} canEdit={perm("actions","edit")} canDelete={perm("actions","delete")} canAssign={perm("actions","assign")} tenantId={currentOrg?.id ?? null} isReal={!!user?._isReal} quizzes={quizzes} sharedAssignmentData={sharedAssignmentData} />;
       case "quizzes":           return <QuizzesScreen role={gameRole} onNav={navigate} quizzes={quizzes} onEditQuiz={handleEditQuiz} onDeleteQuiz={handleDeleteQuiz} onToggleFavorite={handleToggleFavorite} onToggleActive={handleToggleActive} pendingQuizId={pendingQuizId} onClearPendingQuiz={() => setPendingQuizId(null)} canCreate={perm("actions","create")} canEdit={perm("actions","edit")} canDelete={perm("actions","delete")} canLaunch={perm("actions","launch")} canAssign={perm("actions","assign")} onAssignQuiz={handleAssignQuiz} onLaunchQuiz={handleCreateSession} orgUsers={orgUsers} orgs={orgs} currentUser={currentUser} tenantId={currentOrg?.id ?? null} isReal={!!user?._isReal} quizzesReady={quizzesReady} sharedAssignmentData={sharedAssignmentData} onRefreshQuizzes={refreshQuizzes} />;
       case "battlecards":       return (isAdminType && perm("actions","edit"))
         ? <BattleCardsAdminScreen categories={bcCategories} cards={battleCards} onSaveCategory={handleSaveBcCategory} onDeleteCategory={handleDeleteBcCategory} onSaveCard={handleSaveBattleCard} onDeleteCard={handleDeleteBattleCard} />
