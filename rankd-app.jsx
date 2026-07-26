@@ -8951,7 +8951,7 @@ function fmtUpdated(iso) {
   return d.toLocaleDateString("en-US", { month: "short", day: "numeric", year: "numeric" });
 }
 
-function LearnScreen({ role, canManageLearn, user, orgUsers = [], orgs = [], onNav, onAwardXp, pendingLessonId, onClearPendingLesson, pendingCourseId, onClearPendingCourse, canCreate = true, canEdit = true, canDelete = true, canAssign = true, tenantId = null, isReal = false, quizzes = [], sharedAssignmentData = null }) {
+function LearnScreen({ role, canManageLearn, user, orgUsers = [], orgs = [], onNav, onStartQuiz, onAwardXp, pendingLessonId, onClearPendingLesson, pendingCourseId, onClearPendingCourse, canCreate = true, canEdit = true, canDelete = true, canAssign = true, tenantId = null, isReal = false, quizzes = [], sharedAssignmentData = null }) {
   // "Can manage Learn" (assignment tracking, assign/unassign, content CRUD/archive)
   // is a Learn-scoped authority derived from the canonical profile role — it now
   // includes the DB `manager` role, which the backend RLS/RPCs already authorize.
@@ -8959,7 +8959,21 @@ function LearnScreen({ role, canManageLearn, user, orgUsers = [], orgs = [], onN
   const isAdmin = canManageLearn ?? (role === "admin");
   const toast   = useToast();
   const assignSkipPanel = useAssignmentSkipPanel(); // Sprint 2 Task 6 — "View details" on skipped users
-  const [tab, setTab]           = useState(isAdmin ? "courses" : "assigned");
+  // Manager subtab persists across refresh via the SAME sessionStorage pattern
+  // the app already uses for the top-level screen (LAST_SCREEN_KEY) — so a
+  // refresh on Manager → Learn → Assignments returns to Assignments, not Courses.
+  const [tab, setTab] = useState(() => {
+    if (!isAdmin) return "assigned";
+    try {
+      const saved = sessionStorage.getItem("ralli_learn_admin_tab");
+      if (saved && ["courses", "lessons", "assignments", "archived"].includes(saved)) return saved;
+    } catch {}
+    return "courses";
+  });
+  useEffect(() => {
+    if (!isAdmin) return;
+    try { sessionStorage.setItem("ralli_learn_admin_tab", tab); } catch {}
+  }, [isAdmin, tab]);
   // Real users start with empty arrays — seed data would flash before DB load completes
   const [courses, setCourses]   = useState(isReal ? [] : INITIAL_LEARN_COURSES);
   const [lessons, setLessons]   = useState(isReal ? [] : INITIAL_LEARN_LESSONS);
@@ -9537,9 +9551,17 @@ function LearnScreen({ role, canManageLearn, user, orgUsers = [], orgs = [], onN
     // Course detail view
     if (activeCourse) {
       const cls = activeCourse.lessonIds.map(id => lessons.find(l => l.id === id)).filter(Boolean);
-      const doneCount = cls.filter(l => completedLessons.has(l.id)).length;
       // Availability timing: find this user's assignment for the course and compute per-lesson unlock dates
       const courseAssignment = myAssignments.find(a => a.contentType === "course" && a.contentId === activeCourse.id);
+      // Completion is INSTANCE-AWARE for an assigned course (only completions
+      // dated at/after THIS assignment's assigned_at count) so a scheduled
+      // re-assignment never reads as complete off a prior instance's progress —
+      // matching the card/selector and the manager view. Free browsing (no
+      // assignment) keeps ever-completed membership. The denominator is always
+      // the FULL canonical lesson set (locked/scheduled lessons stay required).
+      const doneCount = courseAssignment
+        ? cls.filter(l => isQualifyingEvent(completedLessonsAt.get(l.id), courseAssignment.assignedAtRaw)).length
+        : cls.filter(l => completedLessons.has(l.id)).length;
       const assignedDate = courseAssignment?.assignedAtRaw
         ? new Date(courseAssignment.assignedAtRaw)
         : courseAssignment?.assignedAt ? new Date(courseAssignment.assignedAt) : null;
@@ -9562,10 +9584,22 @@ function LearnScreen({ role, canManageLearn, user, orgUsers = [], orgs = [], onN
       // Assigned-course status elsewhere (Home, manager tracking) is always
       // computed separately via the shared engine (resolveAssignmentStatus),
       // never from this local pct.
-      const pct = Math.round((doneCount / Math.max(cls.length, 1)) * 100);
+      const pct = cls.length ? Math.round((doneCount / cls.length) * 100) : 0;
       const totalXp = cls.reduce((s, l) => s + (l.xp || 0), 0);
       const bonusXp = Math.round(totalXp * 0.2);
-      const isComplete = pct === 100;
+      // Complete ONLY when every canonical lesson is done — never via an empty
+      // set (0 lessons, or 0 currently-unlocked, must never read as complete).
+      const isComplete = cls.length > 0 && doneCount === cls.length;
+      // Scheduling: an assigned course whose lessons are all still locked and has
+      // no qualifying progress yet is "Scheduled", not complete and not 0%-in-
+      // progress. Surface the honest upcoming-unlock date.
+      const unlockedUndone = cls.filter(l => !completedLessons.has(l.id) && !getLessonAvailability(l.id).locked);
+      const nextUnlockDate = cls
+        .map(l => getLessonAvailability(l.id).availableDate)
+        .filter(Boolean)
+        .filter(d => d.getTime() > Date.now())
+        .sort((x, y) => x - y)[0] ?? null;
+      const isScheduledNotStarted = !!courseAssignment && !isComplete && doneCount === 0 && unlockedUndone.length === 0;
       return (
         <div style={{ display: "flex", flexDirection: "column", gap: 20 }}>
           <button onClick={() => setActiveCourse(null)} style={{ background: "none", border: "none", cursor: "pointer", color: C.textSub, fontSize: 13, fontWeight: 600, display: "flex", alignItems: "center", gap: 6, padding: 0, alignSelf: "flex-start" }}>
@@ -9582,6 +9616,11 @@ function LearnScreen({ role, canManageLearn, user, orgUsers = [], orgs = [], onN
                   <span>⏱ {cls.reduce((s, l) => s + (parseInt(l.duration) || 0), 0)} min</span>
                   <span style={{ color: C.orange, fontWeight: 700 }}>{totalXp} XP{isComplete ? ` +${bonusXp} bonus` : ""}</span>
                   {isComplete && <span style={{ color: C.green, fontWeight: 700 }}>✓ Complete</span>}
+                  {isScheduledNotStarted && (
+                    <span style={{ color: C.blue, fontWeight: 700 }}>
+                      🗓 {nextUnlockDate ? `Starts ${nextUnlockDate.toLocaleDateString("en-US", { month: "short", day: "numeric" })}` : "Scheduled"}
+                    </span>
+                  )}
                 </div>
               </div>
               {!isComplete && cls.find(l => !completedLessons.has(l.id) && !getLessonAvailability(l.id).locked) && (
@@ -9830,7 +9869,10 @@ function LearnScreen({ role, canManageLearn, user, orgUsers = [], orgs = [], onN
                     </div>
                     <div style={{ fontSize: 15, fontWeight: 700, color: C.text }}>{content?.name ?? content?.title ?? "Quiz"}</div>
                     <div style={{ display: "flex", justifyContent: "flex-end", marginTop: 12 }}>
-                      <button onClick={() => onNav?.("quizzes")} style={{ padding: "8px 16px", borderRadius: 8, border: "none", cursor: "pointer", background: status === "completed" ? C.white : C.purple, color: status === "completed" ? C.textSub : "#fff", borderWidth: status === "completed" ? 1 : 0, borderStyle: "solid", borderColor: C.border, fontSize: 13, fontWeight: 700 }}>{cta}</button>
+                      {/* Deep-link straight into the canonical quiz flow (auto-launches
+                          via pendingQuizId) — no Quizzes-listing detour, exact quiz id.
+                          Reuses the same launch/retake/results path everywhere else. */}
+                      <button onClick={() => onStartQuiz?.(a.contentId)} style={{ padding: "8px 16px", borderRadius: 8, border: "none", cursor: "pointer", background: status === "completed" ? C.white : C.purple, color: status === "completed" ? C.textSub : "#fff", borderWidth: status === "completed" ? 1 : 0, borderStyle: "solid", borderColor: C.border, fontSize: 13, fontWeight: 700 }}>{cta}</button>
                     </div>
                   </div>
                 </div>
@@ -10465,13 +10507,26 @@ function LearnScreen({ role, canManageLearn, user, orgUsers = [], orgs = [], onN
                       <div style={{ fontSize: 11, color: C.textSub }}>{contentLabel}{a.required ? " · Required" : " · Recommended"}</div>
                     </div>
                   </div>
-                  {/* Rep */}
-                  <div style={{ display: "flex", alignItems: "center", gap: 7, minWidth: 0 }}>
-                    <div style={{ width: 24, height: 24, borderRadius: "50%", background: u.color ?? C.orange, display: "flex", alignItems: "center", justifyContent: "center", fontSize: 10, fontWeight: 700, color: "#fff", flexShrink: 0 }}>
-                      {(u.initials ?? u.name?.[0] ?? "?").toUpperCase()}
-                    </div>
-                    <span style={{ fontSize: 13, fontWeight: 600, color: C.text, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{u.name}</span>
-                  </div>
+                  {/* Rep — the individual learner is ALWAYS the primary assignee,
+                      one row per learner instance. When the assignment was fanned
+                      out from a team/group/all target, the origin shows only as a
+                      secondary "via [Team]" line; the team is never the assignee. */}
+                  {(() => {
+                    const originLabel = (a.source?.type && a.source.type !== "individual")
+                      ? (a.source.label ?? (a.source.type === "group" ? "Everyone" : a.source.type === "all" ? "All users" : "Team"))
+                      : (a.assignedTo?.type === "team" ? (a.assignedTo.teamName ?? "Team") : a.assignedTo?.type === "group" ? "Everyone" : null);
+                    return (
+                      <div style={{ display: "flex", alignItems: "center", gap: 7, minWidth: 0 }}>
+                        <div style={{ width: 24, height: 24, borderRadius: "50%", background: u.color ?? C.orange, display: "flex", alignItems: "center", justifyContent: "center", fontSize: 10, fontWeight: 700, color: "#fff", flexShrink: 0 }}>
+                          {(u.initials ?? u.name?.[0] ?? "?").toUpperCase()}
+                        </div>
+                        <div style={{ minWidth: 0 }}>
+                          <div style={{ fontSize: 13, fontWeight: 600, color: C.text, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{u.name}</div>
+                          {originLabel && <div style={{ fontSize: 10, color: C.textMuted, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>via {originLabel}</div>}
+                        </div>
+                      </div>
+                    );
+                  })()}
                   {/* Assigned */}
                   <span style={{ fontSize: 13, color: C.textSub }}>{assignedLabel}</span>
                   {/* Due */}
@@ -25027,7 +25082,7 @@ export default function App() {
       }} />;
       case "rankd-game":        return <RankdGameScreen onNav={navigate} sessionName={lobbySessionName} role={gameRole} playerName={lobbyPlayerName ?? user.name} playerEmoji={lobbyPlayerEmoji} questions={gameQuestions ?? GAME_QUESTIONS} demoMode={gameRole === "admin" && activeGameIsDemo} pin={lobbyPin} sessionDbId={activeGameSessionDbId} tenantId={currentOrg?.id ?? user?.orgId ?? null} broadcast={broadcast} trackPlayerPresence={trackPlayerPresence} chMsg={chMsg} chStatus={chStatus} chAnswers={chAnswers} chPlayers={chPlayers} playerId={gamePlayerId} onGameEnd={handleGameEnd} setChAnswers={setChAnswers} />;
       case "rankd-results":     return <RankdResultsScreen onNav={navigate} sessionDbId={viewResultsDbId} sessionCode={viewResultsCode} sessions={[...sessions, ...pastSessions]} gameData={gameResultsData} />;
-      case "learn":             return <LearnScreen role={gameRole} canManageLearn={canManageLearn} user={user} orgUsers={orgUsers} orgs={orgs} onNav={navigate} onAwardXp={handleAwardXp} pendingLessonId={pendingLessonId} onClearPendingLesson={() => setPendingLessonId(null)} pendingCourseId={pendingCourseId} onClearPendingCourse={() => setPendingCourseId(null)} canCreate={perm("actions","create")} canEdit={perm("actions","edit")} canDelete={perm("actions","delete")} canAssign={perm("actions","assign")} tenantId={currentOrg?.id ?? null} isReal={!!user?._isReal} quizzes={quizzes} sharedAssignmentData={sharedAssignmentData} />;
+      case "learn":             return <LearnScreen role={gameRole} canManageLearn={canManageLearn} user={user} orgUsers={orgUsers} orgs={orgs} onNav={navigate} onStartQuiz={(id) => { setPendingQuizId(id); navigate("quizzes"); }} onAwardXp={handleAwardXp} pendingLessonId={pendingLessonId} onClearPendingLesson={() => setPendingLessonId(null)} pendingCourseId={pendingCourseId} onClearPendingCourse={() => setPendingCourseId(null)} canCreate={perm("actions","create")} canEdit={perm("actions","edit")} canDelete={perm("actions","delete")} canAssign={perm("actions","assign")} tenantId={currentOrg?.id ?? null} isReal={!!user?._isReal} quizzes={quizzes} sharedAssignmentData={sharedAssignmentData} />;
       case "quizzes":           return <QuizzesScreen role={gameRole} onNav={navigate} quizzes={quizzes} onEditQuiz={handleEditQuiz} onDeleteQuiz={handleDeleteQuiz} onToggleFavorite={handleToggleFavorite} onToggleActive={handleToggleActive} pendingQuizId={pendingQuizId} onClearPendingQuiz={() => setPendingQuizId(null)} canCreate={perm("actions","create")} canEdit={perm("actions","edit")} canDelete={perm("actions","delete")} canLaunch={perm("actions","launch")} canAssign={perm("actions","assign")} onAssignQuiz={handleAssignQuiz} onLaunchQuiz={handleCreateSession} orgUsers={orgUsers} orgs={orgs} currentUser={currentUser} tenantId={currentOrg?.id ?? null} isReal={!!user?._isReal} quizzesReady={quizzesReady} sharedAssignmentData={sharedAssignmentData} onRefreshQuizzes={refreshQuizzes} />;
       case "battlecards":       return (isAdminType && perm("actions","edit"))
         ? <BattleCardsAdminScreen categories={bcCategories} cards={battleCards} onSaveCategory={handleSaveBcCategory} onDeleteCategory={handleDeleteBcCategory} onSaveCard={handleSaveBattleCard} onDeleteCard={handleDeleteBattleCard} />
@@ -25109,7 +25164,12 @@ export default function App() {
                 // Filter nav items by (1) subscription plan and (2) admin-controlled role permission.
                 ...NAV_ITEMS.filter(item =>
                   (!item.featureKey || canAccessTenant(item.featureKey)) &&
-                  perm("features", item.permKey ?? item.id)
+                  perm("features", item.permKey ?? item.id) &&
+                  // Learners have no standalone Quizzes nav — they reach assigned
+                  // quizzes through Home → Assigned Learning and Learn (deep-links
+                  // still auto-launch the exact quiz). Managers keep Quizzes for
+                  // authoring/tagging/assigning/reporting.
+                  !(item.id === "quizzes" && !canManageLearn)
                 ),
                 // Team is managed inside Settings for org admins
               ]),
@@ -25329,7 +25389,8 @@ export default function App() {
             { id: "settings",      label: "Settings",      icon: "" },
           ] : NAV_ITEMS.filter(item =>
             (!item.featureKey || canAccessTenant(item.featureKey)) &&
-            perm("features", item.permKey ?? item.id)
+            perm("features", item.permKey ?? item.id) &&
+            !(item.id === "quizzes" && !canManageLearn)  // learners: no standalone Quizzes nav (see desktop nav)
           )).map(item => {
             const active = screen === item.id || (screen.startsWith("rankd-") && item.id === "rankd");
             return (
