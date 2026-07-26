@@ -839,17 +839,21 @@ function HomeScreen({ user, onNav, quizAssignments = [], onResumeLesson, onStart
         (a.assignedTo?.type === "individual" && a.assignedTo?.userId === user?.id)   ||
         (a.assignedTo?.type === "team"       && userTeamId && userTeamId === a.assignedTo?.teamId)
       );
-      // Dedupe quiz assignments to the LATEST per quiz (one actionable card per
-      // quiz) via the shared engine helper, so a resolved-by-failure original +
-      // its reassignment don't both count as pending. Lesson/course rows pass
-      // through unchanged.
+      // ONE current card per content (F5) — collapse every content type to its
+      // LATEST assignment instance, so a resolved-by-failure original + its
+      // reassignment never both count. Quizzes use the shared engine helper;
+      // lessons/courses take the newest instance (mine is assigned_at DESC, so
+      // the first seen per contentId is the latest). Learner Learn does the same,
+      // so Home and Learn always agree on the current set.
       const quizRowsByContent = new Map();
+      const latestByContent = new Map(); // contentId -> latest lesson/course instance
       const dedupedMine = [];
       for (const a of mine) {
         if (a.contentType === "quiz") {
           if (!quizRowsByContent.has(a.contentId)) quizRowsByContent.set(a.contentId, []);
           quizRowsByContent.get(a.contentId).push(a);
-        } else {
+        } else if (!latestByContent.has(a.contentId)) {
+          latestByContent.set(a.contentId, a);
           dedupedMine.push(a);
         }
       }
@@ -9506,6 +9510,18 @@ function LearnScreen({ role, user, orgUsers = [], orgs = [], onNav, onAwardXp, p
       (a.assignedTo.type === "individual" && a.assignedTo.userId === user?.id)    ||
       (a.assignedTo.type === "team"       && userTeamId && userTeamId === a.assignedTo.teamId)
     );
+    // Honest "Assigned" count (F5) — the number of lesson/course cards actually
+    // shown in the Assigned tab: one per existing content (deduped across
+    // instances/paths), NOT the raw row count (which double-counts reassignment
+    // instances and includes quizzes, which live on the Quizzes screen). This is
+    // the count the header and the tab badge use, so it matches the cards below.
+    const myAssignedContentKeys = new Set();
+    myAssignments.forEach(a => {
+      if (a.contentType === "quiz") return;
+      const content = a.contentType === "course" ? courses.find(c => c.id === a.contentId) : lessons.find(l => l.id === a.contentId);
+      if (content) myAssignedContentKeys.add(`${a.contentType}:${a.contentId}`);
+    });
+    const myAssignedCount = myAssignedContentKeys.size;
     const xpEarned = [...completedLessons].reduce((s, id) => s + (lessons.find(x => x.id === id)?.xp ?? 0), 0);
 
     if (activeLesson) {
@@ -9645,14 +9661,14 @@ function LearnScreen({ role, user, orgUsers = [], orgs = [], onNav, onAwardXp, p
           <div>
             <h2 style={{ margin: 0, fontSize: 22, fontWeight: 800, color: C.text }}>My Learning</h2>
             <p style={{ margin: "4px 0 0", fontSize: 13, color: C.textSub }}>
-              {myAssignments.length} assigned · <span style={{ color: C.orange, fontWeight: 700 }}>{xpEarned.toLocaleString()} XP earned</span>
+              {myAssignedCount} assigned · <span style={{ color: C.orange, fontWeight: 700 }}>{xpEarned.toLocaleString()} XP earned</span>
             </p>
           </div>
         </div>
 
         {/* Tabs */}
         <div style={{ display: "flex", gap: 4, borderBottom: `1px solid ${C.border}` }}>
-          {[{ id: "assigned", label: "Assigned", count: myAssignments.length }, { id: "browse", label: "Knowledge Base" }].map(t => (
+          {[{ id: "assigned", label: "Assigned", count: myAssignedCount }, { id: "browse", label: "Knowledge Base" }].map(t => (
             <button key={t.id} onClick={() => { setUserTab(t.id); setSearch(""); }} style={{
               padding: "10px 18px", border: "none", cursor: "pointer", background: "transparent",
               fontWeight: userTab === t.id ? 700 : 500, color: userTab === t.id ? C.orange : C.textSub,
@@ -10181,16 +10197,25 @@ function LearnScreen({ role, user, orgUsers = [], orgs = [], onNav, onAwardXp, p
           cancelled:   { label: "Unassigned",  bg: C.muted,    text: C.textMuted },
         };
 
-        // Expand assignments into per-rep rows
-        const allRows = uniqueAssignments.flatMap(a => {
+        // Manager history = EVERY assignment INSTANCE (not deduped by content).
+        // A reassignment is its own instance with its own assigned_at; collapsing
+        // instances hid completed history and made Not Started/In Progress wrong.
+        // Each instance is resolved against its OWN assigned_at by the shared
+        // engine, so old resolved instances read as Completed and the current
+        // one reads by its own evidence. (The learner-facing "current work" views
+        // still collapse to one latest card per content — that's Home/Learn, not
+        // this manager history.) Missing/archived content degrades to an honest
+        // "(removed)" label rather than being silently dropped.
+        const allRows = assignments.flatMap(a => {
           const isCourse = a.contentType === "course";
           const isQuiz   = a.contentType === "quiz";
-          const content  = isCourse
+          const foundContent = isCourse
             ? courses.find(c => c.id === a.contentId)
             : isQuiz
               ? quizzes.find(q => q.id === a.contentId)
               : lessons.find(l => l.id === a.contentId);
-          if (!content) return [];
+          const content = foundContent ?? { id: a.contentId, title: `${isCourse ? "Course" : isQuiz ? "Quiz" : "Lesson"} (removed)`, _missing: true, lessonIds: [] };
+          const missingContent = !foundContent;
 
           let users = [];
           if (a.assignedTo?.type === "individual") {
@@ -10238,7 +10263,7 @@ function LearnScreen({ role, user, orgUsers = [], orgs = [], onNav, onAwardXp, p
               completedAt = engineResult.completedAt;
             }
 
-            return { a, content, isCourse, isQuiz, u, progress, status, completedAt, courseLessons, completedAtByLesson, userAttempts };
+            return { a, content, isCourse, isQuiz, u, progress, status, completedAt, courseLessons, completedAtByLesson, userAttempts, _missingContent: missingContent };
           });
         });
 
@@ -10386,6 +10411,7 @@ function LearnScreen({ role, user, orgUsers = [], orgs = [], onNav, onAwardXp, p
             </div>
             {rows.map((row, i) => {
               const { a, content, isCourse, isQuiz, u, progress, status, completedAt, userAttempts } = row;
+              const missingContent = row._missingContent;
               const isEnded = status === "cancelled";
               const sc     = STATUS_CONFIG[status] ?? STATUS_CONFIG.not_started;
               // Ended rows read their true reason: Unassigned vs Content Archived.
@@ -10404,7 +10430,7 @@ function LearnScreen({ role, user, orgUsers = [], orgs = [], onNav, onAwardXp, p
               const sortedAttempts = isQuiz ? [...userAttempts].sort((x, y) => new Date(y.created_at) - new Date(x.created_at)) : [];
               const latestAttempt  = sortedAttempts[0] ?? null;
               const bestScore      = sortedAttempts.length ? Math.max(...sortedAttempts.map(at => at.score ?? 0)) : null;
-              const canDrilldown   = !u._isAggregate && !isEnded;  // ended rows are history, no drill-in
+              const canDrilldown   = !u._isAggregate && !isEnded && !missingContent;  // history / removed content: no drill-in
               const rowKey = `${a.id}-${u.id}`;
               // Unassign is offered only for true per-user rows that are still
               // actionable — active / in-progress / overdue. A COMPLETED row is
@@ -10433,7 +10459,7 @@ function LearnScreen({ role, user, orgUsers = [], orgs = [], onNav, onAwardXp, p
                         onClick={(e) => { e.stopPropagation(); setSelectedAssignmentId(selectedAssignmentId === a.id ? null : a.id); }}
                         style={{ background: "none", border: "none", padding: 0, cursor: "pointer", textAlign: "left" }}
                       >
-                        <div style={{ fontSize: 13, fontWeight: 700, color: C.text, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap", textDecoration: "underline", textDecorationColor: C.border }}>{contentTitle}</div>
+                        <div style={{ fontSize: 13, fontWeight: 700, color: missingContent ? C.textMuted : C.text, fontStyle: missingContent ? "italic" : "normal", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap", textDecoration: missingContent ? "none" : "underline", textDecorationColor: C.border }}>{contentTitle}</div>
                       </button>
                       <div style={{ fontSize: 11, color: C.textSub }}>{contentLabel}{a.required ? " · Required" : " · Recommended"}</div>
                     </div>
@@ -10564,7 +10590,12 @@ function LearnScreen({ role, user, orgUsers = [], orgs = [], onNav, onAwardXp, p
                         fontSize: 12, fontWeight: 700, color: on ? C.orange : C.textSub, cursor: "pointer",
                       }}>
                         <span>{label}</span>
-                        <span style={{ fontSize: 11, fontWeight: 800, color: on ? C.orange : color, background: on ? "transparent" : C.pageBg, borderRadius: 99, padding: on ? 0 : "1px 7px" }}>{count}</span>
+                        {/* F8 — never present a "0" as a metric; the tab stays a
+                            usable filter even at zero (Unassigned becomes meaningful
+                            once a manager uses Unassign). Show the count only when > 0. */}
+                        {count > 0 && (
+                          <span style={{ fontSize: 11, fontWeight: 800, color: on ? C.orange : color, background: on ? "transparent" : C.pageBg, borderRadius: 99, padding: on ? 0 : "1px 7px" }}>{count}</span>
+                        )}
                       </button>
                     );
                   })}
@@ -11866,7 +11897,11 @@ function AssignContentModal({ contentType, contentId, content, orgUsers, orgs, c
   const [selectedTeamId, setSelectedTeamId] = useState("");
   const [selectedUserId, setSelectedUserId] = useState("");
   const [dueDate, setDueDate]   = useState("");
-  const [required, setRequired] = useState(false);
+  // F7 — quiz assignments default to Required (a quiz is a knowledge check, not
+  // optional reading); lessons/courses keep the Recommended default. The manager
+  // can still toggle either way, and existing saved assignments are untouched
+  // (this only seeds the modal for a NEW assignment). Same `required` field/options.
+  const [required, setRequired] = useState(contentType === "quiz");
 
   // Loaded from Supabase for real users; fall back to passed props for demo
   const [tenantUsers,  setTenantUsers]  = useState(null); // null = loading
