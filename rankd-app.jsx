@@ -78,7 +78,7 @@ import {
   updateLastSeenAssignmentsAt,
   subscribeToTenantAssignments,
 } from "./src/lib/contentService.js";
-import { resolveAssignmentStatus, resolveLatestQuizAssignment, isQualifyingEvent, daysUntilDue } from "./src/lib/assignmentEngine.js";
+import { resolveAssignmentStatus, resolveLatestQuizAssignment, resolveLearnerAssignments, isQualifyingEvent, daysUntilDue } from "./src/lib/assignmentEngine.js";
 import {
   metaListToCatalog,
   questionCountOf,
@@ -839,71 +839,23 @@ function HomeScreen({ user, onNav, quizAssignments = [], onResumeLesson, onStart
         (a.assignedTo?.type === "individual" && a.assignedTo?.userId === user?.id)   ||
         (a.assignedTo?.type === "team"       && userTeamId && userTeamId === a.assignedTo?.teamId)
       );
-      // ONE current card per content (F5) — collapse every content type to its
-      // LATEST assignment instance, so a resolved-by-failure original + its
-      // reassignment never both count. Quizzes use the shared engine helper;
-      // lessons/courses take the newest instance (mine is assigned_at DESC, so
-      // the first seen per contentId is the latest). Learner Learn does the same,
-      // so Home and Learn always agree on the current set.
-      const quizRowsByContent = new Map();
-      const latestByContent = new Map(); // contentId -> latest lesson/course instance
-      const dedupedMine = [];
-      for (const a of mine) {
-        if (a.contentType === "quiz") {
-          if (!quizRowsByContent.has(a.contentId)) quizRowsByContent.set(a.contentId, []);
-          quizRowsByContent.get(a.contentId).push(a);
-        } else if (!latestByContent.has(a.contentId)) {
-          latestByContent.set(a.contentId, a);
-          dedupedMine.push(a);
-        }
-      }
-      for (const [contentId, rows] of quizRowsByContent) {
-        const latest = resolveLatestQuizAssignment(rows, homeQuizAttempts.filter(at => at.quiz_id === contentId)).latest;
-        if (latest) dedupedMine.push(latest);
-      }
-      return dedupedMine.map(a => {
-        const isCourse = a.contentType === "course";
-        const isLesson = a.contentType === "lesson";
-        const content  = isCourse ? homeCourses.find(c => c.id === a.contentId)
-                       : isLesson ? homeLessons.find(l => l.id === a.contentId)
-                       : quizzes.find(q => q.id === a.contentId);
-        if (!content) return null;
-        // Resolution (complete/pending, and % progress) now comes from the
-        // shared Resolved Assignment engine (src/lib/assignmentEngine.js) —
-        // see its header for why this used to be computed independently
-        // here, in LearnScreen, QuizzesScreen, and RepDrillDownModal, and how
-        // that drifted. Course/lesson/quiz all gate on THIS assignment row's
-        // own assigned_at, exactly like _course_assignment_active_user_ids() /
-        // _lesson_assignment_active_user_ids() / _quiz_assignment_active_user_ids()
-        // (037/036_*.sql) enforce server-side.
-        let pct, isComplete;
-        if (isCourse) {
-          const cls = (content.lessonIds ?? []).map(id => homeLessons.find(l => l.id === id)).filter(Boolean);
-          const engineResult = resolveAssignmentStatus("course", a, {
-            lessonIds: cls.map(l => l.id),
-            completedAtByLesson: homeCompletedAt,
-          });
-          pct = engineResult.progress;
-          isComplete = engineResult.status === "completed";
-        } else if (isLesson) {
-          const engineResult = resolveAssignmentStatus("lesson", a, { completedAt: homeCompletedAt.get(content.id) ?? null });
-          pct = engineResult.progress;
-          isComplete = engineResult.status === "completed";
-        } else {
-          // Quiz — complete once there's a PASSED attempt created at or after
-          // this assignment's assigned_at. See assignmentEngine.js's
-          // resolveQuizAssignment() for the full reasoning (an unresolved
-          // reassignment must never read as complete off a stale prior pass).
-          const engineResult = resolveAssignmentStatus("quiz", a, {
-            attempts: homeQuizAttempts.filter(at => at.quiz_id === content.id),
-          });
-          pct = engineResult.progress;
-          isComplete = engineResult.status === "completed";
-        }
-        const dueStatus = (a.dueAt && a.dueAt !== "Open") ? getDueStatus(a.dueAt) : null;
+      // THE canonical current-work set (lessons + courses + quizzes), from the
+      // one shared selector Learn also uses — so Home is a true preview of Learn.
+      // One latest instance per content, cancelled excluded, resolved by the
+      // shared engine. Missing content is dropped from the Home PREVIEW (it must
+      // not render a clickable fake card); Learn surfaces it as a non-clickable
+      // "unavailable" row.
+      const rows = resolveLearnerAssignments(mine, {
+        completedAtByLesson: homeCompletedAt,
+        quizAttempts: homeQuizAttempts,
+        courses: homeCourses, lessons: homeLessons, quizzes,
+      });
+      return rows.filter(r => !r.missing).map(r => {
+        const a = r.assignment;
+        const dueStatus = (!r.isCompleted && a.dueAt && a.dueAt !== "Open") ? getDueStatus(a.dueAt) : null;
         const isNew = !!lastSeenAt && !!a.assignedAtRaw && a.assignedAtRaw > lastSeenAt;
-        return { ...a, content, contentKind: isCourse ? "course" : isLesson ? "lesson" : "quiz", pct, isComplete, dueStatus, isNew };
-      }).filter(Boolean);
+        return { ...a, content: r.content, contentKind: r.contentType, pct: r.progress, isComplete: r.isCompleted, dueStatus, isNew };
+      });
     }
     // Demo: wrap quizAssignments (outstanding only shown, completed = has passed attempt)
     // + append the Continue Learning seed (in-progress course/lesson) — demo-only, unchanged quiz data.
@@ -966,14 +918,12 @@ function PersonalDashboardScreen({
   readinessThreshold = 80,
 }) {
   const mobile     = useMobile();
-  // Home "Assigned Learning" is lessons + courses ONLY (contradiction 1) — the
-  // same content types Learner Learn → Assigned shows, resolved from the same
-  // latest-instance dataset. Quiz assignments are a separate product area: they
-  // live in Quizzes → To Do (and the manager assignment history), never counted
-  // or previewed inside Home's learning section. These derived sets drive the
-  // Assigned Learning header count, preview cards, and "+ N more".
-  const learningPending   = pendingAssignments.filter(x => x.contentKind !== "quiz");
-  const learningCompleted = completedAssignments.filter(x => x.contentKind !== "quiz");
+  // Home "Assigned Learning" is a preview of the SAME unified current-work set
+  // Learn shows — lessons, courses AND quizzes — from the shared selector
+  // (enrichedAssignments in HomeScreen). Quiz assignments still route into the
+  // canonical Quizzes flow on click; Home never re-implements grading/attempts.
+  const learningPending   = pendingAssignments;
+  const learningCompleted = completedAssignments;
   const firstName  = (user.name ?? "").split(" ")[0];
   const hour       = new Date().getHours();
   const greeting   = hour < 12 ? "Good morning" : hour < 17 ? "Good afternoon" : "Good evening";
@@ -1371,8 +1321,8 @@ function PersonalDashboardScreen({
 
       {/* ── Continue Learning — in-progress assignments, resume where you left off ── */}
       {(() => {
-        // Lessons/courses only — quizzes are resumed from Quizzes → To Do, never
-        // a Home learning section (contradiction 1).
+        // In-progress items from the unified current-work set (lessons/courses/
+        // quizzes). A quiz card routes into the canonical Quizzes flow on click.
         const inProgress = learningPending.filter(x => x.pct > 0);
         if (!inProgress.length) return null;
         return (
@@ -1428,7 +1378,7 @@ function PersonalDashboardScreen({
                 <span style={{ fontSize: 11, fontWeight: 700, color: C.trueGreen, letterSpacing: "0.06em" }}>ALL CAUGHT UP</span>
               </div>
               <p style={{ margin: 0, fontSize: 14, color: C.textSub }}>
-                No outstanding lessons or courses. Check the Learn or Quizzes tabs for more content.
+                No outstanding assignments. Check the Learn or Quizzes tabs for more content.
               </p>
             </Card>
           ) : learningPending.slice(0, 3).map((item) => {
@@ -9014,6 +8964,7 @@ function LearnScreen({ role, canManageLearn, user, orgUsers = [], orgs = [], onN
   const [courses, setCourses]   = useState(isReal ? [] : INITIAL_LEARN_COURSES);
   const [lessons, setLessons]   = useState(isReal ? [] : INITIAL_LEARN_LESSONS);
   const [catalogLoading, setCatalogLoading] = useState(isReal); // catalog/admin fetch only — cleared once DB load resolves
+  const learnLoadSeqRef = useRef(0); // stale-guard: only the newest load may write state
 
   // Task 13 — assignments and this user's lesson completions now come from
   // the shared hook (owned once in App(), see useSharedUserAssignmentData)
@@ -9031,21 +8982,19 @@ function LearnScreen({ role, canManageLearn, user, orgUsers = [], orgs = [], onN
   });
   const [demoCompletedLessonsAt, setDemoCompletedLessonsAt] = useState(new Map());
 
-  // Learn lifecycle integrity (063): cancelled assignments (content archived/
-  // removed) are excluded from all active views. Managers can still SEE them as
-  // historical "Unavailable" items — loaded here with includeCancelled and shown
-  // in the Assignments tab. Refreshes with the tenant_assignments subscription
-  // (loadedAt bumps when the shared data reloads).
+  // Manager assignment data is TENANT-WIDE and authoritative — it must NOT come
+  // from the learner-scoped shared hook (useSharedUserAssignmentData is enabled
+  // only for gameRole==="user", so for an orgAdmin it returns []). Loading it
+  // from there made the manager Assignments tab go empty after refresh once the
+  // profile role resolved to admin. Instead the manager's ACTIVE assignments,
+  // cancelled/unassigned history, tenant completions, and quiz attempts are all
+  // loaded together in loadLearnCatalog below (one retryable unit, isAdmin-gated,
+  // stale-guarded), so a refresh restores the same rows and counts.
+  const [managerActiveAssignments, setManagerActiveAssignments] = useState([]);
   const [cancelledAssignments, setCancelledAssignments] = useState([]);
-  const cancelledLoadKey = sharedAssignmentData?.loadedAt ?? 0;
-  useEffect(() => {
-    if (!isReal || !tenantId || !isAdmin) { setCancelledAssignments([]); return; }
-    let alive = true;
-    getTenantAssignments(tenantId, { includeCancelled: true }).then(({ data }) => {
-      if (alive && data) setCancelledAssignments(data.filter(a => a.cancelledAt));
-    });
-    return () => { alive = false; };
-  }, [isReal, tenantId, isAdmin, cancelledLoadKey]);
+  // Bumped after a manager mutation (unassign/archive) to force a fresh
+  // tenant-wide reload of the rows above.
+  const [managerRefreshKey, setManagerRefreshKey] = useState(0);
 
   const sharedCompletedLessonsAt = sharedAssignmentData?.lessonCompletionsAt ?? new Map();
   // lesson_id → completed_at (ISO), used only for assignment-instance-aware
@@ -9058,7 +9007,9 @@ function LearnScreen({ role, canManageLearn, user, orgUsers = [], orgs = [], onN
     [sharedCompletedLessonsAt]
   );
 
-  const assignments         = isReal ? (sharedAssignmentData?.assignments ?? []) : demoAssignments;
+  // Managers read tenant-wide active assignments (loaded in loadLearnCatalog);
+  // learners read their own set from the shared hook. Demo uses local seed.
+  const assignments         = isReal ? (isAdmin ? managerActiveAssignments : (sharedAssignmentData?.assignments ?? [])) : demoAssignments;
   const completedLessonsAt  = isReal ? sharedCompletedLessonsAt : demoCompletedLessonsAt;
   const completedLessons    = isReal ? sharedCompletedLessons   : demoCompletedLessons;
 
@@ -9069,7 +9020,7 @@ function LearnScreen({ role, canManageLearn, user, orgUsers = [], orgs = [], onN
   const [activeLesson, setActiveLesson] = useState(null); // { lesson, courseTitle?, nextLesson? }
   const [activeCourse, setActiveCourse] = useState(null); // course object for detail view
   const [userTab,    setUserTab]    = useState("assigned");
-  const [learnFilter, setLearnFilter] = useState("due"); // "due" | "complete" | "all"
+  const [learnFilter, setLearnFilter] = useState("todo"); // "todo" | "complete" | "all"
   const [search,     setSearch]     = useState("");
   const [archivedCourses,   setArchivedCourses]   = useState([]);
   const [archivedLessons,   setArchivedLessons]   = useState([]);
@@ -9121,9 +9072,12 @@ function LearnScreen({ role, canManageLearn, user, orgUsers = [], orgs = [], onN
         sharedAssignmentData?.retry?.();
         return;
       }
-      // Optimistic — Home/Learn/Quizzes (all fed by the same shared hook) drop
-      // the now-cancelled assignment from active views immediately; a refetch
-      // brings it back as "Unassigned" history. Realtime backs up other tabs.
+      // Optimistic — drop the now-cancelled row from the manager's active set
+      // immediately; the tenant-wide reload (managerRefreshKey) brings it back as
+      // an "Unassigned" history row and refreshes every status count. The shared
+      // hook is a no-op for admins but is patched too for the learner surfaces.
+      setManagerActiveAssignments(prev => prev.filter(x => x.id !== a.id));
+      setManagerRefreshKey(k => k + 1);
       sharedAssignmentData?.applyLocalAssignmentsRemoved?.(a.id);
       sharedAssignmentData?.retry?.();
       if (selectedAssignmentId === a.id) setSelectedAssignmentId(null);
@@ -9149,15 +9103,30 @@ function LearnScreen({ role, canManageLearn, user, orgUsers = [], orgs = [], onN
 
   const loadLearnCatalog = useCallback(() => {
     if (!isReal || !tenantId || !user?.id) { setCatalogLoading(false); return; }
+    // Stale-guard: only the most recent load may write state, so a slow response
+    // for an old tenant/role can never overwrite newer data (e.g. during auth
+    // restore when tenantId/isAdmin settle a beat apart).
+    const seq = ++learnLoadSeqRef.current;
+    setCatalogLoading(true);
     setCatalogError(null);
     const calls = [
       getTenantCourses(tenantId),
       getTenantLessons(tenantId),
     ];
     if (isAdmin) {
-      calls.push(getTenantLessonCompletions(tenantId), getTenantQuizAttempts(tenantId));
+      // Manager tenant-wide data — active assignments, cancelled/unassigned
+      // history, tenant completions, tenant quiz attempts. All required; a null
+      // (errored) result is treated as a FAILURE (retryable), never as an empty
+      // valid dataset.
+      calls.push(
+        getTenantLessonCompletions(tenantId),
+        getTenantQuizAttempts(tenantId),
+        getTenantAssignments(tenantId),
+        getTenantAssignments(tenantId, { includeCancelled: true }),
+      );
     }
     Promise.all(calls).then((results) => {
+      if (seq !== learnLoadSeqRef.current) return; // superseded by a newer load
       const [{ data: dbCourses }, { data: dbLessons }, ...adminResults] = results;
       const adminFailed = isAdmin && adminResults.some(r => !r.data);
       if (!dbCourses || !dbLessons || adminFailed) {
@@ -9168,12 +9137,15 @@ function LearnScreen({ role, canManageLearn, user, orgUsers = [], orgs = [], onN
       setCourses(dbCourses);
       setLessons(dbLessons);
       if (isAdmin) {
-        const [{ data: dbTenantCompletions }, { data: dbTenantQuizAttempts }] = adminResults;
+        const [{ data: dbTenantCompletions }, { data: dbTenantQuizAttempts }, { data: dbActive }, { data: dbAll }] = adminResults;
         setTenantCompletions(dbTenantCompletions);
         setTenantQuizAttempts(dbTenantQuizAttempts);
+        setManagerActiveAssignments(dbActive);
+        setCancelledAssignments(dbAll.filter(a => a.cancelledAt));
       }
       setCatalogLoading(false);
     }).catch(() => {
+      if (seq !== learnLoadSeqRef.current) return;
       setCatalogError("Could not load your learning data. Please try again.");
       setCatalogLoading(false);
     });
@@ -9184,9 +9156,18 @@ function LearnScreen({ role, canManageLearn, user, orgUsers = [], orgs = [], onN
         if (data) { setArchivedCourses(data.courses ?? []); setArchivedLessons(data.lessons ?? []); }
       });
     }
-  }, [tenantId, isReal, isAdmin, user?.id]);
+  }, [tenantId, isReal, isAdmin, user?.id, managerRefreshKey]);
 
   useEffect(() => { loadLearnCatalog(); }, [loadLearnCatalog]);
+
+  // Manager realtime — a teammate (or another tab) assigning/unassigning/
+  // archiving shows up without a manual refresh. Tenant-scoped + RLS-guarded by
+  // subscribeToTenantAssignments; bumps the refresh key so the tenant-wide load
+  // above re-runs. Learners keep their own subscription in the shared hook.
+  useEffect(() => {
+    if (!isReal || !tenantId || !isAdmin) return;
+    return subscribeToTenantAssignments(tenantId, "learn-manager", () => setManagerRefreshKey(k => k + 1));
+  }, [isReal, tenantId, isAdmin]);
 
   // Composite loading/error/retry — same retryable-unit contract LearnScreen
   // always had (`isLearnLoading` / `learnDataError` / `loadLearnData` are the
@@ -9427,6 +9408,7 @@ function LearnScreen({ role, canManageLearn, user, orgUsers = [], orgs = [], onN
     // the tenant_assignments subscription refreshes the affected lists automatically.
     setCourses(prev => prev.filter(c => c.id !== courseId));
     setArchivedCourses(prev => [{ ...course, status: "archived" }, ...prev]);
+    setManagerRefreshKey(k => k + 1); // reload tenant-wide assignments (some just became cancelled)
     toast.success("Course archived. Its active assignments were cancelled.");
   };
 
@@ -9457,6 +9439,7 @@ function LearnScreen({ role, canManageLearn, user, orgUsers = [], orgs = [], onN
     // subscription refreshes the affected lists automatically.
     setLessons(prev => prev.filter(l => l.id !== lessonId));
     setArchivedLessons(prev => [{ ...lesson, status: "archived" }, ...prev]);
+    setManagerRefreshKey(k => k + 1); // reload tenant-wide assignments (some just became cancelled)
     toast.success("Lesson archived. Its active assignments were cancelled.");
   };
 
@@ -9524,18 +9507,14 @@ function LearnScreen({ role, canManageLearn, user, orgUsers = [], orgs = [], onN
       (a.assignedTo.type === "individual" && a.assignedTo.userId === user?.id)    ||
       (a.assignedTo.type === "team"       && userTeamId && userTeamId === a.assignedTo.teamId)
     );
-    // Honest "Assigned" count (F5) — the number of lesson/course cards actually
-    // shown in the Assigned tab: one per existing content (deduped across
-    // instances/paths), NOT the raw row count (which double-counts reassignment
-    // instances and includes quizzes, which live on the Quizzes screen). This is
-    // the count the header and the tab badge use, so it matches the cards below.
-    const myAssignedContentKeys = new Set();
-    myAssignments.forEach(a => {
-      if (a.contentType === "quiz") return;
-      const content = a.contentType === "course" ? courses.find(c => c.id === a.contentId) : lessons.find(l => l.id === a.contentId);
-      if (content) myAssignedContentKeys.add(`${a.contentType}:${a.contentId}`);
-    });
-    const myAssignedCount = myAssignedContentKeys.size;
+    // Honest "Assigned" count — the number of unified current cards shown in the
+    // Assigned tab (lessons + courses + quizzes), one per content via the shared
+    // selector. Matches the cards below and Home's Assigned Learning set exactly.
+    const myAssignedCount = resolveLearnerAssignments(myAssignments, {
+      completedAtByLesson: completedLessonsAt,
+      quizAttempts: sharedAssignmentData?.quizAttempts ?? [],
+      courses, lessons, quizzes,
+    }).filter(r => !r.missing).length;
     const xpEarned = [...completedLessons].reduce((s, id) => s + (lessons.find(x => x.id === id)?.xp ?? 0), 0);
 
     if (activeLesson) {
@@ -9697,64 +9676,40 @@ function LearnScreen({ role, canManageLearn, user, orgUsers = [], orgs = [], onN
           ))}
         </div>
 
-        {/* ASSIGNED TAB */}
+        {/* ASSIGNED TAB — the unified learner assignment center: lessons,
+            courses AND quizzes, from the ONE shared selector Home also uses. */}
         {userTab === "assigned" && (() => {
-          // ── Deduplicate by contentType:contentId ──────────────────────────────
-          // The same content can be assigned to a user via multiple paths
-          // (individual + group + team). Count and display it only once.
-          const seenKeys = new Set();
-          const dedupedAssignments = myAssignments.filter(a => {
-            const key = `${a.contentType}:${a.contentId}`;
-            if (seenKeys.has(key)) return false;
-            seenKeys.add(key);
-            return true;
+          // Canonical current-work set: one latest instance per content, cancelled
+          // excluded, resolved by the shared engine. Identical to Home. A quiz
+          // card routes into the canonical Quizzes flow — Learn never duplicates
+          // quiz grading/attempt logic.
+          const rows = resolveLearnerAssignments(myAssignments, {
+            completedAtByLesson: completedLessonsAt,
+            quizAttempts: sharedAssignmentData?.quizAttempts ?? [],
+            courses, lessons, quizzes,
+          });
+          // Deleted/archived content is not actionable current work for the
+          // learner — excluded here exactly as Home excludes it, so the two views
+          // resolve the identical set. It is preserved in the MANAGER history as
+          // a "(removed)" row (the honest system-of-record for that lifecycle).
+          const enrichedAssigned = rows.filter(r => !r.missing).map(r => {
+            const a = r.assignment;
+            if (r.contentType === "course") {
+              const courseLessons = (r.content?.lessonIds ?? []).map(id => lessons.find(l => l.id === id)).filter(Boolean);
+              const doneCount = courseLessons.filter(l => isQualifyingEvent(completedLessonsAt.get(l.id), a.assignedAtRaw)).length;
+              return { r, a, content: r.content, kind: "course", isCourse: true, courseLessons, doneCount, pct: r.progress, isComplete: r.isCompleted, status: r.status, missing: r.missing };
+            }
+            if (r.contentType === "quiz") {
+              return { r, a, content: r.content, kind: "quiz", isQuiz: true, courseLessons: [], doneCount: 0, pct: r.progress, isComplete: r.isCompleted, status: r.status, missing: r.missing };
+            }
+            return { r, a, content: r.content, kind: "lesson", isCourse: false, courseLessons: [], doneCount: 0, pct: r.progress, isComplete: r.isCompleted, status: r.status, missing: r.missing };
           });
 
-          // ── Enrich each assignment with completion + availability ──────────────
-          const todayMsForFilter = new Date().setHours(0, 0, 0, 0);
-          // Resolution (pct/isComplete) now comes from the shared Resolved
-          // Assignment engine (src/lib/assignmentEngine.js) — course/lesson
-          // gate on THIS assignment row's own assigned_at, exactly like
-          // _lesson_assignment_active_user_ids() / _course_assignment_active_user_ids()
-          // (037_assignment_aware_lesson_course_eligibility.sql) enforce
-          // server-side. Scoped to this ASSIGNED tab only — the plain
-          // `completedLessons` Set above is still used everywhere else in
-          // LearnScreen (lesson viewer, "next up", course browsing progress)
-          // where assignment timing doesn't apply.
-          const enrichedAssigned = dedupedAssignments.map(a => {
-            const isCourse = a.contentType === "course";
-            const content  = isCourse ? courses.find(c => c.id === a.contentId) : lessons.find(l => l.id === a.contentId);
-            if (!content) return null;
-            const courseLessons = isCourse ? content.lessonIds.map(id => lessons.find(l => l.id === id)).filter(Boolean) : [];
-            const engineResult = isCourse
-              ? resolveAssignmentStatus("course", a, { lessonIds: courseLessons.map(l => l.id), completedAtByLesson: completedLessonsAt })
-              : resolveAssignmentStatus("lesson", a, { completedAt: completedLessonsAt.get(content.id) ?? null });
-            const doneCount = isCourse ? courseLessons.filter(l => isQualifyingEvent(completedLessonsAt.get(l.id), a.assignedAtRaw)).length : 0;
-            const pct = engineResult.progress;
-            const isComplete = engineResult.status === "completed";
-            // Availability: does the user have at least one lesson they can act on now?
-            // Locked-only courses are excluded from Due but still shown in All.
-            let isAvailable = true;
-            if (isCourse && !isComplete) {
-              const assignedDate = a.assignedAtRaw ? new Date(a.assignedAtRaw)
-                : a.assignedAt ? new Date(a.assignedAt) : null;
-              const lessonSched = content.lessonSchedule ?? {};
-              const isLockedForFilter = (lessonId) => {
-                const days = lessonSched[lessonId]?.available_after_days ?? 0;
-                if (!assignedDate || days === 0) return false;
-                const base = new Date(assignedDate); base.setHours(0, 0, 0, 0);
-                return todayMsForFilter < base.getTime() + days * 86400000;
-              };
-              isAvailable = courseLessons.some(l => !isQualifyingEvent(completedLessonsAt.get(l.id), a.assignedAtRaw) && !isLockedForFilter(l.id));
-            }
-            return { a, content, isCourse, courseLessons, doneCount, pct, isComplete, isAvailable };
-          }).filter(Boolean);
-
-          const dueItems      = enrichedAssigned.filter(e => !e.isComplete && e.isAvailable);
+          // To Do = not_started + in_progress + overdue; Completed = completed.
+          // All = To Do ∪ Completed (invariant guaranteed by the selector).
+          const toDoItems     = enrichedAssigned.filter(e => !e.isComplete);
           const completeItems = enrichedAssigned.filter(e => e.isComplete);
-          // Locked: assigned, not complete, but no lessons are available yet (schedule lock)
-          const lockedItems   = enrichedAssigned.filter(e => !e.isComplete && !e.isAvailable);
-          const filterItems   = learnFilter === "due" ? dueItems : learnFilter === "complete" ? completeItems : enrichedAssigned;
+          const filterItems   = learnFilter === "todo" ? toDoItems : learnFilter === "complete" ? completeItems : enrichedAssigned;
 
           const AssignedCard = ({ a, content, isCourse, courseLessons, doneCount, pct, isComplete }) => {
             const totalXp   = isCourse ? courseLessons.reduce((s, l) => s + (l.xp || 0), 0) : (content.xp || 0);
@@ -9854,22 +9809,51 @@ function LearnScreen({ role, canManageLearn, user, orgUsers = [], orgs = [], onN
             );
           };
 
+          // Quiz assignment card — status from the shared quiz engine; the action
+          // routes into the canonical Quizzes flow (Take / Retry / Review). Learn
+          // never renders questions, answers, or scoring itself.
+          const QuizAssignedCard = ({ a, content, status }) => {
+            const label = status === "completed" ? "Completed" : status === "overdue" ? "Overdue" : status === "in_progress" ? "In Progress" : "Not Started";
+            const labelColor = status === "completed" ? C.green : status === "overdue" ? C.red : status === "in_progress" ? C.blue : C.textSub;
+            const cta = status === "completed" ? "Review →" : status === "in_progress" || status === "overdue" ? "Retry →" : "Take quiz →";
+            const dueStatus = (status !== "completed" && a.dueAt && a.dueAt !== "Open") ? getDueStatus(a.dueAt) : null;
+            return (
+              <Card>
+                <div style={{ display: "flex", alignItems: "flex-start", gap: 16 }}>
+                  <div style={{ width: 52, height: 52, borderRadius: 12, flexShrink: 0, background: C.purple + "20", border: `1px solid ${C.purple}30`, display: "flex", alignItems: "center", justifyContent: "center", fontSize: 24, opacity: status === "completed" ? 0.55 : 1 }}>📋</div>
+                  <div style={{ flex: 1, minWidth: 0 }}>
+                    <div style={{ display: "flex", alignItems: "center", gap: 6, marginBottom: 2, flexWrap: "wrap" }}>
+                      <span style={{ fontSize: 11, fontWeight: 700, color: C.purple, letterSpacing: "0.06em" }}>QUIZ</span>
+                      <span style={{ fontSize: 10, fontWeight: 700, padding: "1px 6px", borderRadius: 4, background: a.required ? C.redBg : "#F1F5F9", color: a.required ? C.red : "#475569" }}>{a.required ? "REQUIRED" : "RECOMMENDED"}</span>
+                      <span style={{ fontSize: 10, fontWeight: 700, padding: "1px 6px", borderRadius: 4, background: labelColor + "18", color: labelColor }}>{label}</span>
+                      {dueStatus && <span style={{ fontSize: 10, fontWeight: 700, padding: "1px 7px", borderRadius: 4, background: dueStatus.color + "18", color: dueStatus.color, marginLeft: "auto" }}>{dueStatus.label}</span>}
+                    </div>
+                    <div style={{ fontSize: 15, fontWeight: 700, color: C.text }}>{content?.name ?? content?.title ?? "Quiz"}</div>
+                    <div style={{ display: "flex", justifyContent: "flex-end", marginTop: 12 }}>
+                      <button onClick={() => onNav?.("quizzes")} style={{ padding: "8px 16px", borderRadius: 8, border: "none", cursor: "pointer", background: status === "completed" ? C.white : C.purple, color: status === "completed" ? C.textSub : "#fff", borderWidth: status === "completed" ? 1 : 0, borderStyle: "solid", borderColor: C.border, fontSize: 13, fontWeight: 700 }}>{cta}</button>
+                    </div>
+                  </div>
+                </div>
+              </Card>
+            );
+          };
+
           return (
             <div style={{ display: "flex", flexDirection: "column", gap: 14 }}>
               {/* Empty state — no assignments at all */}
-              {dedupedAssignments.length === 0 && (
+              {enrichedAssigned.length === 0 && (
                 <div style={{ padding: 60, textAlign: "center", background: C.white, borderRadius: 12, border: `1px solid ${C.border}` }}>
                   <p style={{ margin: 0, fontSize: 15, fontWeight: 700, color: C.text }}>No assignments yet</p>
-                  <p style={{ margin: "6px 0 0", fontSize: 13, color: C.textSub }}>Your manager will assign courses and lessons here</p>
+                  <p style={{ margin: "6px 0 0", fontSize: 13, color: C.textSub }}>Your manager will assign lessons, courses, and quizzes here</p>
                 </div>
               )}
 
-              {/* Due / Complete / All pills */}
-              {dedupedAssignments.length > 0 && (
+              {/* To Do / Completed / All pills */}
+              {enrichedAssigned.length > 0 && (
                 <div style={{ display: "flex", gap: 6 }}>
                   {[
-                    ["due",      `Due (${dueItems.length})`],
-                    ["complete", `Complete (${completeItems.length})`],
+                    ["todo",     `To Do (${toDoItems.length})`],
+                    ["complete", `Completed (${completeItems.length})`],
                     ["all",      `All (${enrichedAssigned.length})`],
                   ].map(([id, label]) => (
                     <button key={id} onClick={() => setLearnFilter(id)} style={{
@@ -9884,32 +9868,29 @@ function LearnScreen({ role, canManageLearn, user, orgUsers = [], orgs = [], onN
               )}
 
               {/* Per-tab empty state */}
-              {dedupedAssignments.length > 0 && filterItems.length === 0 && (
+              {enrichedAssigned.length > 0 && filterItems.length === 0 && (
                 <div style={{ padding: 48, textAlign: "center", background: C.white, borderRadius: 16, border: `1px solid ${C.border}` }}>
                   <p style={{ fontSize: 15, fontWeight: 700, color: C.text, margin: "0 0 4px" }}>
-                    {learnFilter === "complete"
-                      ? "Nothing completed yet"
-                      : (learnFilter === "due" && lockedItems.length > 0)
-                        ? "Nothing due right now"
-                        : "All caught up!"}
+                    {learnFilter === "complete" ? "Nothing completed yet" : "All caught up!"}
                   </p>
                   <p style={{ fontSize: 13, color: C.textSub, margin: 0 }}>
                     {learnFilter === "complete"
-                      ? "Complete a lesson or course to see it here."
-                      : (learnFilter === "due" && lockedItems.length > 0)
-                        ? `${lockedItems.length} assignment${lockedItems.length === 1 ? "" : "s"} unlock on a schedule — check the All tab to see what's coming.`
-                        : learnFilter === "all"
-                          ? "No assignments found."
-                          : "No pending work — you're all done!"}
+                      ? "Complete a lesson, course, or quiz to see it here."
+                      : "No To Do items — you're all done!"}
                   </p>
                 </div>
               )}
 
-              {/* Assignment cards */}
-              {filterItems.map(e => <AssignedCard key={e.a.id} {...e} />)}
+              {/* Assignment cards — lesson/course use the existing viewer/course
+                  flow; quiz routes into the canonical Quizzes flow. */}
+              {filterItems.map(e => (
+                e.isQuiz
+                  ? <QuizAssignedCard key={e.a.id} a={e.a} content={e.content} status={e.status} />
+                  : <AssignedCard key={e.a.id} {...e} />
+              ))}
 
-              {/* Course suggestions — only in Due and All tabs */}
-              {(learnFilter === "due" || learnFilter === "all") && (() => {
+              {/* Course suggestions — only in To Do and All tabs */}
+              {(learnFilter === "todo" || learnFilter === "all") && (() => {
                 const suggestions = courses.filter(c => !myAssignments.some(a => a.contentType === "course" && a.contentId === c.id)).slice(0, 3);
                 if (!suggestions.length) return null;
                 return (
@@ -10195,11 +10176,17 @@ function LearnScreen({ role, canManageLearn, user, orgUsers = [], orgs = [], onN
         </div>
       )}
 
-      {/* ASSIGNMENTS TAB — manager assignment portal */}
+      {/* ASSIGNMENTS TAB — manager assignment portal.
+          Honest states: error (retryable) → loading → data/empty. A refresh shows
+          "Loading…" until the tenant-wide data resolves, never a false "No
+          assignments yet" built from a not-yet-loaded (empty) dataset. */}
       {tab === "assignments" && learnDataError && (
         <ErrorState message={learnDataError} onRetry={loadLearnData} />
       )}
-      {tab === "assignments" && !learnDataError && (() => {
+      {tab === "assignments" && !learnDataError && isLearnLoading && (
+        <div style={{ padding: 60, textAlign: "center", color: C.textMuted, fontSize: 14 }}>Loading assignments…</div>
+      )}
+      {tab === "assignments" && !learnDataError && !isLearnLoading && (() => {
         const STATUS_CONFIG = {
           not_started: { label: "Not Started", bg: C.muted,    text: C.textSub  },
           in_progress: { label: "In Progress", bg: C.blueBg,   text: C.blue     },
@@ -10808,8 +10795,12 @@ function LearnScreen({ role, canManageLearn, user, orgUsers = [], orgs = [], onN
                 return; // keep modal open — manager can adjust and retry
               }
               // created is one row per eligible fanned-out user (1 for individual, N for team/group).
-              // Patches the shared hook's assignments optimistically (Task 13) —
-              // real assignments now live there, not in local LearnScreen state.
+              // Manager view reads tenant-wide managerActiveAssignments — patch it
+              // optimistically and bump the refresh key so the authoritative
+              // tenant-wide reload confirms it. Also patch the shared hook for the
+              // learner surfaces (no-op for admins).
+              if (created?.length) setManagerActiveAssignments(prev => [...prev, ...created]);
+              setManagerRefreshKey(k => k + 1);
               sharedAssignmentData?.applyLocalAssignmentsCreated?.(created);
               if (skippedCount > 0) {
                 if (assignedCount === 0) {

@@ -1,6 +1,6 @@
 // Focused tests for resolveLatestQuizAssignment (one card per user+quiz).
 // Run: node src/lib/assignmentEngine.latest.test.mjs   (no creds, no DB)
-import { resolveLatestQuizAssignment, resolveAssignmentStatus } from "./assignmentEngine.js";
+import { resolveLatestQuizAssignment, resolveAssignmentStatus, resolveLearnerAssignments } from "./assignmentEngine.js";
 let pass = 0, fail = 0;
 const eq = (n, got, want) => { const a=JSON.stringify(got), b=JSON.stringify(want);
   if (a===b){pass++;console.log("PASS  "+n);} else {fail++;console.log(`FAIL  ${n}\n  got ${a}\n  want ${b}`);} };
@@ -141,6 +141,41 @@ const at = (created_at, passed, score) => ({ created_at, passed, score });
   // A non-cancelled assignment is unaffected (regression guard)
   const active = resolveAssignmentStatus("lesson", { dueAt: "Open" }, { completedAt: null });
   eq("non-cancelled lesson still resolves normally", active.status, "not_started");
+}
+
+// ── 11. Shared learner selector — one card per content, All = ToDo + Completed ─
+{
+  const now = "2026-07-25T00:00:00Z";
+  const assignments = [
+    // lesson: one instance, completed
+    { id: "L1a", contentType: "lesson", contentId: "L1", assigned_at: "2026-07-01T00:00:00Z" },
+    // course: latest instance, 1 of 2 members done -> in_progress
+    { id: "C1a", contentType: "course", contentId: "C1", assigned_at: "2026-07-01T00:00:00Z" },
+    { id: "C1b", contentType: "course", contentId: "C1", assigned_at: "2026-07-10T00:00:00Z" },
+    // quiz: reassigned, latest not_started
+    { id: "Q1a", contentType: "quiz", contentId: "Q1", assigned_at: "2026-07-01T00:00:00Z" },
+    { id: "Q1b", contentType: "quiz", contentId: "Q1", assigned_at: "2026-07-10T00:00:00Z" },
+    // cancelled -> excluded
+    { id: "X1",  contentType: "lesson", contentId: "L2", assigned_at: "2026-07-01T00:00:00Z", cancelledAt: now },
+    // missing content -> kept, flagged
+    { id: "M1",  contentType: "quiz", contentId: "GONE", assigned_at: "2026-07-01T00:00:00Z" },
+  ];
+  const rows = resolveLearnerAssignments(assignments, {
+    completedAtByLesson: new Map([["L1", "2026-07-02T00:00:00Z"], ["c1L1", "2026-07-11T00:00:00Z"]]),
+    quizAttempts: [{ quiz_id: "Q1", created_at: "2026-07-02T00:00:00Z", passed: true, score: 100 }], // BEFORE Q1b -> not qualifying
+    lessons: [{ id: "L1" }, { id: "c1L1" }, { id: "c1L2" }],
+    courses: [{ id: "C1", lessonIds: ["c1L1", "c1L2"] }],
+    quizzes: [{ id: "Q1" }], // GONE missing on purpose
+  });
+  eq("selector: one row per content (L1,C1,Q1,GONE; L2 cancelled excluded)", rows.length, 4);
+  const byId = Object.fromEntries(rows.map(r => [r.contentId, r]));
+  eq("selector: lesson L1 completed", byId.L1.status, "completed");
+  eq("selector: course C1 latest instance in_progress (1/2)", byId.C1.status, "in_progress");
+  eq("selector: quiz Q1 not_started (pass predates latest instance)", byId.Q1.status, "not_started");
+  eq("selector: missing content flagged", byId.GONE.missing, true);
+  const all = rows.length, todo = rows.filter(r => r.isToDo).length, done = rows.filter(r => r.isCompleted).length;
+  eq("selector: All === ToDo + Completed", all, todo + done);
+  eq("selector: exactly one Completed (L1)", done, 1);
 }
 
 console.log(`\n${pass} passed, ${fail} failed`);

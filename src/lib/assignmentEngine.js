@@ -326,3 +326,73 @@ export function resolveLatestQuizAssignment(assignments = [], attempts = []) {
     scopedAttempts, attemptCount, latestScore, bestScore,
   };
 }
+
+/**
+ * THE canonical learner "current work" selector — the single source of truth
+ * shared by Home (Assigned Learning) and Learner Learn (Assigned/All, To Do,
+ * Completed). Collapses every content type to ONE current card per
+ * (contentType, contentId): the LATEST assignment instance, resolved to its
+ * status by the same engine used everywhere else. Cancelled instances are
+ * excluded (they are history, not current work). Missing/deleted content is
+ * kept but flagged `missing` so the UI can render a non-clickable honest card
+ * rather than dropping it silently or linking to nothing.
+ *
+ * Guarantees the caller can rely on:
+ *   - one entry per content (no duplicate current cards, no historical dupes)
+ *   - status ∈ not_started | in_progress | completed | overdue
+ *   - `isCompleted` splits the set into exactly Completed vs To Do, so
+ *     All === To Do ∪ Completed, To Do === not_started + in_progress + overdue.
+ *
+ * @param {Array<Object>} assignments  this learner's assignment rows (all instances)
+ * @param {Object} ctx { completedAtByLesson:Map, quizAttempts:[], courses:[], lessons:[], quizzes:[] }
+ * @returns {Array<{ contentType, contentId, assignment, content, missing, status, progress, completedAt, isCompleted, isToDo, isOverdue }>}
+ */
+export function resolveLearnerAssignments(assignments = [], ctx = {}) {
+  const { completedAtByLesson = new Map(), quizAttempts = [], courses = [], lessons = [], quizzes = [] } = ctx;
+  const courseById = new Map(courses.map(c => [c.id, c]));
+  const lessonById = new Map(lessons.map(l => [l.id, l]));
+  const quizById   = new Map(quizzes.map(q => [q.id, q]));
+
+  const groups = new Map(); // contentType:contentId -> instances[]
+  for (const a of (assignments ?? [])) {
+    if (a?.cancelledAt) continue; // current work excludes cancelled/unassigned
+    const key = `${a.contentType}:${a.contentId}`;
+    if (!groups.has(key)) groups.set(key, []);
+    groups.get(key).push(a);
+  }
+
+  const out = [];
+  for (const instances of groups.values()) {
+    const contentType = instances[0].contentType;
+    const contentId   = instances[0].contentId;
+    let latest, status, progress, completedAt;
+
+    if (contentType === "quiz") {
+      const r = resolveLatestQuizAssignment(instances, (quizAttempts ?? []).filter(at => at.quiz_id === contentId));
+      latest = r.latest; status = r.status; progress = r.progress; completedAt = r.completedAt;
+    } else {
+      latest = instances.reduce((m, a) =>
+        (new Date(assignedAtOf(a) ?? 0).getTime() >= new Date(assignedAtOf(m) ?? 0).getTime() ? a : m), instances[0]);
+      if (contentType === "course") {
+        const course   = courseById.get(contentId);
+        const eligible = (course?.lessonIds ?? []).filter(id => lessonById.has(id)); // archived/missing members excluded from the denominator
+        const r = resolveAssignmentStatus("course", latest, { lessonIds: eligible, completedAtByLesson });
+        status = r.status; progress = r.progress; completedAt = r.completedAt;
+      } else {
+        const r = resolveAssignmentStatus("lesson", latest, { completedAt: completedAtByLesson.get(contentId) ?? null });
+        status = r.status; progress = r.progress; completedAt = r.completedAt;
+      }
+    }
+
+    const content = contentType === "course" ? courseById.get(contentId)
+                  : contentType === "quiz"   ? quizById.get(contentId)
+                  : lessonById.get(contentId);
+    const isCompleted = status === "completed";
+    out.push({
+      contentType, contentId, assignment: latest, content: content ?? null, missing: !content,
+      status, progress, completedAt,
+      isCompleted, isToDo: !isCompleted, isOverdue: status === "overdue",
+    });
+  }
+  return out;
+}
