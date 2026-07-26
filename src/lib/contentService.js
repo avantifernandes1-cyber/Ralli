@@ -371,16 +371,45 @@ export async function upsertQuiz(tenantId, quiz, userId) {
 }
 
 /**
- * Delete a quiz by id.
+ * Archive a quiz (soft, reversible) — migration 065 archive_quiz RPC.
+ * Sets status='archived' and cancels the quiz's still-active assignments with a
+ * server-controlled reason ('content_archived'), preserving every attempt,
+ * score, XP award, result, review, snapshot, tag, and analytics row. The
+ * archived quiz leaves the learner Knowledge Base / Home / To-Do and the
+ * new-assignment picker, while historical results stay honest. Server-authorized
+ * (manager/orgAdmin/ralli_admin), tenant-scoped, idempotent.
  * @param {string} quizId
- * @returns {Promise<{ error: Object|null }>}
+ * @returns {Promise<{ data: Object|null, error: Object|null }>}
+ */
+export async function archiveQuiz(quizId) {
+  const { data, error } = await supabase.rpc("archive_quiz", { p_quiz_id: quizId });
+  return { data: data ?? null, error };
+}
+
+/**
+ * Restore an archived quiz to the active library — migration 065 restore_quiz.
+ * Returns status to 'active' and allows fresh reassignment. Does NOT reactivate
+ * the assignments archive cancelled, and never rewrites past results.
+ * @param {string} quizId
+ * @returns {Promise<{ data: Object|null, error: Object|null }>}
+ */
+export async function restoreQuiz(quizId) {
+  const { data, error } = await supabase.rpc("restore_quiz", { p_quiz_id: quizId });
+  return { data: data ?? null, error };
+}
+
+/**
+ * Hard-delete a quiz — migration 065 delete_quiz RPC. The raw table DELETE path
+ * is closed (RLS policy dropped + grant revoked); this restricted RPC REFUSES to
+ * delete a quiz that has any assignment or attempt (it directs the caller to
+ * archive instead), so a delete can never orphan history. The manager UI no
+ * longer offers this; retained for a genuinely unused, never-assigned quiz.
+ * @param {string} quizId
+ * @returns {Promise<{ data: Object|null, error: Object|null }>}
  */
 export async function deleteQuiz(quizId) {
-  const { error } = await supabase
-    .from("tenant_quizzes")
-    .delete()
-    .eq("id", quizId);
-  return { error };
+  const { data, error } = await supabase.rpc("delete_quiz", { p_quiz_id: quizId });
+  return { data: data ?? null, error };
 }
 
 

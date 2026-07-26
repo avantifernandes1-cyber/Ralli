@@ -47,6 +47,8 @@ import {
   upsertCourse,
   upsertQuiz,
   deleteQuiz as dbDeleteQuiz,
+  archiveQuiz as dbArchiveQuiz,
+  restoreQuiz as dbRestoreQuiz,
   getLessonCompletions,
   getLessonCompletionsWithDates,
   markLessonComplete,
@@ -8968,7 +8970,7 @@ function LearnScreen({ role, canManageLearn, user, orgUsers = [], orgs = [], onN
       const saved = sessionStorage.getItem("ralli_learn_admin_tab");
       if (saved && ["courses", "lessons", "quizzes", "assignments", "archived"].includes(saved)) return saved;
     } catch {}
-    return "courses";
+    return "assignments"; // manager Learn defaults to Assignments (the primary view)
   });
   useEffect(() => {
     if (!isAdmin) return;
@@ -9036,6 +9038,7 @@ function LearnScreen({ role, canManageLearn, user, orgUsers = [], orgs = [], onN
   const [userTab,    setUserTab]    = useState("assigned");
   const [learnFilter, setLearnFilter] = useState("todo"); // "todo" | "complete" | "all"
   const [search,     setSearch]     = useState("");
+  const [browseKind, setBrowseKind] = useState("all"); // Knowledge Base content-type filter: "all" | "lesson" | "course" | "quiz"
   const [archivedCourses,   setArchivedCourses]   = useState([]);
   const [archivedLessons,   setArchivedLessons]   = useState([]);
   const [confirmArchive,    setConfirmArchive]    = useState(null); // { type: "course"|"lesson", id, title }
@@ -9679,15 +9682,36 @@ function LearnScreen({ role, canManageLearn, user, orgUsers = [], orgs = [], onN
       );
     }
 
-    // Knowledge Base: all content, filterable
+    // Knowledge Base: all searchable content — lessons, courses, AND quizzes.
+    // Quizzes come from the learner-safe catalog (list_quizzes_for_learner →
+    // metaListToCatalog): metadata ONLY (title, tags, question count, passing
+    // score, revision) — never question bodies or answer keys. We additionally
+    // keep only status "active", so archived/inactive/draft quizzes never
+    // surface here; the RPC itself is tenant-scoped and eligibility-gated, so
+    // cross-tenant/ineligible quizzes never reach this browser to begin with.
+    const kbQuizAttempts = sharedAssignmentData?.quizAttempts ?? [];
+    const quizStatusOf = (quizId) => {
+      const attempts = kbQuizAttempts.filter(at => at.quiz_id === quizId);
+      if (attempts.length === 0) return "none";
+      return attempts.some(at => at.passed === true) ? "passed" : "attempted";
+    };
     const allContent = [
       ...courses.map(c => ({ ...c, _kind: "course" })),
       ...lessons.filter(l => l.status === "active").map(l => ({ ...l, _kind: "lesson" })),
+      ...quizzes
+        .filter(q => (q.status ?? "active") === "active")
+        .map(q => ({ ...q, _kind: "quiz", _quizStatus: quizStatusOf(q.id) })),
     ];
     const sq = search.toLowerCase();
+    const kindFiltered = browseKind === "all" ? allContent : allContent.filter(x => x._kind === browseKind);
     const browseResults = sq
-      ? allContent.filter(x => x.title.toLowerCase().includes(sq) || (x.description ?? "").toLowerCase().includes(sq))
-      : allContent;
+      ? kindFiltered.filter(x => {
+          const title = (x.title ?? x.name ?? "").toLowerCase();
+          const desc  = (x.description ?? "").toLowerCase();
+          const tags  = Array.isArray(x.tags) ? x.tags.join(" ").toLowerCase() : "";
+          return title.includes(sq) || desc.includes(sq) || tags.includes(sq);
+        })
+      : kindFiltered;
 
     return (
       <div style={{ display: "flex", flexDirection: "column", gap: 20 }}>
@@ -9964,38 +9988,86 @@ function LearnScreen({ role, canManageLearn, user, orgUsers = [], orgs = [], onN
             <input
               value={search}
               onChange={e => setSearch(e.target.value)}
-              placeholder="Search courses, lessons, and content..."
+              placeholder="Search courses, lessons, and quizzes..."
               autoFocus
               style={{
                 width: "100%", padding: "10px 14px", borderRadius: 10, border: `1px solid ${C.border}`,
                 fontSize: 14, color: C.text, background: C.white, boxSizing: "border-box",
               }}
             />
-            {search && browseResults.length === 0 && (
-              <div style={{ padding: 40, textAlign: "center", color: C.textSub }}>No results for "{search}"</div>
+            {/* Content Type filter — lets a learner narrow the Knowledge Base to
+                Lessons, Courses, or Quizzes. Quizzes are searchable here from the
+                learner-safe catalog; the answer key is never present client-side. */}
+            <div style={{ display: "flex", gap: 8, flexWrap: "wrap" }}>
+              {[{ id: "all", label: "All" }, { id: "lesson", label: "Lessons" }, { id: "course", label: "Courses" }, { id: "quiz", label: "Quizzes" }].map(f => (
+                <button key={f.id} onClick={() => setBrowseKind(f.id)} style={{
+                  padding: "6px 14px", borderRadius: 999, cursor: "pointer", fontSize: 12, fontWeight: 700,
+                  border: `1px solid ${browseKind === f.id ? C.orange : C.border}`,
+                  background: browseKind === f.id ? C.orangeLight : C.white,
+                  color: browseKind === f.id ? C.orange : C.textSub,
+                }}>{f.label}</button>
+              ))}
+            </div>
+            {browseResults.length === 0 && (
+              <div style={{ padding: 40, textAlign: "center", color: C.textSub }}>
+                {search ? `No results for "${search}"` : "No content available."}
+              </div>
             )}
-            {browseResults.map(item => (
+            {browseResults.map(item => {
+              const isQuiz = item._kind === "quiz";
+              // Quiz result-status → badge + CTA. The action ALWAYS routes into
+              // the canonical quiz-launch flow (onStartQuiz); the flow decides
+              // start vs. safe review/results based on the learner's attempts.
+              const qStatus = item._quizStatus; // "passed" | "attempted" | "none"
+              const quizBadge = qStatus === "passed" ? { label: "Completed", color: C.green }
+                              : qStatus === "attempted" ? { label: "In Progress", color: C.blue }
+                              : null;
+              const quizCta = qStatus === "passed" ? "Review →" : qStatus === "attempted" ? "Retry →" : "Take quiz →";
+              const onClick = isQuiz
+                ? () => onStartQuiz?.(item.id)
+                : () => item._kind === "lesson" ? openLesson(item) : setActiveCourse(item);
+              return (
               <Card key={item.id} style={{ display: "flex", alignItems: "center", gap: 14, cursor: "pointer" }}
-                onClick={() => item._kind === "lesson" ? openLesson(item) : setActiveCourse(item)}>
+                onClick={onClick}>
                 <div style={{
                   width: 44, height: 44, borderRadius: 10, flexShrink: 0,
-                  background: ((item._kind === "course" ? item.color : LESSON_TYPE_COLORS[item.type]) ?? C.orange) + "20",
+                  background: (isQuiz ? C.purple : ((item._kind === "course" ? item.color : LESSON_TYPE_COLORS[item.type]) ?? C.orange)) + "20",
                   display: "flex", alignItems: "center", justifyContent: "center", fontSize: 22,
                 }}>
-                  {item._kind === "course" ? item.emoji : LESSON_TYPE_ICONS[item.type]}
+                  {isQuiz ? "📋" : item._kind === "course" ? item.emoji : LESSON_TYPE_ICONS[item.type]}
                 </div>
                 <div style={{ flex: 1, minWidth: 0 }}>
-                  <div style={{ fontSize: 11, fontWeight: 700, color: C.textMuted, letterSpacing: "0.06em", marginBottom: 2 }}>
-                    {item._kind === "course" ? `COURSE · ${item.lessonIds?.length ?? 0} LESSONS` : `LESSON · ${(item.type ?? "").toUpperCase()}`}
+                  <div style={{ display: "flex", alignItems: "center", gap: 6, marginBottom: 2, flexWrap: "wrap" }}>
+                    <span style={{ fontSize: 11, fontWeight: 700, color: isQuiz ? C.purple : C.textMuted, letterSpacing: "0.06em" }}>
+                      {isQuiz ? `QUIZ · ${item.questionCount ?? 0} QUESTION${(item.questionCount ?? 0) === 1 ? "" : "S"}`
+                             : item._kind === "course" ? `COURSE · ${item.lessonIds?.length ?? 0} LESSONS`
+                             : `LESSON · ${(item.type ?? "").toUpperCase()}`}
+                    </span>
+                    {isQuiz && typeof item.passingScore === "number" && (
+                      <span style={{ fontSize: 10, fontWeight: 700, padding: "1px 6px", borderRadius: 4, background: C.muted, color: C.textSub }}>Pass {item.passingScore}%</span>
+                    )}
+                    {isQuiz && quizBadge && (
+                      <span style={{ fontSize: 10, fontWeight: 700, padding: "1px 6px", borderRadius: 4, background: quizBadge.color + "18", color: quizBadge.color }}>{quizBadge.label}</span>
+                    )}
                   </div>
-                  <div style={{ fontSize: 14, fontWeight: 700, color: C.text }}>{item.title}</div>
-                  <div style={{ fontSize: 12, color: C.textSub, marginTop: 2, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
-                    {item.description?.slice(0, 90)}{(item.description?.length ?? 0) > 90 ? "…" : ""}
-                  </div>
+                  <div style={{ fontSize: 14, fontWeight: 700, color: C.text }}>{item.title ?? item.name}</div>
+                  {!isQuiz && (
+                    <div style={{ fontSize: 12, color: C.textSub, marginTop: 2, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
+                      {item.description?.slice(0, 90)}{(item.description?.length ?? 0) > 90 ? "…" : ""}
+                    </div>
+                  )}
+                  {isQuiz && Array.isArray(item.tags) && item.tags.length > 0 && (
+                    <div style={{ fontSize: 12, color: C.textSub, marginTop: 2, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
+                      {item.tags.slice(0, 4).map(t => `#${t}`).join("  ")}
+                    </div>
+                  )}
                 </div>
-                {item._kind === "lesson" && <span style={{ fontSize: 12, color: C.textSub, flexShrink: 0 }}>⏱ {item.duration}</span>}
+                {isQuiz
+                  ? <span style={{ fontSize: 12, color: C.purple, fontWeight: 700, flexShrink: 0 }}>{quizCta}</span>
+                  : item._kind === "lesson" && <span style={{ fontSize: 12, color: C.textSub, flexShrink: 0 }}>⏱ {item.duration}</span>}
               </Card>
-            ))}
+              );
+            })}
           </div>
         )}
       </div>
@@ -13876,15 +13948,21 @@ function SnapshotQuizReview({
 }
 
 // ── QuizLibraryGrid ──────────────────────────────────────────────────────────
-// Admin/Manager quiz list. Displays each quiz with edit, delete, favorite, and
-// active-toggle actions. Production hook: replace callbacks with API mutations.
-function QuizLibraryGrid({ quizzes, onEditQuiz, onNav, onDeleteQuiz, onToggleFavorite, onToggleActive, onAssign, onLaunchQuiz, canEdit = true, canDelete = true, canAssign = true, canLaunch = false, tagModelByQuiz = null, tagCatalogById = new Map() }) {
-  const [confirmDelete, setConfirmDelete] = useState(null); // quiz id pending delete confirm
+// Admin/Manager quiz list. Displays each quiz with edit, favorite, active-toggle,
+// and — instead of a permanent delete — Archive (active quizzes) / Restore
+// (archived quizzes). Archiving is soft and reversible (migration 065): it
+// preserves every attempt/score/result and cancels the quiz's active assignments
+// server-side. Archived quizzes render in a separate, dimmed section at the
+// bottom and are never assignable/launchable until restored.
+function QuizLibraryGrid({ quizzes, onEditQuiz, onNav, onArchiveQuiz, onRestoreQuiz, onToggleFavorite, onToggleActive, onAssign, onLaunchQuiz, canEdit = true, canDelete = true, canAssign = true, canLaunch = false, tagModelByQuiz = null, tagCatalogById = new Map() }) {
+  const [confirmArchive, setConfirmArchive] = useState(null); // quiz id pending archive confirm
 
-  return (
-    <div style={{ display: "flex", flexDirection: "column", gap: 10 }}>
-      {quizzes.map(quiz => {
+  const activeQuizzes   = quizzes.filter(q => q.status !== "archived");
+  const archivedQuizzes = quizzes.filter(q => q.status === "archived");
+
+  const renderRow = (quiz) => {
         const qCount   = quiz.questions?.length ?? 0;
+        const archived = quiz.status === "archived";
         const inactive = quiz.status === "inactive";
         const fav      = !!quiz.favorite;
         return (
@@ -13892,13 +13970,15 @@ function QuizLibraryGrid({ quizzes, onEditQuiz, onNav, onDeleteQuiz, onToggleFav
             display: "flex", alignItems: "center", gap: 16,
             padding: "16px 20px", borderRadius: 14,
             border: `1.5px solid ${C.border}`, background: C.white,
-            opacity: inactive ? 0.6 : 1, transition: "opacity 0.15s",
+            opacity: archived ? 0.6 : inactive ? 0.6 : 1, transition: "opacity 0.15s",
           }}>
             <div style={{ flex: 1, minWidth: 0 }}>
               <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
                 <span style={{ fontSize: 14, fontWeight: 700, color: C.text }}>{quiz.name}</span>
-                {fav && <span style={{ fontSize: 11, color: C.orange }}>★</span>}
-                {inactive && (
+                {fav && !archived && <span style={{ fontSize: 11, color: C.orange }}>★</span>}
+                {archived ? (
+                  <span style={{ fontSize: 10, fontWeight: 700, padding: "2px 7px", borderRadius: 4, background: C.muted, color: C.textMuted }}>Archived</span>
+                ) : inactive && (
                   <span style={{ fontSize: 10, fontWeight: 700, padding: "2px 7px", borderRadius: 4, background: C.muted, color: C.textMuted }}>Inactive</span>
                 )}
               </div>
@@ -13913,6 +13993,18 @@ function QuizLibraryGrid({ quizzes, onEditQuiz, onNav, onDeleteQuiz, onToggleFav
 
             {/* Actions */}
             <div style={{ display: "flex", alignItems: "center", gap: 6, flexShrink: 0 }}>
+              {archived ? (
+                /* Archived quiz: only Restore. No assign/launch/edit/toggle — an
+                   archived quiz is out of circulation until restored. Its
+                   attempts/results remain accessible via drilldowns. */
+                canDelete && (
+                  <button
+                    onClick={() => onRestoreQuiz?.(quiz.id)}
+                    style={{ fontSize: 12, fontWeight: 700, padding: "6px 14px", borderRadius: 8, border: `1px solid ${C.orange}`, background: C.orangeLight, color: C.orange, cursor: "pointer" }}
+                  >Restore</button>
+                )
+              ) : (
+              <>
               {/* Favorite */}
               <button
                 onClick={() => onToggleFavorite(quiz.id)}
@@ -13952,28 +14044,45 @@ function QuizLibraryGrid({ quizzes, onEditQuiz, onNav, onDeleteQuiz, onToggleFav
                 >Edit</button>
               )}
 
-              {/* Delete */}
-              {canDelete && (confirmDelete === quiz.id ? (
+              {/* Archive (replaces permanent Delete): soft + reversible, preserves
+                  all attempts/results and cancels this quiz's active assignments. */}
+              {canDelete && (confirmArchive === quiz.id ? (
                 <div style={{ display: "flex", gap: 4 }}>
                   <button
-                    onClick={() => { onDeleteQuiz(quiz.id); setConfirmDelete(null); }}
-                    style={{ fontSize: 11, fontWeight: 700, padding: "5px 10px", borderRadius: 6, border: "none", background: C.red, color: "#fff", cursor: "pointer" }}
-                  >Confirm</button>
+                    onClick={() => { onArchiveQuiz?.(quiz.id); setConfirmArchive(null); }}
+                    style={{ fontSize: 11, fontWeight: 700, padding: "5px 10px", borderRadius: 6, border: "none", background: C.orange, color: "#fff", cursor: "pointer" }}
+                  >Archive</button>
                   <button
-                    onClick={() => setConfirmDelete(null)}
+                    onClick={() => setConfirmArchive(null)}
                     style={{ fontSize: 11, fontWeight: 700, padding: "5px 10px", borderRadius: 6, border: `1px solid ${C.border}`, background: C.white, color: C.textSub, cursor: "pointer" }}
                   >Cancel</button>
                 </div>
               ) : (
                 <button
-                  onClick={() => setConfirmDelete(quiz.id)}
-                  style={{ fontSize: 12, fontWeight: 700, padding: "6px 10px", borderRadius: 8, border: `1px solid ${C.border}`, background: C.white, color: C.red, cursor: "pointer" }}
-                >✕</button>
+                  onClick={() => setConfirmArchive(quiz.id)}
+                  title="Archive quiz"
+                  style={{ fontSize: 12, fontWeight: 700, padding: "6px 14px", borderRadius: 8, border: `1px solid ${C.border}`, background: C.white, color: C.textSub, cursor: "pointer" }}
+                >Archive</button>
               ))}
+              </>
+              )}
             </div>
           </div>
         );
-      })}
+  };
+
+  return (
+    <div style={{ display: "flex", flexDirection: "column", gap: 10 }}>
+      {activeQuizzes.map(renderRow)}
+      {archivedQuizzes.length > 0 && (
+        <>
+          <div style={{ display: "flex", alignItems: "center", gap: 8, marginTop: 8 }}>
+            <span style={{ fontSize: 12, fontWeight: 700, color: C.textMuted, letterSpacing: "0.04em" }}>ARCHIVED ({archivedQuizzes.length})</span>
+            <div style={{ flex: 1, height: 1, background: C.border }} />
+          </div>
+          {archivedQuizzes.map(renderRow)}
+        </>
+      )}
     </div>
   );
 }
@@ -14511,7 +14620,7 @@ function QuizTrackingPanel({ quizzes, orgUsers, tenantId, isReal, refreshKey, on
 }
 
 // ── QuizzesScreen (user branch rewritten, admin branch preserved) ─────────────
-function QuizzesScreen({ role, onNav, quizzes, onEditQuiz, onDeleteQuiz, onToggleFavorite, onToggleActive, pendingQuizId, onClearPendingQuiz, canCreate = true, canEdit = true, canDelete = true, canLaunch = true, canAssign = true, onAssignQuiz, onLaunchQuiz, orgUsers = [], orgs = [], currentUser = null, tenantId = null, isReal = false, quizzesReady = false, sharedAssignmentData = null, onRefreshQuizzes = null }) {
+function QuizzesScreen({ role, onNav, quizzes, onEditQuiz, onDeleteQuiz, onArchiveQuiz, onRestoreQuiz, onToggleFavorite, onToggleActive, pendingQuizId, onClearPendingQuiz, canCreate = true, canEdit = true, canDelete = true, canLaunch = true, canAssign = true, onAssignQuiz, onLaunchQuiz, orgUsers = [], orgs = [], currentUser = null, tenantId = null, isReal = false, quizzesReady = false, sharedAssignmentData = null, onRefreshQuizzes = null }) {
 
   // ── USER VIEW ─────────────────────────────────────────────────────────────
   if (role === "user") {
@@ -15203,7 +15312,8 @@ function QuizzesScreen({ role, onNav, quizzes, onEditQuiz, onDeleteQuiz, onToggl
                 tagCatalogById={tagCatalogById}
                 onEditQuiz={onEditQuiz}
                 onNav={onNav}
-                onDeleteQuiz={onDeleteQuiz}
+                onArchiveQuiz={onArchiveQuiz}
+                onRestoreQuiz={onRestoreQuiz}
                 onToggleFavorite={onToggleFavorite}
                 onToggleActive={onToggleActive}
                 onAssign={canAssign ? (quiz) => setAssignModal(quiz) : null}
@@ -23004,7 +23114,17 @@ function defaultScreenForRestore(isSuperAdminUser) {
 function getRestorableScreen() {
   try {
     const saved = sessionStorage.getItem(LAST_SCREEN_KEY);
-    return saved && RESTORABLE_SCREENS.has(saved) ? saved : null;
+    if (!saved || !RESTORABLE_SCREENS.has(saved)) return null;
+    // A mid-quiz refresh can't durably restore the in-progress attempt (current
+    // answers/index are never persisted), and the standalone Quizzes screen is
+    // retired from navigation. Route to Learn instead — the learner lands on
+    // their To Do with the quiz assignment visible once, restartable via the
+    // canonical Start/Retry. No attempt/XP is created until the real final
+    // submission, so nothing is lost. (pendingQuizId and the quiz-player view
+    // state are React-only and start fresh on reload, so there's no stale
+    // selected-answer or auto-launch to clear.) The quiz builder maps here too.
+    if (saved === "quizzes" || saved === "rankd-quiz-builder") return "learn";
+    return saved;
   } catch { return null; }
 }
 
@@ -23864,6 +23984,15 @@ export default function App() {
   const perm = (scope, key) => hasPermission(rolePermissions, role, scope, key);
 
   const navigate = (s) => setScreen(s);
+  // A FRESH click of a top-level nav item. Clicking "Learn" always opens its
+  // primary view (manager: Assignments) — we seed the persisted subtab so a
+  // deliberate nav is distinguishable from a browser refresh (which restores the
+  // last subtab from sessionStorage untouched). Programmatic returns (e.g. the
+  // quiz builder → Learn → Quizzes) set their own subtab and don't go through here.
+  const navigateFromNav = (s) => {
+    if (s === "learn") { try { sessionStorage.setItem("ralli_learn_admin_tab", "assignments"); } catch {} }
+    navigate(s);
+  };
 
   // Persist the current screen (when it's a safe-to-restore destination) so a
   // page refresh can return the user to where they were instead of always
@@ -24626,6 +24755,57 @@ export default function App() {
     }
   };
 
+  // Archive a quiz (soft, reversible) — replaces permanent delete in the manager
+  // UI. Archiving cancels the quiz's active assignments server-side (migration
+  // 065 archive_quiz, reason 'content_archived'); attempts/scores/results are
+  // preserved. Pessimistic: the DB must confirm before local state flips.
+  const handleArchiveQuiz = async (id) => {
+    if (!user?._isReal || !id || id.startsWith("quiz_") || id.startsWith("sq_")) {
+      setQuizzes(prev => prev.map(q => q.id === id ? { ...q, status: "archived" } : q));
+      toast.success("Quiz archived.");
+      return;
+    }
+    if (deletingQuizIdsRef.current.has(id)) return;
+    deletingQuizIdsRef.current.add(id);
+    try {
+      const { data, error } = await dbArchiveQuiz(id);
+      if (error) {
+        console.error("[ralli] archiveQuiz failed:", error);
+        toast.error("Failed to archive quiz. Please try again.");
+        return;
+      }
+      setQuizzes(prev => prev.map(q => q.id === id ? { ...q, status: "archived" } : q));
+      const n = Number(data?.cancelled_assignments ?? 0);
+      toast.success(n > 0 ? `Quiz archived. ${n} active assignment${n === 1 ? "" : "s"} cancelled.` : "Quiz archived.");
+    } finally {
+      deletingQuizIdsRef.current.delete(id);
+    }
+  };
+
+  // Restore an archived quiz to the active library (migration 065 restore_quiz).
+  // Does NOT reactivate the assignments archive cancelled.
+  const handleRestoreQuiz = async (id) => {
+    if (!user?._isReal || !id || id.startsWith("quiz_") || id.startsWith("sq_")) {
+      setQuizzes(prev => prev.map(q => q.id === id ? { ...q, status: "active" } : q));
+      toast.success("Quiz restored.");
+      return;
+    }
+    if (deletingQuizIdsRef.current.has(id)) return;
+    deletingQuizIdsRef.current.add(id);
+    try {
+      const { error } = await dbRestoreQuiz(id);
+      if (error) {
+        console.error("[ralli] restoreQuiz failed:", error);
+        toast.error("Failed to restore quiz. Please try again.");
+        return;
+      }
+      setQuizzes(prev => prev.map(q => q.id === id ? { ...q, status: "active" } : q));
+      toast.success("Quiz restored to the active library.");
+    } finally {
+      deletingQuizIdsRef.current.delete(id);
+    }
+  };
+
   const handleToggleFavorite = (id) => {
     const orgId = currentOrg?.id ?? user?.orgId ?? null;
     const current = quizzes.find(q => q.id === id);
@@ -25142,9 +25322,9 @@ export default function App() {
       case "rankd-results":     return <RankdResultsScreen onNav={navigate} sessionDbId={viewResultsDbId} sessionCode={viewResultsCode} sessions={[...sessions, ...pastSessions]} gameData={gameResultsData} />;
       case "learn":             return <LearnScreen role={gameRole} canManageLearn={canManageLearn} user={user} orgUsers={orgUsers} orgs={orgs} onNav={navigate} onStartQuiz={(id) => { setPendingQuizId(id); navigate("quizzes"); }} onAwardXp={handleAwardXp} pendingLessonId={pendingLessonId} onClearPendingLesson={() => setPendingLessonId(null)} pendingCourseId={pendingCourseId} onClearPendingCourse={() => setPendingCourseId(null)} canCreate={perm("actions","create")} canEdit={perm("actions","edit")} canDelete={perm("actions","delete")} canAssign={perm("actions","assign")} tenantId={currentOrg?.id ?? null} isReal={!!user?._isReal} quizzes={quizzes} sharedAssignmentData={sharedAssignmentData}
         quizzesPanel={canManageLearn ? (
-          <QuizzesScreen role="admin" onNav={navigate} quizzes={quizzes} onEditQuiz={handleEditQuiz} onDeleteQuiz={handleDeleteQuiz} onToggleFavorite={handleToggleFavorite} onToggleActive={handleToggleActive} pendingQuizId={null} onClearPendingQuiz={() => {}} canCreate={perm("actions","create")} canEdit={perm("actions","edit")} canDelete={perm("actions","delete")} canLaunch={perm("actions","launch")} canAssign={perm("actions","assign")} onAssignQuiz={handleAssignQuiz} onLaunchQuiz={handleCreateSession} orgUsers={orgUsers} orgs={orgs} currentUser={currentUser} tenantId={currentOrg?.id ?? null} isReal={!!user?._isReal} quizzesReady={quizzesReady} sharedAssignmentData={sharedAssignmentData} onRefreshQuizzes={refreshQuizzes} />
+          <QuizzesScreen role="admin" onNav={navigate} quizzes={quizzes} onEditQuiz={handleEditQuiz} onDeleteQuiz={handleDeleteQuiz} onArchiveQuiz={handleArchiveQuiz} onRestoreQuiz={handleRestoreQuiz} onToggleFavorite={handleToggleFavorite} onToggleActive={handleToggleActive} pendingQuizId={null} onClearPendingQuiz={() => {}} canCreate={perm("actions","create")} canEdit={perm("actions","edit")} canDelete={perm("actions","delete")} canLaunch={perm("actions","launch")} canAssign={perm("actions","assign")} onAssignQuiz={handleAssignQuiz} onLaunchQuiz={handleCreateSession} orgUsers={orgUsers} orgs={orgs} currentUser={currentUser} tenantId={currentOrg?.id ?? null} isReal={!!user?._isReal} quizzesReady={quizzesReady} sharedAssignmentData={sharedAssignmentData} onRefreshQuizzes={refreshQuizzes} />
         ) : null} />;
-      case "quizzes":           return <QuizzesScreen role={gameRole} onNav={navigate} quizzes={quizzes} onEditQuiz={handleEditQuiz} onDeleteQuiz={handleDeleteQuiz} onToggleFavorite={handleToggleFavorite} onToggleActive={handleToggleActive} pendingQuizId={pendingQuizId} onClearPendingQuiz={() => setPendingQuizId(null)} canCreate={perm("actions","create")} canEdit={perm("actions","edit")} canDelete={perm("actions","delete")} canLaunch={perm("actions","launch")} canAssign={perm("actions","assign")} onAssignQuiz={handleAssignQuiz} onLaunchQuiz={handleCreateSession} orgUsers={orgUsers} orgs={orgs} currentUser={currentUser} tenantId={currentOrg?.id ?? null} isReal={!!user?._isReal} quizzesReady={quizzesReady} sharedAssignmentData={sharedAssignmentData} onRefreshQuizzes={refreshQuizzes} />;
+      case "quizzes":           return <QuizzesScreen role={gameRole} onNav={navigate} quizzes={quizzes} onEditQuiz={handleEditQuiz} onDeleteQuiz={handleDeleteQuiz} onArchiveQuiz={handleArchiveQuiz} onRestoreQuiz={handleRestoreQuiz} onToggleFavorite={handleToggleFavorite} onToggleActive={handleToggleActive} pendingQuizId={pendingQuizId} onClearPendingQuiz={() => setPendingQuizId(null)} canCreate={perm("actions","create")} canEdit={perm("actions","edit")} canDelete={perm("actions","delete")} canLaunch={perm("actions","launch")} canAssign={perm("actions","assign")} onAssignQuiz={handleAssignQuiz} onLaunchQuiz={handleCreateSession} orgUsers={orgUsers} orgs={orgs} currentUser={currentUser} tenantId={currentOrg?.id ?? null} isReal={!!user?._isReal} quizzesReady={quizzesReady} sharedAssignmentData={sharedAssignmentData} onRefreshQuizzes={refreshQuizzes} />;
       case "battlecards":       return (isAdminType && perm("actions","edit"))
         ? <BattleCardsAdminScreen categories={bcCategories} cards={battleCards} onSaveCategory={handleSaveBcCategory} onDeleteCategory={handleDeleteBcCategory} onSaveCard={handleSaveBattleCard} onDeleteCard={handleDeleteBattleCard} />
         : <BattleCardsScreen categories={bcCategories} cards={battleCards} isLoading={bcLoading} isReal={!!user?._isReal} />;
@@ -25232,7 +25412,7 @@ export default function App() {
             ].map(item => {
               const active = screen === item.id || (screen.startsWith("rankd-") && item.id === "rankd");
               return (
-                <button key={item.id} onClick={() => navigate(item.id)}
+                <button key={item.id} onClick={() => navigateFromNav(item.id)}
                   onMouseEnter={e => { if (!active) e.currentTarget.style.background = C.pageBg; }}
                   onMouseLeave={e => { if (!active) e.currentTarget.style.background = "transparent"; }}
                   style={{
@@ -25448,7 +25628,7 @@ export default function App() {
           )).map(item => {
             const active = screen === item.id || (screen.startsWith("rankd-") && item.id === "rankd");
             return (
-              <button key={item.id} onClick={() => navigate(item.id)} style={{
+              <button key={item.id} onClick={() => navigateFromNav(item.id)} style={{
                 flex: 1, display: "flex", flexDirection: "column", alignItems: "center", justifyContent: "center", gap: 3,
                 border: "none", cursor: "pointer",
                 background: active ? C.sidebarAccent : "transparent",
