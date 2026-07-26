@@ -1,6 +1,9 @@
 // Focused tests for resolveLatestQuizAssignment (one card per user+quiz).
 // Run: node src/lib/assignmentEngine.latest.test.mjs   (no creds, no DB)
-import { resolveLatestQuizAssignment, resolveAssignmentStatus, resolveLearnerAssignments } from "./assignmentEngine.js";
+// Pin to UTC so the day-boundary unlock assertions are deterministic regardless
+// of the machine timezone (lessonUnlockState uses local day boundaries by design).
+process.env.TZ = "UTC";
+import { resolveLatestQuizAssignment, resolveAssignmentStatus, resolveLearnerAssignments, lessonUnlockState } from "./assignmentEngine.js";
 let pass = 0, fail = 0;
 const eq = (n, got, want) => { const a=JSON.stringify(got), b=JSON.stringify(want);
   if (a===b){pass++;console.log("PASS  "+n);} else {fail++;console.log(`FAIL  ${n}\n  got ${a}\n  want ${b}`);} };
@@ -176,6 +179,46 @@ const at = (created_at, passed, score) => ({ created_at, passed, score });
   const all = rows.length, todo = rows.filter(r => r.isToDo).length, done = rows.filter(r => r.isCompleted).length;
   eq("selector: All === ToDo + Completed", all, todo + done);
   eq("selector: exactly one Completed (L1)", done, 1);
+}
+
+// ── 12. Course-unlock BOUNDARIES (deterministic controlled timestamps) ───────
+{
+  const assignedAt = "2026-07-01T00:00:00Z"; // day boundary
+  const days = 5; // unlocks on 2026-07-06
+  // Before first unlock
+  eq("unlock: before (day 2) → locked", lessonUnlockState(assignedAt, days, new Date("2026-07-03T09:00:00Z")).locked, true);
+  // Exact unlock boundary (start of unlock day)
+  eq("unlock: exact boundary (day 5) → unlocked", lessonUnlockState(assignedAt, days, new Date("2026-07-06T00:00:00Z")).locked, false);
+  // After unlock
+  eq("unlock: after (day 6) → unlocked", lessonUnlockState(assignedAt, days, new Date("2026-07-07T12:00:00Z")).locked, false);
+  // Day-before boundary still locked
+  eq("unlock: day-before boundary (day 4) → locked", lessonUnlockState(assignedAt, days, new Date("2026-07-05T23:00:00Z")).locked, true);
+  // No schedule ⇒ always unlocked
+  eq("unlock: days=0 → unlocked", lessonUnlockState(assignedAt, 0, new Date("2026-07-01T00:00:00Z")).locked, false);
+  eq("unlock: availableDate is the unlock day", lessonUnlockState(assignedAt, days).availableDate.toISOString().slice(0,10), "2026-07-06");
+}
+
+// ── 13. Course completion: empty never complete; partial→in_progress; full→completed;
+//        pre-assignment completions never count (scheduled reassignment) ───────
+{
+  const A = { assigned_at: "2026-07-05T00:00:00Z" };
+  const empty = resolveAssignmentStatus("course", A, { lessonIds: [], completedAtByLesson: new Map() });
+  eq("course empty: NOT completed (no 0===0)", empty.status !== "completed", true);
+  eq("course empty: progress 0", empty.progress, 0);
+
+  const partial = resolveAssignmentStatus("course", A, { lessonIds: ["a","b"], completedAtByLesson: new Map([["a","2026-07-06T00:00:00Z"]]) });
+  eq("course partial: in_progress", partial.status, "in_progress");
+  eq("course partial: progress 50", partial.progress, 50);
+
+  const full = resolveAssignmentStatus("course", A, { lessonIds: ["a","b"], completedAtByLesson: new Map([["a","2026-07-06T00:00:00Z"],["b","2026-07-07T00:00:00Z"]]) });
+  eq("course full: completed", full.status, "completed");
+  eq("course full: progress 100", full.progress, 100);
+
+  // A scheduled RE-assignment: the lessons were completed BEFORE this assigned_at
+  // (prior instance) — must NOT count, so the course is not_started, not complete.
+  const scheduled = resolveAssignmentStatus("course", A, { lessonIds: ["a","b"], completedAtByLesson: new Map([["a","2026-07-01T00:00:00Z"],["b","2026-07-02T00:00:00Z"]]) });
+  eq("course scheduled reassignment: pre-assignment completions ignored → not_started", scheduled.status, "not_started");
+  eq("course scheduled reassignment: progress 0", scheduled.progress, 0);
 }
 
 console.log(`\n${pass} passed, ${fail} failed`);

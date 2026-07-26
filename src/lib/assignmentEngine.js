@@ -328,6 +328,28 @@ export function resolveLatestQuizAssignment(assignments = [], attempts = []) {
 }
 
 /**
+ * Per-lesson schedule unlock — pure and deterministic (accepts `now` for tests).
+ * A lesson unlocks `availableAfterDays` days after the assignment's assigned_at,
+ * compared on local day boundaries (same rule the Learn UI used inline). Returns
+ * { locked, availableDate }. days=0 / no assigned date ⇒ always unlocked.
+ *
+ * @param {string|Date|null} assignedAtRaw
+ * @param {number} availableAfterDays
+ * @param {Date} now
+ * @returns {{ locked: boolean, availableDate: Date|null }}
+ */
+export function lessonUnlockState(assignedAtRaw, availableAfterDays = 0, now = new Date()) {
+  const days = availableAfterDays ?? 0;
+  if (!assignedAtRaw || days === 0) return { locked: false, availableDate: null };
+  const base = new Date(assignedAtRaw);
+  if (Number.isNaN(base.getTime())) return { locked: false, availableDate: null };
+  base.setHours(0, 0, 0, 0);
+  const availMs = base.getTime() + days * 86400000;
+  const nowMs = new Date(now); nowMs.setHours(0, 0, 0, 0);
+  return { locked: nowMs.getTime() < availMs, availableDate: new Date(availMs) };
+}
+
+/**
  * THE canonical learner "current work" selector — the single source of truth
  * shared by Home (Assigned Learning) and Learner Learn (Assigned/All, To Do,
  * Completed). Collapses every content type to ONE current card per

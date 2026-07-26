@@ -78,7 +78,7 @@ import {
   updateLastSeenAssignmentsAt,
   subscribeToTenantAssignments,
 } from "./src/lib/contentService.js";
-import { resolveAssignmentStatus, resolveLatestQuizAssignment, resolveLearnerAssignments, isQualifyingEvent, daysUntilDue } from "./src/lib/assignmentEngine.js";
+import { resolveAssignmentStatus, resolveLatestQuizAssignment, resolveLearnerAssignments, lessonUnlockState, isQualifyingEvent, daysUntilDue } from "./src/lib/assignmentEngine.js";
 import {
   metaListToCatalog,
   questionCountOf,
@@ -9050,6 +9050,8 @@ function LearnScreen({ role, canManageLearn, user, orgUsers = [], orgs = [], onN
   // filters map to the shared engine's resolved status (+ cancelled reason for
   // the two ended states). Never a separate status calculation.
   const [assignStatusFilter, setAssignStatusFilter] = useState("all"); // all|not_started|in_progress|completed|overdue|unassigned|content_archived
+  const [assignContentType, setAssignContentType] = useState("all");   // all|lesson|course|quiz
+  const [assignRep, setAssignRep] = useState("all");                    // all | learner userId
   // Assignment Experience Priority 1 — assignment removal. confirmRemove
   // holds the row pending confirmation (null = no dialog open);
   // removingId guards against a double-click firing two deletes for the
@@ -9565,15 +9567,11 @@ function LearnScreen({ role, canManageLearn, user, orgUsers = [], orgs = [], onN
       const assignedDate = courseAssignment?.assignedAtRaw
         ? new Date(courseAssignment.assignedAtRaw)
         : courseAssignment?.assignedAt ? new Date(courseAssignment.assignedAt) : null;
-      const todayMs = new Date().setHours(0, 0, 0, 0);
       const lessonSchedule = activeCourse.lessonSchedule ?? {};
-      const getLessonAvailability = (lessonId) => {
-        const days = lessonSchedule[lessonId]?.available_after_days ?? 0;
-        if (!assignedDate || days === 0) return { locked: false, availableDate: null };
-        const base = new Date(assignedDate); base.setHours(0, 0, 0, 0);
-        const availMs = base.getTime() + days * 86400000;
-        return { locked: todayMs < availMs, availableDate: new Date(availMs) };
-      };
+      // Shared, unit-tested unlock math (lessonUnlockState) — one implementation
+      // for the viewer, the card, and the tests.
+      const getLessonAvailability = (lessonId) =>
+        lessonUnlockState(assignedDate, lessonSchedule[lessonId]?.available_after_days ?? 0);
       // Task 16 — this pct/isComplete is ORGANIC browse progress (lessons
       // done ÷ lessons total), shown for any course a user opens whether or
       // not `courseAssignment` above resolved to a real row. That's
@@ -9618,7 +9616,7 @@ function LearnScreen({ role, canManageLearn, user, orgUsers = [], orgs = [], onN
                   {isComplete && <span style={{ color: C.green, fontWeight: 700 }}>✓ Complete</span>}
                   {isScheduledNotStarted && (
                     <span style={{ color: C.blue, fontWeight: 700 }}>
-                      🗓 {nextUnlockDate ? `Starts ${nextUnlockDate.toLocaleDateString("en-US", { month: "short", day: "numeric" })}` : "Scheduled"}
+                      {nextUnlockDate ? `Scheduled · Starts ${nextUnlockDate.toLocaleDateString("en-US", { month: "short", day: "numeric" })}` : "Scheduled"}
                     </span>
                   )}
                 </div>
@@ -9807,17 +9805,11 @@ function LearnScreen({ role, canManageLearn, user, orgUsers = [], orgs = [], onN
                       onClick={() => {
                         if (isComplete) { setActiveCourse(content); }
                         else {
-                          // Respect per-lesson availability schedule — don't open locked lessons
-                          const assignedDate = a.assignedAtRaw ? new Date(a.assignedAtRaw)
-                            : a.assignedAt ? new Date(a.assignedAt) : null;
-                          const todayMs = new Date().setHours(0, 0, 0, 0);
+                          // Respect per-lesson availability schedule — don't open locked
+                          // lessons (shared, unit-tested lessonUnlockState).
                           const lessonSched = content.lessonSchedule ?? {};
-                          const isLockedLesson = (lessonId) => {
-                            const days = lessonSched[lessonId]?.available_after_days ?? 0;
-                            if (!assignedDate || days === 0) return false;
-                            const base = new Date(assignedDate); base.setHours(0, 0, 0, 0);
-                            return todayMs < base.getTime() + days * 86400000;
-                          };
+                          const isLockedLesson = (lessonId) =>
+                            lessonUnlockState(a.assignedAtRaw ?? a.assignedAt ?? null, lessonSched[lessonId]?.available_after_days ?? 0).locked;
                           const next = courseLessons.find(l => !isQualifyingEvent(completedLessonsAt.get(l.id), a.assignedAtRaw) && !isLockedLesson(l.id));
                           if (next) openLesson(next, content);
                           else setActiveCourse(content); // all next lessons are still locked — show course detail
@@ -10391,7 +10383,17 @@ function LearnScreen({ role, canManageLearn, user, orgUsers = [], orgs = [], onN
             default:                 return true; // "all"
           }
         };
-        const filteredRows = timeframeRows.filter(statusMatch);
+        // All four dropdown filters combine (AND) over the SAME canonical dataset.
+        const contentTypeMatch = (r) => assignContentType === "all" || r.a.contentType === assignContentType;
+        const repMatch = (r) => assignRep === "all" || r.u?.id === assignRep;
+        // Rep options — every learner with any assignment history in the current
+        // timeframe (individual rows only; stable userId as the value).
+        const repOptions = (() => {
+          const seen = new Map();
+          timeframeRows.forEach(r => { if (r.u?.id && !r.u._isAggregate && !seen.has(r.u.id)) seen.set(r.u.id, r.u.name ?? "—"); });
+          return [...seen.entries()].map(([id, name]) => ({ id, name })).sort((a, b) => a.name.localeCompare(b.name));
+        })();
+        const filteredRows = timeframeRows.filter(r => statusMatch(r) && contentTypeMatch(r) && repMatch(r));
 
         // Tab counts — from the timeframe-filtered set (not the status-filtered
         // one), so each tab shows its own total. "Active" excludes completed AND
@@ -10588,76 +10590,62 @@ function LearnScreen({ role, canManageLearn, user, orgUsers = [], orgs = [], onN
 
         return (
           <div>
-            {/* Timeframe filters + summary stats — list view only */}
-            {!selectedAssignmentId && (
-              <>
-                {/* Timeframe filter row */}
-                <div style={{ display: "flex", alignItems: "center", gap: 8, marginBottom: 16, flexWrap: "wrap" }}>
-                  {[
-                    { id: "all",   label: "All time" },
-                    { id: "week",  label: "This week" },
-                    { id: "month", label: "This month" },
-                    { id: "custom", label: "Custom range" },
-                  ].map(({ id, label }) => (
-                    <button key={id} onClick={() => setAssignTimeframe(id)} style={{
-                      padding: "5px 12px", borderRadius: 99, border: `1.5px solid ${assignTimeframe === id ? C.orange : C.border}`,
-                      background: assignTimeframe === id ? C.orangeLight : C.white,
-                      fontSize: 12, fontWeight: 600, color: assignTimeframe === id ? C.orange : C.textSub,
-                      cursor: "pointer", transition: "all 0.15s",
-                    }}>{label}</button>
-                  ))}
+            {/* Compact dropdown filters (Status / Content Type / Rep / Timeframe)
+                — replaces the tab rows. All combine over the one canonical history
+                dataset; defaults show every row. Unassigned stays a Status option. */}
+            {!selectedAssignmentId && (() => {
+              const selStyle = { padding: "7px 10px", borderRadius: 8, border: `1px solid ${C.border}`, background: C.white, color: C.text, fontSize: 12, fontWeight: 600, cursor: "pointer" };
+              const labelStyle = { fontSize: 10, fontWeight: 700, color: C.textMuted, letterSpacing: "0.04em", marginBottom: 4, display: "block" };
+              const cnt = (n) => (n > 0 ? ` (${n})` : "");
+              return (
+                <div style={{ display: "flex", alignItems: "flex-end", gap: 12, marginBottom: 18, flexWrap: "wrap" }}>
+                  <label>
+                    <span style={labelStyle}>STATUS</span>
+                    <select value={assignStatusFilter} onChange={e => setAssignStatusFilter(e.target.value)} style={selStyle}>
+                      <option value="all">All statuses{cnt(statCounts.all)}</option>
+                      <option value="not_started">Not Started{cnt(statCounts.not_started)}</option>
+                      <option value="in_progress">In Progress{cnt(statCounts.in_progress)}</option>
+                      <option value="completed">Completed{cnt(statCounts.completed)}</option>
+                      <option value="overdue">Overdue{cnt(statCounts.overdue)}</option>
+                      <option value="unassigned">Unassigned{cnt(statCounts.unassigned)}</option>
+                      <option value="content_archived">Content Archived{cnt(statCounts.content_archived)}</option>
+                    </select>
+                  </label>
+                  <label>
+                    <span style={labelStyle}>CONTENT TYPE</span>
+                    <select value={assignContentType} onChange={e => setAssignContentType(e.target.value)} style={selStyle}>
+                      <option value="all">All types</option>
+                      <option value="lesson">Lesson</option>
+                      <option value="course">Course</option>
+                      <option value="quiz">Quiz</option>
+                    </select>
+                  </label>
+                  <label>
+                    <span style={labelStyle}>REP</span>
+                    <select value={assignRep} onChange={e => setAssignRep(e.target.value)} style={{ ...selStyle, maxWidth: 200 }}>
+                      <option value="all">All reps</option>
+                      {repOptions.map(r => <option key={r.id} value={r.id}>{r.name}</option>)}
+                    </select>
+                  </label>
+                  <label>
+                    <span style={labelStyle}>TIMEFRAME</span>
+                    <select value={assignTimeframe} onChange={e => setAssignTimeframe(e.target.value)} style={selStyle}>
+                      <option value="all">All time</option>
+                      <option value="week">This week</option>
+                      <option value="month">This month</option>
+                      <option value="custom">Custom range</option>
+                    </select>
+                  </label>
                   {assignTimeframe === "custom" && (
-                    <div style={{ display: "flex", alignItems: "center", gap: 6, marginLeft: 4 }}>
-                      <input
-                        type="date" value={assignDateRange.start}
-                        onChange={e => setAssignDateRange(p => ({ ...p, start: e.target.value }))}
-                        style={{ padding: "4px 8px", borderRadius: 7, border: `1px solid ${C.border}`, fontSize: 12, color: C.text, background: C.white }}
-                      />
+                    <div style={{ display: "flex", alignItems: "center", gap: 6 }}>
+                      <input type="date" value={assignDateRange.start} onChange={e => setAssignDateRange(p => ({ ...p, start: e.target.value }))} style={{ padding: "6px 8px", borderRadius: 7, border: `1px solid ${C.border}`, fontSize: 12, color: C.text, background: C.white }} />
                       <span style={{ fontSize: 12, color: C.textSub }}>to</span>
-                      <input
-                        type="date" value={assignDateRange.end}
-                        onChange={e => setAssignDateRange(p => ({ ...p, end: e.target.value }))}
-                        style={{ padding: "4px 8px", borderRadius: 7, border: `1px solid ${C.border}`, fontSize: 12, color: C.text, background: C.white }}
-                      />
+                      <input type="date" value={assignDateRange.end} onChange={e => setAssignDateRange(p => ({ ...p, end: e.target.value }))} style={{ padding: "6px 8px", borderRadius: 7, border: `1px solid ${C.border}`, fontSize: 12, color: C.text, background: C.white }} />
                     </div>
                   )}
                 </div>
-
-                {/* One canonical history — status filter tabs (defaults to All).
-                    Every tab maps to the shared engine's resolved status; the two
-                    ended tabs split on cancellation reason. */}
-                <div style={{ display: "flex", flexWrap: "wrap", gap: 8, marginBottom: 20 }}>
-                  {[
-                    { id: "all",              label: "All",              count: statCounts.all,              color: C.text,    title: "Everything — active and ended" },
-                    { id: "not_started",      label: "Not Started",      count: statCounts.not_started,      color: C.textSub, title: "Assigned, no progress yet" },
-                    { id: "in_progress",      label: "In Progress",      count: statCounts.in_progress,      color: C.blue,    title: "Started but not complete" },
-                    { id: "completed",        label: "Completed",        count: statCounts.completed,        color: C.green,   title: "Finished" },
-                    { id: "overdue",          label: "Overdue",          count: statCounts.overdue,          color: C.red,     title: "Past due date, not complete" },
-                    { id: "unassigned",       label: "Unassigned",       count: statCounts.unassigned,       color: C.textMuted, title: "Manager unassigned — kept for history" },
-                    { id: "content_archived", label: "Content Archived", count: statCounts.content_archived, color: C.textMuted, title: "Ended because the content was archived/removed" },
-                  ].map(({ id, label, count, color, title }) => {
-                    const on = assignStatusFilter === id;
-                    return (
-                      <button key={id} title={title} onClick={() => setAssignStatusFilter(id)} style={{
-                        display: "flex", alignItems: "center", gap: 7,
-                        padding: "7px 13px", borderRadius: 99,
-                        border: `1.5px solid ${on ? C.orange : C.border}`,
-                        background: on ? C.orangeLight : C.white,
-                        fontSize: 12, fontWeight: 700, color: on ? C.orange : C.textSub, cursor: "pointer",
-                      }}>
-                        <span>{label}</span>
-                        {/* F8 — never present a "0" as a metric; the tab stays a
-                            usable filter even at zero (Unassigned becomes meaningful
-                            once a manager uses Unassign). Show the count only when > 0. */}
-                        {count > 0 && (
-                          <span style={{ fontSize: 11, fontWeight: 800, color: on ? C.orange : color, background: on ? "transparent" : C.pageBg, borderRadius: 99, padding: on ? 0 : "1px 7px" }}>{count}</span>
-                        )}
-                      </button>
-                    );
-                  })}
-                </div>
-              </>
-            )}
+              );
+            })()}
 
             {/* Detail view header */}
             {selectedAssignmentId && detailContent && (
@@ -12765,10 +12753,6 @@ function MatchCard({ ri, placedLeftIdx, revealed, isPicked, isDragged, rightText
 // `revealFeedback` to keep its original teach-as-you-go per-question feedback on
 // its own canonical seed data. Default is the safe (neutral) mode: if the prop
 // is ever omitted, a learner cannot leak an answer.
-// [RALLI_QUIZ_DUP_TRACE] TEMPORARY diagnostic — module-level live-mount counter,
-// so we can detect whether two quiz players are mounted at once. Remove with the
-// rest of the trace once the duplicate-question boundary is identified.
-let __RALLI_QUIZ_TRACE_MOUNTS = 0;
 function QuizTakingView({ quiz, onComplete, onExit, revealFeedback = false }) {
   const mobile = useMobile(); // matching is the first two-column layout in this view — needs to stack on narrow screens
   const [qIdx,          setQIdx]          = useState(0);
@@ -12810,6 +12794,9 @@ function QuizTakingView({ quiz, onComplete, onExit, revealFeedback = false }) {
       ? crypto.randomUUID()
       : `sub-${Date.now()}-${Math.random().toString(36).slice(2)}`;
   }
+  // Timestamp of the last auto-advance — used to swallow a physical double-click
+  // that would otherwise land a second commit on the freshly-shown next question.
+  const advanceGuardRef = useRef(0);
 
   const q        = quiz.questions[qIdx];
   const total    = quiz.questions.length;
@@ -12823,35 +12810,6 @@ function QuizTakingView({ quiz, onComplete, onExit, revealFeedback = false }) {
   // from before that type was removed) falls back to a safe, explicit notice
   // instead of silently rendering as a broken multiple-choice list.
   const isKnownType = isSlider || isType || isMatch || isOpen || q.type === "mc" || q.type === "tf";
-
-  // ─── [RALLI_QUIZ_DUP_TRACE] TEMPORARY diagnostic (remove after capture) ───
-  // Mount/unmount + duplicate-id snapshot of THIS player instance, so we can see
-  // whether two players are mounted, whether the question array has duplicate
-  // ids, and the exact canonical length/ids/revision being rendered.
-  useEffect(() => {
-    __RALLI_QUIZ_TRACE_MOUNTS += 1;
-    const ids = (quiz.questions ?? []).map(x => x?.id);
-    console.log("[RALLI_QUIZ_DUP_TRACE] QuizTakingView MOUNT", {
-      liveMounts: __RALLI_QUIZ_TRACE_MOUNTS,
-      quizId: quiz.id, revision: quiz.questionRevision,
-      nQuestions: ids.length, questionIds: ids,
-      distinctIds: new Set(ids).size, hasDupIds: new Set(ids).size !== ids.length,
-      submissionId: submissionIdRef.current,
-    });
-    return () => {
-      __RALLI_QUIZ_TRACE_MOUNTS -= 1;
-      console.log("[RALLI_QUIZ_DUP_TRACE] QuizTakingView UNMOUNT", { liveMounts: __RALLI_QUIZ_TRACE_MOUNTS, quizId: quiz.id });
-    };
-  }, []); // eslint-disable-line react-hooks/exhaustive-deps
-  // Which question is currently rendered, its id/index and whether it already
-  // has a selected answer (the "answer remains visible" symptom).
-  useEffect(() => {
-    console.log("[RALLI_QUIZ_DUP_TRACE] render question", {
-      qIdx, total, renderedQuestionId: quiz.questions[qIdx]?.id,
-      hasSelected: (quiz.questions[qIdx]?.id in answers), selected: answers[quiz.questions[qIdx]?.id] ?? null,
-      revealed,
-    });
-  }, [qIdx]); // eslint-disable-line react-hooks/exhaustive-deps
 
   // Reset draft state when question changes
   useEffect(() => {
@@ -12942,27 +12900,31 @@ function QuizTakingView({ quiz, onComplete, onExit, revealFeedback = false }) {
   const fb = revealed && showFeedback;
   const isCorrect = fb && isAnswerCorrect(q, selected);
 
+  // Swallow a physical double-click that lands just after an auto-advance (so it
+  // can't answer+advance the freshly-shown next question). Same-question double
+  // commits are already no-ops via the `revealed` guard.
+  const justAdvanced = () => advanceGuardRef.current && (Date.now() - advanceGuardRef.current < 350);
+
   const choose = (idx) => {
-    console.log("[RALLI_QUIZ_DUP_TRACE] submit-handler choose()", { qIdx, questionId: q.id, idx, revealedBefore: revealed });
-    if (revealed) return;
+    if (revealed || justAdvanced()) return;
     setAnswers(prev => ({ ...prev, [q.id]: idx }));
     setRevealed(true);
   };
 
   const commitSlider = () => {
-    if (revealed) return;
+    if (revealed || justAdvanced()) return;
     setAnswers(prev => ({ ...prev, [q.id]: sliderVal }));
     setRevealed(true);
   };
 
   const commitType = () => {
-    if (revealed || !textDraft.trim()) return;
+    if (revealed || justAdvanced() || !textDraft.trim()) return;
     setAnswers(prev => ({ ...prev, [q.id]: textDraft }));
     setRevealed(true);
   };
 
   const commitOpen = () => {
-    if (revealed || !textDraft.trim()) return;
+    if (revealed || justAdvanced() || !textDraft.trim()) return;
     setAnswers(prev => ({ ...prev, [q.id]: textDraft }));
     setRevealed(true);
   };
@@ -13005,7 +12967,7 @@ function QuizTakingView({ quiz, onComplete, onExit, revealFeedback = false }) {
   };
 
   const commitMatch = () => {
-    if (revealed || !matchAllDone) return;
+    if (revealed || justAdvanced() || !matchAllDone) return;
     setRevealed(true);
   };
 
@@ -13104,7 +13066,6 @@ function QuizTakingView({ quiz, onComplete, onExit, revealFeedback = false }) {
   }, [matchDrag?.pointerId]); // eslint-disable-line react-hooks/exhaustive-deps
 
   const next = () => {
-    console.log("[RALLI_QUIZ_DUP_TRACE] next() ENTER", { qIdx, isLast, currentQuestionId: q.id, revealed });
     if (isLast) {
       // Server-safe submission: one entry per question, matching decoupled to
       // {leftIdx, rightText}, NO canonical `correct`. This is exactly what
@@ -13136,12 +13097,27 @@ function QuizTakingView({ quiz, onComplete, onExit, revealFeedback = false }) {
       // started. Setting it here closes that race; the qIdx effect still
       // runs too and just redundantly confirms the same value.
       const nextQ = quiz.questions[qIdx + 1];
-      console.log("[RALLI_QUIZ_DUP_TRACE] next() ADVANCE", { from: qIdx, to: qIdx + 1, fromQuestionId: q.id, toQuestionId: nextQ?.id });
       setTimeLeft(nextQ?.timeLimit > 0 ? nextQ.timeLimit : null);
       setQIdx(i => i + 1);
       setRevealed(false);
     }
   };
+
+  // Learner-mode auto-advance: when NO feedback is shown (real learner attempt),
+  // a committed answer must advance to the next question immediately — no
+  // separate "Next Question" click (which, with feedback hidden, read as the
+  // same question being asked twice). The answer is already committed to
+  // `answers`/`revealed` before this runs, so the FINAL question's submit builds
+  // the complete answer list through the existing canonical path. When feedback
+  // IS shown (demo/authorized preview), Submit → feedback → Next is preserved.
+  // useLayoutEffect advances before paint, so the locked-but-unadvanced frame
+  // never flashes. Fires exactly once per commit (guarded on `revealed`); the
+  // last question routes through next()→onComplete (double-submit-safe upstream).
+  React.useLayoutEffect(() => {
+    if (!revealed || showFeedback) return;
+    advanceGuardRef.current = Date.now();
+    next();
+  }, [revealed]); // eslint-disable-line react-hooks/exhaustive-deps
 
   // Learner mode shows NO per-question message once an answer is locked — the
   // learner's own selection stays visible (highlighted option / disabled input /
@@ -14599,7 +14575,6 @@ function QuizzesScreen({ role, onNav, quizzes, onEditQuiz, onDeleteQuiz, onToggl
     // always picked up — no hard refresh). An RPC failure shows a Retry state,
     // and NEVER falls back to canonical quiz data. Demo uses the local seed.
     const beginQuiz = (id) => {
-      console.log("[RALLI_QUIZ_DUP_TRACE] beginQuiz()", { quizId: id, isReal, currentUserId: currentUser?.id });
       setActiveId(id);
       setActiveAttempt(null);
       setReviewModel(null);
@@ -14612,17 +14587,11 @@ function QuizzesScreen({ role, onNav, quizzes, onEditQuiz, onDeleteQuiz, onToggl
       setView("starting");
       getQuizForAttempt(id)
         .then(({ data, error }) => {
-          if (error || !data) { console.log("[RALLI_QUIZ_DUP_TRACE] getQuizForAttempt ERROR", { quizId: id, error: String(error?.message ?? error) }); setView("start_error"); return; }
-          const ids = Array.isArray(data.questions) ? data.questions.map(x => x?.id) : [];
-          console.log("[RALLI_QUIZ_DUP_TRACE] getQuizForAttempt OK", {
-            quizId: data.id, revision: data.question_revision,
-            nQuestions: ids.length, questionIds: ids,
-            distinctIds: new Set(ids).size, hasDupIds: new Set(ids).size !== ids.length,
-          });
+          if (error || !data) { setView("start_error"); return; }
           setTakeQuiz(rpcQuizToTakeable(data));
           setView("taking");
         })
-        .catch((e) => { console.log("[RALLI_QUIZ_DUP_TRACE] getQuizForAttempt THREW", { quizId: id, err: String(e) }); setView("start_error"); });
+        .catch(() => setView("start_error"));
     };
     const startQuiz  = (id) => beginQuiz(id);
     const retakeQuiz = (id) => beginQuiz(id);
@@ -14702,14 +14671,12 @@ function QuizzesScreen({ role, onNav, quizzes, onEditQuiz, onDeleteQuiz, onToggl
     //   loaded + not found → surface an error, then clear
     // Re-runs when pendingQuizId changes (new deep-link) or assignmentsLoaded flips (data ready).
     useEffect(() => {
-      console.log("[RALLI_QUIZ_DUP_TRACE] deep-link effect run", { pendingQuizId, assignmentsLoaded, view });
       if (!pendingQuizId) return;
       if (!assignmentsLoaded) return; // real users: wait for Supabase assignments to resolve
 
       const found = assignments.find(q => q.id === pendingQuizId)
                  ?? (!isReal ? USER_QUIZ_ASSIGNMENTS_SEED.find(q => q.id === pendingQuizId) : null);
 
-      console.log("[RALLI_QUIZ_DUP_TRACE] deep-link resolving", { pendingQuizId, found: !!found });
       if (found) {
         startQuiz(pendingQuizId);
       } else {
