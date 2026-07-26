@@ -12765,6 +12765,10 @@ function MatchCard({ ri, placedLeftIdx, revealed, isPicked, isDragged, rightText
 // `revealFeedback` to keep its original teach-as-you-go per-question feedback on
 // its own canonical seed data. Default is the safe (neutral) mode: if the prop
 // is ever omitted, a learner cannot leak an answer.
+// [RALLI_QUIZ_DUP_TRACE] TEMPORARY diagnostic — module-level live-mount counter,
+// so we can detect whether two quiz players are mounted at once. Remove with the
+// rest of the trace once the duplicate-question boundary is identified.
+let __RALLI_QUIZ_TRACE_MOUNTS = 0;
 function QuizTakingView({ quiz, onComplete, onExit, revealFeedback = false }) {
   const mobile = useMobile(); // matching is the first two-column layout in this view — needs to stack on narrow screens
   const [qIdx,          setQIdx]          = useState(0);
@@ -12819,6 +12823,35 @@ function QuizTakingView({ quiz, onComplete, onExit, revealFeedback = false }) {
   // from before that type was removed) falls back to a safe, explicit notice
   // instead of silently rendering as a broken multiple-choice list.
   const isKnownType = isSlider || isType || isMatch || isOpen || q.type === "mc" || q.type === "tf";
+
+  // ─── [RALLI_QUIZ_DUP_TRACE] TEMPORARY diagnostic (remove after capture) ───
+  // Mount/unmount + duplicate-id snapshot of THIS player instance, so we can see
+  // whether two players are mounted, whether the question array has duplicate
+  // ids, and the exact canonical length/ids/revision being rendered.
+  useEffect(() => {
+    __RALLI_QUIZ_TRACE_MOUNTS += 1;
+    const ids = (quiz.questions ?? []).map(x => x?.id);
+    console.log("[RALLI_QUIZ_DUP_TRACE] QuizTakingView MOUNT", {
+      liveMounts: __RALLI_QUIZ_TRACE_MOUNTS,
+      quizId: quiz.id, revision: quiz.questionRevision,
+      nQuestions: ids.length, questionIds: ids,
+      distinctIds: new Set(ids).size, hasDupIds: new Set(ids).size !== ids.length,
+      submissionId: submissionIdRef.current,
+    });
+    return () => {
+      __RALLI_QUIZ_TRACE_MOUNTS -= 1;
+      console.log("[RALLI_QUIZ_DUP_TRACE] QuizTakingView UNMOUNT", { liveMounts: __RALLI_QUIZ_TRACE_MOUNTS, quizId: quiz.id });
+    };
+  }, []); // eslint-disable-line react-hooks/exhaustive-deps
+  // Which question is currently rendered, its id/index and whether it already
+  // has a selected answer (the "answer remains visible" symptom).
+  useEffect(() => {
+    console.log("[RALLI_QUIZ_DUP_TRACE] render question", {
+      qIdx, total, renderedQuestionId: quiz.questions[qIdx]?.id,
+      hasSelected: (quiz.questions[qIdx]?.id in answers), selected: answers[quiz.questions[qIdx]?.id] ?? null,
+      revealed,
+    });
+  }, [qIdx]); // eslint-disable-line react-hooks/exhaustive-deps
 
   // Reset draft state when question changes
   useEffect(() => {
@@ -12910,6 +12943,7 @@ function QuizTakingView({ quiz, onComplete, onExit, revealFeedback = false }) {
   const isCorrect = fb && isAnswerCorrect(q, selected);
 
   const choose = (idx) => {
+    console.log("[RALLI_QUIZ_DUP_TRACE] submit-handler choose()", { qIdx, questionId: q.id, idx, revealedBefore: revealed });
     if (revealed) return;
     setAnswers(prev => ({ ...prev, [q.id]: idx }));
     setRevealed(true);
@@ -13070,6 +13104,7 @@ function QuizTakingView({ quiz, onComplete, onExit, revealFeedback = false }) {
   }, [matchDrag?.pointerId]); // eslint-disable-line react-hooks/exhaustive-deps
 
   const next = () => {
+    console.log("[RALLI_QUIZ_DUP_TRACE] next() ENTER", { qIdx, isLast, currentQuestionId: q.id, revealed });
     if (isLast) {
       // Server-safe submission: one entry per question, matching decoupled to
       // {leftIdx, rightText}, NO canonical `correct`. This is exactly what
@@ -13101,6 +13136,7 @@ function QuizTakingView({ quiz, onComplete, onExit, revealFeedback = false }) {
       // started. Setting it here closes that race; the qIdx effect still
       // runs too and just redundantly confirms the same value.
       const nextQ = quiz.questions[qIdx + 1];
+      console.log("[RALLI_QUIZ_DUP_TRACE] next() ADVANCE", { from: qIdx, to: qIdx + 1, fromQuestionId: q.id, toQuestionId: nextQ?.id });
       setTimeLeft(nextQ?.timeLimit > 0 ? nextQ.timeLimit : null);
       setQIdx(i => i + 1);
       setRevealed(false);
@@ -14563,6 +14599,7 @@ function QuizzesScreen({ role, onNav, quizzes, onEditQuiz, onDeleteQuiz, onToggl
     // always picked up — no hard refresh). An RPC failure shows a Retry state,
     // and NEVER falls back to canonical quiz data. Demo uses the local seed.
     const beginQuiz = (id) => {
+      console.log("[RALLI_QUIZ_DUP_TRACE] beginQuiz()", { quizId: id, isReal, currentUserId: currentUser?.id });
       setActiveId(id);
       setActiveAttempt(null);
       setReviewModel(null);
@@ -14575,11 +14612,17 @@ function QuizzesScreen({ role, onNav, quizzes, onEditQuiz, onDeleteQuiz, onToggl
       setView("starting");
       getQuizForAttempt(id)
         .then(({ data, error }) => {
-          if (error || !data) { setView("start_error"); return; }
+          if (error || !data) { console.log("[RALLI_QUIZ_DUP_TRACE] getQuizForAttempt ERROR", { quizId: id, error: String(error?.message ?? error) }); setView("start_error"); return; }
+          const ids = Array.isArray(data.questions) ? data.questions.map(x => x?.id) : [];
+          console.log("[RALLI_QUIZ_DUP_TRACE] getQuizForAttempt OK", {
+            quizId: data.id, revision: data.question_revision,
+            nQuestions: ids.length, questionIds: ids,
+            distinctIds: new Set(ids).size, hasDupIds: new Set(ids).size !== ids.length,
+          });
           setTakeQuiz(rpcQuizToTakeable(data));
           setView("taking");
         })
-        .catch(() => setView("start_error"));
+        .catch((e) => { console.log("[RALLI_QUIZ_DUP_TRACE] getQuizForAttempt THREW", { quizId: id, err: String(e) }); setView("start_error"); });
     };
     const startQuiz  = (id) => beginQuiz(id);
     const retakeQuiz = (id) => beginQuiz(id);
@@ -14659,12 +14702,14 @@ function QuizzesScreen({ role, onNav, quizzes, onEditQuiz, onDeleteQuiz, onToggl
     //   loaded + not found → surface an error, then clear
     // Re-runs when pendingQuizId changes (new deep-link) or assignmentsLoaded flips (data ready).
     useEffect(() => {
+      console.log("[RALLI_QUIZ_DUP_TRACE] deep-link effect run", { pendingQuizId, assignmentsLoaded, view });
       if (!pendingQuizId) return;
       if (!assignmentsLoaded) return; // real users: wait for Supabase assignments to resolve
 
       const found = assignments.find(q => q.id === pendingQuizId)
                  ?? (!isReal ? USER_QUIZ_ASSIGNMENTS_SEED.find(q => q.id === pendingQuizId) : null);
 
+      console.log("[RALLI_QUIZ_DUP_TRACE] deep-link resolving", { pendingQuizId, found: !!found });
       if (found) {
         startQuiz(pendingQuizId);
       } else {
