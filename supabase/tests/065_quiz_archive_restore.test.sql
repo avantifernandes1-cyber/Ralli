@@ -39,9 +39,12 @@ INSERT INTO public.tenant_assignments (id, tenant_id, content_type, content_id, 
  ('00000000-0000-0000-0000-0000000fb002','00000000-0000-0000-0000-0000000000f0','quiz','00000000-0000-0000-0000-0000000fa002','{"type":"individual","userId":"00000000-0000-0000-0000-0000000000f1","userName":"QL1"}'::jsonb, now()),
  ('00000000-0000-0000-0000-0000000fb003','00000000-0000-0000-0000-0000000000f0','quiz','00000000-0000-0000-0000-0000000fa003','{"type":"individual","userId":"00000000-0000-0000-0000-0000000000f1","userName":"QL1"}'::jsonb, now());
 
--- QZA has a PASSED attempt — must be preserved across archive/restore.
+-- QZA has an UNRESOLVED (failed) attempt for QL1 — so archiving QZA correctly
+-- cancels the assignment (66: only unresolved rows are cancelled); the attempt row
+-- itself must be preserved across archive/restore. (A PASSING attempt would leave
+-- the assignment Completed and uncancelled — that path is covered in 066's suite.)
 INSERT INTO public.quiz_attempts (tenant_id, user_id, quiz_id, score, passed, created_at) VALUES
- ('00000000-0000-0000-0000-0000000000f0','00000000-0000-0000-0000-0000000000f1','00000000-0000-0000-0000-0000000fa001', 90, true, now());
+ ('00000000-0000-0000-0000-0000000000f0','00000000-0000-0000-0000-0000000000f1','00000000-0000-0000-0000-0000000fa001', 40, false, now());
 
 -- ── 1. Manager archives QZA → status archived, assignment cancelled, attempt kept
 DO $$ DECLARE r jsonb; BEGIN

@@ -8968,7 +8968,7 @@ function LearnScreen({ role, canManageLearn, user, orgUsers = [], orgs = [], onN
     if (!isAdmin) return "assigned";
     try {
       const saved = sessionStorage.getItem("ralli_learn_admin_tab");
-      if (saved && ["courses", "lessons", "quizzes", "assignments", "archived"].includes(saved)) return saved;
+      if (saved && ["assignments", "courses", "lessons", "quizzes"].includes(saved)) return saved;
     } catch {}
     return "assignments"; // manager Learn defaults to Assignments (the primary view)
   });
@@ -9035,7 +9035,16 @@ function LearnScreen({ role, canManageLearn, user, orgUsers = [], orgs = [], onN
   const [assignModal, setAssignModal]   = useState(null); // null | { contentType, contentId }
   const [activeLesson, setActiveLesson] = useState(null); // { lesson, courseTitle?, nextLesson? }
   const [activeCourse, setActiveCourse] = useState(null); // course object for detail view
-  const [userTab,    setUserTab]    = useState("assigned");
+  // Learner Learn subtab ("assigned" = To Do | "browse" = Knowledge Base). Persisted
+  // so launching a quiz and pressing in-app Back returns to the ORIGINATING subtab
+  // (To Do vs Knowledge Base) — one return-context mechanism, no per-launch plumbing.
+  // (A mid-quiz REFRESH is forced to To Do by getRestorableScreen, which overrides
+  // this key when it maps the retired "quizzes" screen back to Learn.)
+  const [userTab, setUserTab] = useState(() => {
+    try { const s = sessionStorage.getItem("ralli_learn_user_tab"); if (s === "browse" || s === "assigned") return s; } catch {}
+    return "assigned";
+  });
+  React.useEffect(() => { try { sessionStorage.setItem("ralli_learn_user_tab", userTab); } catch {} }, [userTab]);
   const [learnFilter, setLearnFilter] = useState("todo"); // "todo" | "complete" | "all"
   const [search,     setSearch]     = useState("");
   const [browseKind, setBrowseKind] = useState("all"); // Knowledge Base content-type filter: "all" | "lesson" | "course" | "quiz"
@@ -10132,12 +10141,15 @@ function LearnScreen({ role, canManageLearn, user, orgUsers = [], orgs = [], onN
     });
   }).length;
 
+  // Quiz-content counts (active tab count vs archived section count) — mirrors the
+  // Courses/Lessons active/archived split; never mixes in assignment counts.
+  const activeQuizzes   = quizzes.filter(q => (q.status ?? "active") !== "archived");
+  const archivedQuizzes = quizzes.filter(q => q.status === "archived");
   const TABS = [
+    { id: "assignments", label: "Assignments", count: activeAssignmentCount },
     { id: "courses",     label: "Courses",     count: filteredCourses.length },
     { id: "lessons",     label: "Lessons",     count: filteredLessons.length },
-    { id: "quizzes",     label: "Quizzes" },
-    { id: "assignments", label: "Assignments", count: activeAssignmentCount },
-    { id: "archived",    label: "Archived",    count: archivedCourses.length + archivedLessons.length },
+    { id: "quizzes",     label: "Quizzes",     count: activeQuizzes.length },
   ];
 
   const getAssignedLabel = (a) => {
@@ -10204,6 +10216,7 @@ function LearnScreen({ role, canManageLearn, user, orgUsers = [], orgs = [], onN
 
       {/* COURSES TAB */}
       {tab === "courses" && (
+        <>
         <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fill, minmax(240px, 1fr))", gap: 16 }}>
           {filteredCourses.map(course => {
             const courseLessons = course.lessonIds.map(id => lessons.find(l => l.id === id)).filter(Boolean);
@@ -10253,10 +10266,35 @@ function LearnScreen({ role, canManageLearn, user, orgUsers = [], orgs = [], onN
             </button>
           )}
         </div>
+        {/* Archived courses — clearly separated below active; Restore available.
+            Archived content never counts toward the active tab count or assignment choices. */}
+        {archivedCourses.length > 0 && (
+          <div style={{ marginTop: 24 }}>
+            <div style={{ display: "flex", alignItems: "center", gap: 8, marginBottom: 12 }}>
+              <span style={{ fontSize: 12, fontWeight: 800, color: C.textMuted, letterSpacing: "0.06em" }}>ARCHIVED ({archivedCourses.length})</span>
+              <div style={{ flex: 1, height: 1, background: C.border }} />
+            </div>
+            <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
+              {archivedCourses.map(c => (
+                <Card key={c.id} style={{ display: "flex", alignItems: "center", gap: 14, opacity: 0.72 }}>
+                  {c.emoji && <div style={{ width: 36, height: 36, borderRadius: 8, background: (c.color ?? C.orange) + "20", flexShrink: 0, display: "flex", alignItems: "center", justifyContent: "center", fontSize: 18 }}>{c.emoji}</div>}
+                  <div style={{ flex: 1, minWidth: 0 }}>
+                    <div style={{ fontSize: 13, fontWeight: 700, color: C.text }}>{c.title}</div>
+                    <div style={{ fontSize: 11, color: C.textSub }}>Course · {c.lessonIds?.length ?? 0} lessons</div>
+                  </div>
+                  <span style={{ fontSize: 10, fontWeight: 700, padding: "2px 7px", borderRadius: 4, background: C.muted, color: C.textMuted }}>Archived</span>
+                  {canEdit && <button onClick={() => handleRestoreCourse(c.id)} disabled={archiveInFlight.has(c.id)} style={{ padding: "6px 14px", borderRadius: 8, border: `1px solid ${C.orange}`, background: C.orangeLight, color: archiveInFlight.has(c.id) ? C.textMuted : C.orange, fontSize: 12, fontWeight: 700, cursor: archiveInFlight.has(c.id) ? "not-allowed" : "pointer", flexShrink: 0 }}>{archiveInFlight.has(c.id) ? "Restoring…" : "Restore"}</button>}
+                </Card>
+              ))}
+            </div>
+          </div>
+        )}
+        </>
       )}
 
       {/* LESSONS TAB */}
       {tab === "lessons" && (
+        <>
         <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fill, minmax(300px, 1fr))", gap: 16 }}>
           {filteredLessons.map(lesson => (
             <Card key={lesson.id} style={{ opacity: lesson.status === "inactive" ? 0.6 : 1, display: "flex", flexDirection: "column" }}>
@@ -10286,6 +10324,28 @@ function LearnScreen({ role, canManageLearn, user, orgUsers = [], orgs = [], onN
             </button>
           )}
         </div>
+        {/* Archived lessons — separated below active; Restore available. */}
+        {archivedLessons.length > 0 && (
+          <div style={{ marginTop: 24 }}>
+            <div style={{ display: "flex", alignItems: "center", gap: 8, marginBottom: 12 }}>
+              <span style={{ fontSize: 12, fontWeight: 800, color: C.textMuted, letterSpacing: "0.06em" }}>ARCHIVED ({archivedLessons.length})</span>
+              <div style={{ flex: 1, height: 1, background: C.border }} />
+            </div>
+            <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
+              {archivedLessons.map(l => (
+                <Card key={l.id} style={{ display: "flex", alignItems: "center", gap: 14, opacity: 0.72 }}>
+                  <div style={{ flex: 1, minWidth: 0 }}>
+                    <div style={{ fontSize: 13, fontWeight: 700, color: C.text }}>{l.title}</div>
+                    <div style={{ fontSize: 11, color: C.textSub }}>{(l.type ?? "").toUpperCase()} · {l.duration}</div>
+                  </div>
+                  <span style={{ fontSize: 10, fontWeight: 700, padding: "2px 7px", borderRadius: 4, background: C.muted, color: C.textMuted }}>Archived</span>
+                  {canEdit && <button onClick={() => handleRestoreLesson(l.id)} disabled={archiveInFlight.has(l.id)} style={{ padding: "6px 14px", borderRadius: 8, border: `1px solid ${C.orange}`, background: C.orangeLight, color: archiveInFlight.has(l.id) ? C.textMuted : C.orange, fontSize: 12, fontWeight: 700, cursor: archiveInFlight.has(l.id) ? "not-allowed" : "pointer", flexShrink: 0 }}>{archiveInFlight.has(l.id) ? "Restoring…" : "Restore"}</button>}
+                </Card>
+              ))}
+            </div>
+          </div>
+        )}
+        </>
       )}
 
       {/* QUIZZES TAB — the existing canonical manager quiz library, embedded
@@ -10603,7 +10663,12 @@ function LearnScreen({ role, canManageLearn, user, orgUsers = [], orgs = [], onN
                       >
                         <div style={{ fontSize: 13, fontWeight: 700, color: missingContent ? C.textMuted : C.text, fontStyle: missingContent ? "italic" : "normal", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap", textDecoration: missingContent ? "none" : "underline", textDecorationColor: C.border }}>{contentTitle}</div>
                       </button>
-                      <div style={{ fontSize: 11, color: C.textSub }}>{contentLabel}{a.required ? " · Required" : " · Recommended"}</div>
+                      <div style={{ fontSize: 11, color: C.textSub }}>
+                        {contentLabel}{a.required ? " · Required" : " · Recommended"}
+                        {/* Content archived but the assignment history (incl. completed
+                            scores) stays intact and viewable — honest historical truth. */}
+                        {content?.status === "archived" && <span style={{ marginLeft: 6, fontSize: 9, fontWeight: 700, padding: "1px 5px", borderRadius: 4, background: C.muted, color: C.textMuted, letterSpacing: "0.04em" }}>ARCHIVED</span>}
+                      </div>
                     </div>
                   </div>
                   {/* Rep — the individual learner is ALWAYS the primary assignee,
@@ -10749,6 +10814,19 @@ function LearnScreen({ role, canManageLearn, user, orgUsers = [], orgs = [], onN
                       <input type="date" value={assignDateRange.end} onChange={e => setAssignDateRange(p => ({ ...p, end: e.target.value }))} style={{ padding: "6px 8px", borderRadius: 7, border: `1px solid ${C.border}`, fontSize: 12, color: C.text, background: C.white }} />
                     </div>
                   )}
+                  {/* Reset filters — clears every dropdown AND any active content/rep
+                      drilldown together, returning to the full default history dataset. */}
+                  {(() => {
+                    const isDefault = assignStatusFilter === "all" && assignContentType === "all"
+                      && assignRep === "all" && assignTimeframe === "all" && !drillContent && !drillRep && !selectedRowKey;
+                    return (
+                      <button
+                        onClick={() => { setAssignStatusFilter("all"); setAssignContentType("all"); setAssignRep("all"); setAssignTimeframe("all"); setAssignDateRange({ start: "", end: "" }); setDrillContent(null); setDrillRep(null); setSelectedRowKey(null); }}
+                        disabled={isDefault}
+                        style={{ padding: "7px 14px", borderRadius: 8, border: `1px solid ${C.border}`, background: isDefault ? C.pageBg : C.white, color: isDefault ? C.textMuted : C.textSub, fontSize: 12, fontWeight: 700, cursor: isDefault ? "default" : "pointer" }}
+                      >Reset filters</button>
+                    );
+                  })()}
                 </div>
               );
             })()}
@@ -10788,51 +10866,6 @@ function LearnScreen({ role, canManageLearn, user, orgUsers = [], orgs = [], onN
       })()}
 
       {/* ARCHIVED TAB */}
-      {tab === "archived" && (
-        <div style={{ display: "flex", flexDirection: "column", gap: 20 }}>
-          {archivedCourses.length === 0 && archivedLessons.length === 0 && (
-            <div style={{ padding: 60, textAlign: "center", background: C.white, borderRadius: 12, border: `1px solid ${C.border}` }}>
-              <div style={{ fontSize: 32, marginBottom: 12 }}>📦</div>
-              <p style={{ margin: 0, fontSize: 15, fontWeight: 700, color: C.text }}>Nothing archived</p>
-              <p style={{ margin: "6px 0 0", fontSize: 13, color: C.textSub }}>Archived courses and lessons will appear here. Use the Archive button on any course or lesson to move it here.</p>
-            </div>
-          )}
-          {archivedCourses.length > 0 && (
-            <div>
-              <h3 style={{ margin: "0 0 10px", fontSize: 12, fontWeight: 800, color: C.textMuted, letterSpacing: "0.06em" }}>COURSES ({archivedCourses.length})</h3>
-              <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
-                {archivedCourses.map(c => (
-                  <Card key={c.id} style={{ display: "flex", alignItems: "center", gap: 14, opacity: 0.72 }}>
-                    {c.emoji && <div style={{ width: 36, height: 36, borderRadius: 8, background: (c.color ?? C.orange) + "20", flexShrink: 0, display: "flex", alignItems: "center", justifyContent: "center", fontSize: 18 }}>{c.emoji}</div>}
-                    <div style={{ flex: 1, minWidth: 0 }}>
-                      <div style={{ fontSize: 13, fontWeight: 700, color: C.text }}>{c.title}</div>
-                      <div style={{ fontSize: 11, color: C.textSub }}>Course · {c.lessonIds?.length ?? 0} lessons</div>
-                    </div>
-                    <button onClick={() => handleRestoreCourse(c.id)} disabled={archiveInFlight.has(c.id)} style={{ padding: "6px 14px", borderRadius: 8, border: `1px solid ${C.border}`, background: C.white, color: archiveInFlight.has(c.id) ? C.textMuted : C.textSub, fontSize: 12, fontWeight: 700, cursor: archiveInFlight.has(c.id) ? "not-allowed" : "pointer", flexShrink: 0 }}>{archiveInFlight.has(c.id) ? "Restoring…" : "Restore"}</button>
-                  </Card>
-                ))}
-              </div>
-            </div>
-          )}
-          {archivedLessons.length > 0 && (
-            <div>
-              <h3 style={{ margin: "0 0 10px", fontSize: 12, fontWeight: 800, color: C.textMuted, letterSpacing: "0.06em" }}>LESSONS ({archivedLessons.length})</h3>
-              <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
-                {archivedLessons.map(l => (
-                  <Card key={l.id} style={{ display: "flex", alignItems: "center", gap: 14, opacity: 0.72 }}>
-                    <div style={{ flex: 1, minWidth: 0 }}>
-                      <div style={{ fontSize: 13, fontWeight: 700, color: C.text }}>{l.title}</div>
-                      <div style={{ fontSize: 11, color: C.textSub }}>{(l.type ?? "").toUpperCase()} · {l.duration}</div>
-                    </div>
-                    <button onClick={() => handleRestoreLesson(l.id)} disabled={archiveInFlight.has(l.id)} style={{ padding: "6px 14px", borderRadius: 8, border: `1px solid ${C.border}`, background: C.white, color: archiveInFlight.has(l.id) ? C.textMuted : C.textSub, fontSize: 12, fontWeight: 700, cursor: archiveInFlight.has(l.id) ? "not-allowed" : "pointer", flexShrink: 0 }}>{archiveInFlight.has(l.id) ? "Restoring…" : "Restore"}</button>
-                  </Card>
-                ))}
-              </div>
-            </div>
-          )}
-        </div>
-      )}
-
       {/* ARCHIVE CONFIRMATION MODAL */}
       {confirmArchive && (
         <div style={{ position: "fixed", inset: 0, background: "rgba(0,0,0,0.5)", display: "flex", alignItems: "center", justifyContent: "center", zIndex: 1001 }}
@@ -10841,7 +10874,7 @@ function LearnScreen({ role, canManageLearn, user, orgUsers = [], orgs = [], onN
             <div style={{ fontSize: 32, marginBottom: 12, textAlign: "center" }}>⚠️</div>
             <h3 style={{ margin: "0 0 8px", fontSize: 17, fontWeight: 800, color: C.text, textAlign: "center" }}>Archive {confirmArchive.type === "course" ? "Course" : "Lesson"}?</h3>
             <p style={{ margin: "0 0 24px", fontSize: 13, color: C.textSub, textAlign: "center", lineHeight: 1.6 }}>
-              <strong>{confirmArchive.title}</strong> will be archived and learners will lose access. You can restore it from the Archived tab.
+              <strong>{confirmArchive.title}</strong> will be archived and learners will lose access. Completed history is preserved; you can restore it from the Archived section on this tab.
             </p>
             <div style={{ display: "flex", gap: 10 }}>
               <button onClick={() => setConfirmArchive(null)} style={{ flex: 1, padding: "11px", borderRadius: 10, border: `1px solid ${C.border}`, background: C.white, color: C.text, fontSize: 13, fontWeight: 700, cursor: "pointer" }}>Cancel</button>
@@ -14620,7 +14653,7 @@ function QuizTrackingPanel({ quizzes, orgUsers, tenantId, isReal, refreshKey, on
 }
 
 // ── QuizzesScreen (user branch rewritten, admin branch preserved) ─────────────
-function QuizzesScreen({ role, onNav, quizzes, onEditQuiz, onDeleteQuiz, onArchiveQuiz, onRestoreQuiz, onToggleFavorite, onToggleActive, pendingQuizId, onClearPendingQuiz, canCreate = true, canEdit = true, canDelete = true, canLaunch = true, canAssign = true, onAssignQuiz, onLaunchQuiz, orgUsers = [], orgs = [], currentUser = null, tenantId = null, isReal = false, quizzesReady = false, sharedAssignmentData = null, onRefreshQuizzes = null }) {
+function QuizzesScreen({ role, onNav, quizzes, onEditQuiz, onDeleteQuiz, onArchiveQuiz, onRestoreQuiz, onToggleFavorite, onToggleActive, pendingQuizId, onClearPendingQuiz, canCreate = true, canEdit = true, canDelete = true, canLaunch = true, canAssign = true, onAssignQuiz, onLaunchQuiz, orgUsers = [], orgs = [], currentUser = null, tenantId = null, isReal = false, quizzesReady = false, sharedAssignmentData = null, onRefreshQuizzes = null, onExitQuiz = null }) {
 
   // ── USER VIEW ─────────────────────────────────────────────────────────────
   if (role === "user") {
@@ -14906,6 +14939,13 @@ function QuizzesScreen({ role, onNav, quizzes, onEditQuiz, onDeleteQuiz, onArchi
         .finally(() => { submittingRef.current = false; });
     };
 
+    // Back/Exit destination. For a learner who deep-launched from Learn, onExitQuiz
+    // returns to the ORIGINATING Learn context (To Do / Knowledge Base) and NEVER
+    // renders the retired Quizzes dashboard. In the manager quiz-library panel (no
+    // onExitQuiz) "back" means the library list, as before.
+    const backToList = onExitQuiz ?? (() => setView("list"));
+    const backLabel  = onExitQuiz ? "← Back to Learn" : "← Back to Quizzes";
+
     // ── Loading the sanitized quiz for a real learner (Start / Retake) ──
     if (view === "starting") {
       return <LoadingState rows={2} message="Loading quiz…" />;
@@ -14915,7 +14955,7 @@ function QuizzesScreen({ role, onNav, quizzes, onEditQuiz, onDeleteQuiz, onArchi
     if (view === "start_error") {
       return (
         <div style={{ display: "flex", flexDirection: "column", gap: 20 }}>
-          <button onClick={() => setView("list")} style={{ background: "none", border: "none", cursor: "pointer", fontSize: 13, fontWeight: 600, color: C.textSub, padding: 0, alignSelf: "flex-start" }}>← Back to Quizzes</button>
+          <button onClick={backToList} style={{ background: "none", border: "none", cursor: "pointer", fontSize: 13, fontWeight: 600, color: C.textSub, padding: 0, alignSelf: "flex-start" }}>{backLabel}</button>
           <ErrorState message="We couldn't load this quiz. Please try again." onRetry={() => startQuiz(activeId)} />
         </div>
       );
@@ -14926,7 +14966,7 @@ function QuizzesScreen({ role, onNav, quizzes, onEditQuiz, onDeleteQuiz, onArchi
     if (view === "review_loading") {
       return (
         <div style={{ display: "flex", flexDirection: "column", gap: 20 }}>
-          <button onClick={() => setView("list")} style={{ background: "none", border: "none", cursor: "pointer", fontSize: 13, fontWeight: 600, color: C.textSub, padding: 0, alignSelf: "flex-start" }}>← Back to Quizzes</button>
+          <button onClick={backToList} style={{ background: "none", border: "none", cursor: "pointer", fontSize: 13, fontWeight: 600, color: C.textSub, padding: 0, alignSelf: "flex-start" }}>{backLabel}</button>
           <LoadingState rows={2} message="Loading your results…" />
         </div>
       );
@@ -14934,7 +14974,7 @@ function QuizzesScreen({ role, onNav, quizzes, onEditQuiz, onDeleteQuiz, onArchi
     if (view === "review_error") {
       return (
         <div style={{ display: "flex", flexDirection: "column", gap: 20 }}>
-          <button onClick={() => setView("list")} style={{ background: "none", border: "none", cursor: "pointer", fontSize: 13, fontWeight: 600, color: C.textSub, padding: 0, alignSelf: "flex-start" }}>← Back to Quizzes</button>
+          <button onClick={backToList} style={{ background: "none", border: "none", cursor: "pointer", fontSize: 13, fontWeight: 600, color: C.textSub, padding: 0, alignSelf: "flex-start" }}>{backLabel}</button>
           <ErrorState message="We couldn't load these results. Please try again." onRetry={() => reviewTarget && viewResults(reviewTarget.id, reviewTarget.attempt)} />
         </div>
       );
@@ -14953,7 +14993,7 @@ function QuizzesScreen({ role, onNav, quizzes, onEditQuiz, onDeleteQuiz, onArchi
     // ── Quiz taking — sanitized quiz for real learners (no answer keys, no
     //    client feedback); demo keeps its canonical seed + teach-as-you-go. ──
     if (view === "taking" && takeQuiz) {
-      return <QuizTakingView quiz={takeQuiz} onComplete={onComplete} onExit={() => setView("list")} revealFeedback={!isReal} />;
+      return <QuizTakingView quiz={takeQuiz} onComplete={onComplete} onExit={backToList} revealFeedback={!isReal} />;
     }
 
     // ── Results ──
@@ -14970,12 +15010,12 @@ function QuizzesScreen({ role, onNav, quizzes, onEditQuiz, onDeleteQuiz, onArchi
             reviewStatus={reviewModel.status ?? "ready"}
             onRetryReview={() => loadReview(reviewModel.attemptId)}
             onRetake={() => retakeQuiz(activeId)}
-            onBack={() => setView("list")}
+            onBack={backToList}
           />
         );
       }
       if (!isReal && takeQuiz && activeAttempt) {
-        return <QuizResultsView quiz={takeQuiz} attempt={activeAttempt} onRetake={() => retakeQuiz(activeId)} onBack={() => setView("list")} />;
+        return <QuizResultsView quiz={takeQuiz} attempt={activeAttempt} onRetake={() => retakeQuiz(activeId)} onBack={backToList} />;
       }
     }
 
@@ -23123,7 +23163,13 @@ function getRestorableScreen() {
     // submission, so nothing is lost. (pendingQuizId and the quiz-player view
     // state are React-only and start fresh on reload, so there's no stale
     // selected-answer or auto-launch to clear.) The quiz builder maps here too.
-    if (saved === "quizzes" || saved === "rankd-quiz-builder") return "learn";
+    if (saved === "quizzes" || saved === "rankd-quiz-builder") {
+      // Mid-quiz refresh is approved to land on Learn → To Do specifically — force
+      // the learner subtab to "assigned", overriding any persisted Knowledge Base
+      // context (which is only for in-app Back, not a page reload).
+      try { sessionStorage.setItem("ralli_learn_user_tab", "assigned"); } catch {}
+      return "learn";
+    }
     return saved;
   } catch { return null; }
 }
@@ -25324,7 +25370,7 @@ export default function App() {
         quizzesPanel={canManageLearn ? (
           <QuizzesScreen role="admin" onNav={navigate} quizzes={quizzes} onEditQuiz={handleEditQuiz} onDeleteQuiz={handleDeleteQuiz} onArchiveQuiz={handleArchiveQuiz} onRestoreQuiz={handleRestoreQuiz} onToggleFavorite={handleToggleFavorite} onToggleActive={handleToggleActive} pendingQuizId={null} onClearPendingQuiz={() => {}} canCreate={perm("actions","create")} canEdit={perm("actions","edit")} canDelete={perm("actions","delete")} canLaunch={perm("actions","launch")} canAssign={perm("actions","assign")} onAssignQuiz={handleAssignQuiz} onLaunchQuiz={handleCreateSession} orgUsers={orgUsers} orgs={orgs} currentUser={currentUser} tenantId={currentOrg?.id ?? null} isReal={!!user?._isReal} quizzesReady={quizzesReady} sharedAssignmentData={sharedAssignmentData} onRefreshQuizzes={refreshQuizzes} />
         ) : null} />;
-      case "quizzes":           return <QuizzesScreen role={gameRole} onNav={navigate} quizzes={quizzes} onEditQuiz={handleEditQuiz} onDeleteQuiz={handleDeleteQuiz} onArchiveQuiz={handleArchiveQuiz} onRestoreQuiz={handleRestoreQuiz} onToggleFavorite={handleToggleFavorite} onToggleActive={handleToggleActive} pendingQuizId={pendingQuizId} onClearPendingQuiz={() => setPendingQuizId(null)} canCreate={perm("actions","create")} canEdit={perm("actions","edit")} canDelete={perm("actions","delete")} canLaunch={perm("actions","launch")} canAssign={perm("actions","assign")} onAssignQuiz={handleAssignQuiz} onLaunchQuiz={handleCreateSession} orgUsers={orgUsers} orgs={orgs} currentUser={currentUser} tenantId={currentOrg?.id ?? null} isReal={!!user?._isReal} quizzesReady={quizzesReady} sharedAssignmentData={sharedAssignmentData} onRefreshQuizzes={refreshQuizzes} />;
+      case "quizzes":           return <QuizzesScreen role={gameRole} onNav={navigate} quizzes={quizzes} onEditQuiz={handleEditQuiz} onDeleteQuiz={handleDeleteQuiz} onArchiveQuiz={handleArchiveQuiz} onRestoreQuiz={handleRestoreQuiz} onToggleFavorite={handleToggleFavorite} onToggleActive={handleToggleActive} pendingQuizId={pendingQuizId} onClearPendingQuiz={() => setPendingQuizId(null)} canCreate={perm("actions","create")} canEdit={perm("actions","edit")} canDelete={perm("actions","delete")} canLaunch={perm("actions","launch")} canAssign={perm("actions","assign")} onAssignQuiz={handleAssignQuiz} onLaunchQuiz={handleCreateSession} orgUsers={orgUsers} orgs={orgs} currentUser={currentUser} tenantId={currentOrg?.id ?? null} isReal={!!user?._isReal} quizzesReady={quizzesReady} sharedAssignmentData={sharedAssignmentData} onRefreshQuizzes={refreshQuizzes} onExitQuiz={() => { setPendingQuizId(null); navigate("learn"); }} />;
       case "battlecards":       return (isAdminType && perm("actions","edit"))
         ? <BattleCardsAdminScreen categories={bcCategories} cards={battleCards} onSaveCategory={handleSaveBcCategory} onDeleteCategory={handleDeleteBcCategory} onSaveCard={handleSaveBattleCard} onDeleteCard={handleDeleteBattleCard} />
         : <BattleCardsScreen categories={bcCategories} cards={battleCards} isLoading={bcLoading} isReal={!!user?._isReal} />;
