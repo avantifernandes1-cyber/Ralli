@@ -14,13 +14,20 @@
 -- list_quizzes_for_learner (excludes archived by design), list_my_quiz_attempts_safe
 -- (no name/title), get_quiz_review (per-attempt, pass-gated, not a list).
 --
--- This RPC returns ONLY the authenticated learner's OWN passed quizzes (including
--- archived), with SAFE metadata (id, name, status, passing_score, best_score,
--- last_passed_at). It NEVER returns questions or answer keys (those remain behind the
--- existing pass-gated get_quiz_review contract), never exposes another learner's rows,
--- and is HISTORY only — it does not make archived content startable or searchable and
--- does not weaken 065's active-catalog exclusion. Tenant + learner identity are enforced
--- server-side. Additive: creates one function; changes no table, policy, or other RPC.
+-- This RPC returns ONLY safe CATALOG METADATA (id, name, status, passing_score) for the
+-- quizzes the authenticated caller has PASSED, in the caller's tenant — INCLUDING archived
+-- ones. It is a title/status LOOKUP, nothing more. It deliberately does NOT return any
+-- per-attempt score or date: an assignment-instance's score/completion date is NOT a
+-- lifetime-per-quiz aggregate (a quiz can be reassigned and passed again at a different
+-- score/date), so those MUST come from the existing instance-scoped safe attempt source
+-- (list_my_quiz_attempts_safe / the client's own quiz_attempts, filtered to attempts
+-- created on/after THAT assignment's assigned_at). Returning aggregates here would invite
+-- misattribution, so they are omitted. `name` is CURRENT catalog metadata (a manager may
+-- rename a quiz), not an immutable historical title; immutable historical questions/answers
+-- remain solely in the pass-gated get_quiz_review snapshot contract. NEVER returns
+-- questions/answer keys, never another learner's rows, never makes archived content
+-- startable/searchable, never weakens 065's active-catalog exclusion. Tenant + learner
+-- enforced server-side. Additive: one function; changes no table, policy, or other RPC.
 -- ─────────────────────────────────────────────────────────────────────────────
 
 CREATE OR REPLACE FUNCTION public.list_my_completed_quiz_history()
@@ -35,33 +42,23 @@ BEGIN
     WHERE id = v_uid AND COALESCE(status,'active') <> 'inactive';
   IF v_tenant IS NULL THEN RETURN '[]'::jsonb; END IF;
 
-  -- One row per quiz the CALLER has ever PASSED, in the caller's tenant. Safe metadata
-  -- only — NO questions/answers. Archived quizzes are included (this is history), but
-  -- the payload carries the real status so the UI shows an "Archived" badge and never
-  -- offers Start/Retry. best_score/last_passed_at come from the caller's OWN attempts.
-  SELECT COALESCE(jsonb_agg(item ORDER BY item->>'last_passed_at' DESC), '[]'::jsonb)
+  -- One row per quiz the CALLER has EVER passed, in the caller's tenant. SAFE catalog
+  -- metadata ONLY (id, name, status, passing_score) — NO questions/answers, NO per-attempt
+  -- score or date (those are instance facts, resolved client-side from scoped attempts).
+  -- Archived quizzes are included so their title/status resolves for Completed history.
+  SELECT COALESCE(jsonb_agg(DISTINCT jsonb_build_object(
+           'id',            q.id,
+           'name',          q.name,
+           'status',        q.status,
+           'passing_score', q.passing_score
+         )), '[]'::jsonb)
   INTO v_out
-  FROM (
-    SELECT jsonb_build_object(
-             'id',             q.id,
-             'name',           q.name,
-             'status',         q.status,
-             'passing_score',  q.passing_score,
-             'best_score',     mine.best_score,
-             'passed',         true,
-             'last_passed_at', mine.last_passed_at
-           ) AS item
-    FROM public.tenant_quizzes q
-    JOIN (
-      SELECT qa.quiz_id,
-             max(qa.score) AS best_score,
-             max(qa.created_at) AS last_passed_at
-      FROM public.quiz_attempts qa
-      WHERE qa.user_id = v_uid AND qa.passed IS TRUE
-      GROUP BY qa.quiz_id
-    ) mine ON mine.quiz_id = q.id
-    WHERE q.tenant_id = v_tenant
-  ) s;
+  FROM public.tenant_quizzes q
+  WHERE q.tenant_id = v_tenant
+    AND EXISTS (
+      SELECT 1 FROM public.quiz_attempts qa
+      WHERE qa.quiz_id = q.id AND qa.user_id = v_uid AND qa.passed IS TRUE
+    );
 
   RETURN v_out;
 END $$;

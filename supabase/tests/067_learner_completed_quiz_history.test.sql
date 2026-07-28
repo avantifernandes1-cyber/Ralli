@@ -46,13 +46,13 @@ DO $$ DECLARE v jsonb; v_ids text[]; v_arch jsonb; v_act jsonb; BEGIN
   SELECT e INTO v_arch FROM jsonb_array_elements(v) e WHERE e->>'id'='00000000-0000-0000-0000-0000000dc002';
   ASSERT v_arch->>'status'='archived', '1. archived status carried';
   ASSERT v_arch->>'name'='ARCHIVED_Q', '1. archived name carried';
-  ASSERT (v_arch->>'best_score')::int=75, '1. archived best_score';
-  SELECT e INTO v_act FROM jsonb_array_elements(v) e WHERE e->>'id'='00000000-0000-0000-0000-0000000dc001';
-  ASSERT (v_act->>'best_score')::int=90, '1. active best_score (max across attempts)';
-  ASSERT (v_act->>'passed')::boolean, '1. passed=true';
+  -- CATALOG METADATA ONLY: exactly {id,name,status,passing_score}; NO per-attempt score/
+  -- date/passed (those are instance facts, resolved client-side from scoped attempts).
+  ASSERT (SELECT array_agg(k ORDER BY k) FROM jsonb_object_keys(v_arch) k) = ARRAY['id','name','passing_score','status'], '1. only catalog keys: '||v_arch::text;
+  ASSERT v_arch ? 'best_score' = false AND v_arch ? 'last_passed_at' = false AND v_arch ? 'passed' = false, '1. NO aggregate score/date/passed field';
   -- confidentiality: no answer-bearing keys anywhere in the payload
-  ASSERT v::text NOT ILIKE '%questions%' AND v::text NOT ILIKE '%"correct"%' AND v::text NOT ILIKE '%acceptedAnswers%', '1. no answer keys';
-  RAISE NOTICE '1. HL1 completed-quiz history: 2 passed (active+archived), failed/cross-tenant excluded, safe metadata: PASS';
+  ASSERT v::text NOT ILIKE '%questions%' AND v::text NOT ILIKE '%"correct"%' AND v::text NOT ILIKE '%acceptedAnswers%' AND v::text NOT ILIKE '%tolerance%' AND v::text NOT ILIKE '%pairs%', '1. no answer keys';
+  RAISE NOTICE '1. HL1 completed-quiz history: 2 passed (active+archived), failed/cross-tenant excluded, catalog-only metadata (no aggregate score/date): PASS';
 END $$;
 
 -- ── 2. HL2 sees only their own; HL8 (other tenant) sees only their tenant's. ─────

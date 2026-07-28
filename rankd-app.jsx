@@ -9779,12 +9779,16 @@ function LearnScreen({ role, canManageLearn, user, orgUsers = [], orgs = [], onN
           // the active catalog/KB/To Do (these locals are used ONLY for this selector
           // call). Archived-UNRESOLVED assignments were cancelled on archive, so the
           // selector already excludes them (cancelled) — only completed ones survive.
+          // Only augment with archived content THIS learner actually has an assignment
+          // to — never unrelated tenant archived content (rendering is already limited to
+          // myAssignments, and this keeps the augmented catalogs minimal + tenant-isolated).
+          const myContentIds = new Set((myAssignments ?? []).map(a => `${a.contentType}:${a.contentId}`));
           const archQuizCatalog = (completedQuizHistory ?? [])
-            .filter(h => h?.id && !quizzes.some(q => q.id === h.id))
+            .filter(h => h?.id && myContentIds.has(`quiz:${h.id}`) && !quizzes.some(q => q.id === h.id))
             .map(h => ({ id: h.id, name: h.name, title: h.name, status: h.status ?? "archived", passingScore: h.passing_score ?? null, questionCount: 0, _history: true }));
           const histQuizzes = [...quizzes, ...archQuizCatalog];
-          const histLessons = [...lessons, ...(archivedLessons ?? []).filter(l => !lessons.some(x => x.id === l.id))];
-          const histCourses = [...courses, ...(archivedCourses ?? []).filter(c => !courses.some(x => x.id === c.id))];
+          const histLessons = [...lessons, ...(archivedLessons ?? []).filter(l => myContentIds.has(`lesson:${l.id}`) && !lessons.some(x => x.id === l.id))];
+          const histCourses = [...courses, ...(archivedCourses ?? []).filter(c => myContentIds.has(`course:${c.id}`) && !courses.some(x => x.id === c.id))];
           const rows = resolveLearnerAssignments(myAssignments, {
             completedAtByLesson: completedLessonsAt,
             quizAttempts: sharedAssignmentData?.quizAttempts ?? [],
@@ -9803,7 +9807,7 @@ function LearnScreen({ role, canManageLearn, user, orgUsers = [], orgs = [], onN
               return { r, a, content: r.content, kind: "course", isCourse: true, courseLessons, doneCount, pct: r.progress, isComplete: r.isCompleted, status: r.status, missing: r.missing, isArchived };
             }
             if (r.contentType === "quiz") {
-              return { r, a, content: r.content, kind: "quiz", isQuiz: true, courseLessons: [], doneCount: 0, pct: r.progress, isComplete: r.isCompleted, status: r.status, missing: r.missing, isArchived };
+              return { r, a, content: r.content, kind: "quiz", isQuiz: true, courseLessons: [], doneCount: 0, pct: r.progress, isComplete: r.isCompleted, status: r.status, missing: r.missing, isArchived, score: r.score, completedAt: r.completedAt };
             }
             return { r, a, content: r.content, kind: "lesson", isCourse: false, courseLessons: [], doneCount: 0, pct: r.progress, isComplete: r.isCompleted, status: r.status, missing: r.missing, isArchived };
           });
@@ -9929,7 +9933,7 @@ function LearnScreen({ role, canManageLearn, user, orgUsers = [], orgs = [], onN
           // Quiz assignment card — status from the shared quiz engine; the action
           // routes into the canonical Quizzes flow (Take / Retry / Review). Learn
           // never renders questions, answers, or scoring itself.
-          const QuizAssignedCard = ({ a, content, status, isArchived }) => {
+          const QuizAssignedCard = ({ a, content, status, isArchived, score, completedAt }) => {
             const label = status === "completed" ? "Completed" : status === "overdue" ? "Overdue" : status === "in_progress" ? "In Progress" : "Not Started";
             const labelColor = status === "completed" ? C.green : status === "overdue" ? C.red : status === "in_progress" ? C.blue : C.textSub;
             // Archived content is HISTORY: a completed row keeps a safe Review only —
@@ -9937,9 +9941,11 @@ function LearnScreen({ role, canManageLearn, user, orgUsers = [], orgs = [], onN
             // archived can't occur here (archive cancels unresolved rows).
             const cta = status === "completed" ? "Review →" : status === "in_progress" || status === "overdue" ? "Retry →" : "Take quiz →";
             const dueStatus = (!isArchived && status !== "completed" && a.dueAt && a.dueAt !== "Open") ? getDueStatus(a.dueAt) : null;
-            // Best score from the learner's own attempts (safe; already loaded).
-            const myAttempts = (sharedAssignmentData?.quizAttempts ?? []).filter(at => at.quiz_id === a.contentId);
-            const bestScore = myAttempts.length ? Math.max(...myAttempts.map(at => at.score ?? 0)) : null;
+            // Score/date are the engine's INSTANCE-SCOPED values (best PASSING attempt at/
+            // after THIS assignment's assigned_at), NOT a lifetime-per-quiz aggregate — so
+            // a reassignment never lets this instance inherit another instance's score/date.
+            const bestScore = score;
+            const doneOn = completedAt ? new Date(completedAt).toLocaleDateString("en-US", { month: "short", day: "numeric", year: "numeric" }) : null;
             return (
               <Card>
                 <div style={{ display: "flex", alignItems: "flex-start", gap: 16 }}>
@@ -9953,8 +9959,12 @@ function LearnScreen({ role, canManageLearn, user, orgUsers = [], orgs = [], onN
                       {dueStatus && <span style={{ fontSize: 10, fontWeight: 700, padding: "1px 7px", borderRadius: 4, background: dueStatus.color + "18", color: dueStatus.color, marginLeft: "auto" }}>{dueStatus.label}</span>}
                     </div>
                     <div style={{ fontSize: 15, fontWeight: 700, color: C.text }}>{content?.name ?? content?.title ?? "Quiz"}</div>
-                    {status === "completed" && bestScore != null && (
-                      <div style={{ fontSize: 12, color: C.textSub, marginTop: 2 }}>Score {bestScore}%{isArchived ? " · content archived" : ""}</div>
+                    {status === "completed" && (bestScore != null || doneOn) && (
+                      <div style={{ fontSize: 12, color: C.textSub, marginTop: 2 }}>
+                        {bestScore != null ? `Score ${bestScore}%` : ""}
+                        {doneOn ? `${bestScore != null ? " · " : ""}Completed ${doneOn}` : ""}
+                        {isArchived ? " · content archived" : ""}
+                      </div>
                     )}
                     <div style={{ display: "flex", justifyContent: "flex-end", marginTop: 12 }}>
                       {/* Completed → safe pass-gated Review (immutable snapshot, works for
@@ -10014,7 +10024,7 @@ function LearnScreen({ role, canManageLearn, user, orgUsers = [], orgs = [], onN
                   flow; quiz routes into the canonical Quizzes flow. */}
               {filterItems.map(e => (
                 e.isQuiz
-                  ? <QuizAssignedCard key={e.a.id} a={e.a} content={e.content} status={e.status} isArchived={e.isArchived} />
+                  ? <QuizAssignedCard key={e.a.id} a={e.a} content={e.content} status={e.status} isArchived={e.isArchived} score={e.score} completedAt={e.completedAt} />
                   : e.missing
                     ? <MissingCompletedCard key={e.a.id} kind={e.kind} />
                     : <AssignedCard key={e.a.id} {...e} />

@@ -221,5 +221,43 @@ const at = (created_at, passed, score) => ({ created_at, passed, score });
   eq("course scheduled reassignment: progress 0", scheduled.progress, 0);
 }
 
+// ── Reassignment score/date MISATTRIBUTION trap (learner Completed history) ────
+// A quiz reassigned after being passed must never let the displayed (latest) instance
+// inherit an EARLIER instance's score/date. The selector's `score` is instance-scoped
+// (best PASSING attempt with created_at >= the latest instance's assigned_at).
+{
+  const Q = "QT";
+  const base = { contentType: "quiz", contentId: Q, assignedTo: { type: "individual", userId: "u" } };
+  // Trap A: first pass HIGHER (100), reassign, second pass LOWER (80). Latest instance
+  // must resolve to 80 — NOT the earlier 100.
+  const rowsA = resolveLearnerAssignments(
+    [ { ...base, id: "a1", assigned_at: "2026-01-01T00:00:00Z" },
+      { ...base, id: "a2", assigned_at: "2026-02-01T00:00:00Z" } ],
+    { quizAttempts: [
+        { quiz_id: Q, passed: true, score: 100, created_at: "2026-01-05T00:00:00Z" }, // for a1
+        { quiz_id: Q, passed: true, score: 80,  created_at: "2026-02-05T00:00:00Z" }, // for a2 (latest)
+      ], quizzes: [{ id: Q, title: "QT" }] });
+  eq("trap A: one deduped row (latest instance)", rowsA.length, 1);
+  eq("trap A: latest instance score = 80 (own qualifying pass, NOT inherited 100)", rowsA[0].score, 80);
+  eq("trap A: latest instance is the newer assignment", rowsA[0].assignment.id, "a2");
+
+  // Trap B: first pass LOWER (80), reassign, second pass HIGHER (100). Latest = 100.
+  const rowsB = resolveLearnerAssignments(
+    [ { ...base, id: "b1", assigned_at: "2026-01-01T00:00:00Z" },
+      { ...base, id: "b2", assigned_at: "2026-02-01T00:00:00Z" } ],
+    { quizAttempts: [
+        { quiz_id: Q, passed: true, score: 80,  created_at: "2026-01-05T00:00:00Z" },
+        { quiz_id: Q, passed: true, score: 100, created_at: "2026-02-05T00:00:00Z" },
+      ], quizzes: [{ id: Q, title: "QT" }] });
+  eq("trap B: latest instance score = 100 (its own qualifying pass)", rowsB[0].score, 100);
+
+  // Failed attempt after assigned_at must not set a passing score.
+  const rowsC = resolveLearnerAssignments(
+    [ { ...base, id: "c1", assigned_at: "2026-02-01T00:00:00Z" } ],
+    { quizAttempts: [ { quiz_id: Q, passed: false, score: 55, created_at: "2026-02-05T00:00:00Z" } ], quizzes: [{ id: Q, title: "QT" }] });
+  eq("trap C: failed-only instance is not completed", rowsC[0].isCompleted, false);
+  eq("trap C: failed-only instance score = null (no passing attempt)", rowsC[0].score, null);
+}
+
 console.log(`\n${pass} passed, ${fail} failed`);
 process.exit(fail ? 1 : 0);
