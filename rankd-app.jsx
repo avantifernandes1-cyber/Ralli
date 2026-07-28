@@ -71,10 +71,7 @@ import {
   getMyQuizAttemptsSafe,
   getAttemptSolutions,
   getTenantQuizAttempts,
-  getTenantBcCategories,
   getTenantBattleCards,
-  saveBcCategory   as dbSaveBcCategory,
-  deleteBcCategory as dbDeleteBcCategory,
   saveBattleCard   as dbSaveBattleCard,
   setBattleCardArchived as dbSetBattleCardArchived,
   updateUserProfile as dbUpdateUserProfile,
@@ -15524,29 +15521,18 @@ function QuizzesScreen({ role, onNav, quizzes, onEditQuiz, onDeleteQuiz, onArchi
 
 // ── BATTLE CARDS SCREEN ─────────────────────────────────────
 //
-// Data model (production-ready):
-//   BC_CATEGORIES — { id, label, description }
-//   BATTLE_CARDS  — { id, categoryId, title, subtitle, summary,
-//                     strength, weakness, ourWin, talkTrack,
-//                     content: [{ heading, body }], tags, updatedAt }
+// Data model (tags-only; categories removed from the product):
+//   BATTLE_CARDS — { id, title, subtitle, summary, strength, weakness,
+//                    ourWin, talkTrack, content: [{ heading, body }], tags,
+//                    status, updatedAt }
 //
-// Admin/Manager creation tools can be added later without restructuring
-// this data shape. Replace module-level consts with API fetches when
-// the backend is ready.
+// Replace module-level consts with API fetches when the backend is ready.
 // ──────────────────────────────────────────────────────────────────────
-
-const INITIAL_BC_CATEGORIES = [
-  { id: "competitor", label: "Competitor Knowledge", description: "Head-to-head comparisons and positioning against competing products." },
-  { id: "product",    label: "Product Knowledge",    description: "Deep dives into ralli features, use cases, and value props." },
-  { id: "industry",   label: "Industry Knowledge",   description: "Market context, buyer trends, and vertical-specific insights." },
-  { id: "misc",       label: "Misc.",                description: "Objection handling, pricing talk tracks, and one-offs." },
-];
 
 // Production hook: replace with API response from /api/battle-cards
 const INITIAL_BATTLE_CARDS = [
   {
     id: "salesforce",
-    categoryId: "competitor",
     title: "Salesforce",
     subtitle: "CRM",
     summary: "Legacy enterprise CRM with strong brand recognition but high complexity and cost.",
@@ -15573,7 +15559,6 @@ const INITIAL_BATTLE_CARDS = [
   },
   {
     id: "hubspot",
-    categoryId: "competitor",
     title: "HubSpot",
     subtitle: "CRM + Marketing",
     summary: "Popular with marketing-led teams, but sales analytics and enterprise workflow are its weak points.",
@@ -15596,7 +15581,6 @@ const INITIAL_BATTLE_CARDS = [
   },
   {
     id: "outreach",
-    categoryId: "competitor",
     title: "Outreach",
     subtitle: "Sales Engagement",
     summary: "Strong sequencing and dialer, but operates in isolation from CRM and is expensive per seat.",
@@ -15619,7 +15603,6 @@ const INITIAL_BATTLE_CARDS = [
   },
   {
     id: "gong",
-    categoryId: "competitor",
     title: "Gong",
     subtitle: "Revenue Intelligence",
     summary: "Leading call intelligence platform, but passive by nature — it records and reports, it doesn't coach or train.",
@@ -15646,7 +15629,6 @@ const INITIAL_BATTLE_CARDS = [
   },
   {
     id: "ralli-product",
-    categoryId: "product",
     title: "ralli Platform Overview",
     subtitle: "Product Knowledge",
     summary: "Core platform capabilities: LMS, gamification, coaching, and readiness insights in one place.",
@@ -15673,7 +15655,6 @@ const INITIAL_BATTLE_CARDS = [
   },
   {
     id: "sales-cycle",
-    categoryId: "industry",
     title: "Modern B2B Sales Cycles",
     subtitle: "Industry Knowledge",
     summary: "How enterprise B2B buying has changed and what modern reps need to know.",
@@ -15696,7 +15677,6 @@ const INITIAL_BATTLE_CARDS = [
   },
   {
     id: "price-objection",
-    categoryId: "misc",
     title: "Handling the Price Objection",
     subtitle: "Objection Handling",
     summary: "Tactical talk tracks and reframes for when a prospect says your price is too high.",
@@ -15725,616 +15705,118 @@ const INITIAL_BATTLE_CARDS = [
 
 
 // ── BATTLE CARDS ADMIN SCREEN ────────────────────────────────────────────────
-// Admin/Manager: create, edit, delete categories and battle cards.
-// Production hook: replace onSave*/onDelete* callbacks with API calls.
+// Manager/admin: create, edit, tag, archive, and restore battle cards (tags-only
+// taxonomy — no categories; no permanent delete).
 // ─────────────────────────────────────────────────────────────────────────────
 
-function BattleCardsAdminScreen({ categories, cards, onSaveCategory, onDeleteCategory, onSaveCard, onSetArchived, isReal = false, isLoading = false, loadError = null, onRetry }) {
-  // view: "home" | "category" | "detail" | "editCard"
-  const mobile         = useMobile();
-  const [view,         setView]         = useState("home");
-  const [activeCatId,  setActiveCatId]  = useState(null);
-  const [activeCardId, setActiveCardId] = useState(null);
-  const [search,       setSearch]       = useState("");
-  const [editingCard,  setEditingCard]  = useState(null);
-  const [editingCat,   setEditingCat]   = useState(null);
-  const [showCatForm,  setShowCatForm]  = useState(false);
-  const [confirm,      setConfirm]      = useState(null); // { kind: "archiveCard"|"deleteCategory", id }
-  const [tagInput,     setTagInput]     = useState("");
-
-  // ── Navigation ──────────────────────────────────────────────────────────────
-  const openCategory = (catId) => { setActiveCatId(catId); setView("category"); };
-  const openCard     = (cardId) => { setActiveCardId(cardId); setView("detail"); };
-  const goHome       = () => { setView("home"); setActiveCatId(null); setActiveCardId(null); setSearch(""); };
-  const goCategory   = () => { setView("category"); setActiveCardId(null); };
-
-  const isArchived     = (c) => (c.status ?? "active") === "archived";
-  const selectedCard   = cards.find(c => c.id === activeCardId);
-  const selectedCat    = categories.find(c => c.id === activeCatId);
-  // Active cards are the working set (matches the approved Quiz archive pattern);
-  // archived cards live in their own section below and never inflate counts/search.
-  const activeCards    = cards.filter(c => !isArchived(c));
-  const archivedCards  = [...cards.filter(isArchived)].sort((a, b) => a.title.localeCompare(b.title));
-  const cardsInCat     = activeCards.filter(c => c.categoryId === activeCatId).sort((a, b) => a.title.localeCompare(b.title));
-  const archivedInCat  = archivedCards.filter(c => c.categoryId === activeCatId);
-  const allCardsSorted = [...activeCards].sort((a, b) => a.title.localeCompare(b.title));
-  const catLabel       = (id) => categories.find(c => c.id === id)?.label ?? "Uncategorized";
-  const filtered = search.trim()
-    ? allCardsSorted.filter(c => {
-        const q = search.toLowerCase();
-        return c.title.toLowerCase().includes(q) ||
-          c.subtitle.toLowerCase().includes(q) ||
-          c.summary.toLowerCase().includes(q) ||
-          (c.tags ?? []).some(t => t.toLowerCase().includes(q));
-      })
-    : allCardsSorted;
-
-  // ── Card editor state ───────────────────────────────────────────────────────
-  // New cards default to Uncategorized ("") unless created inside a category —
-  // never silently the first category.
-  const blankCard = () => ({
-    id: `card-${Date.now()}`,
-    categoryId: activeCatId ?? "",
-    title: "", subtitle: "", summary: "",
-    strength: "", weakness: "", ourWin: "", talkTrack: "",
-    tags: [], content: [],
-  });
-  const [draft, setDraft] = useState(blankCard);
-  const [cardSaving, setCardSaving] = useState(false);
-  const setF = (field) => (e) => setDraft(d => ({ ...d, [field]: e.target.value }));
-
-  // Tags: trim, drop blanks, de-dupe case-insensitively (mirrors the service-side
-  // normalizeCardTags so authoring and search agree). Existing tags are preserved.
-  const addTag = (raw) => {
-    const t = String(raw ?? "").trim();
-    if (!t) return;
-    setDraft(d => (d.tags ?? []).some(x => x.toLowerCase() === t.toLowerCase())
-      ? d : { ...d, tags: [...(d.tags ?? []), t] });
-    setTagInput("");
-  };
-  const removeTag = (t) => setDraft(d => ({ ...d, tags: (d.tags ?? []).filter(x => x !== t) }));
-
-  const openNewCard  = () => { setDraft(blankCard()); setTagInput(""); setEditingCard("new"); setView("editCard"); };
-  const openEditCard = (card) => { setDraft({ ...card, tags: card.tags ?? [] }); setTagInput(""); setEditingCard(card.id); setView("editCard"); };
-  const saveCard = async () => {
-    if (!draft.title.trim() || cardSaving) return;
-    setCardSaving(true);
-    // Fold any half-typed tag in the input into the card before saving.
-    const pending = tagInput.trim();
-    const tags = pending && !(draft.tags ?? []).some(x => x.toLowerCase() === pending.toLowerCase())
-      ? [...(draft.tags ?? []), pending] : (draft.tags ?? []);
-    const ok = await onSaveCard({ ...draft, title: draft.title.trim(), tags });
-    setCardSaving(false);
-    if (ok) { setTagInput(""); setView(activeCatId ? "category" : "home"); }
-  };
-  const cancelEditCard = () => setView(activeCardId ? "detail" : activeCatId ? "category" : "home");
-
-  // ── Archive / restore (canonical: onSetArchived) ─────────────────────────────
-  const doArchive  = () => {
-    if (!confirm || confirm.kind !== "archiveCard") return;
-    onSetArchived(confirm.id, true);
-    if (activeCardId === confirm.id) (activeCatId ? goCategory() : goHome());
-    setConfirm(null);
-  };
-  const restoreCard = (id) => onSetArchived(id, false);
-
-  // Reusable card-row action buttons (Edit + Archive/Restore, never Delete).
-  const cardRowActions = (card) => (
-    <>
-      <button onClick={() => { setActiveCatId(card.categoryId); openEditCard(card); }} title="Edit" style={{ width:34, height:34, borderRadius:8, border:`1px solid ${C.border}`, background:C.white, fontSize:12, cursor:"pointer", color:C.textSub, flexShrink:0 }}>✎</button>
-      {isArchived(card)
-        ? <button onClick={() => restoreCard(card.id)} title="Restore" style={{ height:34, padding:"0 12px", borderRadius:8, border:`1px solid ${C.border}`, background:C.white, fontSize:12, fontWeight:700, cursor:"pointer", color:C.text, flexShrink:0 }}>Restore</button>
-        : <button onClick={() => setConfirm({ kind:"archiveCard", id:card.id })} title="Archive" style={{ height:34, padding:"0 12px", borderRadius:8, border:`1px solid ${C.border}`, background:C.white, fontSize:12, fontWeight:700, cursor:"pointer", color:C.textSub, flexShrink:0 }}>Archive</button>}
-    </>
-  );
-
-  // content sections
-  const addSection    = () => setDraft(d => ({ ...d, content: [...d.content, { heading: "", body: "" }] }));
-  const removeSection = (i) => setDraft(d => ({ ...d, content: d.content.filter((_,j) => j !== i) }));
-  const setSection    = (i, field, val) => setDraft(d => ({
-    ...d, content: d.content.map((s, j) => j === i ? { ...s, [field]: val } : s),
-  }));
-  const moveSection   = (i, dir) => setDraft(d => {
-    const c = [...d.content];
-    const target = i + dir;
-    if (target < 0 || target >= c.length) return d;
-    [c[i], c[target]] = [c[target], c[i]];
-    return { ...d, content: c };
-  });
-
-  // ── Category editor state ───────────────────────────────────────────────────
-  const blankCat = () => ({ id: `cat-${Date.now()}`, label: "", description: "" });
-  const [catDraft, setCatDraft] = useState(blankCat);
-  const openNewCat  = () => { setCatDraft(blankCat()); setEditingCat("new"); setShowCatForm(true); };
-  const openEditCat = (cat) => { setCatDraft({ ...cat }); setEditingCat(cat.id); setShowCatForm(true); };
-  const saveCat     = async () => {
-    if (!catDraft.label.trim()) return;
-    const saved = await onSaveCategory({ ...catDraft, label: catDraft.label.trim() });
-    setShowCatForm(false);
-    if (editingCat === "new") setActiveCatId(saved?.id ?? catDraft.id);
-  };
-
-  // ── Confirm category delete (cards are archived, never deleted) ───────────────
-  const doDeleteCategory = () => {
-    if (!confirm || confirm.kind !== "deleteCategory") return;
-    onDeleteCategory(confirm.id);
-    if (activeCatId === confirm.id) goHome();
-    setConfirm(null);
-  };
-
-  const inputStyle = { width:"100%", boxSizing:"border-box", padding:"10px 14px", borderRadius:10, border:`1.5px solid ${C.border}`, background:C.cardBg, fontSize:14, color:C.text, outline:"none", fontFamily:"inherit" };
-  const taStyle    = { ...inputStyle, resize:"vertical", minHeight:90, lineHeight:1.6 };
-  const lbl        = (txt, req) => (
-    <label style={{ display:"block", fontSize:11, fontWeight:700, color:C.textMuted, letterSpacing:"0.08em", textTransform:"uppercase", marginBottom:8 }}>
-      {txt}{req && <span style={{ color:C.red }}> *</span>}
-    </label>
-  );
-
-  // Shared modals (appended to every view)
-  const modals = (
-    <>
-      {showCatForm && (
-        <div style={{ position:"fixed", inset:0, background:"rgba(0,0,0,0.45)", display:"flex", alignItems:"center", justifyContent:"center", zIndex:9999 }}
-          onClick={e => { if (e.target === e.currentTarget) setShowCatForm(false); }}>
-          <div style={{ background:C.cardBg, borderRadius:20, padding:"32px 36px", width:420, maxWidth:"90vw", border:`1px solid ${C.creamBorder}` }}>
-            <h3 style={{ margin:"0 0 20px", fontSize:18, fontWeight:900, color:C.text }}>{editingCat === "new" ? "New Category" : "Edit Category"}</h3>
-            <div style={{ marginBottom:14 }}>
-              <label style={{ display:"block", fontSize:11, fontWeight:700, color:C.textMuted, letterSpacing:"0.08em", textTransform:"uppercase", marginBottom:8 }}>Name <span style={{ color:C.red }}>*</span></label>
-              <input style={{ width:"100%", boxSizing:"border-box", padding:"10px 14px", borderRadius:10, border:`1.5px solid ${C.border}`, background:C.white, fontSize:14, color:C.text, outline:"none", fontFamily:"inherit" }}
-                value={catDraft.label} onChange={e => setCatDraft(d => ({ ...d, label: e.target.value }))} placeholder="e.g. Competitor Knowledge"
-                autoFocus />
-            </div>
-            <div style={{ marginBottom:24 }}>
-              <label style={{ display:"block", fontSize:11, fontWeight:700, color:C.textMuted, letterSpacing:"0.08em", textTransform:"uppercase", marginBottom:8 }}>Description</label>
-              <textarea style={{ width:"100%", boxSizing:"border-box", padding:"10px 14px", borderRadius:10, border:`1.5px solid ${C.border}`, background:C.white, fontSize:13, color:C.text, outline:"none", fontFamily:"inherit", resize:"vertical", minHeight:72, lineHeight:1.6 }}
-                value={catDraft.description} onChange={e => setCatDraft(d => ({ ...d, description: e.target.value }))} placeholder="Short description shown to reps" />
-            </div>
-            <div style={{ display:"flex", gap:10 }}>
-              <button onClick={() => setShowCatForm(false)} style={{ flex:1, padding:"11px 0", borderRadius:10, border:`1px solid ${C.border}`, background:C.cardBg, fontSize:13, fontWeight:700, cursor:"pointer", color:C.text }}>Cancel</button>
-              <button onClick={saveCat} disabled={!catDraft.label.trim()} style={{ flex:2, padding:"11px 0", borderRadius:10, border:"none", background:catDraft.label.trim()?C.orange:C.muted, color:catDraft.label.trim()?"#fff":C.textMuted, fontSize:13, fontWeight:700, cursor:catDraft.label.trim()?"pointer":"not-allowed" }}>
-                {editingCat === "new" ? "Create Category" : "Save Changes"}
-              </button>
-            </div>
-          </div>
-        </div>
-      )}
-      {confirm?.kind === "archiveCard" && (
-        <div style={{ position:"fixed", inset:0, background:"rgba(0,0,0,0.45)", display:"flex", alignItems:"center", justifyContent:"center", zIndex:9999 }}>
-          <div style={{ background:C.cardBg, borderRadius:20, padding:"32px 36px", width:380, maxWidth:"90vw", textAlign:"center", border:`1px solid ${C.creamBorder}` }}>
-            <h3 style={{ margin:"0 0 8px", fontSize:18, fontWeight:900, color:C.text }}>Archive this card?</h3>
-            <p style={{ margin:"0 0 24px", fontSize:13, color:C.textSub }}>
-              It will be hidden from reps and removed from search and category counts. Nothing is deleted — you can restore it anytime from the Archived section.
-            </p>
-            <div style={{ display:"flex", gap:10 }}>
-              <button onClick={() => setConfirm(null)} style={{ flex:1, padding:"11px 0", borderRadius:10, border:`1px solid ${C.border}`, background:C.cardBg, fontSize:13, fontWeight:700, cursor:"pointer", color:C.text }}>Cancel</button>
-              <button onClick={doArchive} style={{ flex:1, padding:"11px 0", borderRadius:10, border:"none", background:C.orange, color:"#fff", fontSize:13, fontWeight:700, cursor:"pointer" }}>Archive</button>
-            </div>
-          </div>
-        </div>
-      )}
-      {confirm?.kind === "deleteCategory" && (
-        <div style={{ position:"fixed", inset:0, background:"rgba(0,0,0,0.45)", display:"flex", alignItems:"center", justifyContent:"center", zIndex:9999 }}>
-          <div style={{ background:C.cardBg, borderRadius:20, padding:"32px 36px", width:380, maxWidth:"90vw", textAlign:"center", border:`1px solid ${C.creamBorder}` }}>
-            <h3 style={{ margin:"0 0 8px", fontSize:18, fontWeight:900, color:C.text }}>Delete this category?</h3>
-            <p style={{ margin:"0 0 24px", fontSize:13, color:C.textSub }}>
-              The category is removed. Its cards are kept and become Uncategorized — no card or content is lost.
-            </p>
-            <div style={{ display:"flex", gap:10 }}>
-              <button onClick={() => setConfirm(null)} style={{ flex:1, padding:"11px 0", borderRadius:10, border:`1px solid ${C.border}`, background:C.cardBg, fontSize:13, fontWeight:700, cursor:"pointer", color:C.text }}>Cancel</button>
-              <button onClick={doDeleteCategory} style={{ flex:1, padding:"11px 0", borderRadius:10, border:"none", background:"#ef4444", color:"#fff", fontSize:13, fontWeight:700, cursor:"pointer" }}>Delete category</button>
-            </div>
-          </div>
-        </div>
-      )}
-    </>
-  );
-
-  // ── Honest load states (real tenants) ────────────────────────────────────────
-  if (loadError) {
-    return (
-      <div style={{ padding:"48px 32px", textAlign:"center", borderRadius:16, border:`1px solid ${C.creamBorder}`, background:C.cardBg, maxWidth:520, margin:"0 auto" }}>
-        <p style={{ margin:"0 0 6px", fontSize:15, fontWeight:800, color:C.text }}>Couldn't load battle cards</p>
-        <p style={{ margin:"0 0 20px", fontSize:13, color:C.textSub }}>Something went wrong reaching the server. This is not the same as an empty library.</p>
-        <button onClick={() => onRetry?.()} style={{ padding:"10px 22px", borderRadius:10, border:"none", background:C.orange, color:"#fff", fontSize:13, fontWeight:700, cursor:"pointer" }}>Retry</button>
-      </div>
-    );
+// ── Battle Cards: tags-only taxonomy (categories removed from the product) ─────
+// Shared helpers so the manager and learner surfaces filter identically.
+function bcIsArchived(c) { return (c.status ?? "active") === "archived"; }
+function bcCardTags(c) { return Array.isArray(c.tags) ? c.tags : []; }
+// Distinct tags across the given cards (case-insensitive, first casing kept, sorted).
+function bcDistinctTags(cards) {
+  const seen = new Map();
+  for (const c of cards) for (const t of bcCardTags(c)) {
+    const k = String(t).toLowerCase();
+    if (!seen.has(k)) seen.set(k, t);
   }
-  if (isReal && isLoading) {
-    return <LoadingState rows={4} message="Loading battle cards…" />;
-  }
-
-  // ── CARD EDITOR VIEW ────────────────────────────────────────────────────────
-  if (view === "editCard") {
-    const isNew = editingCard === "new";
-    return (
-      <div style={{ maxWidth: 740, display:"flex", flexDirection:"column", gap:0 }}>
-        <div style={{ display:"flex", alignItems:"center", justifyContent:"space-between", flexWrap:"wrap", gap:12, marginBottom:24 }}>
-          <div>
-            <button onClick={cancelEditCard} style={{ background:"none", border:"none", cursor:"pointer", fontSize:13, fontWeight:600, color:C.textSub, padding:0, display:"flex", alignItems:"center", gap:6, marginBottom:8 }}>← Battle Cards</button>
-            <h2 style={{ margin:0, fontSize:20, fontWeight:900, color:C.text }}>{isNew ? "New Battle Card" : `Edit: ${cards.find(c => c.id === editingCard)?.title ?? ""}`}</h2>
-          </div>
-          <div style={{ display:"flex", gap:10 }}>
-            <button onClick={cancelEditCard} style={{ padding:"10px 18px", borderRadius:10, border:`1px solid ${C.border}`, background:C.cardBg, fontSize:13, fontWeight:700, cursor:"pointer", color:C.text }}>Cancel</button>
-            <button onClick={saveCard} disabled={!draft.title.trim() || cardSaving} style={{ padding:"10px 20px", borderRadius:10, border:"none", background:draft.title.trim()&&!cardSaving?C.orange:C.muted, color:draft.title.trim()&&!cardSaving?"#fff":C.textMuted, fontSize:13, fontWeight:700, cursor:draft.title.trim()&&!cardSaving?"pointer":"not-allowed" }}>
-              {cardSaving ? "Saving…" : isNew ? "Create Card" : "Save Changes"}
-            </button>
-          </div>
-        </div>
-
-        <div style={{ display:"flex", flexDirection:"column", gap:16 }}>
-          <Card>
-            <div style={{ fontSize:13, fontWeight:800, color:C.text, marginBottom:16 }}>Basic Info</div>
-            <div style={{ display:"grid", gridTemplateColumns: mobile ? "1fr" : "1fr 1fr", gap:14, marginBottom:14 }}>
-              <div>{lbl("Title", true)}<input style={inputStyle} value={draft.title} onChange={setF("title")} placeholder="e.g. Salesforce" /></div>
-              <div>{lbl("Subtitle / Type")}<input style={inputStyle} value={draft.subtitle} onChange={setF("subtitle")} placeholder="e.g. CRM" /></div>
-            </div>
-            <div style={{ marginBottom:14 }}>
-              {lbl("Category")}
-              {/* Explicit Uncategorized option — the select always reflects the real
-                  state (value ""), never silently showing the first category. */}
-              <select value={draft.categoryId ?? ""} onChange={setF("categoryId")} style={{ ...inputStyle }}>
-                <option value="">Uncategorized</option>
-                {categories.map(c => <option key={c.id} value={c.id}>{c.label}</option>)}
-              </select>
-            </div>
-            <div style={{ marginBottom:14 }}>{lbl("Summary")}<input style={inputStyle} value={draft.summary} onChange={setF("summary")} placeholder="One-line description shown in lists" /></div>
-            <div>
-              {lbl("Tags")}
-              <div style={{ display:"flex", flexWrap:"wrap", gap:6, marginBottom:(draft.tags?.length ? 8 : 0) }}>
-                {(draft.tags ?? []).map(t => (
-                  <span key={t} style={{ display:"inline-flex", alignItems:"center", gap:6, padding:"4px 10px", borderRadius:999, background:C.orangeLight, color:C.orange, fontSize:12, fontWeight:700 }}>
-                    {t}
-                    <button onClick={() => removeTag(t)} title="Remove tag" style={{ background:"none", border:"none", cursor:"pointer", color:C.orange, fontSize:13, lineHeight:1, padding:0 }}>✕</button>
-                  </span>
-                ))}
-              </div>
-              <input
-                style={inputStyle}
-                value={tagInput}
-                onChange={e => setTagInput(e.target.value)}
-                onKeyDown={e => {
-                  if (e.key === "Enter" || e.key === ",") { e.preventDefault(); addTag(tagInput); }
-                  else if (e.key === "Backspace" && !tagInput && (draft.tags?.length)) { removeTag(draft.tags[draft.tags.length - 1]); }
-                }}
-                onBlur={() => addTag(tagInput)}
-                placeholder="Add a tag and press Enter (reps can search these)"
-              />
-            </div>
-          </Card>
-
-          <Card>
-            <div style={{ fontSize:13, fontWeight:800, color:C.text, marginBottom:16 }}>Competitive Detail</div>
-            <div style={{ display:"flex", flexDirection:"column", gap:14 }}>
-              <div>{lbl("Their Strengths", true)}<textarea style={taStyle} value={draft.strength} onChange={setF("strength")} placeholder="What they do well..." /></div>
-              <div>{lbl("Their Weaknesses", true)}<textarea style={taStyle} value={draft.weakness} onChange={setF("weakness")} placeholder="Where they fall short..." /></div>
-              <div>{lbl("Why We Win", true)}<textarea style={taStyle} value={draft.ourWin} onChange={setF("ourWin")} placeholder="Our differentiated value..." /></div>
-              <div>{lbl("Talk Track")}<textarea style={{ ...taStyle, minHeight:110 }} value={draft.talkTrack} onChange={setF("talkTrack")} placeholder="The rep's suggested script..." /></div>
-            </div>
-          </Card>
-
-          <Card>
-            <div style={{ display:"flex", alignItems:"center", justifyContent:"space-between", marginBottom:16 }}>
-              <div style={{ fontSize:13, fontWeight:800, color:C.text }}>In-Depth Content</div>
-              <button onClick={addSection} style={{ padding:"7px 14px", borderRadius:9, border:`1px solid ${C.orange}`, background:C.orangeLight, color:C.orange, fontSize:12, fontWeight:700, cursor:"pointer" }}>+ Add Section</button>
-            </div>
-            {draft.content.length === 0 ? (
-              <div style={{ padding:"28px 0", textAlign:"center", borderRadius:10, border:`2px dashed ${C.creamBorder}`, background:C.pageBg }}>
-                <p style={{ margin:0, fontSize:13, color:C.textSub }}>No sections yet. Add sections to give reps deeper context.</p>
-              </div>
-            ) : (
-              <div style={{ display:"flex", flexDirection:"column", gap:12 }}>
-                {draft.content.map((sec, i) => (
-                  <div key={i} style={{ borderRadius:12, border:`1px solid ${C.creamBorder}`, padding:16, background:C.pageBg }}>
-                    <div style={{ display:"flex", alignItems:"center", justifyContent:"space-between", marginBottom:10 }}>
-                      <span style={{ fontSize:11, fontWeight:700, color:C.textMuted }}>SECTION {i+1}</span>
-                      <div style={{ display:"flex", gap:6 }}>
-                        {i > 0                      && <button onClick={() => moveSection(i,-1)} style={{ background:"none", border:`1px solid ${C.border}`, borderRadius:6, width:26, height:26, cursor:"pointer", fontSize:12, color:C.textSub }}>↑</button>}
-                        {i < draft.content.length-1 && <button onClick={() => moveSection(i, 1)} style={{ background:"none", border:`1px solid ${C.border}`, borderRadius:6, width:26, height:26, cursor:"pointer", fontSize:12, color:C.textSub }}>↓</button>}
-                        <button onClick={() => removeSection(i)} style={{ background:"none", border:`1px solid rgba(239,68,68,0.3)`, borderRadius:6, width:26, height:26, cursor:"pointer", fontSize:12, color:"#ef4444" }}>✕</button>
-                      </div>
-                    </div>
-                    <input style={{ ...inputStyle, marginBottom:8 }} value={sec.heading} onChange={e => setSection(i,"heading",e.target.value)} placeholder="Section heading" />
-                    <textarea style={{ ...taStyle, minHeight:80 }} value={sec.body} onChange={e => setSection(i,"body",e.target.value)} placeholder="Section body..." />
-                  </div>
-                ))}
-              </div>
-            )}
-          </Card>
-        </div>
-        {modals}
-      </div>
-    );
-  }
-
-  // ── DETAIL VIEW ─────────────────────────────────────────────────────────────
-  if (view === "detail" && selectedCard) {
-    return (
-      <>
-        <BattleCardDetail
-          card={selectedCard}
-          onBack={activeCatId ? goCategory : goHome}
-          actions={
-            <>
-              <button onClick={() => openEditCard(selectedCard)} style={{ padding:"7px 16px", borderRadius:8, border:`1px solid ${C.border}`, background:C.white, fontSize:12, fontWeight:700, cursor:"pointer", color:C.text }}>Edit</button>
-              {isArchived(selectedCard)
-                ? <button onClick={() => restoreCard(selectedCard.id)} style={{ padding:"7px 16px", borderRadius:8, border:`1px solid ${C.border}`, background:C.white, fontSize:12, fontWeight:700, cursor:"pointer", color:C.text }}>Restore</button>
-                : <button onClick={() => setConfirm({ kind:"archiveCard", id:selectedCard.id })} style={{ padding:"7px 16px", borderRadius:8, border:`1px solid ${C.border}`, background:C.white, fontSize:12, fontWeight:700, cursor:"pointer", color:C.textSub }}>Archive</button>}
-            </>
-          }
-        />
-        {modals}
-      </>
-    );
-  }
-
-  // ── CATEGORY VIEW ───────────────────────────────────────────────────────────
-  if (view === "category" && selectedCat) {
-    return (
-      <div style={{ display:"flex", flexDirection:"column", gap:20 }}>
-        <div>
-          <button onClick={goHome} style={{ background:"none", border:"none", cursor:"pointer", padding:0, fontSize:13, fontWeight:600, color:C.textSub, display:"flex", alignItems:"center", gap:6, marginBottom:16 }}>← Battle Cards</button>
-          <div style={{ display:"flex", alignItems:"flex-start", justifyContent:"space-between", flexWrap:"wrap", gap:12 }}>
-            <div>
-              <h2 style={{ margin:0, fontSize:22, fontWeight:900, color:C.text }}>{selectedCat.label}</h2>
-              <p style={{ margin:"4px 0 0", fontSize:13, color:C.textSub }}>{selectedCat.description}</p>
-            </div>
-            <div style={{ display:"flex", gap:8, flexShrink:0 }}>
-              <button onClick={() => openEditCat(selectedCat)} style={{ padding:"9px 16px", borderRadius:10, border:`1px solid ${C.border}`, background:C.white, fontSize:12, fontWeight:700, cursor:"pointer", color:C.text }}>Edit Category</button>
-              <button onClick={openNewCard} style={{ padding:"9px 16px", borderRadius:10, border:"none", background:C.orange, color:"#fff", fontSize:12, fontWeight:700, cursor:"pointer" }}>+ New Card</button>
-            </div>
-          </div>
-        </div>
-
-        {cardsInCat.length === 0 ? (
-          <div style={{ padding:"48px 32px", textAlign:"center", borderRadius:16, border:`2px dashed ${C.creamBorder}`, background:C.cardBg }}>
-            <p style={{ margin:"0 0 6px", fontSize:14, fontWeight:700, color:C.text }}>No cards in this category yet</p>
-            <p style={{ margin:"0 0 20px", fontSize:13, color:C.textSub }}>Create the first card for {selectedCat.label}.</p>
-            <button onClick={openNewCard} style={{ padding:"10px 22px", borderRadius:10, border:"none", background:C.orange, color:"#fff", fontSize:13, fontWeight:700, cursor:"pointer" }}>+ New Card</button>
-          </div>
-        ) : (
-          <div style={{ display:"flex", flexDirection:"column", gap:8 }}>
-            {cardsInCat.map(card => (
-              <div key={card.id} style={{ display:"flex", alignItems:"center", gap:8 }}>
-                <button onClick={() => openCard(card.id)} style={{
-                  flex:1, display:"flex", alignItems:"center", justifyContent:"space-between",
-                  padding:"16px 20px", borderRadius:14,
-                  border:`1px solid ${C.creamBorder}`, background:C.cardBg,
-                  cursor:"pointer", textAlign:"left",
-                  transition:"border-color 0.12s, background 0.12s",
-                }}
-                onMouseEnter={e => { e.currentTarget.style.borderColor = C.orange; e.currentTarget.style.background = C.orangeLight; }}
-                onMouseLeave={e => { e.currentTarget.style.borderColor = C.creamBorder; e.currentTarget.style.background = C.cardBg; }}
-                >
-                  <div>
-                    <div style={{ fontSize:14, fontWeight:700, color:C.text }}>{card.title}</div>
-                    <div style={{ fontSize:12, color:C.textSub, marginTop:2 }}>{card.subtitle}</div>
-                    {card.summary && <div style={{ fontSize:12, color:C.textMuted, marginTop:4, maxWidth:520 }}>{card.summary}</div>}
-                  </div>
-                  <span style={{ fontSize:16, color:C.textMuted, flexShrink:0, marginLeft:16 }}>→</span>
-                </button>
-                {cardRowActions(card)}
-              </div>
-            ))}
-          </div>
-        )}
-
-        {archivedInCat.length > 0 && (
-          <div>
-            <p style={{ margin:"4px 0 10px", fontSize:12, fontWeight:700, color:C.textMuted, letterSpacing:"0.06em", textTransform:"uppercase" }}>Archived · {archivedInCat.length}</p>
-            <div style={{ display:"flex", flexDirection:"column", gap:6 }}>
-              {archivedInCat.map(card => (
-                <div key={card.id} style={{ display:"flex", alignItems:"center", gap:8, opacity:0.72 }}>
-                  <button onClick={() => openCard(card.id)} style={{ flex:1, display:"flex", alignItems:"center", justifyContent:"space-between", padding:"14px 18px", borderRadius:12, border:`1px dashed ${C.creamBorder}`, background:C.cardBg, cursor:"pointer", textAlign:"left" }}>
-                    <div>
-                      <div style={{ fontSize:14, fontWeight:700, color:C.text }}>{card.title}</div>
-                      <div style={{ fontSize:12, color:C.textSub, marginTop:2 }}>{card.subtitle}</div>
-                    </div>
-                    <span style={{ fontSize:11, fontWeight:700, color:C.textMuted, flexShrink:0, marginLeft:16 }}>ARCHIVED</span>
-                  </button>
-                  {cardRowActions(card)}
-                </div>
-              ))}
-            </div>
-          </div>
-        )}
-        {modals}
-      </div>
-    );
-  }
-
-  // ── HOME VIEW ───────────────────────────────────────────────────────────────
+  return [...seen.values()].sort((a, b) => a.localeCompare(b));
+}
+function bcMatchesSearch(c, q) {
+  if (!q) return true;
+  const s = q.toLowerCase();
+  return (c.title ?? "").toLowerCase().includes(s)
+    || (c.subtitle ?? "").toLowerCase().includes(s)
+    || (c.summary ?? "").toLowerCase().includes(s)
+    || bcCardTags(c).some(t => String(t).toLowerCase().includes(s));
+}
+// selectedLower: lowercased Set. Empty = All. Otherwise a card matches if it
+// carries ANY selected tag.
+function bcMatchesTags(c, selectedLower) {
+  if (!selectedLower || selectedLower.size === 0) return true;
+  return bcCardTags(c).some(t => selectedLower.has(String(t).toLowerCase()));
+}
+function bcChipStyle(on) {
+  return { padding: "6px 12px", borderRadius: 999, fontSize: 12, fontWeight: 700, cursor: "pointer",
+    border: `1px solid ${on ? C.orange : C.border}`, background: on ? C.orangeLight : C.white, color: on ? C.orange : C.textSub };
+}
+// Tag-filter chips — visual behavior matches the Quiz tag filters (pill chips, All
+// first, orange when selected). Multi-select; All resets. No category language.
+function BcTagFilters({ tags, selected, onToggle, onAll, allCount, usage }) {
+  if (tags.length === 0) return null;
+  const none = !selected || selected.size === 0;
   return (
-    <div style={{ display:"flex", flexDirection:"column", gap:24 }}>
-      {/* Header */}
-      <div style={{ display:"flex", alignItems:"flex-start", justifyContent:"space-between", flexWrap:"wrap", gap:12 }}>
-        <div>
-          <h2 style={{ margin:0, fontSize:22, fontWeight:800, color:C.text }}>Battle Cards</h2>
-          <p style={{ margin:"4px 0 0", fontSize:13, color:C.textSub }}>Manage competitive intelligence for your team</p>
-        </div>
-        <div style={{ display:"flex", gap:8, flexShrink:0 }}>
-          <button onClick={openNewCat} style={{ padding:"10px 18px", borderRadius:12, border:`1px solid ${C.border}`, background:C.white, color:C.text, fontSize:13, fontWeight:700, cursor:"pointer" }}>+ New Category</button>
-          <button onClick={openNewCard} style={{ padding:"10px 20px", borderRadius:12, border:"none", background:C.orange, color:"#fff", fontSize:13, fontWeight:700, cursor:"pointer" }}>+ New Card</button>
-        </div>
-      </div>
-
-      {/* Search */}
-      <div style={{ display:"flex", alignItems:"center", gap:10, padding:"10px 14px", borderRadius:10, background:C.cardBg, border:`1px solid ${C.creamBorder}`, maxWidth:420 }}>
-        <span style={{ fontSize:13, color:C.textMuted }}>Search</span>
-        <input
-          type="text" value={search} placeholder="Cards, topics, competitors…"
-          onChange={e => setSearch(e.target.value)}
-          style={{ flex:1, border:"none", background:"transparent", fontSize:13, color:C.text, outline:"none", fontFamily:"inherit" }}
-        />
-        {search && <button onClick={() => setSearch("")} style={{ background:"none", border:"none", cursor:"pointer", fontSize:13, color:C.textMuted, padding:0, lineHeight:1 }}>✕</button>}
-      </div>
-
-      {/* Search results */}
-      {search.trim() ? (
-        <div>
-          <p style={{ margin:"0 0 12px", fontSize:12, fontWeight:700, color:C.textMuted, letterSpacing:"0.06em", textTransform:"uppercase" }}>
-            {filtered.length} result{filtered.length !== 1 ? "s" : ""}
-          </p>
-          {filtered.length === 0 ? (
-            <div style={{ padding:"40px 32px", textAlign:"center", borderRadius:16, border:`2px dashed ${C.creamBorder}`, background:C.cardBg }}>
-              <p style={{ margin:0, fontSize:14, fontWeight:700, color:C.text }}>No results for "{search}"</p>
-            </div>
-          ) : (
-            <div style={{ display:"flex", flexDirection:"column", gap:8 }}>
-              {filtered.map(card => (
-                <div key={card.id} style={{ display:"flex", alignItems:"center", gap:8 }}>
-                  <button onClick={() => { setActiveCatId(card.categoryId); openCard(card.id); }} style={{
-                    flex:1, display:"flex", alignItems:"center", justifyContent:"space-between",
-                    padding:"14px 18px", borderRadius:12, border:`1px solid ${C.creamBorder}`,
-                    background:C.cardBg, cursor:"pointer", textAlign:"left",
-                    transition:"border-color 0.12s",
-                  }}
-                  onMouseEnter={e => { e.currentTarget.style.borderColor = C.orange; e.currentTarget.style.background = C.orangeLight; }}
-                  onMouseLeave={e => { e.currentTarget.style.borderColor = C.creamBorder; e.currentTarget.style.background = C.cardBg; }}
-                  >
-                    <div>
-                      <div style={{ fontSize:14, fontWeight:700, color:C.text }}>{card.title}</div>
-                      <div style={{ fontSize:12, color:C.textSub, marginTop:2 }}>{card.subtitle} · {catLabel(card.categoryId)}</div>
-                    </div>
-                    <span style={{ fontSize:16, color:C.textMuted, flexShrink:0, marginLeft:16 }}>→</span>
-                  </button>
-                  {cardRowActions(card)}
-                </div>
-              ))}
+    <div style={{ display: "flex", flexWrap: "wrap", alignItems: "center", gap: 6 }}>
+      <button onClick={onAll} style={bcChipStyle(none)}>All ({allCount})</button>
+      {tags.map(t => (
+        <button key={t} onClick={() => onToggle(t)} style={bcChipStyle(selected.has(t.toLowerCase()))}>
+          {t}{usage ? ` · ${usage.get(t.toLowerCase()) || 0}` : ""}
+        </button>
+      ))}
+      {!none && <button onClick={onAll} style={{ background: "none", border: "none", cursor: "pointer", fontSize: 12, fontWeight: 700, color: C.textMuted, padding: "6px 4px" }}>Clear</button>}
+    </div>
+  );
+}
+// Compact list row (used by both surfaces). Optional trailing actions node.
+function BcCardRow({ card, onOpen, archived = false, actions = null }) {
+  return (
+    <div style={{ display: "flex", alignItems: "center", gap: 8, opacity: archived ? 0.72 : 1 }}>
+      <button onClick={onOpen} style={{
+        flex: 1, display: "flex", alignItems: "center", justifyContent: "space-between",
+        padding: "14px 18px", borderRadius: 12,
+        border: `1px ${archived ? "dashed" : "solid"} ${C.creamBorder}`, background: C.cardBg,
+        cursor: "pointer", textAlign: "left",
+      }}
+      onMouseEnter={e => { if (!archived) { e.currentTarget.style.borderColor = C.orange; e.currentTarget.style.background = C.orangeLight; } }}
+      onMouseLeave={e => { e.currentTarget.style.borderColor = C.creamBorder; e.currentTarget.style.background = C.cardBg; }}
+      >
+        <div style={{ minWidth: 0 }}>
+          <div style={{ fontSize: 14, fontWeight: 700, color: C.text }}>{card.title}</div>
+          {card.subtitle && <div style={{ fontSize: 12, color: C.textSub, marginTop: 2 }}>{card.subtitle}</div>}
+          {bcCardTags(card).length > 0 && (
+            <div style={{ display: "flex", flexWrap: "wrap", gap: 4, marginTop: 6 }}>
+              {bcCardTags(card).map(t => <span key={t} style={{ padding: "2px 8px", borderRadius: 999, background: C.muted, color: C.textSub, fontSize: 11, fontWeight: 700 }}>{t}</span>)}
             </div>
           )}
         </div>
-      ) : (
-        <>
-          {/* Category grid */}
-          <div>
-            <p style={{ margin:"0 0 12px", fontSize:12, fontWeight:700, color:C.textMuted, letterSpacing:"0.06em", textTransform:"uppercase" }}>Categories</p>
-            {categories.length === 0 ? (
-              <div style={{ padding:"48px 32px", textAlign:"center", borderRadius:16, border:`2px dashed ${C.creamBorder}`, background:C.cardBg }}>
-                <p style={{ margin:"0 0 6px", fontSize:14, fontWeight:700, color:C.text }}>No categories yet</p>
-                <p style={{ margin:"0 0 20px", fontSize:13, color:C.textSub }}>Create a category to organize your battle cards.</p>
-                <button onClick={openNewCat} style={{ padding:"10px 22px", borderRadius:10, border:"none", background:C.orange, color:"#fff", fontSize:13, fontWeight:700, cursor:"pointer" }}>+ New Category</button>
-              </div>
-            ) : (
-              <div style={{ display:"grid", gridTemplateColumns: mobile ? "1fr" : "repeat(2, 1fr)", gap:12 }}>
-                {categories.map(cat => {
-                  const count = activeCards.filter(c => c.categoryId === cat.id).length;
-                  return (
-                    <div key={cat.id} style={{ position:"relative" }}>
-                      <button onClick={() => openCategory(cat.id)} style={{
-                        display:"block", width:"100%", padding:"18px 20px", borderRadius:14, textAlign:"left", cursor:"pointer",
-                        border:`1.5px solid ${C.creamBorder}`, background:C.cardBg,
-                        transition:"border-color 0.12s, background 0.12s",
-                      }}
-                      onMouseEnter={e => { e.currentTarget.style.borderColor = C.orange; e.currentTarget.style.background = C.orangeLight; }}
-                      onMouseLeave={e => { e.currentTarget.style.borderColor = C.creamBorder; e.currentTarget.style.background = C.cardBg; }}
-                      >
-                        <div style={{ fontSize:14, fontWeight:800, color:C.text, marginBottom:4, paddingRight:56 }}>{cat.label}</div>
-                        <div style={{ fontSize:12, color:C.textSub, lineHeight:1.4, marginBottom:10 }}>{cat.description}</div>
-                        <div style={{ fontSize:11, fontWeight:700, color:C.orange }}>{count} card{count !== 1 ? "s" : ""} →</div>
-                      </button>
-                      {/* Manager edit/delete overlay */}
-                      <div style={{ position:"absolute", top:10, right:10, display:"flex", gap:4, zIndex:1 }}>
-                        <button onClick={e => { e.stopPropagation(); openEditCat(cat); }} title="Edit category" style={{ width:26, height:26, borderRadius:6, border:`1px solid ${C.border}`, background:"rgba(255,255,255,0.92)", fontSize:11, cursor:"pointer", color:C.textSub }}>✎</button>
-                        <button onClick={e => { e.stopPropagation(); setConfirm({ kind:"deleteCategory", id:cat.id }); }} title="Delete category" style={{ width:26, height:26, borderRadius:6, border:"1px solid rgba(239,68,68,0.3)", background:"rgba(255,255,255,0.92)", fontSize:11, cursor:"pointer", color:"#ef4444" }}>✕</button>
-                      </div>
-                    </div>
-                  );
-                })}
-              </div>
-            )}
-          </div>
-
-          {/* All cards A–Z */}
-          {allCardsSorted.length > 0 && (
-            <div>
-              <p style={{ margin:"0 0 12px", fontSize:12, fontWeight:700, color:C.textMuted, letterSpacing:"0.06em", textTransform:"uppercase" }}>All Cards — A to Z</p>
-              <div style={{ display:"flex", flexDirection:"column", gap:6 }}>
-                {allCardsSorted.map(card => (
-                  <div key={card.id} style={{ display:"flex", alignItems:"center", gap:8 }}>
-                    <button onClick={() => { setActiveCatId(card.categoryId); openCard(card.id); }} style={{
-                      flex:1, display:"flex", alignItems:"center", justifyContent:"space-between",
-                      padding:"14px 18px", borderRadius:12, border:`1px solid ${C.creamBorder}`,
-                      background:C.cardBg, cursor:"pointer", textAlign:"left",
-                      transition:"border-color 0.12s, background 0.12s",
-                    }}
-                    onMouseEnter={e => { e.currentTarget.style.borderColor = C.orange; e.currentTarget.style.background = C.orangeLight; }}
-                    onMouseLeave={e => { e.currentTarget.style.borderColor = C.creamBorder; e.currentTarget.style.background = C.cardBg; }}
-                    >
-                      <div>
-                        <div style={{ fontSize:14, fontWeight:700, color:C.text }}>{card.title}</div>
-                        <div style={{ fontSize:12, color:C.textSub, marginTop:2 }}>{card.subtitle} · {catLabel(card.categoryId)}</div>
-                      </div>
-                      <span style={{ fontSize:16, color:C.textMuted, flexShrink:0, marginLeft:16 }}>→</span>
-                    </button>
-                    {cardRowActions(card)}
-                  </div>
-                ))}
-              </div>
-            </div>
-          )}
-
-          {/* Archived — always below the active working set, never in counts/search */}
-          {archivedCards.length > 0 && (
-            <div>
-              <p style={{ margin:"0 0 12px", fontSize:12, fontWeight:700, color:C.textMuted, letterSpacing:"0.06em", textTransform:"uppercase" }}>Archived · {archivedCards.length}</p>
-              <div style={{ display:"flex", flexDirection:"column", gap:6 }}>
-                {archivedCards.map(card => (
-                  <div key={card.id} style={{ display:"flex", alignItems:"center", gap:8, opacity:0.72 }}>
-                    <button onClick={() => { setActiveCatId(card.categoryId); openCard(card.id); }} style={{ flex:1, display:"flex", alignItems:"center", justifyContent:"space-between", padding:"14px 18px", borderRadius:12, border:`1px dashed ${C.creamBorder}`, background:C.cardBg, cursor:"pointer", textAlign:"left" }}>
-                      <div>
-                        <div style={{ fontSize:14, fontWeight:700, color:C.text }}>{card.title}</div>
-                        <div style={{ fontSize:12, color:C.textSub, marginTop:2 }}>{card.subtitle} · {catLabel(card.categoryId)}</div>
-                      </div>
-                      <span style={{ fontSize:11, fontWeight:700, color:C.textMuted, flexShrink:0, marginLeft:16 }}>ARCHIVED</span>
-                    </button>
-                    {cardRowActions(card)}
-                  </div>
-                ))}
-              </div>
-            </div>
-          )}
-        </>
-      )}
-      {modals}
+        {archived
+          ? <span style={{ fontSize: 11, fontWeight: 700, color: C.textMuted, flexShrink: 0, marginLeft: 16 }}>ARCHIVED</span>
+          : <span style={{ fontSize: 16, color: C.textMuted, flexShrink: 0, marginLeft: 16 }}>→</span>}
+      </button>
+      {actions}
     </div>
   );
 }
 
-// ── BattleCardsScreen ─────────────────────────────────────────────────────────
-// Navigation: home → category view → card detail
-// All navigation is internal state (no router needed for this screen)
-
+// ── BattleCardDetail — distinct card-detail view (no filter controls here) ──────
 function BattleCardDetail({ card, onBack, actions }) {
   return (
     <div style={{ display: "flex", flexDirection: "column", gap: 20 }}>
-      {/* Back + header */}
       <div>
-        <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", marginBottom: 16 }}>
-          <button onClick={onBack} style={{
-            background: "none", border: "none", cursor: "pointer", padding: 0,
-            fontSize: 13, fontWeight: 600, color: C.textSub, display: "flex", alignItems: "center", gap: 6,
-          }}>← Back</button>
-          {actions && <div style={{ display: "flex", gap: 8 }}>{actions}</div>}
-        </div>
-        <div style={{ display: "flex", alignItems: "flex-start", justifyContent: "space-between", flexWrap: "wrap", gap: 10 }}>
-          <div>
-            <h2 style={{ margin: 0, fontSize: 22, fontWeight: 900, color: C.text }}>{card.title}</h2>
-            <p style={{ margin: "4px 0 0", fontSize: 13, color: C.textSub }}>{card.subtitle}</p>
+        <button onClick={onBack} style={{
+          background: "none", border: "none", cursor: "pointer", padding: 0,
+          fontSize: 13, fontWeight: 600, color: C.textSub, display: "flex", alignItems: "center", gap: 6, marginBottom: 16,
+        }}>← Back to Battle Cards</button>
+        {/* Distinct detail header (title + subtitle + tags), visually separated from list rows */}
+        <div style={{ borderRadius: 16, border: `1px solid ${C.creamBorder}`, background: C.cardBg, padding: "20px 24px" }}>
+          <div style={{ display: "flex", alignItems: "flex-start", justifyContent: "space-between", flexWrap: "wrap", gap: 12 }}>
+            <div style={{ minWidth: 0 }}>
+              <h2 style={{ margin: 0, fontSize: 24, fontWeight: 900, color: C.text }}>{card.title}</h2>
+              {card.subtitle && <p style={{ margin: "4px 0 0", fontSize: 14, color: C.textSub }}>{card.subtitle}</p>}
+            </div>
+            {actions && <div style={{ display: "flex", gap: 8, flexShrink: 0 }}>{actions}</div>}
           </div>
-          {card.updatedAt && (
-            <span style={{ fontSize: 11, color: C.textMuted, padding: "4px 10px", borderRadius: 99, background: C.cardBg, border: `1px solid ${C.creamBorder}` }}>
-              Updated {card.updatedAt}
-            </span>
+          {bcCardTags(card).length > 0 && (
+            <div style={{ display: "flex", flexWrap: "wrap", gap: 6, marginTop: 12 }}>
+              {bcCardTags(card).map(t => <span key={t} style={{ padding: "3px 10px", borderRadius: 999, background: C.orangeLight, color: C.orange, fontSize: 12, fontWeight: 700 }}>{t}</span>)}
+            </div>
           )}
+          {card.updatedAt && <div style={{ fontSize: 11, color: C.textMuted, marginTop: 10 }}>Updated {card.updatedAt}</div>}
         </div>
-        {card.summary && (
-          <p style={{ margin: "10px 0 0", fontSize: 14, color: C.text, lineHeight: 1.6, maxWidth: 640 }}>{card.summary}</p>
-        )}
+        {card.summary && <p style={{ margin: "14px 4px 0", fontSize: 14, color: C.text, lineHeight: 1.6, maxWidth: 640 }}>{card.summary}</p>}
       </div>
 
-      {/* ── PRESERVED DETAIL UI ── */}
-      {/* Responsive: auto-fit reflows the strength/weakness/win panels from 3 columns
-          (desktop) to 2 (tablet) to 1 (mobile) so nothing is clipped or crushed. */}
+      {/* Content panels — accent borders + auto-fit so they read as detail, not list rows */}
       <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(240px, 1fr))", gap: 14 }}>
         <Card style={{ borderTop: `3px solid ${C.red}` }}>
           <div style={{ fontSize: 12, fontWeight: 700, color: C.red, letterSpacing: "0.06em", marginBottom: 12 }}>THEIR STRENGTHS</div>
@@ -16352,17 +15834,12 @@ function BattleCardDetail({ card, onBack, actions }) {
 
       <Card style={{ background: C.pageBg }}>
         <div style={{ fontSize: 12, fontWeight: 700, color: C.textSub, letterSpacing: "0.06em", marginBottom: 12 }}>TALK TRACK</div>
-        <p style={{ margin: 0, fontSize: 14, color: C.text, lineHeight: 1.7, fontStyle: "italic" }}>
-          "{card.talkTrack}"
-        </p>
+        <p style={{ margin: 0, fontSize: 14, color: C.text, lineHeight: 1.7, fontStyle: "italic" }}>"{card.talkTrack}"</p>
       </Card>
 
-      {/* ── IN-DEPTH CONTENT ── */}
       {card.content?.length > 0 && (
         <div>
-          <div style={{ fontSize: 11, fontWeight: 700, color: C.textMuted, letterSpacing: "0.1em", textTransform: "uppercase", marginBottom: 14 }}>
-            In-Depth
-          </div>
+          <div style={{ fontSize: 11, fontWeight: 700, color: C.textMuted, letterSpacing: "0.1em", textTransform: "uppercase", marginBottom: 14 }}>In-Depth</div>
           <div style={{ display: "flex", flexDirection: "column", gap: 14 }}>
             {card.content.map((section, i) => (
               <Card key={i}>
@@ -16377,114 +15854,301 @@ function BattleCardDetail({ card, onBack, actions }) {
   );
 }
 
-function BattleCardsScreen({ categories = INITIAL_BC_CATEGORIES, cards = INITIAL_BATTLE_CARDS, isLoading = false, loadError = null, onRetry, isReal = false }) {
-  // view: "home" | "category" | "detail"
-  const mobile       = useMobile();
-  const [view,       setView]       = useState("home");
-  const [activeCat,  setActiveCat]  = useState(null); // BC_CATEGORIES id
-  const [activeCard, setActiveCard] = useState(null); // BATTLE_CARDS id
-  const [search,     setSearch]     = useState("");
+// ── BattleCardsAdminScreen — manager: one list (active + archived), tags only ───
+function BattleCardsAdminScreen({ cards, onSaveCard, onSetArchived, isReal = false, isLoading = false, loadError = null, onRetry }) {
+  const mobile = useMobile();
+  const [view,         setView]         = useState("list"); // list | detail | editCard
+  const [activeCardId, setActiveCardId] = useState(null);
+  const [search,       setSearch]       = useState("");
+  const [selected,     setSelected]     = useState(() => new Set()); // lowercased tags
+  const [editingCard,  setEditingCard]  = useState(null);
+  const [confirmArchive, setConfirmArchive] = useState(null);
+  const [tagInput,     setTagInput]     = useState("");
+  const [showTagError, setShowTagError] = useState(false);
+  const [cardSaving,   setCardSaving]   = useState(false);
 
-  const openCategory = (catId) => { setActiveCat(catId); setView("category"); };
-  const openCard     = (cardId) => { setActiveCard(cardId); setView("detail"); };
-  const goHome       = ()       => { setView("home"); setActiveCat(null); setActiveCard(null); setSearch(""); };
-  const goCategory   = ()       => { setView("category"); setActiveCard(null); };
+  const blankCard = () => ({ id: `card-${Date.now()}`, title: "", subtitle: "", summary: "", strength: "", weakness: "", ourWin: "", talkTrack: "", tags: [], content: [] });
+  const [draft, setDraft] = useState(blankCard);
+  const setF = (field) => (e) => setDraft(d => ({ ...d, [field]: e.target.value }));
 
-  // Learners only ever see ACTIVE cards. RLS already excludes archived rows for the
-  // learner role (migration 068); this client filter is defense-in-depth and also
-  // covers demo mode, so archived cards never appear in the list, categories,
-  // counts, or search.
-  const visibleCards = cards.filter(c => (c.status ?? "active") !== "archived");
-  const selectedCard = visibleCards.find(c => c.id === activeCard);
-  const selectedCat  = categories.find(c => c.id === activeCat);
-  const cardsInCat   = visibleCards.filter(c => c.categoryId === activeCat).sort((a, b) => a.title.localeCompare(b.title));
-  const allCardsSorted = [...visibleCards].sort((a, b) => a.title.localeCompare(b.title));
+  const activeCards   = cards.filter(c => !bcIsArchived(c));
+  const archivedCards = [...cards.filter(bcIsArchived)].sort((a, b) => a.title.localeCompare(b.title));
+  const tagUniverse   = bcDistinctTags(activeCards);
+  const usage = new Map();
+  for (const c of activeCards) for (const t of bcCardTags(c)) { const k = t.toLowerCase(); usage.set(k, (usage.get(k) || 0) + 1); }
+  const filteredActive = [...activeCards].filter(c => bcMatchesSearch(c, search.trim()) && bcMatchesTags(c, selected)).sort((a, b) => a.title.localeCompare(b.title));
 
-  const filtered = search.trim()
-    ? (() => {
-        const q = search.toLowerCase();
-        return allCardsSorted.filter(c => {
-          const catLabel = categories.find(cat => cat.id === c.categoryId)?.label ?? "";
-          return (
-            c.title?.toLowerCase().includes(q) ||
-            c.subtitle?.toLowerCase().includes(q) ||
-            c.summary?.toLowerCase().includes(q) ||
-            catLabel.toLowerCase().includes(q) ||
-            c.talkTrack?.toLowerCase().includes(q) ||
-            c.strength?.toLowerCase().includes(q) ||
-            c.weakness?.toLowerCase().includes(q) ||
-            c.ourWin?.toLowerCase().includes(q) ||
-            c.tags?.some(t => t.toLowerCase().includes(q)) ||
-            c.content?.some(s => s.heading?.toLowerCase().includes(q) || s.body?.toLowerCase().includes(q))
-          );
-        });
-      })()
-    : allCardsSorted;
+  const selectedCard = cards.find(c => c.id === activeCardId);
+  const openCard = (id) => { setActiveCardId(id); setView("detail"); };
+  const goList   = () => { setView("list"); setActiveCardId(null); };
+  const toggleTag = (t) => setSelected(prev => { const n = new Set(prev); const k = t.toLowerCase(); n.has(k) ? n.delete(k) : n.add(k); return n; });
+  const clearTags = () => setSelected(new Set());
 
-  // ── DETAIL VIEW ──
-  if (view === "detail" && selectedCard) {
+  // Tags editor (mirrors normalizeCardTags: trim, no blanks, case-insensitive dedupe).
+  const addTag = (raw) => {
+    const t = String(raw ?? "").trim();
+    if (!t) return;
+    setDraft(d => (d.tags ?? []).some(x => x.toLowerCase() === t.toLowerCase()) ? d : { ...d, tags: [...(d.tags ?? []), t] });
+    setTagInput(""); setShowTagError(false);
+  };
+  const removeTag = (t) => setDraft(d => ({ ...d, tags: (d.tags ?? []).filter(x => x !== t) }));
+
+  const openNewCard  = () => { setDraft(blankCard()); setTagInput(""); setShowTagError(false); setEditingCard("new"); setView("editCard"); };
+  const openEditCard = (card) => { setDraft({ ...card, tags: card.tags ?? [] }); setTagInput(""); setShowTagError(false); setEditingCard(card.id); setView("editCard"); };
+  const cancelEditCard = () => setView(activeCardId ? "detail" : "list");
+  const saveCard = async () => {
+    if (!draft.title.trim() || cardSaving) return;
+    const pending = tagInput.trim();
+    const tags = pending && !(draft.tags ?? []).some(x => x.toLowerCase() === pending.toLowerCase())
+      ? [...(draft.tags ?? []), pending] : (draft.tags ?? []);
+    if (tags.length === 0) { setShowTagError(true); return; }  // require ≥1 tag — honest block
+    setCardSaving(true);
+    const ok = await onSaveCard({ ...draft, title: draft.title.trim(), tags });
+    setCardSaving(false);
+    if (ok) { setTagInput(""); goList(); }
+  };
+
+  // content sections
+  const addSection    = () => setDraft(d => ({ ...d, content: [...d.content, { heading: "", body: "" }] }));
+  const removeSection = (i) => setDraft(d => ({ ...d, content: d.content.filter((_, j) => j !== i) }));
+  const setSection    = (i, field, val) => setDraft(d => ({ ...d, content: d.content.map((s, j) => j === i ? { ...s, [field]: val } : s) }));
+  const moveSection   = (i, dir) => setDraft(d => { const c = [...d.content]; const t = i + dir; if (t < 0 || t >= c.length) return d; [c[i], c[t]] = [c[t], c[i]]; return { ...d, content: c }; });
+
+  const inputStyle = { width: "100%", boxSizing: "border-box", padding: "10px 14px", borderRadius: 10, border: `1.5px solid ${C.border}`, background: C.cardBg, fontSize: 14, color: C.text, outline: "none", fontFamily: "inherit" };
+  const taStyle    = { ...inputStyle, resize: "vertical", minHeight: 90, lineHeight: 1.6 };
+  const lbl = (txt, req) => (<label style={{ display: "block", fontSize: 11, fontWeight: 700, color: C.textMuted, letterSpacing: "0.08em", textTransform: "uppercase", marginBottom: 8 }}>{txt}{req && <span style={{ color: C.red }}> *</span>}</label>);
+
+  const archiveModal = confirmArchive && (
+    <div style={{ position: "fixed", inset: 0, background: "rgba(0,0,0,0.45)", display: "flex", alignItems: "center", justifyContent: "center", zIndex: 9999 }}>
+      <div style={{ background: C.cardBg, borderRadius: 20, padding: "32px 36px", width: 380, maxWidth: "90vw", textAlign: "center", border: `1px solid ${C.creamBorder}` }}>
+        <h3 style={{ margin: "0 0 8px", fontSize: 18, fontWeight: 900, color: C.text }}>Archive this card?</h3>
+        <p style={{ margin: "0 0 24px", fontSize: 13, color: C.textSub }}>It will be hidden from reps and removed from search and counts. Nothing is deleted — you can restore it anytime from the Archived section.</p>
+        <div style={{ display: "flex", gap: 10 }}>
+          <button onClick={() => setConfirmArchive(null)} style={{ flex: 1, padding: "11px 0", borderRadius: 10, border: `1px solid ${C.border}`, background: C.cardBg, fontSize: 13, fontWeight: 700, cursor: "pointer", color: C.text }}>Cancel</button>
+          <button onClick={() => { onSetArchived(confirmArchive, true); if (activeCardId === confirmArchive) goList(); setConfirmArchive(null); }} style={{ flex: 1, padding: "11px 0", borderRadius: 10, border: "none", background: C.orange, color: "#fff", fontSize: 13, fontWeight: 700, cursor: "pointer" }}>Archive</button>
+        </div>
+      </div>
+    </div>
+  );
+
+  const rowActions = (card) => (
+    <>
+      <button onClick={() => openEditCard(card)} title="Edit" style={{ width: 34, height: 34, borderRadius: 8, border: `1px solid ${C.border}`, background: C.white, fontSize: 12, cursor: "pointer", color: C.textSub, flexShrink: 0 }}>✎</button>
+      {bcIsArchived(card)
+        ? <button onClick={() => onSetArchived(card.id, false)} title="Restore" style={{ height: 34, padding: "0 12px", borderRadius: 8, border: `1px solid ${C.border}`, background: C.white, fontSize: 12, fontWeight: 700, cursor: "pointer", color: C.text, flexShrink: 0 }}>Restore</button>
+        : <button onClick={() => setConfirmArchive(card.id)} title="Archive" style={{ height: 34, padding: "0 12px", borderRadius: 8, border: `1px solid ${C.border}`, background: C.white, fontSize: 12, fontWeight: 700, cursor: "pointer", color: C.textSub, flexShrink: 0 }}>Archive</button>}
+    </>
+  );
+
+  // ── Honest load states ──
+  if (loadError) {
     return (
-      <BattleCardDetail
-        card={selectedCard}
-        onBack={activeCat ? goCategory : goHome}
-      />
+      <div style={{ padding: "48px 32px", textAlign: "center", borderRadius: 16, border: `1px solid ${C.creamBorder}`, background: C.cardBg, maxWidth: 520, margin: "0 auto" }}>
+        <p style={{ margin: "0 0 6px", fontSize: 15, fontWeight: 800, color: C.text }}>Couldn't load battle cards</p>
+        <p style={{ margin: "0 0 20px", fontSize: 13, color: C.textSub }}>Something went wrong reaching the server. This is not the same as an empty library.</p>
+        <button onClick={() => onRetry?.()} style={{ padding: "10px 22px", borderRadius: 10, border: "none", background: C.orange, color: "#fff", fontSize: 13, fontWeight: 700, cursor: "pointer" }}>Retry</button>
+      </div>
     );
   }
+  if (isReal && isLoading) return <LoadingState rows={4} message="Loading battle cards…" />;
 
-  // ── CATEGORY VIEW ──
-  if (view === "category" && selectedCat) {
+  // ── CARD EDITOR (tags only; ≥1 tag required) ──
+  if (view === "editCard") {
+    const isNew = editingCard === "new";
+    const canSave = draft.title.trim() && !cardSaving;
     return (
-      <div style={{ display: "flex", flexDirection: "column", gap: 20 }}>
-        <div>
-          <button onClick={goHome} style={{
-            background: "none", border: "none", cursor: "pointer", padding: 0,
-            fontSize: 13, fontWeight: 600, color: C.textSub, display: "flex", alignItems: "center", gap: 6, marginBottom: 16,
-          }}>← Battle Cards</button>
-          <h2 style={{ margin: 0, fontSize: 22, fontWeight: 900, color: C.text }}>{selectedCat.label}</h2>
-          <p style={{ margin: "4px 0 0", fontSize: 13, color: C.textSub }}>{selectedCat.description}</p>
+      <div style={{ maxWidth: 740, display: "flex", flexDirection: "column", gap: 0 }}>
+        <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", flexWrap: "wrap", gap: 12, marginBottom: 24 }}>
+          <div>
+            <button onClick={cancelEditCard} style={{ background: "none", border: "none", cursor: "pointer", fontSize: 13, fontWeight: 600, color: C.textSub, padding: 0, display: "flex", alignItems: "center", gap: 6, marginBottom: 8 }}>← Battle Cards</button>
+            <h2 style={{ margin: 0, fontSize: 20, fontWeight: 900, color: C.text }}>{isNew ? "New Battle Card" : `Edit: ${cards.find(c => c.id === editingCard)?.title ?? ""}`}</h2>
+          </div>
+          <div style={{ display: "flex", gap: 10 }}>
+            <button onClick={cancelEditCard} style={{ padding: "10px 18px", borderRadius: 10, border: `1px solid ${C.border}`, background: C.cardBg, fontSize: 13, fontWeight: 700, cursor: "pointer", color: C.text }}>Cancel</button>
+            <button onClick={saveCard} disabled={!canSave} style={{ padding: "10px 20px", borderRadius: 10, border: "none", background: canSave ? C.orange : C.muted, color: canSave ? "#fff" : C.textMuted, fontSize: 13, fontWeight: 700, cursor: canSave ? "pointer" : "not-allowed" }}>{cardSaving ? "Saving…" : isNew ? "Create Card" : "Save Changes"}</button>
+          </div>
         </div>
 
-        {cardsInCat.length === 0 ? (
-          <div style={{ padding: "48px 32px", textAlign: "center", borderRadius: 16, border: `2px dashed ${C.creamBorder}`, background: C.cardBg }}>
-            <p style={{ margin: 0, fontSize: 14, fontWeight: 700, color: C.text }}>No cards in this category yet</p>
-            <p style={{ margin: "6px 0 0", fontSize: 13, color: C.textSub }}>Check back when more content is added.</p>
-          </div>
-        ) : (
-          <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
-            {cardsInCat.map(card => (
-              <button key={card.id} onClick={() => openCard(card.id)} style={{
-                display: "flex", alignItems: "center", justifyContent: "space-between",
-                padding: "16px 20px", borderRadius: 14,
-                border: `1px solid ${C.creamBorder}`, background: C.cardBg,
-                cursor: "pointer", textAlign: "left", width: "100%",
-                transition: "border-color 0.12s, background 0.12s",
-              }}
-              onMouseEnter={e => { e.currentTarget.style.borderColor = C.orange; e.currentTarget.style.background = C.orangeLight; }}
-              onMouseLeave={e => { e.currentTarget.style.borderColor = C.creamBorder; e.currentTarget.style.background = C.cardBg; }}
-              >
-                <div>
-                  <div style={{ fontSize: 14, fontWeight: 700, color: C.text }}>{card.title}</div>
-                  <div style={{ fontSize: 12, color: C.textSub, marginTop: 2 }}>{card.subtitle}</div>
-                  {card.summary && <div style={{ fontSize: 12, color: C.textMuted, marginTop: 4, maxWidth: 520 }}>{card.summary}</div>}
-                </div>
-                <span style={{ fontSize: 16, color: C.textMuted, flexShrink: 0, marginLeft: 16 }}>→</span>
-              </button>
-            ))}
-          </div>
-        )}
+        <div style={{ display: "flex", flexDirection: "column", gap: 16 }}>
+          <Card>
+            <div style={{ fontSize: 13, fontWeight: 800, color: C.text, marginBottom: 16 }}>Basic Info</div>
+            <div style={{ display: "grid", gridTemplateColumns: mobile ? "1fr" : "1fr 1fr", gap: 14, marginBottom: 14 }}>
+              <div>{lbl("Title", true)}<input style={inputStyle} value={draft.title} onChange={setF("title")} placeholder="e.g. Salesforce" /></div>
+              <div>{lbl("Subtitle / Type")}<input style={inputStyle} value={draft.subtitle} onChange={setF("subtitle")} placeholder="e.g. CRM" /></div>
+            </div>
+            <div style={{ marginBottom: 14 }}>{lbl("Summary")}<input style={inputStyle} value={draft.summary} onChange={setF("summary")} placeholder="One-line description shown in lists" /></div>
+            <div>
+              {lbl("Tags", true)}
+              <div style={{ display: "flex", flexWrap: "wrap", gap: 6, marginBottom: (draft.tags?.length ? 8 : 0) }}>
+                {(draft.tags ?? []).map(t => (
+                  <span key={t} style={{ display: "inline-flex", alignItems: "center", gap: 6, padding: "4px 10px", borderRadius: 999, background: C.orangeLight, color: C.orange, fontSize: 12, fontWeight: 700 }}>
+                    {t}
+                    <button onClick={() => removeTag(t)} title="Remove tag" style={{ background: "none", border: "none", cursor: "pointer", color: C.orange, fontSize: 13, lineHeight: 1, padding: 0 }}>✕</button>
+                  </span>
+                ))}
+              </div>
+              <input
+                style={{ ...inputStyle, borderColor: showTagError ? C.red : C.border }}
+                value={tagInput}
+                onChange={e => setTagInput(e.target.value)}
+                onKeyDown={e => {
+                  if (e.key === "Enter" || e.key === ",") { e.preventDefault(); addTag(tagInput); }
+                  else if (e.key === "Backspace" && !tagInput && (draft.tags?.length)) { removeTag(draft.tags[draft.tags.length - 1]); }
+                }}
+                onBlur={() => addTag(tagInput)}
+                placeholder="Add a tag and press Enter (reps search and filter by these)"
+              />
+              {showTagError && <div style={{ fontSize: 12, color: C.red, fontWeight: 700, marginTop: 6 }}>Add at least one tag before saving — Battle Cards are organized by tags.</div>}
+            </div>
+          </Card>
+
+          <Card>
+            <div style={{ fontSize: 13, fontWeight: 800, color: C.text, marginBottom: 16 }}>Competitive Detail</div>
+            <div style={{ display: "flex", flexDirection: "column", gap: 14 }}>
+              <div>{lbl("Their Strengths", true)}<textarea style={taStyle} value={draft.strength} onChange={setF("strength")} placeholder="What they do well..." /></div>
+              <div>{lbl("Their Weaknesses", true)}<textarea style={taStyle} value={draft.weakness} onChange={setF("weakness")} placeholder="Where they fall short..." /></div>
+              <div>{lbl("Why We Win", true)}<textarea style={taStyle} value={draft.ourWin} onChange={setF("ourWin")} placeholder="Our differentiated value..." /></div>
+              <div>{lbl("Talk Track")}<textarea style={{ ...taStyle, minHeight: 110 }} value={draft.talkTrack} onChange={setF("talkTrack")} placeholder="The rep's suggested script..." /></div>
+            </div>
+          </Card>
+
+          <Card>
+            <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", marginBottom: 16 }}>
+              <div style={{ fontSize: 13, fontWeight: 800, color: C.text }}>In-Depth Content</div>
+              <button onClick={addSection} style={{ padding: "7px 14px", borderRadius: 9, border: `1px solid ${C.orange}`, background: C.orangeLight, color: C.orange, fontSize: 12, fontWeight: 700, cursor: "pointer" }}>+ Add Section</button>
+            </div>
+            {draft.content.length === 0 ? (
+              <div style={{ padding: "28px 0", textAlign: "center", borderRadius: 10, border: `2px dashed ${C.creamBorder}`, background: C.pageBg }}>
+                <p style={{ margin: 0, fontSize: 13, color: C.textSub }}>No sections yet. Add sections to give reps deeper context.</p>
+              </div>
+            ) : (
+              <div style={{ display: "flex", flexDirection: "column", gap: 12 }}>
+                {draft.content.map((sec, i) => (
+                  <div key={i} style={{ borderRadius: 12, border: `1px solid ${C.creamBorder}`, padding: 16, background: C.pageBg }}>
+                    <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", marginBottom: 10 }}>
+                      <span style={{ fontSize: 11, fontWeight: 700, color: C.textMuted }}>SECTION {i + 1}</span>
+                      <div style={{ display: "flex", gap: 6 }}>
+                        {i > 0                      && <button onClick={() => moveSection(i, -1)} style={{ background: "none", border: `1px solid ${C.border}`, borderRadius: 6, width: 26, height: 26, cursor: "pointer", fontSize: 12, color: C.textSub }}>↑</button>}
+                        {i < draft.content.length-1 && <button onClick={() => moveSection(i, 1)} style={{ background: "none", border: `1px solid ${C.border}`, borderRadius: 6, width: 26, height: 26, cursor: "pointer", fontSize: 12, color: C.textSub }}>↓</button>}
+                        <button onClick={() => removeSection(i)} style={{ background: "none", border: `1px solid rgba(239,68,68,0.3)`, borderRadius: 6, width: 26, height: 26, cursor: "pointer", fontSize: 12, color: "#ef4444" }}>✕</button>
+                      </div>
+                    </div>
+                    <input style={{ ...inputStyle, marginBottom: 8 }} value={sec.heading} onChange={e => setSection(i, "heading", e.target.value)} placeholder="Section heading" />
+                    <textarea style={{ ...taStyle, minHeight: 80 }} value={sec.body} onChange={e => setSection(i, "body", e.target.value)} placeholder="Section body..." />
+                  </div>
+                ))}
+              </div>
+            )}
+          </Card>
+        </div>
       </div>
     );
   }
 
-  // ── ERROR / LOADING / EMPTY GUARDS (real users only) ──
-  // A failed load is NOT an empty library: show an error with Retry, never "none yet".
+  // ── DETAIL (preview) with manager actions: Edit + Archive/Restore ──
+  if (view === "detail" && selectedCard) {
+    return (
+      <>
+        <BattleCardDetail
+          card={selectedCard}
+          onBack={goList}
+          actions={
+            <>
+              <button onClick={() => openEditCard(selectedCard)} style={{ padding: "7px 16px", borderRadius: 8, border: `1px solid ${C.border}`, background: C.white, fontSize: 12, fontWeight: 700, cursor: "pointer", color: C.text }}>Edit</button>
+              {bcIsArchived(selectedCard)
+                ? <button onClick={() => onSetArchived(selectedCard.id, false)} style={{ padding: "7px 16px", borderRadius: 8, border: `1px solid ${C.border}`, background: C.white, fontSize: 12, fontWeight: 700, cursor: "pointer", color: C.text }}>Restore</button>
+                : <button onClick={() => setConfirmArchive(selectedCard.id)} style={{ padding: "7px 16px", borderRadius: 8, border: `1px solid ${C.border}`, background: C.white, fontSize: 12, fontWeight: 700, cursor: "pointer", color: C.textSub }}>Archive</button>}
+            </>
+          }
+        />
+        {archiveModal}
+      </>
+    );
+  }
+
+  // ── LIST (single list: active first, archived below) ──
+  return (
+    <div style={{ display: "flex", flexDirection: "column", gap: 20 }}>
+      <div style={{ display: "flex", alignItems: "flex-start", justifyContent: "space-between", flexWrap: "wrap", gap: 12 }}>
+        <div>
+          <h2 style={{ margin: 0, fontSize: 22, fontWeight: 800, color: C.text }}>Battle Cards</h2>
+          <p style={{ margin: "4px 0 0", fontSize: 13, color: C.textSub }}>Competitive intelligence for your team</p>
+        </div>
+        <button onClick={openNewCard} style={{ padding: "10px 20px", borderRadius: 12, border: "none", background: C.orange, color: "#fff", fontSize: 13, fontWeight: 700, cursor: "pointer", flexShrink: 0 }}>+ New Card</button>
+      </div>
+
+      <div style={{ display: "flex", alignItems: "center", gap: 10, padding: "10px 14px", borderRadius: 10, background: C.cardBg, border: `1px solid ${C.creamBorder}`, maxWidth: 420 }}>
+        <span style={{ fontSize: 13, color: C.textMuted }}>Search</span>
+        <input type="text" value={search} placeholder="Title, subtitle, summary, tags…" onChange={e => setSearch(e.target.value)} style={{ flex: 1, border: "none", background: "transparent", fontSize: 13, color: C.text, outline: "none", fontFamily: "inherit" }} />
+        {search && <button onClick={() => setSearch("")} style={{ background: "none", border: "none", cursor: "pointer", fontSize: 13, color: C.textMuted, padding: 0, lineHeight: 1 }}>✕</button>}
+      </div>
+
+      <BcTagFilters tags={tagUniverse} selected={selected} onToggle={toggleTag} onAll={clearTags} allCount={activeCards.length} usage={usage} />
+
+      {/* Active cards */}
+      {filteredActive.length === 0 ? (
+        <div style={{ padding: "48px 32px", textAlign: "center", borderRadius: 16, border: `2px dashed ${C.creamBorder}`, background: C.cardBg }}>
+          <p style={{ margin: "0 0 6px", fontSize: 14, fontWeight: 700, color: C.text }}>{activeCards.length === 0 ? "No battle cards yet" : "No cards match this filter"}</p>
+          <p style={{ margin: "0 0 20px", fontSize: 13, color: C.textSub }}>{activeCards.length === 0 ? "Create the first card for your team." : "Try a different search or clear the tag filters."}</p>
+          {activeCards.length === 0 && <button onClick={openNewCard} style={{ padding: "10px 22px", borderRadius: 10, border: "none", background: C.orange, color: "#fff", fontSize: 13, fontWeight: 700, cursor: "pointer" }}>+ New Card</button>}
+        </div>
+      ) : (
+        <div>
+          <p style={{ margin: "0 0 12px", fontSize: 12, fontWeight: 700, color: C.textMuted, letterSpacing: "0.06em", textTransform: "uppercase" }}>Active · {filteredActive.length}</p>
+          <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
+            {filteredActive.map(card => <BcCardRow key={card.id} card={card} onOpen={() => openCard(card.id)} actions={rowActions(card)} />)}
+          </div>
+        </div>
+      )}
+
+      {/* Archived cards below (managers only) */}
+      {archivedCards.length > 0 && (
+        <div>
+          <p style={{ margin: "0 0 12px", fontSize: 12, fontWeight: 700, color: C.textMuted, letterSpacing: "0.06em", textTransform: "uppercase" }}>Archived · {archivedCards.length}</p>
+          <div style={{ display: "flex", flexDirection: "column", gap: 6 }}>
+            {archivedCards.map(card => <BcCardRow key={card.id} card={card} onOpen={() => openCard(card.id)} archived actions={rowActions(card)} />)}
+          </div>
+        </div>
+      )}
+      {archiveModal}
+    </div>
+  );
+}
+
+// ── BattleCardsScreen — learner: one active-card list, tags only, read-only ─────
+function BattleCardsScreen({ cards = INITIAL_BATTLE_CARDS, isLoading = false, loadError = null, onRetry, isReal = false }) {
+  const mobile = useMobile();
+  const [view,         setView]         = useState("list"); // list | detail
+  const [activeCardId, setActiveCardId] = useState(null);
+  // Persist search + tag filters so returning to Battle Cards restores the list state.
+  const [search, setSearch] = useState(() => { try { return sessionStorage.getItem("ralli_bc_search") || ""; } catch { return ""; } });
+  const [selected, setSelected] = useState(() => { try { const s = sessionStorage.getItem("ralli_bc_tags"); return new Set(s ? JSON.parse(s) : []); } catch { return new Set(); } });
+  React.useEffect(() => { try { sessionStorage.setItem("ralli_bc_search", search); } catch {} }, [search]);
+  React.useEffect(() => { try { sessionStorage.setItem("ralli_bc_tags", JSON.stringify([...selected])); } catch {} }, [selected]);
+
+  const visibleCards = cards.filter(c => !bcIsArchived(c)); // learners: active only (RLS also enforces)
+  const tagUniverse  = bcDistinctTags(visibleCards);
+  const usage = new Map();
+  for (const c of visibleCards) for (const t of bcCardTags(c)) { const k = t.toLowerCase(); usage.set(k, (usage.get(k) || 0) + 1); }
+  const filtered = [...visibleCards].filter(c => bcMatchesSearch(c, search.trim()) && bcMatchesTags(c, selected)).sort((a, b) => a.title.localeCompare(b.title));
+
+  const selectedCard = visibleCards.find(c => c.id === activeCardId);
+  const openCard = (id) => { setActiveCardId(id); setView("detail"); };
+  const goList   = () => { setView("list"); setActiveCardId(null); };
+  const toggleTag = (t) => setSelected(prev => { const n = new Set(prev); const k = t.toLowerCase(); n.has(k) ? n.delete(k) : n.add(k); return n; });
+  const clearTags = () => setSelected(new Set());
+
+  const header = (
+    <div>
+      <h2 style={{ margin: 0, fontSize: 22, fontWeight: 800, color: C.text }}>Battle Cards</h2>
+      <p style={{ margin: "4px 0 0", fontSize: 13, color: C.textSub }}>Competitive intelligence at your fingertips</p>
+    </div>
+  );
+
   if (loadError) {
     return (
       <div style={{ display: "flex", flexDirection: "column", gap: 20 }}>
-        <div>
-          <h2 style={{ margin: 0, fontSize: 22, fontWeight: 800, color: C.text }}>Battle Cards</h2>
-          <p style={{ margin: "4px 0 0", fontSize: 13, color: C.textSub }}>Competitive intelligence at your fingertips</p>
-        </div>
+        {header}
         <div style={{ padding: "48px 32px", textAlign: "center", borderRadius: 16, border: `1px solid ${C.creamBorder}`, background: C.cardBg }}>
           <p style={{ margin: "0 0 6px", fontSize: 15, fontWeight: 800, color: C.text }}>Couldn't load battle cards</p>
           <p style={{ margin: "0 0 20px", fontSize: 13, color: C.textSub }}>Something went wrong reaching the server. Please try again.</p>
@@ -16493,689 +16157,45 @@ function BattleCardsScreen({ categories = INITIAL_BC_CATEGORIES, cards = INITIAL
       </div>
     );
   }
-
   if (isLoading) {
+    return <div style={{ display: "flex", flexDirection: "column", gap: 20 }}>{header}<LoadingState rows={4} message="Loading battle cards…" /></div>;
+  }
+  if (isReal && visibleCards.length === 0) {
     return (
       <div style={{ display: "flex", flexDirection: "column", gap: 20 }}>
-        <div>
-          <h2 style={{ margin: 0, fontSize: 22, fontWeight: 800, color: C.text }}>Battle Cards</h2>
-          <p style={{ margin: "4px 0 0", fontSize: 13, color: C.textSub }}>Competitive intelligence at your fingertips</p>
-        </div>
-        <LoadingState rows={4} message="Loading battle cards…" />
+        {header}
+        <EmptyState icon="🃏" title="No battle cards yet" message="Your admin hasn't added any battle cards. Check back after your team configures your content library." />
       </div>
     );
   }
 
-  if (isReal && categories.length === 0 && visibleCards.length === 0) {
-    return (
-      <div style={{ display: "flex", flexDirection: "column", gap: 20 }}>
-        <div>
-          <h2 style={{ margin: 0, fontSize: 22, fontWeight: 800, color: C.text }}>Battle Cards</h2>
-          <p style={{ margin: "4px 0 0", fontSize: 13, color: C.textSub }}>Competitive intelligence at your fingertips</p>
-        </div>
-        <EmptyState
-          icon="🃏"
-          title="No battle cards yet"
-          message="Your admin hasn't added any battle cards. Check back after your team configures your content library."
-        />
-      </div>
-    );
+  // ── DETAIL (read-only) ──
+  if (view === "detail" && selectedCard) {
+    return <BattleCardDetail card={selectedCard} onBack={goList} />;
   }
 
-  // ── HOME VIEW ──
+  // ── LIST ──
   return (
-    <div style={{ display: "flex", flexDirection: "column", gap: 24 }}>
-      {/* Header */}
-      <div>
-        <h2 style={{ margin: 0, fontSize: 22, fontWeight: 800, color: C.text }}>Battle Cards</h2>
-        <p style={{ margin: "4px 0 0", fontSize: 13, color: C.textSub }}>Competitive intelligence at your fingertips</p>
-      </div>
-
-      {/* Search */}
+    <div style={{ display: "flex", flexDirection: "column", gap: 20 }}>
+      {header}
       <div style={{ display: "flex", alignItems: "center", gap: 10, padding: "10px 14px", borderRadius: 10, background: C.cardBg, border: `1px solid ${C.creamBorder}`, maxWidth: 420 }}>
         <span style={{ fontSize: 13, color: C.textMuted }}>Search</span>
-        <input
-          type="text" value={search} placeholder="Search battle cards…"
-          onChange={e => setSearch(e.target.value)}
-          style={{ flex: 1, border: "none", background: "transparent", fontSize: 13, color: C.text, outline: "none", fontFamily: "inherit" }}
-        />
-        {search && (
-          <button onClick={() => setSearch("")} style={{ background: "none", border: "none", cursor: "pointer", fontSize: 13, color: C.textMuted, padding: 0, lineHeight: 1 }}>✕</button>
-        )}
+        <input type="text" value={search} placeholder="Title, subtitle, summary, tags…" onChange={e => setSearch(e.target.value)} style={{ flex: 1, border: "none", background: "transparent", fontSize: 13, color: C.text, outline: "none", fontFamily: "inherit" }} />
+        {search && <button onClick={() => setSearch("")} style={{ background: "none", border: "none", cursor: "pointer", fontSize: 13, color: C.textMuted, padding: 0, lineHeight: 1 }}>✕</button>}
       </div>
-
-      {/* Search results */}
-      {search.trim() ? (
-        <div>
-          <p style={{ margin: "0 0 12px", fontSize: 12, fontWeight: 700, color: C.textMuted, letterSpacing: "0.06em", textTransform: "uppercase" }}>
-            {filtered.length} result{filtered.length !== 1 ? "s" : ""}
-          </p>
-          {filtered.length === 0 ? (
-            <EmptyState
-              icon="🔍"
-              title={`No results for "${search}"`}
-              message="Try a competitor name, category, or keyword from the card content."
-            />
-          ) : (
-            <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
-              {filtered.map(card => (
-                <button key={card.id} onClick={() => { setActiveCat(card.categoryId); openCard(card.id); }} style={{
-                  display: "flex", alignItems: "center", justifyContent: "space-between",
-                  padding: "14px 18px", borderRadius: 12, border: `1px solid ${C.creamBorder}`,
-                  background: C.cardBg, cursor: "pointer", textAlign: "left", width: "100%",
-                  transition: "border-color 0.12s",
-                }}
-                onMouseEnter={e => { e.currentTarget.style.borderColor = C.orange; e.currentTarget.style.background = C.orangeLight; }}
-                onMouseLeave={e => { e.currentTarget.style.borderColor = C.creamBorder; e.currentTarget.style.background = C.cardBg; }}
-                >
-                  <div>
-                    <div style={{ fontSize: 14, fontWeight: 700, color: C.text }}>{card.title}</div>
-                    <div style={{ fontSize: 12, color: C.textSub, marginTop: 2 }}>{card.subtitle} · {categories.find(c => c.id === card.categoryId)?.label}</div>
-                  </div>
-                  <span style={{ fontSize: 16, color: C.textMuted, flexShrink: 0, marginLeft: 16 }}>→</span>
-                </button>
-              ))}
-            </div>
-          )}
+      <BcTagFilters tags={tagUniverse} selected={selected} onToggle={toggleTag} onAll={clearTags} allCount={visibleCards.length} usage={usage} />
+      {filtered.length === 0 ? (
+        <div style={{ padding: "40px 32px", textAlign: "center", borderRadius: 16, border: `2px dashed ${C.creamBorder}`, background: C.cardBg }}>
+          <p style={{ margin: 0, fontSize: 14, fontWeight: 700, color: C.text }}>No cards match this filter</p>
+          <p style={{ margin: "6px 0 0", fontSize: 13, color: C.textSub }}>Try a different search or clear the tag filters.</p>
         </div>
       ) : (
-        <>
-          {/* Categories */}
-          <div>
-            <p style={{ margin: "0 0 12px", fontSize: 12, fontWeight: 700, color: C.textMuted, letterSpacing: "0.06em", textTransform: "uppercase" }}>Categories</p>
-            <div style={{ display: "grid", gridTemplateColumns: mobile ? "1fr" : "repeat(2, 1fr)", gap: 12 }}>
-              {categories.map(cat => {
-                const count = visibleCards.filter(c => c.categoryId === cat.id).length;
-                return (
-                  <button key={cat.id} onClick={() => openCategory(cat.id)} style={{
-                    padding: "18px 20px", borderRadius: 14, textAlign: "left", cursor: "pointer",
-                    border: `1.5px solid ${C.creamBorder}`, background: C.cardBg, width: "100%",
-                    transition: "border-color 0.12s, background 0.12s",
-                  }}
-                  onMouseEnter={e => { e.currentTarget.style.borderColor = C.orange; e.currentTarget.style.background = C.orangeLight; }}
-                  onMouseLeave={e => { e.currentTarget.style.borderColor = C.creamBorder; e.currentTarget.style.background = C.cardBg; }}
-                  >
-                    <div style={{ fontSize: 14, fontWeight: 800, color: C.text, marginBottom: 4 }}>{cat.label}</div>
-                    <div style={{ fontSize: 12, color: C.textSub, lineHeight: 1.4, marginBottom: 10 }}>{cat.description}</div>
-                    <div style={{ fontSize: 11, fontWeight: 700, color: C.orange }}>{count} card{count !== 1 ? "s" : ""} →</div>
-                  </button>
-                );
-              })}
-            </div>
-          </div>
-
-          {/* All cards A–Z */}
-          <div>
-            <p style={{ margin: "0 0 12px", fontSize: 12, fontWeight: 700, color: C.textMuted, letterSpacing: "0.06em", textTransform: "uppercase" }}>All Cards — A to Z</p>
-            <div style={{ display: "flex", flexDirection: "column", gap: 6 }}>
-              {allCardsSorted.map(card => (
-                <button key={card.id} onClick={() => { setActiveCat(card.categoryId); openCard(card.id); }} style={{
-                  display: "flex", alignItems: "center", justifyContent: "space-between",
-                  padding: "14px 18px", borderRadius: 12, border: `1px solid ${C.creamBorder}`,
-                  background: C.cardBg, cursor: "pointer", textAlign: "left", width: "100%",
-                  transition: "border-color 0.12s, background 0.12s",
-                }}
-                onMouseEnter={e => { e.currentTarget.style.borderColor = C.orange; e.currentTarget.style.background = C.orangeLight; }}
-                onMouseLeave={e => { e.currentTarget.style.borderColor = C.creamBorder; e.currentTarget.style.background = C.cardBg; }}
-                >
-                  <div>
-                    <div style={{ fontSize: 14, fontWeight: 700, color: C.text }}>{card.title}</div>
-                    <div style={{ fontSize: 12, color: C.textSub, marginTop: 2 }}>
-                      {card.subtitle} · {categories.find(c => c.id === card.categoryId)?.label}
-                    </div>
-                  </div>
-                  <span style={{ fontSize: 16, color: C.textMuted, flexShrink: 0, marginLeft: 16 }}>→</span>
-                </button>
-              ))}
-            </div>
-          </div>
-        </>
+        <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
+          {filtered.map(card => <BcCardRow key={card.id} card={card} onOpen={() => openCard(card.id)} />)}
+        </div>
       )}
     </div>
   );
-}
-
-// ── LEADERSHIP DASHBOARD ─────────────────────────────────────
-//
-// SALES READINESS SCORE MODEL
-// ─────────────────────────────────────────────────────────────
-// Score is a weighted composite across platform activities.
-// Production hook: replace mock data with /api/orgs/:id/readiness or
-// computed columns in the analytics DB. Each contributor can be weighted
-// independently and new sources can be added without restructuring the model.
-//
-// Score contributors (0-100 each):
-//   lessons       — % of assigned lessons completed
-//   quizzes       — average quiz pass rate
-//   games         — average game score percentile
-//   battlecards   — % of battle cards reviewed
-//   certifications— % of active certs current
-//   coaching      — % of coaching sessions attended
-//   assignments   — % of assignments completed on time
-//   aiScore       — AI-inferred readiness from engagement patterns (future)
-//
-const READINESS_SCORE_WEIGHTS = {
-  lessons:        0.20,
-  quizzes:        0.25,
-  games:          0.15,
-  battlecards:    0.10,
-  certifications: 0.10,
-  coaching:       0.10,
-  assignments:    0.10,
-  aiScore:        0.00, // reserved for future AI contribution
-};
-
-// computeReadinessScore(contributions) → number 0-100
-// contributions: { lessons, quizzes, games, ... } each 0-100
-// Returns null if no data. Extensible: unknown keys are ignored.
-function computeReadinessScore(contributions = {}) {
-  let totalWeight = 0;
-  let weightedSum = 0;
-  for (const [key, weight] of Object.entries(READINESS_SCORE_WEIGHTS)) {
-    if (contributions[key] != null && weight > 0) {
-      weightedSum += contributions[key] * weight;
-      totalWeight  += weight;
-    }
-  }
-  if (totalWeight === 0) return null;
-  return Math.round(weightedSum / totalWeight);
-}
-
-// ── LEADERSHIP SEED DATA ──────────────────────────────────────
-// Production hook: replace with /api/orgs/:id/readiness-dashboard
-// All shapes here match the final API response model so the component
-// can be wired to real data with minimal changes.
-
-const LEADERSHIP_SEED = {
-  // Company-level readiness
-  company: {
-    readinessScore:   87,
-    previousScore:    82,
-    targetScore:      90,
-    period:           "Jun 2026",
-    contributions: {
-      lessons: 88, quizzes: 91, games: 84,
-      battlecards: 79, certifications: 82, coaching: 86, assignments: 90,
-    },
-  },
-
-  // Teams (supports any team structure — team.id is org-defined)
-  teams: [
-    {
-      id: "smb",  name: "SMB Outbound",    headcount: 6,
-      readinessScore: 94, previousScore: 90,
-      contributions: { lessons: 96, quizzes: 95, games: 92, battlecards: 91, certifications: 94, coaching: 93, assignments: 96 },
-    },
-    {
-      id: "mid",  name: "Mid-Market",      headcount: 5,
-      readinessScore: 89, previousScore: 85,
-      contributions: { lessons: 90, quizzes: 92, games: 87, battlecards: 85, certifications: 88, coaching: 90, assignments: 91 },
-    },
-    {
-      id: "ent",  name: "Enterprise AE",   headcount: 4,
-      readinessScore: 72, previousScore: 74,
-      contributions: { lessons: 70, quizzes: 74, games: 68, battlecards: 62, certifications: 71, coaching: 75, assignments: 73 },
-    },
-    {
-      id: "bdr",  name: "BDR / SDR",       headcount: 8,
-      readinessScore: 81, previousScore: 78,
-      contributions: { lessons: 82, quizzes: 83, games: 79, battlecards: 76, certifications: 80, coaching: 82, assignments: 84 },
-    },
-  ],
-
-  // Knowledge heatmap — topics × reps (repScores keyed to people[].id)
-  heatmap: [
-    {
-      topic: "Product Knowledge", score: 91, prev: 86, trend: "up", repsBelow: 0, repsTotal: 10,
-      repScores: [
-        { userId: "p1", score: 98 }, { userId: "p2", score: 97 }, { userId: "p3", score: 93 },
-        { userId: "p4", score: 92 }, { userId: "p5", score: 89 }, { userId: "p6", score: 87 },
-        { userId: "p7", score: 85 }, { userId: "p8", score: 90 }, { userId: "p9", score: 82 },
-        { userId: "p10", score: 78 },
-      ],
-    },
-    {
-      topic: "Discovery", score: 88, prev: 82, trend: "up", repsBelow: 0, repsTotal: 10,
-      repScores: [
-        { userId: "p1", score: 96 }, { userId: "p2", score: 92 }, { userId: "p3", score: 90 },
-        { userId: "p4", score: 89 }, { userId: "p5", score: 86 }, { userId: "p6", score: 84 },
-        { userId: "p7", score: 79 }, { userId: "p8", score: 88 }, { userId: "p9", score: 80 },
-        { userId: "p10", score: 76 },
-      ],
-    },
-    {
-      topic: "Objection Handling", score: 80, prev: 78, trend: "up", repsBelow: 1, repsTotal: 10,
-      repScores: [
-        { userId: "p1", score: 92 }, { userId: "p2", score: 88 }, { userId: "p3", score: 85 },
-        { userId: "p4", score: 82 }, { userId: "p5", score: 80 }, { userId: "p6", score: 75 },
-        { userId: "p7", score: 70 }, { userId: "p8", score: 78 }, { userId: "p9", score: 68 },
-        { userId: "p10", score: 62 },
-      ],
-    },
-    {
-      topic: "Competitive Positioning", score: 64, prev: 70, trend: "down", repsBelow: 4, repsTotal: 10,
-      repScores: [
-        { userId: "p1", score: 82 }, { userId: "p2", score: 78 }, { userId: "p3", score: 74 },
-        { userId: "p4", score: 71 }, { userId: "p5", score: 65 }, { userId: "p6", score: 58 },
-        { userId: "p7", score: 54 }, { userId: "p8", score: 62 }, { userId: "p9", score: 49 },
-        { userId: "p10", score: 47 },
-      ],
-    },
-    {
-      topic: "Pricing", score: 76, prev: 73, trend: "up", repsBelow: 2, repsTotal: 10,
-      repScores: [
-        { userId: "p1", score: 90 }, { userId: "p2", score: 85 }, { userId: "p3", score: 82 },
-        { userId: "p4", score: 78 }, { userId: "p5", score: 74 }, { userId: "p6", score: 70 },
-        { userId: "p7", score: 66 }, { userId: "p8", score: 76 }, { userId: "p9", score: 63 },
-        { userId: "p10", score: 56 },
-      ],
-    },
-    {
-      topic: "Negotiation", score: 69, prev: 68, trend: "flat", repsBelow: 3, repsTotal: 10,
-      repScores: [
-        { userId: "p1", score: 88 }, { userId: "p2", score: 80 }, { userId: "p3", score: 76 },
-        { userId: "p4", score: 72 }, { userId: "p5", score: 67 }, { userId: "p6", score: 62 },
-        { userId: "p7", score: 58 }, { userId: "p8", score: 70 }, { userId: "p9", score: 54 },
-        { userId: "p10", score: 43 },
-      ],
-    },
-  ],
-
-  // Trends — each period has a score for company and each team
-  // Production hook: query readiness_snapshots table for range
-  trends: {
-    weekly: [
-      { label: "W21", company: 79, smb: 88, mid: 83, ent: 68, bdr: 75 },
-      { label: "W22", company: 81, smb: 90, mid: 84, ent: 69, bdr: 76 },
-      { label: "W23", company: 83, smb: 91, mid: 86, ent: 70, bdr: 78 },
-      { label: "W24", company: 85, smb: 92, mid: 87, ent: 71, bdr: 79 },
-      { label: "W25", company: 87, smb: 94, mid: 89, ent: 72, bdr: 81 },
-    ],
-    monthly: [
-      { label: "Feb",  company: 74, smb: 82, mid: 78, ent: 63, bdr: 70 },
-      { label: "Mar",  company: 77, smb: 85, mid: 80, ent: 65, bdr: 72 },
-      { label: "Apr",  company: 80, smb: 88, mid: 84, ent: 68, bdr: 76 },
-      { label: "May",  company: 82, smb: 90, mid: 86, ent: 70, bdr: 78 },
-      { label: "Jun",  company: 87, smb: 94, mid: 89, ent: 72, bdr: 81 },
-    ],
-    quarterly: [
-      { label: "Q2 '25", company: 68, smb: 76, mid: 72, ent: 57, bdr: 64 },
-      { label: "Q3 '25", company: 73, smb: 81, mid: 76, ent: 61, bdr: 69 },
-      { label: "Q4 '25", company: 78, smb: 86, mid: 82, ent: 66, bdr: 74 },
-      { label: "Q1 '26", company: 83, smb: 90, mid: 86, ent: 70, bdr: 78 },
-      { label: "Q2 '26", company: 87, smb: 94, mid: 89, ent: 72, bdr: 81 },
-    ],
-  },
-
-  // AI-generated summary — production: replace with LLM call against aggregated data
-  aiSummary: {
-    generatedAt:  "Jun 28, 2026",
-    improvements: [
-      "Product Knowledge improved 5 pts — strongest driver of company-wide gain.",
-      "Discovery scores up 6 pts. Reps are applying the discovery framework from the June session.",
-      "SMB Outbound team hit 94% readiness — highest score in 6 months.",
-    ],
-    declines: [
-      "Competitive Positioning dropped 6 pts. Likely gap: recent competitor updates not yet covered.",
-      "Enterprise AE team slipped 2 pts — Negotiation and Pricing scores below target.",
-    ],
-    attention: [
-      "3 Enterprise AEs below 70% readiness — suggest prioritized coaching.",
-      "2 reps have overdue certifications expiring within 14 days.",
-    ],
-    recommendations: [
-      "Assign updated Competitive Positioning course to all AEs.",
-      "Schedule a Negotiation refresher for Enterprise AE team.",
-      "Run a ralli game session focused on pricing objections this week.",
-    ],
-  },
-
-  // People insights
-  people: [
-    { id: "p1",  name: "Mia Chen",       initials: "MC", title: "Enterprise AE",     team: "ent", color: "#8B5CF6", score: 98, prev: 93, certsCurrent: true,  coachingAttendance: 100, tag: "promotion",  daysStreak: 21 },
-    { id: "p2",  name: "Dev Patel",       initials: "DP", title: "Mid-Market AE",     team: "mid", color: "#3B82F6", score: 95, prev: 88, certsCurrent: true,  coachingAttendance: 90,  tag: "top",        daysStreak: 18 },
-    { id: "p3",  name: "Jordan Rivera",   initials: "JR", title: "Senior AE",         team: "smb", color: C.orange,  score: 91, prev: 84, certsCurrent: true,  coachingAttendance: 85,  tag: "improved",   daysStreak: 7  },
-    { id: "p4",  name: "Sara Kim",        initials: "SK", title: "SDR Team Lead",     team: "bdr", color: "#22C55E", score: 88, prev: 86, certsCurrent: true,  coachingAttendance: 95,  tag: "top",        daysStreak: 10 },
-    { id: "p5",  name: "Tom Walsh",       initials: "TW", title: "SDR",               team: "bdr", color: "#64748B", score: 84, prev: 76, certsCurrent: false, coachingAttendance: 80,  tag: "improved",   daysStreak: 5  },
-    { id: "p6",  name: "Nina Barnes",     initials: "NB", title: "BDR",               team: "bdr", color: "#EC4899", score: 78, prev: 75, certsCurrent: false, coachingAttendance: 70,  tag: null,         daysStreak: 8  },
-    { id: "p7",  name: "Carlos Reyes",    initials: "CR", title: "SDR",               team: "bdr", color: "#14B8A6", score: 74, prev: 78, certsCurrent: false, coachingAttendance: 60,  tag: "coaching",   daysStreak: 2  },
-    { id: "p8",  name: "Alex Liu",        initials: "AL", title: "AE",                team: "ent", color: "#F59E0B", score: 81, prev: 84, certsCurrent: true,  coachingAttendance: 65,  tag: null,         daysStreak: 3  },
-    { id: "p9",  name: "Elena Torres",    initials: "ET", title: "Enterprise AE",     team: "ent", color: "#6366F1", score: 67, prev: 71, certsCurrent: false, coachingAttendance: 50,  tag: "coaching",   daysStreak: 1  },
-    { id: "p10", name: "Brendan Walsh",   initials: "BW", title: "Enterprise AE",     team: "ent", color: "#F87171", score: 63, prev: 69, certsCurrent: false, coachingAttendance: 45,  tag: "coaching",   daysStreak: 0  },
-  ],
-
-  // Company risk
-  risk: {
-    activeAssignments:     34, // Beta Cleanup — demo parity for the new Active Assignments org-metric card
-    overdueAssignments:    7,
-    overdueAssignmentReps: ["Carlos Reyes", "Elena Torres", "Brendan Walsh", "Alex Liu", "Tom Walsh", "Nina Barnes", "Dev Patel"],
-    overdueCertifications: 4,
-    certExpiringSoon:      ["Elena Torres", "Carlos Reyes", "Nina Barnes", "Brendan Walsh"],
-    lowReadinessReps:      [{ name: "Brendan Walsh", score: 63 }, { name: "Elena Torres", score: 67 }, { name: "Carlos Reyes", score: 74 }],
-    teamsBelowTarget:      [{ name: "Enterprise AE", score: 72, target: 85 }],
-    coachingGaps:          [{ name: "Brendan Walsh", attendance: 45 }, { name: "Elena Torres", attendance: 50 }, { name: "Carlos Reyes", attendance: 60 }],
-  },
-};
-
-// ── Demo seed data for RepDrillDownModal ──────────────────────
-// Used only when isReal = false. Keyed by LEADERSHIP_SEED people[].id.
-// Topic scores mirror LEADERSHIP_SEED.heatmap.repScores exactly.
-// Content titles match INITIAL_LEARN_COURSES, INITIAL_LEARN_LESSONS, USER_QUIZ_ASSIGNMENTS_SEED.
-const DEMO_QUIZ_NAMES = {
-  qa1: "Objection Handling: Price & Value",
-  qa2: "MEDDIC Qualification Framework",
-  qa3: "Prospecting Fundamentals",
-  qa4: "Competitor Positioning: Salesforce vs. ralli",
-  qa5: "Discovery Call Framework",
-};
-
-const DEMO_REP_DRILL_DATA = {
-  // Mia Chen — 98, promotion, Enterprise AE
-  p1: {
-    topicScores: [
-      { topic: "Product Knowledge",       avgScore: 98, attempts: 4, passed: 4 },
-      { topic: "Discovery",               avgScore: 96, attempts: 5, passed: 5 },
-      { topic: "Objection Handling",      avgScore: 92, attempts: 3, passed: 3 },
-      { topic: "Pricing",                 avgScore: 90, attempts: 2, passed: 2 },
-      { topic: "Negotiation",             avgScore: 88, attempts: 3, passed: 3 },
-      { topic: "Competitive Positioning", avgScore: 82, attempts: 3, passed: 2 },
-    ],
-    quizHistory: [
-      { id: "p1h1", quiz_id: "qa2", score: 100, passed: true,  attempt_num: 1, created_at: _dateStr(-3)  },
-      { id: "p1h2", quiz_id: "qa5", score: 100, passed: true,  attempt_num: 1, created_at: _dateStr(-9)  },
-      { id: "p1h3", quiz_id: "qa4", score:  93, passed: true,  attempt_num: 1, created_at: _dateStr(-15) },
-      { id: "p1h4", quiz_id: "qa1", score: 100, passed: true,  attempt_num: 1, created_at: _dateStr(-22) },
-    ],
-    assignments: [
-      { id: "p1a1", title: "Enterprise Deal Strategy",          content_type: "course", due_at: _dateStr(10), required: true,  status: "Complete"    },
-      { id: "p1a2", title: "MEDDIC Qualification Framework",    content_type: "quiz",   due_at: _dateStr(5),  required: true,  status: "Passed"      },
-      { id: "p1a3", title: "Objection Handling Mastery",        content_type: "course", due_at: _dateStr(14), required: false, status: "Complete"    },
-      { id: "p1a4", title: "Executive Outreach Messaging",      content_type: "lesson", due_at: null,         required: false, status: "Complete"    },
-    ],
-  },
-
-  // Dev Patel — 95, top, Mid-Market AE
-  p2: {
-    topicScores: [
-      { topic: "Product Knowledge",       avgScore: 97, attempts: 4, passed: 4 },
-      { topic: "Discovery",               avgScore: 92, attempts: 4, passed: 4 },
-      { topic: "Objection Handling",      avgScore: 88, attempts: 3, passed: 3 },
-      { topic: "Pricing",                 avgScore: 85, attempts: 2, passed: 2 },
-      { topic: "Negotiation",             avgScore: 80, attempts: 2, passed: 2 },
-      { topic: "Competitive Positioning", avgScore: 78, attempts: 3, passed: 2 },
-    ],
-    quizHistory: [
-      { id: "p2h1", quiz_id: "qa5", score: 100, passed: true,  attempt_num: 1, created_at: _dateStr(-2)  },
-      { id: "p2h2", quiz_id: "qa1", score:  93, passed: true,  attempt_num: 1, created_at: _dateStr(-7)  },
-      { id: "p2h3", quiz_id: "qa4", score:  93, passed: true,  attempt_num: 1, created_at: _dateStr(-16) },
-      { id: "p2h4", quiz_id: "qa3", score: 100, passed: true,  attempt_num: 1, created_at: _dateStr(-28) },
-    ],
-    assignments: [
-      { id: "p2a1", title: "SDR Core Fundamentals",             content_type: "course", due_at: _dateStr(7),  required: true,  status: "Complete"    },
-      { id: "p2a2", title: "Enterprise Deal Strategy",          content_type: "course", due_at: _dateStr(12), required: true,  status: "Complete"    },
-      { id: "p2a3", title: "Discovery Call Framework",          content_type: "quiz",   due_at: _dateStr(3),  required: true,  status: "Passed"      },
-      { id: "p2a4", title: "Competitive Positioning vs. Salesforce", content_type: "lesson", due_at: null,    required: false, status: "Complete"    },
-    ],
-  },
-
-  // Jordan Rivera — 91, improved, Senior AE
-  p3: {
-    topicScores: [
-      { topic: "Product Knowledge",       avgScore: 93, attempts: 3, passed: 3 },
-      { topic: "Discovery",               avgScore: 90, attempts: 3, passed: 3 },
-      { topic: "Objection Handling",      avgScore: 85, attempts: 2, passed: 2 },
-      { topic: "Pricing",                 avgScore: 82, attempts: 2, passed: 2 },
-      { topic: "Negotiation",             avgScore: 76, attempts: 2, passed: 1 },
-      { topic: "Competitive Positioning", avgScore: 74, attempts: 3, passed: 2 },
-    ],
-    quizHistory: [
-      { id: "p3h1", quiz_id: "qa4", score:  93, passed: true,  attempt_num: 1, created_at: _dateStr(-5)  },
-      { id: "p3h2", quiz_id: "qa5", score: 100, passed: true,  attempt_num: 1, created_at: _dateStr(-12) },
-      { id: "p3h3", quiz_id: "qa1", score:  80, passed: false, attempt_num: 1, created_at: _dateStr(-20) },
-    ],
-    assignments: [
-      { id: "p3a1", title: "Objection Handling Mastery",                 content_type: "course", due_at: _dateStr(4),  required: true,  status: "Complete"    },
-      { id: "p3a2", title: "Competitor Positioning: Salesforce vs. ralli", content_type: "quiz", due_at: _dateStr(6), required: true,  status: "Passed"      },
-      { id: "p3a3", title: "Multi-Threading Your Deals",                  content_type: "lesson", due_at: _dateStr(3), required: false, status: "In Progress" },
-      { id: "p3a4", title: "Objection Handling: Price & Value",           content_type: "quiz",   due_at: _dateStr(8), required: false, status: "Pending"     },
-    ],
-  },
-
-  // Sara Kim — 88, top, SDR Team Lead
-  p4: {
-    topicScores: [
-      { topic: "Product Knowledge",       avgScore: 92, attempts: 3, passed: 3 },
-      { topic: "Discovery",               avgScore: 89, attempts: 3, passed: 3 },
-      { topic: "Objection Handling",      avgScore: 82, attempts: 2, passed: 2 },
-      { topic: "Pricing",                 avgScore: 78, attempts: 2, passed: 2 },
-      { topic: "Negotiation",             avgScore: 72, attempts: 2, passed: 1 },
-      { topic: "Competitive Positioning", avgScore: 71, attempts: 2, passed: 1 },
-    ],
-    quizHistory: [
-      { id: "p4h1", quiz_id: "qa3", score: 100, passed: true,  attempt_num: 1, created_at: _dateStr(-4)  },
-      { id: "p4h2", quiz_id: "qa5", score:  93, passed: true,  attempt_num: 1, created_at: _dateStr(-11) },
-      { id: "p4h3", quiz_id: "qa1", score:  80, passed: false, attempt_num: 1, created_at: _dateStr(-18) },
-      { id: "p4h4", quiz_id: "qa1", score:  93, passed: true,  attempt_num: 2, created_at: _dateStr(-13) },
-    ],
-    assignments: [
-      { id: "p4a1", title: "SDR Core Fundamentals",       content_type: "course", due_at: _dateStr(5),  required: true,  status: "Complete"    },
-      { id: "p4a2", title: "Cold Call Opening Framework", content_type: "lesson", due_at: _dateStr(2),  required: true,  status: "Complete"    },
-      { id: "p4a3", title: "Prospecting Fundamentals",    content_type: "quiz",   due_at: _dateStr(6),  required: true,  status: "Passed"      },
-      { id: "p4a4", title: "Enterprise Deal Strategy",    content_type: "course", due_at: _dateStr(14), required: false, status: "In Progress" },
-    ],
-  },
-
-  // Tom Walsh — 84 (from 76, improving), SDR
-  p5: {
-    topicScores: [
-      { topic: "Product Knowledge",       avgScore: 89, attempts: 3, passed: 3 },
-      { topic: "Discovery",               avgScore: 86, attempts: 2, passed: 2 },
-      { topic: "Objection Handling",      avgScore: 80, attempts: 2, passed: 2 },
-      { topic: "Pricing",                 avgScore: 74, attempts: 2, passed: 1 },
-      { topic: "Competitive Positioning", avgScore: 65, attempts: 2, passed: 1 },
-      { topic: "Negotiation",             avgScore: 67, attempts: 2, passed: 1 },
-    ],
-    quizHistory: [
-      { id: "p5h1", quiz_id: "qa3", score:  75, passed: false, attempt_num: 1, created_at: _dateStr(-14) },
-      { id: "p5h2", quiz_id: "qa3", score:  93, passed: true,  attempt_num: 2, created_at: _dateStr(-8)  },
-      { id: "p5h3", quiz_id: "qa5", score:  93, passed: true,  attempt_num: 1, created_at: _dateStr(-3)  },
-    ],
-    assignments: [
-      { id: "p5a1", title: "SDR Core Fundamentals",                      content_type: "course", due_at: _dateStr(3),  required: true,  status: "In Progress" },
-      { id: "p5a2", title: "Cold Call Opening Framework",                 content_type: "lesson", due_at: _dateStr(-2), required: true,  status: "Complete"    },
-      { id: "p5a3", title: "Prospecting Fundamentals",                    content_type: "quiz",   due_at: _dateStr(5),  required: true,  status: "Passed"      },
-      { id: "p5a4", title: "Handling the 'Not Interested' Objection",     content_type: "lesson", due_at: _dateStr(7),  required: false, status: "Pending"     },
-    ],
-  },
-
-  // Nina Barnes — 78, BDR
-  p6: {
-    topicScores: [
-      { topic: "Product Knowledge",       avgScore: 87, attempts: 2, passed: 2 },
-      { topic: "Discovery",               avgScore: 84, attempts: 2, passed: 2 },
-      { topic: "Objection Handling",      avgScore: 75, attempts: 2, passed: 1 },
-      { topic: "Pricing",                 avgScore: 70, attempts: 2, passed: 1 },
-      { topic: "Negotiation",             avgScore: 62, attempts: 2, passed: 0 },
-      { topic: "Competitive Positioning", avgScore: 58, attempts: 2, passed: 0 },
-    ],
-    quizHistory: [
-      { id: "p6h1", quiz_id: "qa1", score:  80, passed: false, attempt_num: 1, created_at: _dateStr(-10) },
-      { id: "p6h2", quiz_id: "qa5", score:  93, passed: true,  attempt_num: 1, created_at: _dateStr(-17) },
-      { id: "p6h3", quiz_id: "qa3", score:  75, passed: false, attempt_num: 1, created_at: _dateStr(-24) },
-    ],
-    assignments: [
-      { id: "p6a1", title: "Cold Call Opening Framework",       content_type: "lesson", due_at: _dateStr(-3), required: true,  status: "Complete"    },
-      { id: "p6a2", title: "Price Objection Response Playbook", content_type: "lesson", due_at: _dateStr(2),  required: true,  status: "In Progress" },
-      { id: "p6a3", title: "Objection Handling: Price & Value", content_type: "quiz",   due_at: _dateStr(4),  required: true,  status: "Pending"     },
-      { id: "p6a4", title: "SDR Core Fundamentals",             content_type: "course", due_at: _dateStr(10), required: false, status: "Pending"     },
-    ],
-  },
-
-  // Carlos Reyes — 74 (from 78, trending down), coaching, SDR
-  p7: {
-    topicScores: [
-      { topic: "Product Knowledge",       avgScore: 85, attempts: 2, passed: 2 },
-      { topic: "Discovery",               avgScore: 79, attempts: 2, passed: 1 },
-      { topic: "Objection Handling",      avgScore: 70, attempts: 2, passed: 1 },
-      { topic: "Pricing",                 avgScore: 66, attempts: 2, passed: 0 },
-      { topic: "Negotiation",             avgScore: 58, attempts: 2, passed: 0 },
-      { topic: "Competitive Positioning", avgScore: 54, attempts: 2, passed: 0 },
-    ],
-    quizHistory: [
-      { id: "p7h1", quiz_id: "qa3", score:  50, passed: false, attempt_num: 1, created_at: _dateStr(-21) },
-      { id: "p7h2", quiz_id: "qa3", score:  75, passed: false, attempt_num: 2, created_at: _dateStr(-14) },
-      { id: "p7h3", quiz_id: "qa1", score:  60, passed: false, attempt_num: 1, created_at: _dateStr(-7)  },
-    ],
-    assignments: [
-      { id: "p7a1", title: "SDR Core Fundamentals",                     content_type: "course", due_at: _dateStr(-5), required: true,  status: "Pending" },
-      { id: "p7a2", title: "Cold Call Opening Framework",                content_type: "lesson", due_at: _dateStr(-5), required: true,  status: "Pending" },
-      { id: "p7a3", title: "Prospecting Fundamentals",                   content_type: "quiz",   due_at: _dateStr(3),  required: true,  status: "Pending" },
-      { id: "p7a4", title: "Handling the 'Not Interested' Objection",    content_type: "lesson", due_at: _dateStr(7),  required: false, status: "Pending" },
-    ],
-  },
-
-  // Alex Liu — 81 (from 84, slight dip), AE
-  p8: {
-    topicScores: [
-      { topic: "Product Knowledge",       avgScore: 90, attempts: 3, passed: 3 },
-      { topic: "Discovery",               avgScore: 88, attempts: 2, passed: 2 },
-      { topic: "Objection Handling",      avgScore: 78, attempts: 2, passed: 1 },
-      { topic: "Pricing",                 avgScore: 76, attempts: 2, passed: 1 },
-      { topic: "Negotiation",             avgScore: 70, attempts: 2, passed: 1 },
-      { topic: "Competitive Positioning", avgScore: 62, attempts: 2, passed: 0 },
-    ],
-    quizHistory: [
-      { id: "p8h1", quiz_id: "qa1", score:  80, passed: false, attempt_num: 1, created_at: _dateStr(-6)  },
-      { id: "p8h2", quiz_id: "qa5", score:  93, passed: true,  attempt_num: 1, created_at: _dateStr(-13) },
-      { id: "p8h3", quiz_id: "qa4", score:  67, passed: false, attempt_num: 1, created_at: _dateStr(-20) },
-    ],
-    assignments: [
-      { id: "p8a1", title: "Objection Handling Mastery",     content_type: "course", due_at: _dateStr(2),  required: true,  status: "Complete"    },
-      { id: "p8a2", title: "Multi-Threading Your Deals",     content_type: "lesson", due_at: _dateStr(5),  required: true,  status: "In Progress" },
-      { id: "p8a3", title: "MEDDIC Qualification Framework", content_type: "quiz",   due_at: _dateStr(7),  required: true,  status: "Pending"     },
-      { id: "p8a4", title: "Enterprise Deal Strategy",       content_type: "course", due_at: _dateStr(14), required: false, status: "Pending"     },
-    ],
-  },
-
-  // Elena Torres — 67 (from 71, declining), coaching, Enterprise AE
-  p9: {
-    topicScores: [
-      { topic: "Product Knowledge",       avgScore: 82, attempts: 2, passed: 2 },
-      { topic: "Discovery",               avgScore: 80, attempts: 2, passed: 1 },
-      { topic: "Objection Handling",      avgScore: 68, attempts: 2, passed: 0 },
-      { topic: "Pricing",                 avgScore: 63, attempts: 2, passed: 0 },
-      { topic: "Negotiation",             avgScore: 54, attempts: 2, passed: 0 },
-      { topic: "Competitive Positioning", avgScore: 49, attempts: 2, passed: 0 },
-    ],
-    quizHistory: [
-      { id: "p9h1", quiz_id: "qa2", score:  50, passed: false, attempt_num: 1, created_at: _dateStr(-18) },
-      { id: "p9h2", quiz_id: "qa2", score:  60, passed: false, attempt_num: 2, created_at: _dateStr(-10) },
-      { id: "p9h3", quiz_id: "qa4", score:  67, passed: false, attempt_num: 1, created_at: _dateStr(-4)  },
-    ],
-    assignments: [
-      { id: "p9a1", title: "Enterprise Deal Strategy",                   content_type: "course", due_at: _dateStr(-8), required: true,  status: "Pending" },
-      { id: "p9a2", title: "Executive Outreach Messaging",               content_type: "lesson", due_at: _dateStr(-3), required: true,  status: "Pending" },
-      { id: "p9a3", title: "MEDDIC Qualification Framework",             content_type: "quiz",   due_at: _dateStr(5),  required: true,  status: "Pending" },
-      { id: "p9a4", title: "Competitive Positioning vs. Salesforce",     content_type: "lesson", due_at: _dateStr(7),  required: false, status: "Pending" },
-    ],
-  },
-
-  // Brendan Walsh — 63 (from 69, most at-risk), coaching, Enterprise AE
-  p10: {
-    topicScores: [
-      { topic: "Product Knowledge",       avgScore: 78, attempts: 2, passed: 1 },
-      { topic: "Discovery",               avgScore: 76, attempts: 2, passed: 1 },
-      { topic: "Objection Handling",      avgScore: 62, attempts: 2, passed: 0 },
-      { topic: "Pricing",                 avgScore: 56, attempts: 2, passed: 0 },
-      { topic: "Competitive Positioning", avgScore: 47, attempts: 2, passed: 0 },
-      { topic: "Negotiation",             avgScore: 43, attempts: 2, passed: 0 },
-    ],
-    quizHistory: [
-      { id: "p10h1", quiz_id: "qa2", score:  40, passed: false, attempt_num: 1, created_at: _dateStr(-25) },
-      { id: "p10h2", quiz_id: "qa2", score:  50, passed: false, attempt_num: 2, created_at: _dateStr(-15) },
-      { id: "p10h3", quiz_id: "qa3", score:  50, passed: false, attempt_num: 1, created_at: _dateStr(-8)  },
-      { id: "p10h4", quiz_id: "qa4", score:  67, passed: false, attempt_num: 1, created_at: _dateStr(-3)  },
-    ],
-    assignments: [
-      { id: "p10a1", title: "Enterprise Deal Strategy",                  content_type: "course", due_at: _dateStr(-10), required: true,  status: "Pending" },
-      { id: "p10a2", title: "Competitive Positioning vs. Salesforce",    content_type: "lesson", due_at: _dateStr(-5),  required: true,  status: "Pending" },
-      { id: "p10a3", title: "MEDDIC Qualification Framework",            content_type: "quiz",   due_at: _dateStr(3),   required: true,  status: "Pending" },
-      { id: "p10a4", title: "Forecasting Accuracy Fundamentals",         content_type: "lesson", due_at: _dateStr(7),   required: false, status: "Pending" },
-    ],
-  },
-};
-
-// ── LeadershipDashboardScreen ─────────────────────────────────
-// ─────────────────────────────────────────────────────────────
-// RepDrillDownModal — per-rep readiness detail for managers
-// ─────────────────────────────────────────────────────────────
-// Manager-First Performance Summary — shared helpers used by RepDrillDownModal
-// only. Kept module-level (not inline in the component) so they're pure,
-// order-independent functions with no closure surprises.
-
-// Works for both real (engineStatus from assignmentEngine.js) and demo
-// (pre-labeled status strings) assignment shapes — see RepDrillDownModal's
-// enrichment loop for how engineStatus is set on the real path.
-function _repAssignmentDone(a) {
-  return a.engineStatus ? a.engineStatus === "completed" : (a.status === "Complete" || a.status === "Passed");
-}
-function _repAssignmentOverdue(a) {
-  if (a.engineStatus) return a.engineStatus === "overdue";
-  // Demo path has no engine call — approximate from due_at, same rule the
-  // engine itself uses (not resolved + due date in the past).
-  if (_repAssignmentDone(a) || !a.due_at || a.due_at === "Open") return false;
-  const d = new Date(a.due_at);
-  return !isNaN(d) && d < new Date();
-}
-
-// Most-recent-first is NOT guaranteed on either path (getRepTopicScores
-// sorts ascending; demo seed arrays happen to be hand-authored descending) —
-// always find max/min explicitly rather than trusting array position.
-function _strongestTopic(topicScores) {
-  return topicScores?.length ? [...topicScores].sort((a, b) => b.avgScore - a.avgScore)[0] : null;
-}
-function _weakestTopic(topicScores) {
-  return topicScores?.length ? [...topicScores].sort((a, b) => a.avgScore - b.avgScore)[0] : null;
-}
-
-function _relativeActivityLabel(iso) {
-  if (!iso) return null;
-  const d = new Date(iso);
-  if (isNaN(d)) return null;
-  const days = Math.floor((Date.now() - d.getTime()) / 86400000);
-  if (days <= 0) return "Today";
-  if (days === 1) return "Yesterday";
-  if (days < 14) return `${days} days ago`;
-  return d.toLocaleDateString();
-}
-
-function _contentTypeLabel(contentType) {
-  return contentType === "course" ? "Course" :
-         contentType === "lesson" ? "Lesson" :
-         contentType === "quiz"   ? "Quiz"   : contentType;
-}
-
-// Rep Drill-Down Final Polish — days a due date is past, floored at 0 (never
-// negative; callers only invoke this for items already known to be overdue).
-// Assignment Experience Priority 2 — now derived from the same
-// daysUntilDue() the shared engine's own "overdue" status and getDueStatus()
-// use, instead of this component's own raw-timestamp diff (which could
-// disagree with both by up to a day depending on timezone/time-of-day).
-function _daysOverdue(dueAt) {
-  const diff = daysUntilDue(dueAt);
-  return diff != null && diff < 0 ? -diff : null;
-}
-
-// Rep Drill-Down Final Polish — shared newest-first sort for every
-// collapsible history list below (Recent Quiz Activity, Assigned Learning,
-// Overdue Assignments detail). Non-mutating; missing/unparsable dates sort
-// last rather than throwing.
-function _sortDesc(list, getDateStr) {
-  return [...(list ?? [])].sort((a, b) => {
-    const db = new Date(getDateStr(b) ?? 0).getTime();
-    const da = new Date(getDateStr(a) ?? 0).getTime();
-    return (isNaN(db) ? 0 : db) - (isNaN(da) ? 0 : da);
-  });
 }
 
 // Rep Drill-Down Final Polish — one small reusable expand/collapse control,
@@ -24168,14 +23188,9 @@ export default function App() {
   // Reuses the ONE canonical manager loader; not a second assignment-state path.
   const [learnAssignRefreshKey, setLearnAssignRefreshKey] = useState(0);
 
-  // Battle card categories — demo: localStorage; real users: Supabase tenant_bc_categories
-  const [bcCategories, setBcCategories] = useState(() => {
-    if (/* real user check deferred to useEffect */ false) return [];
-    try {
-      const saved = localStorage.getItem("ralli_bc_categories");
-      return saved ? JSON.parse(saved) : INITIAL_BC_CATEGORIES;
-    } catch { return INITIAL_BC_CATEGORIES; }
-  });
+  // Battle cards use a TAGS-ONLY taxonomy — categories were removed from the product.
+  // (The legacy tenant_bc_categories table is kept for migration safety, but the
+  // frontend no longer reads or writes it.)
 
   // Battle cards — demo: localStorage; real users: Supabase tenant_battle_cards
   const [battleCards, setBattleCards] = useState(() => {
@@ -24233,31 +23248,28 @@ export default function App() {
   // Ralli Admin can toggle these per-tenant; they override the plan-based defaults.
   const [tenantFeatureAccess, setTenantFeatureAccess] = useState(null); // null = not yet loaded
 
-  // ── Load BC data from Supabase for real users ─────────────────────────────
+  // ── Load Battle Cards from Supabase for real users (tags-only; no categories) ──
   // Placed here so user + currentOrg are already declared above.
-  // Clear demo/localStorage data immediately so real users never see seed categories,
-  // even if the DB call fails — empty state is safer than misleading demo content.
+  // Clear demo/localStorage data immediately so real users never see seed content,
+  // even if the DB call fails — an honest error is safer than misleading demo cards.
   useEffect(() => {
     const tid = currentOrg?.id ?? user?.orgId ?? null;
     if (!user?._isReal || !tid) return;
     let cancelled = false;
-    setBcCategories([]);  // clear seed immediately; DB result fills in below
     setBattleCards([]);
     setBcError(null);
     setBcLoaded(false);   // gate rendering until this load resolves — no demo flash
     setBcLoading(true);
-    Promise.allSettled([getTenantBcCategories(tid), getTenantBattleCards(tid)])
-      .then(([catRes, cardRes]) => {
+    getTenantBattleCards(tid)
+      .then(({ data, error }) => {
         if (cancelled) return;
-        const catErr  = catRes.status  === "fulfilled" ? catRes.value.error  : catRes.reason;
-        const cardErr = cardRes.status === "fulfilled" ? cardRes.value.error : cardRes.reason;
         // A load FAILURE must never masquerade as an empty library — surface an
         // error (learner/admin screens render Retry) instead of silently showing "none".
-        if (catErr || cardErr) { setBcError(cardErr || catErr); return; }
-        setBcCategories(catRes.value.data ?? []);
-        setBattleCards(cardRes.value.data ?? []);
+        if (error) { setBcError(error); return; }
+        setBattleCards(data ?? []);
         setBcLoaded(true);
       })
+      .catch((e) => { if (!cancelled) setBcError(e); })
       .finally(() => { if (!cancelled) setBcLoading(false); });
     return () => { cancelled = true; };
   }, [user?._isReal, currentOrg?.id, user?.orgId, bcReloadKey]); // eslint-disable-line react-hooks/exhaustive-deps
@@ -24443,7 +23455,6 @@ export default function App() {
         setSessions(INITIAL_SESSIONS);           // prevent real sessions leaking to next demo user
         setPastSessions([]);                     // prevent real past sessions leaking to next demo user
         setBattleCards(INITIAL_BATTLE_CARDS);    // prevent real BC data leaking to next demo user
-        setBcCategories(INITIAL_BC_CATEGORIES);  // prevent real BC categories leaking to next demo user
         clearLearnNavSessionState();              // don't leak screen / Learn subtab / pending quiz review into the next login
         window.location.replace("/login");        // hard-navigate so URL matches the login screen
       }
@@ -24928,60 +23939,9 @@ export default function App() {
     }
   };
 
-  // ── Battle card category CRUD ──
-  const bcCatKey   = currentOrg?.id ? `ralli_bc_categories_${currentOrg.id}` : "ralli_bc_categories";
+  // ── Battle card CRUD (tags-only taxonomy; no categories) ──
   const bcCardsKey = currentOrg?.id ? `ralli_bc_cards_${currentOrg.id}`      : "ralli_battle_cards";
 
-  const handleSaveBcCategory = async (cat) => {
-    const tid = currentOrg?.id ?? user?.orgId ?? null;
-    if (user?._isReal && tid) {
-      const { data, error } = await dbSaveBcCategory(tid, cat);
-      if (error) { console.error("[ralli] saveBcCategory failed:", error); toast.error("Failed to save category. Please try again."); return null; }
-      // data may be null if RLS blocks SELECT after INSERT; treat as success and use local cat shape
-      const canonical = data ?? { ...cat, id: cat.id };
-      setBcCategories(prev => {
-        const byRealId = data ? prev.find(c => c.id === data.id) : null;
-        const byTempId = prev.find(c => c.id === cat.id);
-        if (byRealId) return prev.map(c => c.id === canonical.id ? canonical : c);
-        if (byTempId) return prev.map(c => c.id === cat.id ? canonical : c);
-        return [...prev, canonical];
-      });
-      toast.success("Category saved.");
-      return canonical;
-    }
-    // Demo fallback
-    const canonical = cat;
-    setBcCategories(prev => {
-      const next = prev.find(c => c.id === cat.id) ? prev.map(c => c.id === cat.id ? canonical : c) : [...prev, canonical];
-      try { localStorage.setItem(bcCatKey, JSON.stringify(next)); } catch {}
-      return next;
-    });
-    toast.success("Category saved.");
-    return canonical;
-  };
-  const handleDeleteBcCategory = async (id) => {
-    const tid = currentOrg?.id ?? user?.orgId ?? null;
-    if (user?._isReal && tid) {
-      const { error } = await dbDeleteBcCategory(tid, id);
-      if (error) { console.error("[ralli] deleteBcCategory failed:", error); toast.error("Failed to delete category. Please try again."); return; }
-    }
-    setBcCategories(prev => {
-      const next = prev.filter(c => c.id !== id);
-      if (!user?._isReal) { try { localStorage.setItem(bcCatKey, JSON.stringify(next)); } catch {} }
-      return next;
-    });
-    // Cards in the deleted category become honestly uncategorized (DB does this via
-    // ON DELETE SET NULL; mirror it locally so counts/filters refresh immediately
-    // without a round-trip). Cards themselves are never lost.
-    setBattleCards(prev => {
-      const next = prev.map(c => c.categoryId === id ? { ...c, categoryId: "" } : c);
-      if (!user?._isReal) { try { localStorage.setItem(bcCardsKey, JSON.stringify(next)); } catch {} }
-      return next;
-    });
-    toast.success("Category deleted.");
-  };
-
-  // ── Battle card CRUD ──
   const handleSaveBattleCard = async (card) => {
     const tid = currentOrg?.id ?? user?.orgId ?? null;
     if (user?._isReal && tid) {
@@ -25696,8 +24656,8 @@ export default function App() {
         ) : null} />;
       case "quizzes":           return <QuizzesScreen role={gameRole} onNav={navigate} quizzes={quizzes} onEditQuiz={handleEditQuiz} onDeleteQuiz={handleDeleteQuiz} onArchiveQuiz={handleArchiveQuiz} onRestoreQuiz={handleRestoreQuiz} onToggleFavorite={handleToggleFavorite} onToggleActive={handleToggleActive} pendingQuizId={pendingQuizId} onClearPendingQuiz={() => setPendingQuizId(null)} canCreate={perm("actions","create")} canEdit={perm("actions","edit")} canDelete={perm("actions","delete")} canLaunch={perm("actions","launch")} canAssign={perm("actions","assign")} onAssignQuiz={handleAssignQuiz} onLaunchQuiz={handleCreateSession} orgUsers={orgUsers} orgs={orgs} currentUser={currentUser} tenantId={currentOrg?.id ?? null} isReal={!!user?._isReal} quizzesReady={quizzesReady} sharedAssignmentData={sharedAssignmentData} onRefreshQuizzes={refreshQuizzes} pendingQuizReview={pendingQuizReview} onExitQuiz={() => { setPendingQuizId(null); setPendingQuizReview(null); navigate("learn"); }} />;
       case "battlecards":       return (isAdminType && perm("actions","edit"))
-        ? <BattleCardsAdminScreen categories={bcCategories} cards={battleCards} onSaveCategory={handleSaveBcCategory} onDeleteCategory={handleDeleteBcCategory} onSaveCard={handleSaveBattleCard} onSetArchived={handleSetBattleCardArchived} isReal={!!user?._isReal} isLoading={bcLoading || (!!user?._isReal && !bcLoaded && !bcError)} loadError={bcError} onRetry={() => setBcReloadKey(k => k + 1)} />
-        : <BattleCardsScreen categories={bcCategories} cards={battleCards} isLoading={bcLoading || (!!user?._isReal && !bcLoaded && !bcError)} loadError={bcError} onRetry={() => setBcReloadKey(k => k + 1)} isReal={!!user?._isReal} />;
+        ? <BattleCardsAdminScreen cards={battleCards} onSaveCard={handleSaveBattleCard} onSetArchived={handleSetBattleCardArchived} isReal={!!user?._isReal} isLoading={bcLoading || (!!user?._isReal && !bcLoaded && !bcError)} loadError={bcError} onRetry={() => setBcReloadKey(k => k + 1)} />
+        : <BattleCardsScreen cards={battleCards} isLoading={bcLoading || (!!user?._isReal && !bcLoaded && !bcError)} loadError={bcError} onRetry={() => setBcReloadKey(k => k + 1)} isReal={!!user?._isReal} />;
       case "insights":           return <InsightsScreen user={user} isReal={!!user?._isReal} tenantId={currentOrg?.id ?? null} orgUsers={orgUsers} isAdmin={isAdminType} readinessThreshold={readinessThreshold} />;
       case "progress":          return isAdminType
         ? <LeadershipDashboardScreen currentOrg={currentOrg} orgUsers={orgUsers} isReal={!!user?._isReal} readinessThreshold={readinessThreshold} />
@@ -25710,7 +24670,7 @@ export default function App() {
       case "settings":
         if (isSuperAdmin)  return <RoleAccessScreen rolePermissions={rolePermissions} onSave={handleSaveRolePermissions} currentOrg={currentOrg} />;
         if (isOrgAdmin)    return <OrgAdminSettingsScreen rolePermissions={rolePermissions} onSaveRolePermissions={handleSaveRolePermissions} currentOrg={currentOrg} orgId={user.orgId} orgName={currentOrg?.name ?? "Your Team"} orgUsers={orgUsers} onAddUser={handleAddUser} readinessThreshold={readinessThreshold} onSaveReadinessThreshold={handleSaveReadinessThreshold} />;
-        return <UserSettingsScreen user={user} profile={userProfile} notifPrefs={notifPrefs} onSaveProfile={handleSaveProfile} onSaveNotifs={handleSaveNotifs} currentOrg={currentOrg} onSignOut={async () => { if (user?._isReal) { await supabase.auth.signOut(); /* SIGNED_OUT handler redirects */ } else { setCurrentUser(null); setLastSeenAt(null); setNewAssignmentCount(0); setPendingLessonId(null); setPendingCourseId(null); setPendingQuizId(null); setOrgs(INITIAL_ORGS); setOrgUsers(INITIAL_ORG_USERS); setQuizzesReady(false); setSessions(INITIAL_SESSIONS); setBattleCards(INITIAL_BATTLE_CARDS); setBcCategories(INITIAL_BC_CATEGORIES); clearLearnNavSessionState(); window.location.replace("/login"); } }} />;
+        return <UserSettingsScreen user={user} profile={userProfile} notifPrefs={notifPrefs} onSaveProfile={handleSaveProfile} onSaveNotifs={handleSaveNotifs} currentOrg={currentOrg} onSignOut={async () => { if (user?._isReal) { await supabase.auth.signOut(); /* SIGNED_OUT handler redirects */ } else { setCurrentUser(null); setLastSeenAt(null); setNewAssignmentCount(0); setPendingLessonId(null); setPendingCourseId(null); setPendingQuizId(null); setOrgs(INITIAL_ORGS); setOrgUsers(INITIAL_ORG_USERS); setQuizzesReady(false); setSessions(INITIAL_SESSIONS); setBattleCards(INITIAL_BATTLE_CARDS); clearLearnNavSessionState(); window.location.replace("/login"); } }} />;
       default:                  return <HomeScreen user={user} />;
     }
   };
@@ -25855,7 +24815,7 @@ export default function App() {
                     setQuizzesReady(false);
                     setSessions(INITIAL_SESSIONS);
                     setBattleCards(INITIAL_BATTLE_CARDS);
-                    setBcCategories(INITIAL_BC_CATEGORIES);
+                   
                     clearLearnNavSessionState();
                     window.location.replace("/login");
                   }

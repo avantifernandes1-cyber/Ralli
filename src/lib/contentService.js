@@ -1385,33 +1385,14 @@ export async function getAttemptSolutions(attemptIds) {
 
 // ─────────────────────────────────────────────────────────────────────────────
 // BATTLE CARDS
-// Replaces localStorage-only storage. All tenant members can read; only
-// managers/admins can write. Shape mirrors the in-app BC object:
-//   Category: { id, label, description }
-//   Card:     { id, categoryId, title, subtitle, summary, strength, weakness,
-//               ourWin, talkTrack, tags, content: [{heading,body}] }
+// Tags-only taxonomy (categories removed from the product). All tenant members
+// can read active cards; only managers/admins can write. Shape mirrors the in-app
+// BC object:
+//   Card: { id, title, subtitle, summary, strength, weakness, ourWin, talkTrack,
+//           tags, status, content: [{heading,body}] }
+// The legacy tenant_bc_categories table is kept for migration safety but is no
+// longer read or written by the app (category label conversion → migration 069).
 // ─────────────────────────────────────────────────────────────────────────────
-
-/** Normalise a DB category row → app shape */
-function dbToCategory(row) {
-  return {
-    id:          row.id,
-    label:       row.label,
-    description: row.description ?? "",
-  };
-}
-
-/** Normalise app category → DB insert/update shape.
- *  created_by / updated_by / updated_at are server-authoritative (set by the
- *  BEFORE INSERT/UPDATE trigger in migration 068) — never sent from the client,
- *  so an edit can never overwrite the original creator or trust the browser clock. */
-function categoryToDb(tenantId, cat) {
-  return {
-    tenant_id:   tenantId,
-    label:       cat.label,
-    description: cat.description ?? "",
-  };
-}
 
 /** Canonical Battle Card tag normalisation: trim each tag, drop blanks, and
  *  de-duplicate case-insensitively while preserving the first-seen casing/order.
@@ -1434,7 +1415,6 @@ function normalizeCardTags(tags) {
 function dbToCard(row) {
   return {
     id:          row.id,
-    categoryId:  row.category_id ?? "",
     title:       row.title,
     subtitle:    row.subtitle ?? "",
     summary:     row.summary ?? "",
@@ -1458,7 +1438,6 @@ function dbToCard(row) {
 function cardToDb(tenantId, card) {
   return {
     tenant_id:   tenantId,
-    category_id: card.categoryId || null,
     title:       card.title,
     subtitle:    card.subtitle ?? "",
     summary:     card.summary ?? "",
@@ -1472,21 +1451,6 @@ function cardToDb(tenantId, card) {
 }
 
 /**
- * Fetch all battle card categories for a tenant.
- * @param {string} tenantId
- * @returns {Promise<{ data: Array|null, error: Object|null }>}
- */
-export async function getTenantBcCategories(tenantId) {
-  if (!tenantId) return { data: [], error: null };
-  const { data, error } = await supabase
-    .from("tenant_bc_categories")
-    .select("id, label, description")
-    .eq("tenant_id", tenantId)
-    .order("created_at", { ascending: true });
-  return { data: data ? data.map(dbToCategory) : null, error };
-}
-
-/**
  * Fetch all battle cards for a tenant.
  * @param {string} tenantId
  * @returns {Promise<{ data: Array|null, error: Object|null }>}
@@ -1495,71 +1459,10 @@ export async function getTenantBattleCards(tenantId) {
   if (!tenantId) return { data: [], error: null };
   const { data, error } = await supabase
     .from("tenant_battle_cards")
-    .select("id, category_id, title, subtitle, summary, strength, weakness, our_win, talk_track, tags, content, status, archived_at, updated_at")
+    .select("id, title, subtitle, summary, strength, weakness, our_win, talk_track, tags, content, status, archived_at, updated_at")
     .eq("tenant_id", tenantId)
     .order("title", { ascending: true });
   return { data: data ? data.map(dbToCard) : null, error };
-}
-
-/**
- * Create or update a battle card category.
- * If cat.id is a UUID (from DB), updates. Otherwise inserts (new category).
- *
- * @param {string} tenantId
- * @param {{ id?: string, label: string, description?: string }} cat
- * @param {string} [userId]
- * @returns {Promise<{ data: Object|null, error: Object|null }>}
- */
-export async function saveBcCategory(tenantId, cat) {
-  const isExisting = cat.id && !cat.id.startsWith("cat_") && cat.id.length === 36;
-  const payload = categoryToDb(tenantId, cat);
-
-  if (isExisting) {
-    const { data, error } = await supabase
-      .from("tenant_bc_categories")
-      .update(payload)
-      .eq("id", cat.id)
-      .eq("tenant_id", tenantId)
-      .select("id, label, description")
-      .single();
-    return { data: data ? dbToCategory(data) : null, error };
-  } else {
-    const { data, error } = await supabase
-      .from("tenant_bc_categories")
-      .insert(payload)
-      .select("id, label, description")
-      .single();
-    if (error) return { data: null, error };
-    if (data) return { data: dbToCategory(data), error: null };
-    // Supabase can return null data when RLS blocks the post-insert SELECT.
-    // Fall back to a separate SELECT to retrieve the newly-created row.
-    const { data: fetched } = await supabase
-      .from("tenant_bc_categories")
-      .select("id, label, description")
-      .eq("tenant_id", tenantId)
-      .eq("label", cat.label)
-      .order("created_at", { ascending: false })
-      .limit(1)
-      .maybeSingle();
-    return { data: fetched ? dbToCategory(fetched) : null, error: null };
-  }
-}
-
-/**
- * Delete a battle card category by ID.
- * Cards in this category will have category_id set to NULL (ON DELETE SET NULL).
- *
- * @param {string} tenantId
- * @param {string} catId
- * @returns {Promise<{ error: Object|null }>}
- */
-export async function deleteBcCategory(tenantId, catId) {
-  const { error } = await supabase
-    .from("tenant_bc_categories")
-    .delete()
-    .eq("id", catId)
-    .eq("tenant_id", tenantId);
-  return { error };
 }
 
 /**
@@ -1575,7 +1478,7 @@ export async function saveBattleCard(tenantId, card) {
   const isExisting = card.id && !card.id.startsWith("bc_") && card.id.length === 36;
   const payload = cardToDb(tenantId, card);
 
-  const selectCols = "id, category_id, title, subtitle, summary, strength, weakness, our_win, talk_track, tags, content, status, archived_at, updated_at";
+  const selectCols = "id, title, subtitle, summary, strength, weakness, our_win, talk_track, tags, content, status, archived_at, updated_at";
 
   if (isExisting) {
     const { data, error } = await supabase
@@ -1610,7 +1513,7 @@ export async function saveBattleCard(tenantId, card) {
  * @returns {Promise<{ data: Object|null, error: Object|null }>}
  */
 export async function setBattleCardArchived(tenantId, cardId, archived) {
-  const selectCols = "id, category_id, title, subtitle, summary, strength, weakness, our_win, talk_track, tags, content, status, archived_at, updated_at";
+  const selectCols = "id, title, subtitle, summary, strength, weakness, our_win, talk_track, tags, content, status, archived_at, updated_at";
   const { data, error } = await supabase
     .from("tenant_battle_cards")
     .update({ status: archived ? "archived" : "active" })
