@@ -16197,6 +16197,549 @@ function BattleCardsScreen({ cards = INITIAL_BATTLE_CARDS, isLoading = false, lo
     </div>
   );
 }
+// ── LEADERSHIP DASHBOARD ─────────────────────────────────────
+//
+// SALES READINESS SCORE MODEL
+// ─────────────────────────────────────────────────────────────
+// Score is a weighted composite across platform activities.
+// Production hook: replace mock data with /api/orgs/:id/readiness or
+// computed columns in the analytics DB. Each contributor can be weighted
+// independently and new sources can be added without restructuring the model.
+//
+// Score contributors (0-100 each):
+//   lessons       — % of assigned lessons completed
+//   quizzes       — average quiz pass rate
+//   games         — average game score percentile
+//   battlecards   — % of battle cards reviewed
+//   certifications— % of active certs current
+//   coaching      — % of coaching sessions attended
+//   assignments   — % of assignments completed on time
+//   aiScore       — AI-inferred readiness from engagement patterns (future)
+//
+const READINESS_SCORE_WEIGHTS = {
+  lessons:        0.20,
+  quizzes:        0.25,
+  games:          0.15,
+  battlecards:    0.10,
+  certifications: 0.10,
+  coaching:       0.10,
+  assignments:    0.10,
+  aiScore:        0.00, // reserved for future AI contribution
+};
+
+// computeReadinessScore(contributions) → number 0-100
+// contributions: { lessons, quizzes, games, ... } each 0-100
+// Returns null if no data. Extensible: unknown keys are ignored.
+function computeReadinessScore(contributions = {}) {
+  let totalWeight = 0;
+  let weightedSum = 0;
+  for (const [key, weight] of Object.entries(READINESS_SCORE_WEIGHTS)) {
+    if (contributions[key] != null && weight > 0) {
+      weightedSum += contributions[key] * weight;
+      totalWeight  += weight;
+    }
+  }
+  if (totalWeight === 0) return null;
+  return Math.round(weightedSum / totalWeight);
+}
+
+// ── LEADERSHIP SEED DATA ──────────────────────────────────────
+// Production hook: replace with /api/orgs/:id/readiness-dashboard
+// All shapes here match the final API response model so the component
+// can be wired to real data with minimal changes.
+
+const LEADERSHIP_SEED = {
+  // Company-level readiness
+  company: {
+    readinessScore:   87,
+    previousScore:    82,
+    targetScore:      90,
+    period:           "Jun 2026",
+    contributions: {
+      lessons: 88, quizzes: 91, games: 84,
+      battlecards: 79, certifications: 82, coaching: 86, assignments: 90,
+    },
+  },
+
+  // Teams (supports any team structure — team.id is org-defined)
+  teams: [
+    {
+      id: "smb",  name: "SMB Outbound",    headcount: 6,
+      readinessScore: 94, previousScore: 90,
+      contributions: { lessons: 96, quizzes: 95, games: 92, battlecards: 91, certifications: 94, coaching: 93, assignments: 96 },
+    },
+    {
+      id: "mid",  name: "Mid-Market",      headcount: 5,
+      readinessScore: 89, previousScore: 85,
+      contributions: { lessons: 90, quizzes: 92, games: 87, battlecards: 85, certifications: 88, coaching: 90, assignments: 91 },
+    },
+    {
+      id: "ent",  name: "Enterprise AE",   headcount: 4,
+      readinessScore: 72, previousScore: 74,
+      contributions: { lessons: 70, quizzes: 74, games: 68, battlecards: 62, certifications: 71, coaching: 75, assignments: 73 },
+    },
+    {
+      id: "bdr",  name: "BDR / SDR",       headcount: 8,
+      readinessScore: 81, previousScore: 78,
+      contributions: { lessons: 82, quizzes: 83, games: 79, battlecards: 76, certifications: 80, coaching: 82, assignments: 84 },
+    },
+  ],
+
+  // Knowledge heatmap — topics × reps (repScores keyed to people[].id)
+  heatmap: [
+    {
+      topic: "Product Knowledge", score: 91, prev: 86, trend: "up", repsBelow: 0, repsTotal: 10,
+      repScores: [
+        { userId: "p1", score: 98 }, { userId: "p2", score: 97 }, { userId: "p3", score: 93 },
+        { userId: "p4", score: 92 }, { userId: "p5", score: 89 }, { userId: "p6", score: 87 },
+        { userId: "p7", score: 85 }, { userId: "p8", score: 90 }, { userId: "p9", score: 82 },
+        { userId: "p10", score: 78 },
+      ],
+    },
+    {
+      topic: "Discovery", score: 88, prev: 82, trend: "up", repsBelow: 0, repsTotal: 10,
+      repScores: [
+        { userId: "p1", score: 96 }, { userId: "p2", score: 92 }, { userId: "p3", score: 90 },
+        { userId: "p4", score: 89 }, { userId: "p5", score: 86 }, { userId: "p6", score: 84 },
+        { userId: "p7", score: 79 }, { userId: "p8", score: 88 }, { userId: "p9", score: 80 },
+        { userId: "p10", score: 76 },
+      ],
+    },
+    {
+      topic: "Objection Handling", score: 80, prev: 78, trend: "up", repsBelow: 1, repsTotal: 10,
+      repScores: [
+        { userId: "p1", score: 92 }, { userId: "p2", score: 88 }, { userId: "p3", score: 85 },
+        { userId: "p4", score: 82 }, { userId: "p5", score: 80 }, { userId: "p6", score: 75 },
+        { userId: "p7", score: 70 }, { userId: "p8", score: 78 }, { userId: "p9", score: 68 },
+        { userId: "p10", score: 62 },
+      ],
+    },
+    {
+      topic: "Competitive Positioning", score: 64, prev: 70, trend: "down", repsBelow: 4, repsTotal: 10,
+      repScores: [
+        { userId: "p1", score: 82 }, { userId: "p2", score: 78 }, { userId: "p3", score: 74 },
+        { userId: "p4", score: 71 }, { userId: "p5", score: 65 }, { userId: "p6", score: 58 },
+        { userId: "p7", score: 54 }, { userId: "p8", score: 62 }, { userId: "p9", score: 49 },
+        { userId: "p10", score: 47 },
+      ],
+    },
+    {
+      topic: "Pricing", score: 76, prev: 73, trend: "up", repsBelow: 2, repsTotal: 10,
+      repScores: [
+        { userId: "p1", score: 90 }, { userId: "p2", score: 85 }, { userId: "p3", score: 82 },
+        { userId: "p4", score: 78 }, { userId: "p5", score: 74 }, { userId: "p6", score: 70 },
+        { userId: "p7", score: 66 }, { userId: "p8", score: 76 }, { userId: "p9", score: 63 },
+        { userId: "p10", score: 56 },
+      ],
+    },
+    {
+      topic: "Negotiation", score: 69, prev: 68, trend: "flat", repsBelow: 3, repsTotal: 10,
+      repScores: [
+        { userId: "p1", score: 88 }, { userId: "p2", score: 80 }, { userId: "p3", score: 76 },
+        { userId: "p4", score: 72 }, { userId: "p5", score: 67 }, { userId: "p6", score: 62 },
+        { userId: "p7", score: 58 }, { userId: "p8", score: 70 }, { userId: "p9", score: 54 },
+        { userId: "p10", score: 43 },
+      ],
+    },
+  ],
+
+  // Trends — each period has a score for company and each team
+  // Production hook: query readiness_snapshots table for range
+  trends: {
+    weekly: [
+      { label: "W21", company: 79, smb: 88, mid: 83, ent: 68, bdr: 75 },
+      { label: "W22", company: 81, smb: 90, mid: 84, ent: 69, bdr: 76 },
+      { label: "W23", company: 83, smb: 91, mid: 86, ent: 70, bdr: 78 },
+      { label: "W24", company: 85, smb: 92, mid: 87, ent: 71, bdr: 79 },
+      { label: "W25", company: 87, smb: 94, mid: 89, ent: 72, bdr: 81 },
+    ],
+    monthly: [
+      { label: "Feb",  company: 74, smb: 82, mid: 78, ent: 63, bdr: 70 },
+      { label: "Mar",  company: 77, smb: 85, mid: 80, ent: 65, bdr: 72 },
+      { label: "Apr",  company: 80, smb: 88, mid: 84, ent: 68, bdr: 76 },
+      { label: "May",  company: 82, smb: 90, mid: 86, ent: 70, bdr: 78 },
+      { label: "Jun",  company: 87, smb: 94, mid: 89, ent: 72, bdr: 81 },
+    ],
+    quarterly: [
+      { label: "Q2 '25", company: 68, smb: 76, mid: 72, ent: 57, bdr: 64 },
+      { label: "Q3 '25", company: 73, smb: 81, mid: 76, ent: 61, bdr: 69 },
+      { label: "Q4 '25", company: 78, smb: 86, mid: 82, ent: 66, bdr: 74 },
+      { label: "Q1 '26", company: 83, smb: 90, mid: 86, ent: 70, bdr: 78 },
+      { label: "Q2 '26", company: 87, smb: 94, mid: 89, ent: 72, bdr: 81 },
+    ],
+  },
+
+  // AI-generated summary — production: replace with LLM call against aggregated data
+  aiSummary: {
+    generatedAt:  "Jun 28, 2026",
+    improvements: [
+      "Product Knowledge improved 5 pts — strongest driver of company-wide gain.",
+      "Discovery scores up 6 pts. Reps are applying the discovery framework from the June session.",
+      "SMB Outbound team hit 94% readiness — highest score in 6 months.",
+    ],
+    declines: [
+      "Competitive Positioning dropped 6 pts. Likely gap: recent competitor updates not yet covered.",
+      "Enterprise AE team slipped 2 pts — Negotiation and Pricing scores below target.",
+    ],
+    attention: [
+      "3 Enterprise AEs below 70% readiness — suggest prioritized coaching.",
+      "2 reps have overdue certifications expiring within 14 days.",
+    ],
+    recommendations: [
+      "Assign updated Competitive Positioning course to all AEs.",
+      "Schedule a Negotiation refresher for Enterprise AE team.",
+      "Run a ralli game session focused on pricing objections this week.",
+    ],
+  },
+
+  // People insights
+  people: [
+    { id: "p1",  name: "Mia Chen",       initials: "MC", title: "Enterprise AE",     team: "ent", color: "#8B5CF6", score: 98, prev: 93, certsCurrent: true,  coachingAttendance: 100, tag: "promotion",  daysStreak: 21 },
+    { id: "p2",  name: "Dev Patel",       initials: "DP", title: "Mid-Market AE",     team: "mid", color: "#3B82F6", score: 95, prev: 88, certsCurrent: true,  coachingAttendance: 90,  tag: "top",        daysStreak: 18 },
+    { id: "p3",  name: "Jordan Rivera",   initials: "JR", title: "Senior AE",         team: "smb", color: C.orange,  score: 91, prev: 84, certsCurrent: true,  coachingAttendance: 85,  tag: "improved",   daysStreak: 7  },
+    { id: "p4",  name: "Sara Kim",        initials: "SK", title: "SDR Team Lead",     team: "bdr", color: "#22C55E", score: 88, prev: 86, certsCurrent: true,  coachingAttendance: 95,  tag: "top",        daysStreak: 10 },
+    { id: "p5",  name: "Tom Walsh",       initials: "TW", title: "SDR",               team: "bdr", color: "#64748B", score: 84, prev: 76, certsCurrent: false, coachingAttendance: 80,  tag: "improved",   daysStreak: 5  },
+    { id: "p6",  name: "Nina Barnes",     initials: "NB", title: "BDR",               team: "bdr", color: "#EC4899", score: 78, prev: 75, certsCurrent: false, coachingAttendance: 70,  tag: null,         daysStreak: 8  },
+    { id: "p7",  name: "Carlos Reyes",    initials: "CR", title: "SDR",               team: "bdr", color: "#14B8A6", score: 74, prev: 78, certsCurrent: false, coachingAttendance: 60,  tag: "coaching",   daysStreak: 2  },
+    { id: "p8",  name: "Alex Liu",        initials: "AL", title: "AE",                team: "ent", color: "#F59E0B", score: 81, prev: 84, certsCurrent: true,  coachingAttendance: 65,  tag: null,         daysStreak: 3  },
+    { id: "p9",  name: "Elena Torres",    initials: "ET", title: "Enterprise AE",     team: "ent", color: "#6366F1", score: 67, prev: 71, certsCurrent: false, coachingAttendance: 50,  tag: "coaching",   daysStreak: 1  },
+    { id: "p10", name: "Brendan Walsh",   initials: "BW", title: "Enterprise AE",     team: "ent", color: "#F87171", score: 63, prev: 69, certsCurrent: false, coachingAttendance: 45,  tag: "coaching",   daysStreak: 0  },
+  ],
+
+  // Company risk
+  risk: {
+    activeAssignments:     34, // Beta Cleanup — demo parity for the new Active Assignments org-metric card
+    overdueAssignments:    7,
+    overdueAssignmentReps: ["Carlos Reyes", "Elena Torres", "Brendan Walsh", "Alex Liu", "Tom Walsh", "Nina Barnes", "Dev Patel"],
+    overdueCertifications: 4,
+    certExpiringSoon:      ["Elena Torres", "Carlos Reyes", "Nina Barnes", "Brendan Walsh"],
+    lowReadinessReps:      [{ name: "Brendan Walsh", score: 63 }, { name: "Elena Torres", score: 67 }, { name: "Carlos Reyes", score: 74 }],
+    teamsBelowTarget:      [{ name: "Enterprise AE", score: 72, target: 85 }],
+    coachingGaps:          [{ name: "Brendan Walsh", attendance: 45 }, { name: "Elena Torres", attendance: 50 }, { name: "Carlos Reyes", attendance: 60 }],
+  },
+};
+
+// ── Demo seed data for RepDrillDownModal ──────────────────────
+// Used only when isReal = false. Keyed by LEADERSHIP_SEED people[].id.
+// Topic scores mirror LEADERSHIP_SEED.heatmap.repScores exactly.
+// Content titles match INITIAL_LEARN_COURSES, INITIAL_LEARN_LESSONS, USER_QUIZ_ASSIGNMENTS_SEED.
+const DEMO_QUIZ_NAMES = {
+  qa1: "Objection Handling: Price & Value",
+  qa2: "MEDDIC Qualification Framework",
+  qa3: "Prospecting Fundamentals",
+  qa4: "Competitor Positioning: Salesforce vs. ralli",
+  qa5: "Discovery Call Framework",
+};
+
+const DEMO_REP_DRILL_DATA = {
+  // Mia Chen — 98, promotion, Enterprise AE
+  p1: {
+    topicScores: [
+      { topic: "Product Knowledge",       avgScore: 98, attempts: 4, passed: 4 },
+      { topic: "Discovery",               avgScore: 96, attempts: 5, passed: 5 },
+      { topic: "Objection Handling",      avgScore: 92, attempts: 3, passed: 3 },
+      { topic: "Pricing",                 avgScore: 90, attempts: 2, passed: 2 },
+      { topic: "Negotiation",             avgScore: 88, attempts: 3, passed: 3 },
+      { topic: "Competitive Positioning", avgScore: 82, attempts: 3, passed: 2 },
+    ],
+    quizHistory: [
+      { id: "p1h1", quiz_id: "qa2", score: 100, passed: true,  attempt_num: 1, created_at: _dateStr(-3)  },
+      { id: "p1h2", quiz_id: "qa5", score: 100, passed: true,  attempt_num: 1, created_at: _dateStr(-9)  },
+      { id: "p1h3", quiz_id: "qa4", score:  93, passed: true,  attempt_num: 1, created_at: _dateStr(-15) },
+      { id: "p1h4", quiz_id: "qa1", score: 100, passed: true,  attempt_num: 1, created_at: _dateStr(-22) },
+    ],
+    assignments: [
+      { id: "p1a1", title: "Enterprise Deal Strategy",          content_type: "course", due_at: _dateStr(10), required: true,  status: "Complete"    },
+      { id: "p1a2", title: "MEDDIC Qualification Framework",    content_type: "quiz",   due_at: _dateStr(5),  required: true,  status: "Passed"      },
+      { id: "p1a3", title: "Objection Handling Mastery",        content_type: "course", due_at: _dateStr(14), required: false, status: "Complete"    },
+      { id: "p1a4", title: "Executive Outreach Messaging",      content_type: "lesson", due_at: null,         required: false, status: "Complete"    },
+    ],
+  },
+
+  // Dev Patel — 95, top, Mid-Market AE
+  p2: {
+    topicScores: [
+      { topic: "Product Knowledge",       avgScore: 97, attempts: 4, passed: 4 },
+      { topic: "Discovery",               avgScore: 92, attempts: 4, passed: 4 },
+      { topic: "Objection Handling",      avgScore: 88, attempts: 3, passed: 3 },
+      { topic: "Pricing",                 avgScore: 85, attempts: 2, passed: 2 },
+      { topic: "Negotiation",             avgScore: 80, attempts: 2, passed: 2 },
+      { topic: "Competitive Positioning", avgScore: 78, attempts: 3, passed: 2 },
+    ],
+    quizHistory: [
+      { id: "p2h1", quiz_id: "qa5", score: 100, passed: true,  attempt_num: 1, created_at: _dateStr(-2)  },
+      { id: "p2h2", quiz_id: "qa1", score:  93, passed: true,  attempt_num: 1, created_at: _dateStr(-7)  },
+      { id: "p2h3", quiz_id: "qa4", score:  93, passed: true,  attempt_num: 1, created_at: _dateStr(-16) },
+      { id: "p2h4", quiz_id: "qa3", score: 100, passed: true,  attempt_num: 1, created_at: _dateStr(-28) },
+    ],
+    assignments: [
+      { id: "p2a1", title: "SDR Core Fundamentals",             content_type: "course", due_at: _dateStr(7),  required: true,  status: "Complete"    },
+      { id: "p2a2", title: "Enterprise Deal Strategy",          content_type: "course", due_at: _dateStr(12), required: true,  status: "Complete"    },
+      { id: "p2a3", title: "Discovery Call Framework",          content_type: "quiz",   due_at: _dateStr(3),  required: true,  status: "Passed"      },
+      { id: "p2a4", title: "Competitive Positioning vs. Salesforce", content_type: "lesson", due_at: null,    required: false, status: "Complete"    },
+    ],
+  },
+
+  // Jordan Rivera — 91, improved, Senior AE
+  p3: {
+    topicScores: [
+      { topic: "Product Knowledge",       avgScore: 93, attempts: 3, passed: 3 },
+      { topic: "Discovery",               avgScore: 90, attempts: 3, passed: 3 },
+      { topic: "Objection Handling",      avgScore: 85, attempts: 2, passed: 2 },
+      { topic: "Pricing",                 avgScore: 82, attempts: 2, passed: 2 },
+      { topic: "Negotiation",             avgScore: 76, attempts: 2, passed: 1 },
+      { topic: "Competitive Positioning", avgScore: 74, attempts: 3, passed: 2 },
+    ],
+    quizHistory: [
+      { id: "p3h1", quiz_id: "qa4", score:  93, passed: true,  attempt_num: 1, created_at: _dateStr(-5)  },
+      { id: "p3h2", quiz_id: "qa5", score: 100, passed: true,  attempt_num: 1, created_at: _dateStr(-12) },
+      { id: "p3h3", quiz_id: "qa1", score:  80, passed: false, attempt_num: 1, created_at: _dateStr(-20) },
+    ],
+    assignments: [
+      { id: "p3a1", title: "Objection Handling Mastery",                 content_type: "course", due_at: _dateStr(4),  required: true,  status: "Complete"    },
+      { id: "p3a2", title: "Competitor Positioning: Salesforce vs. ralli", content_type: "quiz", due_at: _dateStr(6), required: true,  status: "Passed"      },
+      { id: "p3a3", title: "Multi-Threading Your Deals",                  content_type: "lesson", due_at: _dateStr(3), required: false, status: "In Progress" },
+      { id: "p3a4", title: "Objection Handling: Price & Value",           content_type: "quiz",   due_at: _dateStr(8), required: false, status: "Pending"     },
+    ],
+  },
+
+  // Sara Kim — 88, top, SDR Team Lead
+  p4: {
+    topicScores: [
+      { topic: "Product Knowledge",       avgScore: 92, attempts: 3, passed: 3 },
+      { topic: "Discovery",               avgScore: 89, attempts: 3, passed: 3 },
+      { topic: "Objection Handling",      avgScore: 82, attempts: 2, passed: 2 },
+      { topic: "Pricing",                 avgScore: 78, attempts: 2, passed: 2 },
+      { topic: "Negotiation",             avgScore: 72, attempts: 2, passed: 1 },
+      { topic: "Competitive Positioning", avgScore: 71, attempts: 2, passed: 1 },
+    ],
+    quizHistory: [
+      { id: "p4h1", quiz_id: "qa3", score: 100, passed: true,  attempt_num: 1, created_at: _dateStr(-4)  },
+      { id: "p4h2", quiz_id: "qa5", score:  93, passed: true,  attempt_num: 1, created_at: _dateStr(-11) },
+      { id: "p4h3", quiz_id: "qa1", score:  80, passed: false, attempt_num: 1, created_at: _dateStr(-18) },
+      { id: "p4h4", quiz_id: "qa1", score:  93, passed: true,  attempt_num: 2, created_at: _dateStr(-13) },
+    ],
+    assignments: [
+      { id: "p4a1", title: "SDR Core Fundamentals",       content_type: "course", due_at: _dateStr(5),  required: true,  status: "Complete"    },
+      { id: "p4a2", title: "Cold Call Opening Framework", content_type: "lesson", due_at: _dateStr(2),  required: true,  status: "Complete"    },
+      { id: "p4a3", title: "Prospecting Fundamentals",    content_type: "quiz",   due_at: _dateStr(6),  required: true,  status: "Passed"      },
+      { id: "p4a4", title: "Enterprise Deal Strategy",    content_type: "course", due_at: _dateStr(14), required: false, status: "In Progress" },
+    ],
+  },
+
+  // Tom Walsh — 84 (from 76, improving), SDR
+  p5: {
+    topicScores: [
+      { topic: "Product Knowledge",       avgScore: 89, attempts: 3, passed: 3 },
+      { topic: "Discovery",               avgScore: 86, attempts: 2, passed: 2 },
+      { topic: "Objection Handling",      avgScore: 80, attempts: 2, passed: 2 },
+      { topic: "Pricing",                 avgScore: 74, attempts: 2, passed: 1 },
+      { topic: "Competitive Positioning", avgScore: 65, attempts: 2, passed: 1 },
+      { topic: "Negotiation",             avgScore: 67, attempts: 2, passed: 1 },
+    ],
+    quizHistory: [
+      { id: "p5h1", quiz_id: "qa3", score:  75, passed: false, attempt_num: 1, created_at: _dateStr(-14) },
+      { id: "p5h2", quiz_id: "qa3", score:  93, passed: true,  attempt_num: 2, created_at: _dateStr(-8)  },
+      { id: "p5h3", quiz_id: "qa5", score:  93, passed: true,  attempt_num: 1, created_at: _dateStr(-3)  },
+    ],
+    assignments: [
+      { id: "p5a1", title: "SDR Core Fundamentals",                      content_type: "course", due_at: _dateStr(3),  required: true,  status: "In Progress" },
+      { id: "p5a2", title: "Cold Call Opening Framework",                 content_type: "lesson", due_at: _dateStr(-2), required: true,  status: "Complete"    },
+      { id: "p5a3", title: "Prospecting Fundamentals",                    content_type: "quiz",   due_at: _dateStr(5),  required: true,  status: "Passed"      },
+      { id: "p5a4", title: "Handling the 'Not Interested' Objection",     content_type: "lesson", due_at: _dateStr(7),  required: false, status: "Pending"     },
+    ],
+  },
+
+  // Nina Barnes — 78, BDR
+  p6: {
+    topicScores: [
+      { topic: "Product Knowledge",       avgScore: 87, attempts: 2, passed: 2 },
+      { topic: "Discovery",               avgScore: 84, attempts: 2, passed: 2 },
+      { topic: "Objection Handling",      avgScore: 75, attempts: 2, passed: 1 },
+      { topic: "Pricing",                 avgScore: 70, attempts: 2, passed: 1 },
+      { topic: "Negotiation",             avgScore: 62, attempts: 2, passed: 0 },
+      { topic: "Competitive Positioning", avgScore: 58, attempts: 2, passed: 0 },
+    ],
+    quizHistory: [
+      { id: "p6h1", quiz_id: "qa1", score:  80, passed: false, attempt_num: 1, created_at: _dateStr(-10) },
+      { id: "p6h2", quiz_id: "qa5", score:  93, passed: true,  attempt_num: 1, created_at: _dateStr(-17) },
+      { id: "p6h3", quiz_id: "qa3", score:  75, passed: false, attempt_num: 1, created_at: _dateStr(-24) },
+    ],
+    assignments: [
+      { id: "p6a1", title: "Cold Call Opening Framework",       content_type: "lesson", due_at: _dateStr(-3), required: true,  status: "Complete"    },
+      { id: "p6a2", title: "Price Objection Response Playbook", content_type: "lesson", due_at: _dateStr(2),  required: true,  status: "In Progress" },
+      { id: "p6a3", title: "Objection Handling: Price & Value", content_type: "quiz",   due_at: _dateStr(4),  required: true,  status: "Pending"     },
+      { id: "p6a4", title: "SDR Core Fundamentals",             content_type: "course", due_at: _dateStr(10), required: false, status: "Pending"     },
+    ],
+  },
+
+  // Carlos Reyes — 74 (from 78, trending down), coaching, SDR
+  p7: {
+    topicScores: [
+      { topic: "Product Knowledge",       avgScore: 85, attempts: 2, passed: 2 },
+      { topic: "Discovery",               avgScore: 79, attempts: 2, passed: 1 },
+      { topic: "Objection Handling",      avgScore: 70, attempts: 2, passed: 1 },
+      { topic: "Pricing",                 avgScore: 66, attempts: 2, passed: 0 },
+      { topic: "Negotiation",             avgScore: 58, attempts: 2, passed: 0 },
+      { topic: "Competitive Positioning", avgScore: 54, attempts: 2, passed: 0 },
+    ],
+    quizHistory: [
+      { id: "p7h1", quiz_id: "qa3", score:  50, passed: false, attempt_num: 1, created_at: _dateStr(-21) },
+      { id: "p7h2", quiz_id: "qa3", score:  75, passed: false, attempt_num: 2, created_at: _dateStr(-14) },
+      { id: "p7h3", quiz_id: "qa1", score:  60, passed: false, attempt_num: 1, created_at: _dateStr(-7)  },
+    ],
+    assignments: [
+      { id: "p7a1", title: "SDR Core Fundamentals",                     content_type: "course", due_at: _dateStr(-5), required: true,  status: "Pending" },
+      { id: "p7a2", title: "Cold Call Opening Framework",                content_type: "lesson", due_at: _dateStr(-5), required: true,  status: "Pending" },
+      { id: "p7a3", title: "Prospecting Fundamentals",                   content_type: "quiz",   due_at: _dateStr(3),  required: true,  status: "Pending" },
+      { id: "p7a4", title: "Handling the 'Not Interested' Objection",    content_type: "lesson", due_at: _dateStr(7),  required: false, status: "Pending" },
+    ],
+  },
+
+  // Alex Liu — 81 (from 84, slight dip), AE
+  p8: {
+    topicScores: [
+      { topic: "Product Knowledge",       avgScore: 90, attempts: 3, passed: 3 },
+      { topic: "Discovery",               avgScore: 88, attempts: 2, passed: 2 },
+      { topic: "Objection Handling",      avgScore: 78, attempts: 2, passed: 1 },
+      { topic: "Pricing",                 avgScore: 76, attempts: 2, passed: 1 },
+      { topic: "Negotiation",             avgScore: 70, attempts: 2, passed: 1 },
+      { topic: "Competitive Positioning", avgScore: 62, attempts: 2, passed: 0 },
+    ],
+    quizHistory: [
+      { id: "p8h1", quiz_id: "qa1", score:  80, passed: false, attempt_num: 1, created_at: _dateStr(-6)  },
+      { id: "p8h2", quiz_id: "qa5", score:  93, passed: true,  attempt_num: 1, created_at: _dateStr(-13) },
+      { id: "p8h3", quiz_id: "qa4", score:  67, passed: false, attempt_num: 1, created_at: _dateStr(-20) },
+    ],
+    assignments: [
+      { id: "p8a1", title: "Objection Handling Mastery",     content_type: "course", due_at: _dateStr(2),  required: true,  status: "Complete"    },
+      { id: "p8a2", title: "Multi-Threading Your Deals",     content_type: "lesson", due_at: _dateStr(5),  required: true,  status: "In Progress" },
+      { id: "p8a3", title: "MEDDIC Qualification Framework", content_type: "quiz",   due_at: _dateStr(7),  required: true,  status: "Pending"     },
+      { id: "p8a4", title: "Enterprise Deal Strategy",       content_type: "course", due_at: _dateStr(14), required: false, status: "Pending"     },
+    ],
+  },
+
+  // Elena Torres — 67 (from 71, declining), coaching, Enterprise AE
+  p9: {
+    topicScores: [
+      { topic: "Product Knowledge",       avgScore: 82, attempts: 2, passed: 2 },
+      { topic: "Discovery",               avgScore: 80, attempts: 2, passed: 1 },
+      { topic: "Objection Handling",      avgScore: 68, attempts: 2, passed: 0 },
+      { topic: "Pricing",                 avgScore: 63, attempts: 2, passed: 0 },
+      { topic: "Negotiation",             avgScore: 54, attempts: 2, passed: 0 },
+      { topic: "Competitive Positioning", avgScore: 49, attempts: 2, passed: 0 },
+    ],
+    quizHistory: [
+      { id: "p9h1", quiz_id: "qa2", score:  50, passed: false, attempt_num: 1, created_at: _dateStr(-18) },
+      { id: "p9h2", quiz_id: "qa2", score:  60, passed: false, attempt_num: 2, created_at: _dateStr(-10) },
+      { id: "p9h3", quiz_id: "qa4", score:  67, passed: false, attempt_num: 1, created_at: _dateStr(-4)  },
+    ],
+    assignments: [
+      { id: "p9a1", title: "Enterprise Deal Strategy",                   content_type: "course", due_at: _dateStr(-8), required: true,  status: "Pending" },
+      { id: "p9a2", title: "Executive Outreach Messaging",               content_type: "lesson", due_at: _dateStr(-3), required: true,  status: "Pending" },
+      { id: "p9a3", title: "MEDDIC Qualification Framework",             content_type: "quiz",   due_at: _dateStr(5),  required: true,  status: "Pending" },
+      { id: "p9a4", title: "Competitive Positioning vs. Salesforce",     content_type: "lesson", due_at: _dateStr(7),  required: false, status: "Pending" },
+    ],
+  },
+
+  // Brendan Walsh — 63 (from 69, most at-risk), coaching, Enterprise AE
+  p10: {
+    topicScores: [
+      { topic: "Product Knowledge",       avgScore: 78, attempts: 2, passed: 1 },
+      { topic: "Discovery",               avgScore: 76, attempts: 2, passed: 1 },
+      { topic: "Objection Handling",      avgScore: 62, attempts: 2, passed: 0 },
+      { topic: "Pricing",                 avgScore: 56, attempts: 2, passed: 0 },
+      { topic: "Competitive Positioning", avgScore: 47, attempts: 2, passed: 0 },
+      { topic: "Negotiation",             avgScore: 43, attempts: 2, passed: 0 },
+    ],
+    quizHistory: [
+      { id: "p10h1", quiz_id: "qa2", score:  40, passed: false, attempt_num: 1, created_at: _dateStr(-25) },
+      { id: "p10h2", quiz_id: "qa2", score:  50, passed: false, attempt_num: 2, created_at: _dateStr(-15) },
+      { id: "p10h3", quiz_id: "qa3", score:  50, passed: false, attempt_num: 1, created_at: _dateStr(-8)  },
+      { id: "p10h4", quiz_id: "qa4", score:  67, passed: false, attempt_num: 1, created_at: _dateStr(-3)  },
+    ],
+    assignments: [
+      { id: "p10a1", title: "Enterprise Deal Strategy",                  content_type: "course", due_at: _dateStr(-10), required: true,  status: "Pending" },
+      { id: "p10a2", title: "Competitive Positioning vs. Salesforce",    content_type: "lesson", due_at: _dateStr(-5),  required: true,  status: "Pending" },
+      { id: "p10a3", title: "MEDDIC Qualification Framework",            content_type: "quiz",   due_at: _dateStr(3),   required: true,  status: "Pending" },
+      { id: "p10a4", title: "Forecasting Accuracy Fundamentals",         content_type: "lesson", due_at: _dateStr(7),   required: false, status: "Pending" },
+    ],
+  },
+};
+
+// ── LeadershipDashboardScreen ─────────────────────────────────
+// ─────────────────────────────────────────────────────────────
+// RepDrillDownModal — per-rep readiness detail for managers
+// ─────────────────────────────────────────────────────────────
+// Manager-First Performance Summary — shared helpers used by RepDrillDownModal
+// only. Kept module-level (not inline in the component) so they're pure,
+// order-independent functions with no closure surprises.
+
+// Works for both real (engineStatus from assignmentEngine.js) and demo
+// (pre-labeled status strings) assignment shapes — see RepDrillDownModal's
+// enrichment loop for how engineStatus is set on the real path.
+function _repAssignmentDone(a) {
+  return a.engineStatus ? a.engineStatus === "completed" : (a.status === "Complete" || a.status === "Passed");
+}
+function _repAssignmentOverdue(a) {
+  if (a.engineStatus) return a.engineStatus === "overdue";
+  // Demo path has no engine call — approximate from due_at, same rule the
+  // engine itself uses (not resolved + due date in the past).
+  if (_repAssignmentDone(a) || !a.due_at || a.due_at === "Open") return false;
+  const d = new Date(a.due_at);
+  return !isNaN(d) && d < new Date();
+}
+
+// Most-recent-first is NOT guaranteed on either path (getRepTopicScores
+// sorts ascending; demo seed arrays happen to be hand-authored descending) —
+// always find max/min explicitly rather than trusting array position.
+function _strongestTopic(topicScores) {
+  return topicScores?.length ? [...topicScores].sort((a, b) => b.avgScore - a.avgScore)[0] : null;
+}
+function _weakestTopic(topicScores) {
+  return topicScores?.length ? [...topicScores].sort((a, b) => a.avgScore - b.avgScore)[0] : null;
+}
+
+function _relativeActivityLabel(iso) {
+  if (!iso) return null;
+  const d = new Date(iso);
+  if (isNaN(d)) return null;
+  const days = Math.floor((Date.now() - d.getTime()) / 86400000);
+  if (days <= 0) return "Today";
+  if (days === 1) return "Yesterday";
+  if (days < 14) return `${days} days ago`;
+  return d.toLocaleDateString();
+}
+
+function _contentTypeLabel(contentType) {
+  return contentType === "course" ? "Course" :
+         contentType === "lesson" ? "Lesson" :
+         contentType === "quiz"   ? "Quiz"   : contentType;
+}
+
+// Rep Drill-Down Final Polish — days a due date is past, floored at 0 (never
+// negative; callers only invoke this for items already known to be overdue).
+// Assignment Experience Priority 2 — now derived from the same
+// daysUntilDue() the shared engine's own "overdue" status and getDueStatus()
+// use, instead of this component's own raw-timestamp diff (which could
+// disagree with both by up to a day depending on timezone/time-of-day).
+function _daysOverdue(dueAt) {
+  const diff = daysUntilDue(dueAt);
+  return diff != null && diff < 0 ? -diff : null;
+}
+
+// Rep Drill-Down Final Polish — shared newest-first sort for every
+// collapsible history list below (Recent Quiz Activity, Assigned Learning,
+// Overdue Assignments detail). Non-mutating; missing/unparsable dates sort
+// last rather than throwing.
+function _sortDesc(list, getDateStr) {
+  return [...(list ?? [])].sort((a, b) => {
+    const db = new Date(getDateStr(b) ?? 0).getTime();
+    const da = new Date(getDateStr(a) ?? 0).getTime();
+    return (isNaN(db) ? 0 : db) - (isNaN(da) ? 0 : da);
+  });
+}
+
 
 // Rep Drill-Down Final Polish — one small reusable expand/collapse control,
 // reused by every "show 3, then View all (N)" list in RepDrillDownModal
