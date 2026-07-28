@@ -39,7 +39,7 @@ WHERE c.category_id = g.id;
 ALTER TABLE public.tenant_battle_cards ENABLE TRIGGER trg_touch_tenant_battle_cards;
 
 DO $$
-DECLARE r record;
+DECLARE r record; before record; after record; n2 int;
 BEGIN
   -- C1: label appended, existing tag preserved, category cleared
   SELECT * INTO r FROM public.tenant_battle_cards WHERE id='00000000-0000-0000-0000-00000000f001';
@@ -81,6 +81,39 @@ BEGIN
   -- Category table itself is kept intact (migration safety)
   IF (SELECT count(*) FROM public.tenant_bc_categories WHERE tenant_id='00000000-0000-0000-0000-0000000000a0') <> 3 THEN RAISE EXCEPTION 'T8 FAIL: category rows were deleted'; END IF;
   RAISE NOTICE '8. legacy category table left intact: PASS';
+
+  -- Test 9: IDEMPOTENCY. The conversion already ran once (above). Snapshot the full
+  -- state, run the EXACT 069 conversion a SECOND time, and prove it is a no-op:
+  -- zero rows changed; tags, category_id, and provenance/timestamps all unchanged.
+  SELECT id, tags, category_id, title, content, status, tenant_id, created_by, updated_by, created_at, updated_at
+    INTO before FROM public.tenant_battle_cards WHERE id='00000000-0000-0000-0000-00000000f001';
+  ALTER TABLE public.tenant_battle_cards DISABLE TRIGGER trg_touch_tenant_battle_cards;
+  UPDATE public.tenant_battle_cards c
+  SET tags = CASE
+               WHEN btrim(g.label) = '' THEN c.tags
+               WHEN EXISTS (SELECT 1 FROM unnest(c.tags) AS x WHERE lower(x) = lower(btrim(g.label))) THEN c.tags
+               ELSE c.tags || ARRAY[btrim(g.label)]
+             END,
+      category_id = NULL
+  FROM public.tenant_bc_categories g
+  WHERE c.category_id = g.id;
+  GET DIAGNOSTICS n2 = ROW_COUNT;
+  ALTER TABLE public.tenant_battle_cards ENABLE TRIGGER trg_touch_tenant_battle_cards;
+  SELECT id, tags, category_id, title, content, status, tenant_id, created_by, updated_by, created_at, updated_at
+    INTO after FROM public.tenant_battle_cards WHERE id='00000000-0000-0000-0000-00000000f001';
+  IF n2 <> 0 THEN RAISE EXCEPTION 'T9 FAIL: second conversion pass changed % rows (expected 0)', n2; END IF;
+  IF after.tags IS DISTINCT FROM before.tags THEN RAISE EXCEPTION 'T9 FAIL: tags changed on re-run (% -> %)', before.tags, after.tags; END IF;
+  IF after.category_id IS DISTINCT FROM before.category_id OR after.category_id IS NOT NULL THEN RAISE EXCEPTION 'T9 FAIL: category_id not still null on re-run'; END IF;
+  IF after.created_by IS DISTINCT FROM before.created_by OR after.updated_by IS DISTINCT FROM before.updated_by
+     OR after.created_at IS DISTINCT FROM before.created_at OR after.updated_at IS DISTINCT FROM before.updated_at THEN
+    RAISE EXCEPTION 'T9 FAIL: provenance/timestamps changed on re-run';
+  END IF;
+  IF after.title IS DISTINCT FROM before.title OR after.content IS DISTINCT FROM before.content
+     OR after.status IS DISTINCT FROM before.status OR after.tenant_id IS DISTINCT FROM before.tenant_id THEN
+    RAISE EXCEPTION 'T9 FAIL: card body changed on re-run';
+  END IF;
+  IF EXISTS (SELECT 1 FROM public.tenant_battle_cards WHERE category_id IS NOT NULL) THEN RAISE EXCEPTION 'T9 FAIL: a category_id reappeared on re-run'; END IF;
+  RAISE NOTICE '9. idempotent: second conversion pass updated 0 rows; tags/category_id/provenance unchanged: PASS';
 
   RAISE NOTICE '069 ALL TESTS PASSED';
 END $$;
