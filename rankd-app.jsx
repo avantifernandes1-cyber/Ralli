@@ -65,6 +65,7 @@ import {
   submitQuizAttemptAtomic,
   submitQuizAttemptAtomicV2,
   listQuizzesForLearner,
+  listMyCompletedQuizHistory,
   getQuizForAttempt,
   getQuizReview,
   getMyQuizAttemptsSafe,
@@ -9048,6 +9049,13 @@ function LearnScreen({ role, canManageLearn, user, orgUsers = [], orgs = [], onN
   const [learnFilter, setLearnFilter] = useState("todo"); // "todo" | "complete" | "all"
   const [search,     setSearch]     = useState("");
   const [browseKind, setBrowseKind] = useState("all"); // Knowledge Base content-type filter: "all" | "lesson" | "course" | "quiz"
+  // Learner-only: safe titles for ARCHIVED content the learner has COMPLETED, so an
+  // archived-but-completed row keeps its Completed-history card (title/score/date) even
+  // though archived content is (correctly) absent from the active catalog/KB. Quizzes
+  // come from list_my_completed_quiz_history (067, RLS-safe, best-effort); archived
+  // lessons/courses are read via getArchivedContent (in-tenant learner RLS allows it).
+  // These are HISTORY only — never merged into the active catalog, KB, or To Do.
+  const [completedQuizHistory, setCompletedQuizHistory] = useState([]);
   const [archivedCourses,   setArchivedCourses]   = useState([]);
   const [archivedLessons,   setArchivedLessons]   = useState([]);
   const [confirmArchive,    setConfirmArchive]    = useState(null); // { type: "course"|"lesson", id, title }
@@ -9182,12 +9190,19 @@ function LearnScreen({ role, canManageLearn, user, orgUsers = [], orgs = [], onN
       setCatalogError("Could not load your learning data. Please try again.");
       setCatalogLoading(false);
     });
-    // Archived content — content-library housekeeping, not assignment status;
-    // left out of the retryable chain above on purpose (see comment above).
-    if (isAdmin) {
-      getArchivedContent(tenantId).then(({ data }) => {
-        if (data) { setArchivedCourses(data.courses ?? []); setArchivedLessons(data.lessons ?? []); }
-      });
+    // Archived content — for the MANAGER it's content-library housekeeping; for the
+    // LEARNER it supplies safe titles so an archived-but-COMPLETED lesson/course keeps
+    // its Completed-history card (in-tenant learner RLS permits reading archived
+    // tenant_lessons/tenant_courses). Best-effort, non-retryable, HISTORY only — never
+    // merged into the active catalog or Knowledge Base.
+    getArchivedContent(tenantId).then(({ data }) => {
+      if (data) { setArchivedCourses(data.courses ?? []); setArchivedLessons(data.lessons ?? []); }
+    });
+    if (!isAdmin) {
+      // Archived quizzes are RLS-locked from learners, so a dedicated learner-safe RPC
+      // (067) provides titles/scores for the learner's OWN completed quizzes. Best-
+      // effort: [] if 067 isn't applied yet, so the row still shows (generic label).
+      listMyCompletedQuizHistory().then(({ data }) => setCompletedQuizHistory(data ?? []));
     }
   }, [tenantId, isReal, isAdmin, user?.id, managerRefreshKey, learnAssignRefreshKey]);
 
@@ -9547,7 +9562,7 @@ function LearnScreen({ role, canManageLearn, user, orgUsers = [], orgs = [], onN
       completedAtByLesson: completedLessonsAt,
       quizAttempts: sharedAssignmentData?.quizAttempts ?? [],
       courses, lessons, quizzes,
-    }).filter(r => !r.missing).length;
+    }).filter(r => !r.missing || r.isCompleted).length; // include archived-completed history
     const xpEarned = [...completedLessons].reduce((s, id) => s + (lessons.find(x => x.id === id)?.xp ?? 0), 0);
 
     if (activeLesson) {
@@ -9758,26 +9773,39 @@ function LearnScreen({ role, canManageLearn, user, orgUsers = [], orgs = [], onN
           // excluded, resolved by the shared engine. Identical to Home. A quiz
           // card routes into the canonical Quizzes flow — Learn never duplicates
           // quiz grading/attempt logic.
+          // HISTORY catalogs: the ACTIVE catalogs (quizzes/lessons/courses) plus safe
+          // ARCHIVED content the learner has completed — so a completed-then-archived
+          // row resolves its title for the Completed/All history WITHOUT ever entering
+          // the active catalog/KB/To Do (these locals are used ONLY for this selector
+          // call). Archived-UNRESOLVED assignments were cancelled on archive, so the
+          // selector already excludes them (cancelled) — only completed ones survive.
+          const archQuizCatalog = (completedQuizHistory ?? [])
+            .filter(h => h?.id && !quizzes.some(q => q.id === h.id))
+            .map(h => ({ id: h.id, name: h.name, title: h.name, status: h.status ?? "archived", passingScore: h.passing_score ?? null, questionCount: 0, _history: true }));
+          const histQuizzes = [...quizzes, ...archQuizCatalog];
+          const histLessons = [...lessons, ...(archivedLessons ?? []).filter(l => !lessons.some(x => x.id === l.id))];
+          const histCourses = [...courses, ...(archivedCourses ?? []).filter(c => !courses.some(x => x.id === c.id))];
           const rows = resolveLearnerAssignments(myAssignments, {
             completedAtByLesson: completedLessonsAt,
             quizAttempts: sharedAssignmentData?.quizAttempts ?? [],
-            courses, lessons, quizzes,
+            courses: histCourses, lessons: histLessons, quizzes: histQuizzes,
           });
-          // Deleted/archived content is not actionable current work for the
-          // learner — excluded here exactly as Home excludes it, so the two views
-          // resolve the identical set. It is preserved in the MANAGER history as
-          // a "(removed)" row (the honest system-of-record for that lifecycle).
-          const enrichedAssigned = rows.filter(r => !r.missing).map(r => {
+          // Keep a row when its content resolves OR it is COMPLETED (archived-completed
+          // history stays honest). A NON-completed missing row (genuinely deleted active
+          // content) is still excluded — it is not actionable current work and lives in
+          // the manager history as a "(removed)" row (the system-of-record).
+          const enrichedAssigned = rows.filter(r => !r.missing || r.isCompleted).map(r => {
             const a = r.assignment;
+            const isArchived = r.content?.status === "archived" || r.content?._history || (r.missing && r.isCompleted);
             if (r.contentType === "course") {
-              const courseLessons = (r.content?.lessonIds ?? []).map(id => lessons.find(l => l.id === id)).filter(Boolean);
+              const courseLessons = (r.content?.lessonIds ?? []).map(id => histLessons.find(l => l.id === id)).filter(Boolean);
               const doneCount = courseLessons.filter(l => isQualifyingEvent(completedLessonsAt.get(l.id), a.assignedAtRaw)).length;
-              return { r, a, content: r.content, kind: "course", isCourse: true, courseLessons, doneCount, pct: r.progress, isComplete: r.isCompleted, status: r.status, missing: r.missing };
+              return { r, a, content: r.content, kind: "course", isCourse: true, courseLessons, doneCount, pct: r.progress, isComplete: r.isCompleted, status: r.status, missing: r.missing, isArchived };
             }
             if (r.contentType === "quiz") {
-              return { r, a, content: r.content, kind: "quiz", isQuiz: true, courseLessons: [], doneCount: 0, pct: r.progress, isComplete: r.isCompleted, status: r.status, missing: r.missing };
+              return { r, a, content: r.content, kind: "quiz", isQuiz: true, courseLessons: [], doneCount: 0, pct: r.progress, isComplete: r.isCompleted, status: r.status, missing: r.missing, isArchived };
             }
-            return { r, a, content: r.content, kind: "lesson", isCourse: false, courseLessons: [], doneCount: 0, pct: r.progress, isComplete: r.isCompleted, status: r.status, missing: r.missing };
+            return { r, a, content: r.content, kind: "lesson", isCourse: false, courseLessons: [], doneCount: 0, pct: r.progress, isComplete: r.isCompleted, status: r.status, missing: r.missing, isArchived };
           });
 
           // To Do = not_started + in_progress + overdue; Completed = completed.
@@ -9786,7 +9814,26 @@ function LearnScreen({ role, canManageLearn, user, orgUsers = [], orgs = [], onN
           const completeItems = enrichedAssigned.filter(e => e.isComplete);
           const filterItems   = learnFilter === "todo" ? toDoItems : learnFilter === "complete" ? completeItems : enrichedAssigned;
 
-          const AssignedCard = ({ a, content, isCourse, courseLessons, doneCount, pct, isComplete }) => {
+          // Degraded card for a COMPLETED row whose content can't be resolved even
+          // from the archived-history sources (e.g. a genuinely removed lesson/course,
+          // or a quiz before migration 067 is applied). Keeps history honest/visible.
+          const MissingCompletedCard = ({ kind }) => (
+            <Card>
+              <div style={{ display: "flex", alignItems: "center", gap: 16, opacity: 0.75 }}>
+                <div style={{ width: 52, height: 52, borderRadius: 12, flexShrink: 0, background: C.muted, display: "flex", alignItems: "center", justifyContent: "center", fontSize: 22 }}>{kind === "quiz" ? "📋" : kind === "course" ? "📚" : "📄"}</div>
+                <div style={{ flex: 1, minWidth: 0 }}>
+                  <div style={{ display: "flex", alignItems: "center", gap: 6, flexWrap: "wrap" }}>
+                    <span style={{ fontSize: 11, fontWeight: 700, color: C.textMuted, letterSpacing: "0.06em" }}>{(kind ?? "content").toUpperCase()}</span>
+                    <span style={{ fontSize: 10, fontWeight: 700, padding: "1px 6px", borderRadius: 4, background: C.greenBg, color: C.green }}>COMPLETE</span>
+                    <span style={{ fontSize: 10, fontWeight: 700, padding: "1px 6px", borderRadius: 4, background: C.muted, color: C.textMuted }}>ARCHIVED</span>
+                  </div>
+                  <div style={{ fontSize: 14, fontWeight: 700, color: C.text, marginTop: 2 }}>Archived {kind ?? "content"}</div>
+                  <div style={{ fontSize: 12, color: C.textSub, marginTop: 2 }}>Completed · content archived</div>
+                </div>
+              </div>
+            </Card>
+          );
+          const AssignedCard = ({ a, content, isCourse, courseLessons, doneCount, pct, isComplete, isArchived }) => {
             const totalXp   = isCourse ? courseLessons.reduce((s, l) => s + (l.xp || 0), 0) : (content.xp || 0);
             const bonusXp   = isCourse ? Math.round(totalXp * 0.2) : 0;
             const estMin    = isCourse ? courseLessons.reduce((s, l) => s + (parseInt(l.duration) || 0), 0) : (parseInt(content.duration) || 0);
@@ -9815,6 +9862,7 @@ function LearnScreen({ role, canManageLearn, user, orgUsers = [], orgs = [], onN
                           Required/Recommended, never omit the badge. */}
                       <span style={{ fontSize: 10, fontWeight: 700, padding: "1px 6px", borderRadius: 4, background: a.required ? C.redBg : "#F1F5F9", color: a.required ? C.red : "#475569" }}>{a.required ? "REQUIRED" : "RECOMMENDED"}</span>
                       {isComplete && <span style={{ fontSize: 10, fontWeight: 700, padding: "1px 6px", borderRadius: 4, background: C.greenBg, color: C.green }}>COMPLETE</span>}
+                      {isArchived && <span style={{ fontSize: 10, fontWeight: 700, padding: "1px 6px", borderRadius: 4, background: C.muted, color: C.textMuted }}>ARCHIVED</span>}
                       {dueStatus && (
                         <span style={{ fontSize: 10, fontWeight: 700, padding: "1px 6px", borderRadius: 4,
                           background: dueStatus.color + "18", color: dueStatus.color, marginLeft: "auto" }}>
@@ -9881,11 +9929,17 @@ function LearnScreen({ role, canManageLearn, user, orgUsers = [], orgs = [], onN
           // Quiz assignment card — status from the shared quiz engine; the action
           // routes into the canonical Quizzes flow (Take / Retry / Review). Learn
           // never renders questions, answers, or scoring itself.
-          const QuizAssignedCard = ({ a, content, status }) => {
+          const QuizAssignedCard = ({ a, content, status, isArchived }) => {
             const label = status === "completed" ? "Completed" : status === "overdue" ? "Overdue" : status === "in_progress" ? "In Progress" : "Not Started";
             const labelColor = status === "completed" ? C.green : status === "overdue" ? C.red : status === "in_progress" ? C.blue : C.textSub;
+            // Archived content is HISTORY: a completed row keeps a safe Review only —
+            // never Start/Retry (you can't re-take archived content). Non-completed
+            // archived can't occur here (archive cancels unresolved rows).
             const cta = status === "completed" ? "Review →" : status === "in_progress" || status === "overdue" ? "Retry →" : "Take quiz →";
-            const dueStatus = (status !== "completed" && a.dueAt && a.dueAt !== "Open") ? getDueStatus(a.dueAt) : null;
+            const dueStatus = (!isArchived && status !== "completed" && a.dueAt && a.dueAt !== "Open") ? getDueStatus(a.dueAt) : null;
+            // Best score from the learner's own attempts (safe; already loaded).
+            const myAttempts = (sharedAssignmentData?.quizAttempts ?? []).filter(at => at.quiz_id === a.contentId);
+            const bestScore = myAttempts.length ? Math.max(...myAttempts.map(at => at.score ?? 0)) : null;
             return (
               <Card>
                 <div style={{ display: "flex", alignItems: "flex-start", gap: 16 }}>
@@ -9895,13 +9949,16 @@ function LearnScreen({ role, canManageLearn, user, orgUsers = [], orgs = [], onN
                       <span style={{ fontSize: 11, fontWeight: 700, color: C.purple, letterSpacing: "0.06em" }}>QUIZ</span>
                       <span style={{ fontSize: 10, fontWeight: 700, padding: "1px 6px", borderRadius: 4, background: a.required ? C.redBg : "#F1F5F9", color: a.required ? C.red : "#475569" }}>{a.required ? "REQUIRED" : "RECOMMENDED"}</span>
                       <span style={{ fontSize: 10, fontWeight: 700, padding: "1px 6px", borderRadius: 4, background: labelColor + "18", color: labelColor }}>{label}</span>
+                      {isArchived && <span style={{ fontSize: 10, fontWeight: 700, padding: "1px 6px", borderRadius: 4, background: C.muted, color: C.textMuted }}>ARCHIVED</span>}
                       {dueStatus && <span style={{ fontSize: 10, fontWeight: 700, padding: "1px 7px", borderRadius: 4, background: dueStatus.color + "18", color: dueStatus.color, marginLeft: "auto" }}>{dueStatus.label}</span>}
                     </div>
                     <div style={{ fontSize: 15, fontWeight: 700, color: C.text }}>{content?.name ?? content?.title ?? "Quiz"}</div>
+                    {status === "completed" && bestScore != null && (
+                      <div style={{ fontSize: 12, color: C.textSub, marginTop: 2 }}>Score {bestScore}%{isArchived ? " · content archived" : ""}</div>
+                    )}
                     <div style={{ display: "flex", justifyContent: "flex-end", marginTop: 12 }}>
-                      {/* Deep-link straight into the canonical quiz flow (auto-launches
-                          via pendingQuizId) — no Quizzes-listing detour, exact quiz id.
-                          Reuses the same launch/retake/results path everywhere else. */}
+                      {/* Completed → safe pass-gated Review (immutable snapshot, works for
+                          archived quizzes). Active-content non-completed → canonical launch. */}
                       <button onClick={() => onStartQuiz?.(a.contentId)} style={{ padding: "8px 16px", borderRadius: 8, border: "none", cursor: "pointer", background: status === "completed" ? C.white : C.purple, color: status === "completed" ? C.textSub : "#fff", borderWidth: status === "completed" ? 1 : 0, borderStyle: "solid", borderColor: C.border, fontSize: 13, fontWeight: 700 }}>{cta}</button>
                     </div>
                   </div>
@@ -9957,8 +10014,10 @@ function LearnScreen({ role, canManageLearn, user, orgUsers = [], orgs = [], onN
                   flow; quiz routes into the canonical Quizzes flow. */}
               {filterItems.map(e => (
                 e.isQuiz
-                  ? <QuizAssignedCard key={e.a.id} a={e.a} content={e.content} status={e.status} />
-                  : <AssignedCard key={e.a.id} {...e} />
+                  ? <QuizAssignedCard key={e.a.id} a={e.a} content={e.content} status={e.status} isArchived={e.isArchived} />
+                  : e.missing
+                    ? <MissingCompletedCard key={e.a.id} kind={e.kind} />
+                    : <AssignedCard key={e.a.id} {...e} />
               ))}
 
               {/* Course suggestions — only in To Do and All tabs */}
@@ -24911,13 +24970,12 @@ export default function App() {
         }
         return { blocked: true };
       }
-      // Task 13 — no explicit optimistic patch needed here: the created row(s)
-      // reach the shared assignment hook (useSharedUserAssignmentData, owned
-      // once in App() and passed to Home/Quizzes/Learn) via Task 12's realtime
-      // subscription within a short debounce window. This handler isn't the
-      // shared hook's own creation path (LearnScreen's course/lesson assign
-      // flow patches it directly for instant feedback), so a small delay here
-      // is an acceptable, unchanged tradeoff versus this task's actual scope.
+      // Refresh the canonical manager assignment dataset immediately — the SAME
+      // shared signal archive/restore use (learnAssignRefreshKey → LearnScreen.
+      // loadLearnCatalog), so a newly assigned quiz appears in Learn → Assignments
+      // (with counts/drilldowns) without a browser refresh. Realtime is a best-
+      // effort backup, not the source of truth here. Only fire on a real creation.
+      if (assignedCount > 0) setLearnAssignRefreshKey(k => k + 1);
       if (skippedCount > 0) {
         if (assignedCount === 0) {
           // Whole team/group already had this quiz — same safety-net scenario

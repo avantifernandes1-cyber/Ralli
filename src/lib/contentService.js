@@ -1246,6 +1246,22 @@ export async function listQuizzesForLearner() {
   return { data: data ?? null, error };
 }
 
+/**
+ * The caller's OWN completed (passed) quiz history — SAFE metadata only (id, name,
+ * status, passing_score, best_score, passed, last_passed_at), INCLUDING archived
+ * quizzes, so an archived-but-completed quiz keeps its title/score in the learner's
+ * Completed/All history (migration 067). Never returns questions/answers, never
+ * another learner's rows, and never makes archived content startable/searchable.
+ * Best-effort: returns [] if the RPC isn't present yet (pre-067) so the caller
+ * degrades gracefully (row stays visible with a generic label) instead of erroring.
+ * @returns {Promise<{ data: Array, error: Object|null }>}
+ */
+export async function listMyCompletedQuizHistory() {
+  const { data, error } = await supabase.rpc("list_my_completed_quiz_history");
+  if (error) return { data: [], error };
+  return { data: Array.isArray(data) ? data : [], error: null };
+}
+
 /** Playable, sanitized quiz (no answer keys) + question_revision for one assigned quiz. */
 export async function getQuizForAttempt(quizId) {
   if (!quizId) return { data: null, error: new Error("Missing quizId") };
