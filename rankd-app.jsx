@@ -8953,7 +8953,7 @@ function fmtUpdated(iso) {
   return d.toLocaleDateString("en-US", { month: "short", day: "numeric", year: "numeric" });
 }
 
-function LearnScreen({ role, canManageLearn, user, orgUsers = [], orgs = [], onNav, onStartQuiz, onAwardXp, pendingLessonId, onClearPendingLesson, pendingCourseId, onClearPendingCourse, canCreate = true, canEdit = true, canDelete = true, canAssign = true, tenantId = null, isReal = false, quizzes = [], sharedAssignmentData = null, quizzesPanel = null }) {
+function LearnScreen({ role, canManageLearn, user, orgUsers = [], orgs = [], onNav, onStartQuiz, onAwardXp, pendingLessonId, onClearPendingLesson, pendingCourseId, onClearPendingCourse, canCreate = true, canEdit = true, canDelete = true, canAssign = true, tenantId = null, isReal = false, quizzes = [], sharedAssignmentData = null, quizzesPanel = null, learnAssignRefreshKey = 0 }) {
   // "Can manage Learn" (assignment tracking, assign/unassign, content CRUD/archive)
   // is a Learn-scoped authority derived from the canonical profile role — it now
   // includes the DB `manager` role, which the backend RLS/RPCs already authorize.
@@ -9189,7 +9189,7 @@ function LearnScreen({ role, canManageLearn, user, orgUsers = [], orgs = [], onN
         if (data) { setArchivedCourses(data.courses ?? []); setArchivedLessons(data.lessons ?? []); }
       });
     }
-  }, [tenantId, isReal, isAdmin, user?.id, managerRefreshKey]);
+  }, [tenantId, isReal, isAdmin, user?.id, managerRefreshKey, learnAssignRefreshKey]);
 
   useEffect(() => { loadLearnCatalog(); }, [loadLearnCatalog]);
 
@@ -10217,41 +10217,33 @@ function LearnScreen({ role, canManageLearn, user, orgUsers = [], orgs = [], onN
       {/* COURSES TAB */}
       {tab === "courses" && (
         <>
-        <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fill, minmax(240px, 1fr))", gap: 16 }}>
+        {/* Vertical list — one course per row (matches the Quizzes/Lessons list). */}
+        <div style={{ display: "flex", flexDirection: "column", gap: 10 }}>
           {filteredCourses.map(course => {
             const courseLessons = course.lessonIds.map(id => lessons.find(l => l.id === id)).filter(Boolean);
             const totalMin = courseLessons.reduce((sum, l) => sum + (parseInt(l.duration) || 0), 0);
             return (
-              <Card key={course.id} style={{ display: "flex", flexDirection: "column", gap: 0, padding: 0, overflow: "hidden" }}>
-                {/* Color header */}
-                <div style={{ height: 5, background: course.color }} />
-                <div style={{ padding: 20, display: "flex", flexDirection: "column", flex: 1 }}>
-                  <h3 style={{ margin: "0 0 6px", fontSize: 15, fontWeight: 700, color: C.text, lineHeight: 1.3 }}>{course.title}</h3>
-                  <p style={{ margin: "0 0 12px", fontSize: 12, color: C.textMuted, lineHeight: 1.55 }}>{course.description}</p>
-                  <div style={{ display: "flex", gap: 12, fontSize: 12, color: C.textSub, marginBottom: 14, flexWrap: "wrap" }}>
+              <div key={course.id} style={{ display: "flex", alignItems: "center", gap: 14, flexWrap: "wrap", padding: "16px 20px", borderRadius: 14, border: `1.5px solid ${C.border}`, background: C.white }}>
+                <div style={{ width: 6, alignSelf: "stretch", minHeight: 40, borderRadius: 4, background: course.color ?? C.orange, flexShrink: 0 }} />
+                <div style={{ flex: 1, minWidth: 180 }}>
+                  <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
+                    {course.emoji && <span style={{ fontSize: 15 }}>{course.emoji}</span>}
+                    <span style={{ fontSize: 14, fontWeight: 700, color: C.text }}>{course.title}</span>
+                  </div>
+                  {course.description && <div style={{ fontSize: 12, color: C.textSub, marginTop: 2, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{course.description}</div>}
+                  <div style={{ display: "flex", gap: 10, fontSize: 11, color: C.textMuted, marginTop: 3, flexWrap: "wrap" }}>
                     <span>{courseLessons.length} lessons</span>
                     <span>{totalMin} min</span>
                     <span>{courseLessons.reduce((s, l) => s + (l.xp || 0), 0)} XP</span>
                     {course.updatedAt && <span title="Last updated">Updated {fmtUpdated(course.updatedAt)}</span>}
                   </div>
-                  {/* Lesson list preview */}
-                  <div style={{ display: "flex", flexDirection: "column", gap: 5, marginBottom: 16 }}>
-                    {courseLessons.map((l, i) => (
-                      <div key={l.id} style={{ display: "flex", alignItems: "center", gap: 8, padding: "6px 10px", background: C.pageBg, borderRadius: 8, border: `1px solid ${C.border}` }}>
-                        <span style={{ fontSize: 11, fontWeight: 600, color: C.textMuted, width: 16, flexShrink: 0 }}>{i + 1}</span>
-                        <span style={{ fontSize: 12, fontWeight: 500, color: C.text, flex: 1, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{l.title}</span>
-                        <span style={{ fontSize: 11, color: C.textMuted, flexShrink: 0 }}>{l.duration}</span>
-                      </div>
-                    ))}
-                  </div>
-                  {/* Actions — bottom aligned */}
-                  <div style={{ display: "flex", gap: 6, marginTop: "auto", paddingTop: 4 }}>
-                    {canEdit && <button onClick={() => setCourseModal(course)} style={{ flex: 1, padding: "6px 0", borderRadius: 8, border: `1px solid ${C.border}`, background: C.white, color: C.textSub, fontSize: 12, fontWeight: 600, cursor: "pointer" }}>Edit</button>}
-                    {canAssign && <button onClick={() => setAssignModal({ contentType: "course", contentId: course.id })} style={{ flex: 1, padding: "6px 0", borderRadius: 8, border: "none", background: C.orange, color: "#fff", fontSize: 12, fontWeight: 700, cursor: "pointer" }}>Assign</button>}
-                    {canEdit && <button onClick={() => setConfirmArchive({ type: "course", id: course.id, title: course.title })} style={{ flex: 1, padding: "6px 0", borderRadius: 8, border: `1px solid rgba(239,68,68,0.2)`, background: "transparent", color: C.red, fontSize: 12, fontWeight: 600, cursor: "pointer" }}>Archive</button>}
-                  </div>
                 </div>
-              </Card>
+                <div style={{ display: "flex", alignItems: "center", gap: 6, flexShrink: 0 }}>
+                  {canEdit && <button onClick={() => setCourseModal(course)} style={{ padding: "6px 14px", borderRadius: 8, border: `1px solid ${C.border}`, background: C.white, color: C.textSub, fontSize: 12, fontWeight: 600, cursor: "pointer" }}>Edit</button>}
+                  {canAssign && <button onClick={() => setAssignModal({ contentType: "course", contentId: course.id })} style={{ padding: "6px 14px", borderRadius: 8, border: "none", background: C.orange, color: "#fff", fontSize: 12, fontWeight: 700, cursor: "pointer" }}>Assign</button>}
+                  {canEdit && <button onClick={() => setConfirmArchive({ type: "course", id: course.id, title: course.title })} style={{ padding: "6px 14px", borderRadius: 8, border: `1px solid rgba(239,68,68,0.2)`, background: "transparent", color: C.red, fontSize: 12, fontWeight: 600, cursor: "pointer" }}>Archive</button>}
+                </div>
+              </div>
             );
           })}
 
@@ -10295,29 +10287,32 @@ function LearnScreen({ role, canManageLearn, user, orgUsers = [], orgs = [], onN
       {/* LESSONS TAB */}
       {tab === "lessons" && (
         <>
-        <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fill, minmax(300px, 1fr))", gap: 16 }}>
+        {/* Vertical list — one lesson per row (matches the Quizzes/Courses list). */}
+        <div style={{ display: "flex", flexDirection: "column", gap: 10 }}>
           {filteredLessons.map(lesson => (
-            <Card key={lesson.id} style={{ opacity: lesson.status === "inactive" ? 0.6 : 1, display: "flex", flexDirection: "column" }}>
-              <h3 style={{ margin: "0 0 6px", fontSize: 14, fontWeight: 700, color: C.text, lineHeight: 1.3 }}>{lesson.title}</h3>
-              <p style={{ margin: "0 0 12px", fontSize: 12, color: C.textMuted, lineHeight: 1.55, flex: 1 }}>{lesson.description}</p>
-              <div style={{ display: "flex", gap: 12, fontSize: 12, color: C.textSub, marginBottom: 14, flexWrap: "wrap" }}>
-                <span>{lesson.duration}</span>
-                <span>{lesson.xp} XP</span>
-                {lesson.updatedAt && <span title="Last updated">Updated {fmtUpdated(lesson.updatedAt)}</span>}
+            <div key={lesson.id} style={{ display: "flex", alignItems: "center", gap: 14, flexWrap: "wrap", padding: "16px 20px", borderRadius: 14, border: `1.5px solid ${C.border}`, background: C.white, opacity: lesson.status === "inactive" ? 0.6 : 1 }}>
+              <div style={{ flex: 1, minWidth: 180 }}>
+                <div style={{ fontSize: 14, fontWeight: 700, color: C.text }}>{lesson.title}</div>
+                {lesson.description && <div style={{ fontSize: 12, color: C.textSub, marginTop: 2, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{lesson.description}</div>}
+                <div style={{ display: "flex", gap: 10, fontSize: 11, color: C.textMuted, marginTop: 3, flexWrap: "wrap" }}>
+                  {lesson.type && <span>{(lesson.type ?? "").toUpperCase()}</span>}
+                  <span>{lesson.duration}</span>
+                  <span>{lesson.xp} XP</span>
+                  {lesson.updatedAt && <span title="Last updated">Updated {fmtUpdated(lesson.updatedAt)}</span>}
+                </div>
               </div>
-              {/* Actions — bottom aligned */}
-              <div style={{ display: "flex", gap: 6 }}>
-                {canEdit && <button onClick={() => setLessonModal(lesson)} style={{ flex: 1, padding: "6px 0", borderRadius: 8, border: `1px solid ${C.border}`, background: C.white, color: C.textSub, fontSize: 11, fontWeight: 600, cursor: "pointer" }}>Edit</button>}
-                {canAssign && lesson.type !== "recording" && <button onClick={() => setAssignModal({ contentType: "lesson", contentId: lesson.id })} style={{ flex: 1, padding: "6px 0", borderRadius: 8, border: "none", background: C.orange, color: "#fff", fontSize: 11, fontWeight: 700, cursor: "pointer" }}>Assign</button>}
-                {canEdit && <button onClick={() => setConfirmArchive({ type: "lesson", id: lesson.id, title: lesson.title })} style={{ flex: 1, padding: "6px 0", borderRadius: 8, border: `1px solid rgba(239,68,68,0.2)`, background: "transparent", color: C.red, fontSize: 11, fontWeight: 600, cursor: "pointer" }}>Archive</button>}
+              <div style={{ display: "flex", alignItems: "center", gap: 6, flexShrink: 0 }}>
+                {canEdit && <button onClick={() => setLessonModal(lesson)} style={{ padding: "6px 14px", borderRadius: 8, border: `1px solid ${C.border}`, background: C.white, color: C.textSub, fontSize: 12, fontWeight: 600, cursor: "pointer" }}>Edit</button>}
+                {canAssign && lesson.type !== "recording" && <button onClick={() => setAssignModal({ contentType: "lesson", contentId: lesson.id })} style={{ padding: "6px 14px", borderRadius: 8, border: "none", background: C.orange, color: "#fff", fontSize: 12, fontWeight: 700, cursor: "pointer" }}>Assign</button>}
+                {canEdit && <button onClick={() => setConfirmArchive({ type: "lesson", id: lesson.id, title: lesson.title })} style={{ padding: "6px 14px", borderRadius: 8, border: `1px solid rgba(239,68,68,0.2)`, background: "transparent", color: C.red, fontSize: 12, fontWeight: 600, cursor: "pointer" }}>Archive</button>}
               </div>
-            </Card>
+            </div>
           ))}
 
           {lessons.length === 0 && (
             <button onClick={() => setLessonModal("new")} style={{
               padding: 40, borderRadius: 12, border: `2px dashed ${C.border}`, background: "transparent",
-              color: C.textSub, fontSize: 14, cursor: "pointer", textAlign: "center", gridColumn: "1/-1",
+              color: C.textSub, fontSize: 14, cursor: "pointer", textAlign: "center",
             }}>
               <div style={{ fontWeight: 700, color: C.text, marginBottom: 4 }}>No lessons yet</div>
               <div>Click "+ New Lesson" to create a standalone lesson</div>
@@ -23879,6 +23874,14 @@ export default function App() {
   // QuizzesScreen waits for this before merging assignments so the race is avoided.
   const [quizzesReady, setQuizzesReady] = useState(false);
 
+  // Bumped after a quiz archive/restore so the manager Learn → Assignments dataset
+  // (managerActiveAssignments/cancelled history/counts/drilldowns, loaded by
+  // LearnScreen.loadLearnCatalog) reloads immediately — the archive cancels the
+  // quiz's unresolved assignments server-side, and without this signal those rows
+  // would keep rendering as active (with Unassign) until a full browser refresh.
+  // Reuses the ONE canonical manager loader; not a second assignment-state path.
+  const [learnAssignRefreshKey, setLearnAssignRefreshKey] = useState(0);
+
   // Battle card categories — demo: localStorage; real users: Supabase tenant_bc_categories
   const [bcCategories, setBcCategories] = useState(() => {
     if (/* real user check deferred to useEffect */ false) return [];
@@ -24821,6 +24824,7 @@ export default function App() {
         return;
       }
       setQuizzes(prev => prev.map(q => q.id === id ? { ...q, status: "archived" } : q));
+      setLearnAssignRefreshKey(k => k + 1); // reload manager assignments/counts/drilldowns now
       const n = Number(data?.cancelled_assignments ?? 0);
       toast.success(n > 0 ? `Quiz archived. ${n} active assignment${n === 1 ? "" : "s"} cancelled.` : "Quiz archived.");
     } finally {
@@ -24846,6 +24850,7 @@ export default function App() {
         return;
       }
       setQuizzes(prev => prev.map(q => q.id === id ? { ...q, status: "active" } : q));
+      setLearnAssignRefreshKey(k => k + 1); // reload manager assignments/counts/drilldowns now
       toast.success("Quiz restored to the active library.");
     } finally {
       deletingQuizIdsRef.current.delete(id);
@@ -25366,7 +25371,7 @@ export default function App() {
       }} />;
       case "rankd-game":        return <RankdGameScreen onNav={navigate} sessionName={lobbySessionName} role={gameRole} playerName={lobbyPlayerName ?? user.name} playerEmoji={lobbyPlayerEmoji} questions={gameQuestions ?? GAME_QUESTIONS} demoMode={gameRole === "admin" && activeGameIsDemo} pin={lobbyPin} sessionDbId={activeGameSessionDbId} tenantId={currentOrg?.id ?? user?.orgId ?? null} broadcast={broadcast} trackPlayerPresence={trackPlayerPresence} chMsg={chMsg} chStatus={chStatus} chAnswers={chAnswers} chPlayers={chPlayers} playerId={gamePlayerId} onGameEnd={handleGameEnd} setChAnswers={setChAnswers} />;
       case "rankd-results":     return <RankdResultsScreen onNav={navigate} sessionDbId={viewResultsDbId} sessionCode={viewResultsCode} sessions={[...sessions, ...pastSessions]} gameData={gameResultsData} />;
-      case "learn":             return <LearnScreen role={gameRole} canManageLearn={canManageLearn} user={user} orgUsers={orgUsers} orgs={orgs} onNav={navigate} onStartQuiz={(id) => { setPendingQuizId(id); navigate("quizzes"); }} onAwardXp={handleAwardXp} pendingLessonId={pendingLessonId} onClearPendingLesson={() => setPendingLessonId(null)} pendingCourseId={pendingCourseId} onClearPendingCourse={() => setPendingCourseId(null)} canCreate={perm("actions","create")} canEdit={perm("actions","edit")} canDelete={perm("actions","delete")} canAssign={perm("actions","assign")} tenantId={currentOrg?.id ?? null} isReal={!!user?._isReal} quizzes={quizzes} sharedAssignmentData={sharedAssignmentData}
+      case "learn":             return <LearnScreen role={gameRole} canManageLearn={canManageLearn} user={user} orgUsers={orgUsers} orgs={orgs} onNav={navigate} onStartQuiz={(id) => { setPendingQuizId(id); navigate("quizzes"); }} onAwardXp={handleAwardXp} pendingLessonId={pendingLessonId} onClearPendingLesson={() => setPendingLessonId(null)} pendingCourseId={pendingCourseId} onClearPendingCourse={() => setPendingCourseId(null)} canCreate={perm("actions","create")} canEdit={perm("actions","edit")} canDelete={perm("actions","delete")} canAssign={perm("actions","assign")} tenantId={currentOrg?.id ?? null} isReal={!!user?._isReal} quizzes={quizzes} sharedAssignmentData={sharedAssignmentData} learnAssignRefreshKey={learnAssignRefreshKey}
         quizzesPanel={canManageLearn ? (
           <QuizzesScreen role="admin" onNav={navigate} quizzes={quizzes} onEditQuiz={handleEditQuiz} onDeleteQuiz={handleDeleteQuiz} onArchiveQuiz={handleArchiveQuiz} onRestoreQuiz={handleRestoreQuiz} onToggleFavorite={handleToggleFavorite} onToggleActive={handleToggleActive} pendingQuizId={null} onClearPendingQuiz={() => {}} canCreate={perm("actions","create")} canEdit={perm("actions","edit")} canDelete={perm("actions","delete")} canLaunch={perm("actions","launch")} canAssign={perm("actions","assign")} onAssignQuiz={handleAssignQuiz} onLaunchQuiz={handleCreateSession} orgUsers={orgUsers} orgs={orgs} currentUser={currentUser} tenantId={currentOrg?.id ?? null} isReal={!!user?._isReal} quizzesReady={quizzesReady} sharedAssignmentData={sharedAssignmentData} onRefreshQuizzes={refreshQuizzes} />
         ) : null} />;
