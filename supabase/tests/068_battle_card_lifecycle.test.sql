@@ -5,9 +5,11 @@
 \set ON_ERROR_STOP on
 BEGIN;
 
--- Local supabase omits production's default table grants; replicate them so RLS
--- (not a missing grant) is the gate under test. Transaction-local; rolled back.
-GRANT SELECT, INSERT, UPDATE, DELETE ON public.tenant_battle_cards  TO authenticated;
+-- Local supabase omits production's default table grants; replicate the POST-068
+-- production grants so RLS (not a stray grant) is the gate under test. Note: cards
+-- deliberately have NO DELETE grant to authenticated/anon (migration 068 revokes it);
+-- categories keep DELETE. Transaction-local; rolled back.
+GRANT SELECT, INSERT, UPDATE         ON public.tenant_battle_cards  TO authenticated;  -- no DELETE (068)
 GRANT SELECT, INSERT, UPDATE, DELETE ON public.tenant_bc_categories TO authenticated;
 GRANT SELECT ON public.tenant_battle_cards  TO anon;
 GRANT SELECT ON public.profiles TO authenticated;
@@ -42,6 +44,7 @@ INSERT INTO public.tenant_battle_cards (id, tenant_id, category_id, title, conte
 
 DO $$
 DECLARE v_status text; v_arch timestamptz; v_created uuid; v_created0 uuid; v_upd timestamptz; v_cnt int; v_cat uuid;
+        v_born timestamptz; v_tenant uuid;
 BEGIN
   -- Test 1: existing/owner-inserted card is active with no archived_at
   SELECT status, archived_at INTO v_status, v_arch FROM public.tenant_battle_cards WHERE id='00000000-0000-0000-0000-00000000f000';
@@ -58,6 +61,7 @@ BEGIN
   SELECT created_by, archived_at INTO v_created0, v_arch FROM public.tenant_battle_cards WHERE id='00000000-0000-0000-0000-00000000f001';
   IF v_created0 <> '00000000-0000-0000-0000-0000000000ac' THEN RAISE EXCEPTION 'T1b FAIL: created_by not server-set to caller (got %)', v_created0; END IF;
   IF v_arch IS NOT NULL THEN RAISE EXCEPTION 'T1b FAIL: active card got archived_at'; END IF;
+  SELECT created_at INTO v_born FROM public.tenant_battle_cards WHERE id='00000000-0000-0000-0000-00000000f001';  -- immutable birth stamp
   RAISE NOTICE '   created_by is server-authoritative (caller ac, client value ignored): PASS';
 
   -- Test 3: learner (a1) sees the active card
@@ -124,11 +128,13 @@ BEGIN
   SET LOCAL ROLE authenticated;
   UPDATE public.tenant_battle_cards SET status='active' WHERE id='00000000-0000-0000-0000-00000000f001';
   RESET ROLE;
-  SELECT status, archived_at, created_by INTO v_status, v_arch, v_created FROM public.tenant_battle_cards WHERE id='00000000-0000-0000-0000-00000000f001';
+  SELECT status, archived_at, created_by, created_at, tenant_id INTO v_status, v_arch, v_created, v_upd, v_tenant FROM public.tenant_battle_cards WHERE id='00000000-0000-0000-0000-00000000f001';
   IF v_status <> 'active' OR v_arch IS NOT NULL THEN RAISE EXCEPTION 'T9 FAIL: restore left archived state (% / %)', v_status, v_arch; END IF;
   IF v_created <> '00000000-0000-0000-0000-0000000000ac' THEN RAISE EXCEPTION 'T9 FAIL: restore changed creator'; END IF;
+  IF v_upd <> v_born THEN RAISE EXCEPTION 'T9 FAIL: created_at mutated across archive/restore'; END IF;
+  IF v_tenant <> '00000000-0000-0000-0000-0000000000a0' THEN RAISE EXCEPTION 'T9 FAIL: tenant changed'; END IF;
   IF (SELECT content->0->>'heading' FROM public.tenant_battle_cards WHERE id='00000000-0000-0000-0000-00000000f001') <> 'h' THEN RAISE EXCEPTION 'T9 FAIL: restore changed content'; END IF;
-  RAISE NOTICE '9. restore preserves id/content/creator, clears archived_at: PASS';
+  RAISE NOTICE '9. restore preserves id/content/creator/created_at/tenant, clears archived_at: PASS';
 
   -- Test 6: cross-tenant read + write fail (manager b9 on tenant A card)
   PERFORM set_config('request.jwt.claims','{"sub":"00000000-0000-0000-0000-0000000000b9","role":"authenticated"}',true);
@@ -176,6 +182,48 @@ BEGIN
   IF v_cat IS NOT NULL THEN RAISE EXCEPTION 'T12 FAIL: card still has category after delete'; END IF;
   IF (SELECT count(*) FROM public.tenant_battle_cards WHERE id='00000000-0000-0000-0000-00000000f001') <> 1 THEN RAISE EXCEPTION 'T12 FAIL: card lost on category delete'; END IF;
   RAISE NOTICE '12. category deletion leaves card uncategorized (card intact): PASS';
+
+  -- Tests 14-18: NO client role can permanently DELETE a Battle Card (068 revokes
+  -- the grant + drops the policy). Each attempt raises insufficient_privilege and
+  -- the row survives. f001 still exists (active, uncategorized) from above.
+  -- manager (a9)
+  PERFORM set_config('request.jwt.claims','{"sub":"00000000-0000-0000-0000-0000000000a9","role":"authenticated"}',true);
+  SET LOCAL ROLE authenticated;
+  BEGIN DELETE FROM public.tenant_battle_cards WHERE id='00000000-0000-0000-0000-00000000f001'; RESET ROLE; RAISE EXCEPTION 'T14 FAIL: manager hard-deleted a card';
+  EXCEPTION WHEN insufficient_privilege THEN NULL; END;
+  RESET ROLE;
+  RAISE NOTICE '14. manager direct DELETE fails: PASS';
+  -- orgAdmin (ac)
+  PERFORM set_config('request.jwt.claims','{"sub":"00000000-0000-0000-0000-0000000000ac","role":"authenticated"}',true);
+  SET LOCAL ROLE authenticated;
+  BEGIN DELETE FROM public.tenant_battle_cards WHERE id='00000000-0000-0000-0000-00000000f001'; RESET ROLE; RAISE EXCEPTION 'T15 FAIL: orgAdmin hard-deleted a card';
+  EXCEPTION WHEN insufficient_privilege THEN NULL; END;
+  RESET ROLE;
+  RAISE NOTICE '15. orgAdmin direct DELETE fails: PASS';
+  -- learner (a1)
+  PERFORM set_config('request.jwt.claims','{"sub":"00000000-0000-0000-0000-0000000000a1","role":"authenticated"}',true);
+  SET LOCAL ROLE authenticated;
+  BEGIN DELETE FROM public.tenant_battle_cards WHERE id='00000000-0000-0000-0000-00000000f001'; RESET ROLE; RAISE EXCEPTION 'T16 FAIL: learner hard-deleted a card';
+  EXCEPTION WHEN insufficient_privilege THEN NULL; END;
+  RESET ROLE;
+  RAISE NOTICE '16. learner direct DELETE fails: PASS';
+  -- anon
+  PERFORM set_config('request.jwt.claims','{"role":"anon"}',true);
+  SET LOCAL ROLE anon;
+  BEGIN DELETE FROM public.tenant_battle_cards WHERE id='00000000-0000-0000-0000-00000000f001'; RESET ROLE; RAISE EXCEPTION 'T17 FAIL: anon hard-deleted a card';
+  EXCEPTION WHEN insufficient_privilege THEN NULL; END;
+  RESET ROLE;
+  RAISE NOTICE '17. anon direct DELETE fails: PASS';
+  -- cross-tenant (manager b9 on tenant-A card)
+  PERFORM set_config('request.jwt.claims','{"sub":"00000000-0000-0000-0000-0000000000b9","role":"authenticated"}',true);
+  SET LOCAL ROLE authenticated;
+  BEGIN DELETE FROM public.tenant_battle_cards WHERE id='00000000-0000-0000-0000-00000000f001'; RESET ROLE; RAISE EXCEPTION 'T18 FAIL: cross-tenant hard-delete succeeded';
+  EXCEPTION WHEN insufficient_privilege THEN NULL; END;
+  RESET ROLE;
+  RAISE NOTICE '18. cross-tenant direct DELETE fails: PASS';
+  -- Card must still be present after all delete attempts
+  IF (SELECT count(*) FROM public.tenant_battle_cards WHERE id='00000000-0000-0000-0000-00000000f001') <> 1 THEN RAISE EXCEPTION 'T14-18 FAIL: card was deleted by a client role'; END IF;
+  RAISE NOTICE '   card survives all client DELETE attempts: PASS';
 
   RAISE NOTICE '068 ALL TESTS PASSED';
 END $$;

@@ -147,6 +147,21 @@ CREATE POLICY bc_categories_admin_update
     AND (get_my_role() = 'ralli_admin' OR tenant_id = get_my_tenant_id())
   );
 
+-- ── 6. Remove client HARD DELETE of Battle Cards (archive/restore only) ─────────
+-- The approved lifecycle excludes permanent deletion. Removing it from the UI and
+-- service is not enough while the DELETE policy + grant let a client role delete
+-- rows directly through the API. Close it at the source: drop the DELETE policy and
+-- revoke the DELETE grant from BOTH client roles, so no authenticated client
+-- (manager, orgAdmin, ralli_admin, learner) and no anon client can permanently
+-- delete a Battle Card — they archive instead. service_role and the table owner
+-- (postgres) keep their existing RLS-bypassing DELETE for emergency / GDPR / tenant
+-- offboarding (tenant delete still CASCADEs), and no client-facing hard-delete RPC
+-- is added. tenant_bc_categories DELETE is intentionally left UNCHANGED — category
+-- deletion stays as approved (it only uncategorizes cards via ON DELETE SET NULL).
+DROP POLICY IF EXISTS bc_cards_admin_delete ON public.tenant_battle_cards;
+REVOKE DELETE ON public.tenant_battle_cards FROM authenticated;
+REVOKE DELETE ON public.tenant_battle_cards FROM anon;
+
 -- ─────────────────────────────────────────────────────────────────────────────
 -- Verify (read-only):
 --   \d+ public.tenant_battle_cards  → status, archived_at, updated_by present
