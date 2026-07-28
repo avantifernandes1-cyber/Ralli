@@ -44,6 +44,25 @@ Completed:
 
 ---
 
+### Learn Lifecycle (Lessons / Courses / Quizzes)
+
+Status: Beta Complete
+
+Merged to production: commit `6e1c7474fc7145f71fa3b22915ba7016c242dd29`; Vercel deployment `BCvnfz6hharkZHESKNpu8f8Fc7er`. Migrations 063–067 applied and verified.
+
+Completed:
+
+- Unified learner Learn (To Do / Completed / All) + manager Learn tabs (Assignments / Courses / Lessons / Quizzes); standalone Quizzes nav retired
+- Lifecycle integrity: archive cancels only unresolved assignments, blocks hard delete of referenced content, server-authoritative completion (063)
+- Manager Unassign + one canonical assignment history preserving cancelled/unassigned instances (064)
+- Quiz archive/restore with a canonical assignment-assignability guard closing the archive-vs-assign race (065)
+- Archive never cancels completed history; completed-history repair (066)
+- Learner-safe completed-quiz history incl. archived, catalog-only metadata (067)
+- Instance-scoped assignment score/attempt identity (no reassignment misattribution); Review opens the exact historical attempt (never starts a new one); sign-out clears pending quiz/start/review navigation state
+- "Last Updated" on lesson and course cards from authoritative `updated_at` (empty when missing — no invented dates)
+
+---
+
 ### Ralli Live
 
 Status: Beta Complete
