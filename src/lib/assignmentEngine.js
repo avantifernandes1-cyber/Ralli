@@ -212,6 +212,13 @@ export function resolveCourseAssignment(assignment, lessonIds = [], completedAtB
  * @returns {{ isResolved: boolean, isActive: boolean, status: 'not_started'|'in_progress'|'completed'|'overdue', progress: number, completedAt: string|null }}
  */
 export function resolveAssignmentStatus(contentType, assignment, data = {}) {
+  // Cancelled assignments (063: content archived/removed) are history only —
+  // never active/overdue/pending, never resolved-for-reassignment. The data
+  // source already excludes them from active views; this is a defensive guard
+  // for any caller that passes a cancelled row (e.g. the manager historical view).
+  if (assignment?.cancelledAt) {
+    return { isResolved: false, isActive: false, status: "cancelled", progress: 0, completedAt: null };
+  }
   let result;
   if (contentType === "quiz") {
     result = resolveQuizAssignment(assignment, data.attempts ?? []);
@@ -318,4 +325,107 @@ export function resolveLatestQuizAssignment(assignments = [], attempts = []) {
     progress: resolved.progress, completedAt: resolved.completedAt,
     scopedAttempts, attemptCount, latestScore, bestScore,
   };
+}
+
+/**
+ * Per-lesson schedule unlock — pure and deterministic (accepts `now` for tests).
+ * A lesson unlocks `availableAfterDays` days after the assignment's assigned_at,
+ * compared on local day boundaries (same rule the Learn UI used inline). Returns
+ * { locked, availableDate }. days=0 / no assigned date ⇒ always unlocked.
+ *
+ * @param {string|Date|null} assignedAtRaw
+ * @param {number} availableAfterDays
+ * @param {Date} now
+ * @returns {{ locked: boolean, availableDate: Date|null }}
+ */
+export function lessonUnlockState(assignedAtRaw, availableAfterDays = 0, now = new Date()) {
+  const days = availableAfterDays ?? 0;
+  if (!assignedAtRaw || days === 0) return { locked: false, availableDate: null };
+  const base = new Date(assignedAtRaw);
+  if (Number.isNaN(base.getTime())) return { locked: false, availableDate: null };
+  base.setHours(0, 0, 0, 0);
+  const availMs = base.getTime() + days * 86400000;
+  const nowMs = new Date(now); nowMs.setHours(0, 0, 0, 0);
+  return { locked: nowMs.getTime() < availMs, availableDate: new Date(availMs) };
+}
+
+/**
+ * THE canonical learner "current work" selector — the single source of truth
+ * shared by Home (Assigned Learning) and Learner Learn (Assigned/All, To Do,
+ * Completed). Collapses every content type to ONE current card per
+ * (contentType, contentId): the LATEST assignment instance, resolved to its
+ * status by the same engine used everywhere else. Cancelled instances are
+ * excluded (they are history, not current work). Missing/deleted content is
+ * kept but flagged `missing` so the UI can render a non-clickable honest card
+ * rather than dropping it silently or linking to nothing.
+ *
+ * Guarantees the caller can rely on:
+ *   - one entry per content (no duplicate current cards, no historical dupes)
+ *   - status ∈ not_started | in_progress | completed | overdue
+ *   - `isCompleted` splits the set into exactly Completed vs To Do, so
+ *     All === To Do ∪ Completed, To Do === not_started + in_progress + overdue.
+ *
+ * @param {Array<Object>} assignments  this learner's assignment rows (all instances)
+ * @param {Object} ctx { completedAtByLesson:Map, quizAttempts:[], courses:[], lessons:[], quizzes:[] }
+ * @returns {Array<{ contentType, contentId, assignment, content, missing, status, progress, completedAt, isCompleted, isToDo, isOverdue }>}
+ */
+export function resolveLearnerAssignments(assignments = [], ctx = {}) {
+  const { completedAtByLesson = new Map(), quizAttempts = [], courses = [], lessons = [], quizzes = [] } = ctx;
+  const courseById = new Map(courses.map(c => [c.id, c]));
+  const lessonById = new Map(lessons.map(l => [l.id, l]));
+  const quizById   = new Map(quizzes.map(q => [q.id, q]));
+
+  const groups = new Map(); // contentType:contentId -> instances[]
+  for (const a of (assignments ?? [])) {
+    if (a?.cancelledAt) continue; // current work excludes cancelled/unassigned
+    const key = `${a.contentType}:${a.contentId}`;
+    if (!groups.has(key)) groups.set(key, []);
+    groups.get(key).push(a);
+  }
+
+  const out = [];
+  for (const instances of groups.values()) {
+    const contentType = instances[0].contentType;
+    const contentId   = instances[0].contentId;
+    let latest, status, progress, completedAt, score = null, attemptId = null;
+
+    if (contentType === "quiz") {
+      const r = resolveLatestQuizAssignment(instances, (quizAttempts ?? []).filter(at => at.quiz_id === contentId));
+      latest = r.latest; status = r.status; progress = r.progress; completedAt = r.completedAt;
+      // INSTANCE-SCOPED score + the exact representative attempt — best PASSING attempt
+      // among those already scoped to THIS (latest) instance's assigned_at
+      // (resolveLatestQuizAssignment.scopedAttempts uses isQualifyingEvent, newest-first).
+      // Never a lifetime-per-quiz aggregate, so a reassignment can't let one instance
+      // inherit another instance's score/attempt. attemptId is what Review opens (exact
+      // historical attempt for THIS assignment instance, not merely the latest).
+      const passingScoped = (r.scopedAttempts ?? []).filter(at => at.passed);
+      let rep = null;
+      for (const at of passingScoped) { if (!rep || (at.score ?? 0) > (rep.score ?? 0)) rep = at; }
+      score = rep ? (rep.score ?? 0) : null;
+      attemptId = rep?.id ?? null;
+    } else {
+      latest = instances.reduce((m, a) =>
+        (new Date(assignedAtOf(a) ?? 0).getTime() >= new Date(assignedAtOf(m) ?? 0).getTime() ? a : m), instances[0]);
+      if (contentType === "course") {
+        const course   = courseById.get(contentId);
+        const eligible = (course?.lessonIds ?? []).filter(id => lessonById.has(id)); // archived/missing members excluded from the denominator
+        const r = resolveAssignmentStatus("course", latest, { lessonIds: eligible, completedAtByLesson });
+        status = r.status; progress = r.progress; completedAt = r.completedAt;
+      } else {
+        const r = resolveAssignmentStatus("lesson", latest, { completedAt: completedAtByLesson.get(contentId) ?? null });
+        status = r.status; progress = r.progress; completedAt = r.completedAt;
+      }
+    }
+
+    const content = contentType === "course" ? courseById.get(contentId)
+                  : contentType === "quiz"   ? quizById.get(contentId)
+                  : lessonById.get(contentId);
+    const isCompleted = status === "completed";
+    out.push({
+      contentType, contentId, assignment: latest, content: content ?? null, missing: !content,
+      status, progress, completedAt, score, attemptId, // score/attemptId: instance-scoped (quiz); null otherwise
+      isCompleted, isToDo: !isCompleted, isOverdue: status === "overdue",
+    });
+  }
+  return out;
 }

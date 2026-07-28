@@ -35,6 +35,7 @@ function dbToLesson(row) {
     videoUrl:    row.content?.videoUrl ?? "", // kept for backward compat
     notes:       row.content?.notes    ?? "", // kept for backward compat
     createdAt:   row.created_at,
+    updatedAt:   row.updated_at ?? null,      // authoritative "Last Updated" (surfaced in the UI)
   };
 }
 
@@ -106,11 +107,11 @@ export async function upsertLesson(tenantId, lesson, userId) {
  * @returns {Promise<{ error: Object|null }>}
  */
 export async function deleteLesson(lessonId) {
-  const { error } = await supabase
-    .from("tenant_lessons")
-    .delete()
-    .eq("id", lessonId);
-  return { error };
+  // Hard delete goes through delete_lesson() (063), which BLOCKS deletion when
+  // the lesson still has assignments, completions, or course references — so a
+  // reference is never silently orphaned. Managers should archive instead.
+  const { data, error } = await supabase.rpc("delete_lesson", { p_lesson_id: lessonId });
+  return { data, error };
 }
 
 
@@ -130,6 +131,7 @@ function dbToCourse(row) {
     color:          row.color ?? "#FF6B35",
     status:         row.status ?? "active",
     createdAt:      row.created_at,
+    updatedAt:      row.updated_at ?? null,    // authoritative "Last Updated" (surfaced in the UI)
   };
 }
 
@@ -198,11 +200,10 @@ export async function upsertCourse(tenantId, course, userId) {
  * @returns {Promise<{ error: Object|null }>}
  */
 export async function deleteCourse(courseId) {
-  const { error } = await supabase
-    .from("tenant_courses")
-    .delete()
-    .eq("id", courseId);
-  return { error };
+  // Hard delete goes through delete_course() (063), which BLOCKS deletion when
+  // the course still has assignments — references are never silently orphaned.
+  const { data, error } = await supabase.rpc("delete_course", { p_course_id: courseId });
+  return { data, error };
 }
 
 
@@ -370,16 +371,45 @@ export async function upsertQuiz(tenantId, quiz, userId) {
 }
 
 /**
- * Delete a quiz by id.
+ * Archive a quiz (soft, reversible) — migration 065 archive_quiz RPC.
+ * Sets status='archived' and cancels the quiz's still-active assignments with a
+ * server-controlled reason ('content_archived'), preserving every attempt,
+ * score, XP award, result, review, snapshot, tag, and analytics row. The
+ * archived quiz leaves the learner Knowledge Base / Home / To-Do and the
+ * new-assignment picker, while historical results stay honest. Server-authorized
+ * (manager/orgAdmin/ralli_admin), tenant-scoped, idempotent.
  * @param {string} quizId
- * @returns {Promise<{ error: Object|null }>}
+ * @returns {Promise<{ data: Object|null, error: Object|null }>}
+ */
+export async function archiveQuiz(quizId) {
+  const { data, error } = await supabase.rpc("archive_quiz", { p_quiz_id: quizId });
+  return { data: data ?? null, error };
+}
+
+/**
+ * Restore an archived quiz to the active library — migration 065 restore_quiz.
+ * Returns status to 'active' and allows fresh reassignment. Does NOT reactivate
+ * the assignments archive cancelled, and never rewrites past results.
+ * @param {string} quizId
+ * @returns {Promise<{ data: Object|null, error: Object|null }>}
+ */
+export async function restoreQuiz(quizId) {
+  const { data, error } = await supabase.rpc("restore_quiz", { p_quiz_id: quizId });
+  return { data: data ?? null, error };
+}
+
+/**
+ * Hard-delete a quiz — migration 065 delete_quiz RPC. The raw table DELETE path
+ * is closed (RLS policy dropped + grant revoked); this restricted RPC REFUSES to
+ * delete a quiz that has any assignment or attempt (it directs the caller to
+ * archive instead), so a delete can never orphan history. The manager UI no
+ * longer offers this; retained for a genuinely unused, never-assigned quiz.
+ * @param {string} quizId
+ * @returns {Promise<{ data: Object|null, error: Object|null }>}
  */
 export async function deleteQuiz(quizId) {
-  const { error } = await supabase
-    .from("tenant_quizzes")
-    .delete()
-    .eq("id", quizId);
-  return { error };
+  const { data, error } = await supabase.rpc("delete_quiz", { p_quiz_id: quizId });
+  return { data: data ?? null, error };
 }
 
 
@@ -428,6 +458,11 @@ function dbToAssignment(row) {
       ? new Date(row.assigned_at).toLocaleDateString("en-US", { month: "short", day: "numeric" })
       : "—",
     assignedAtRaw:  row.assigned_at ?? null, // ISO string — used for availability date math
+    // Cancellation (063): set when the assigned content was archived/removed.
+    // A cancelled assignment is preserved for history but never counts as
+    // active/overdue/pending and never blocks reassignment.
+    cancelledAt:     row.cancelled_at ?? null,
+    cancelledReason: row.cancelled_reason ?? null,
   };
 }
 
@@ -436,12 +471,18 @@ function dbToAssignment(row) {
  * @param {string} tenantId
  * @returns {Promise<{ data: Object[]|null, error: Object|null }>}
  */
-export async function getTenantAssignments(tenantId) {
-  const { data, error } = await supabase
+export async function getTenantAssignments(tenantId, { includeCancelled = false } = {}) {
+  // Cancelled assignments (063) are excluded by default so they never count as
+  // active/overdue/pending anywhere (learner lists, Home/To-Do, dashboard KPIs).
+  // The manager historical view passes includeCancelled:true to surface them as
+  // "Unavailable — content archived/removed".
+  let q = supabase
     .from("tenant_assignments")
     .select("*")
     .eq("tenant_id", tenantId)
     .order("assigned_at", { ascending: false });
+  if (!includeCancelled) q = q.is("cancelled_at", null);
+  const { data, error } = await q;
   return { data: data ? data.map(dbToAssignment) : null, error };
 }
 
@@ -648,7 +689,8 @@ async function getQuizAssignmentActiveUserIds(tenantId, contentId) {
     .select("assigned_to, assigned_at")
     .eq("tenant_id", tenantId)
     .eq("content_type", "quiz")
-    .eq("content_id", contentId);
+    .eq("content_id", contentId)
+    .is("cancelled_at", null);   // cancelled assignments never block reassignment (063)
 
   const latestAssignedAtByUser = new Map();
   for (const row of rows ?? []) {
@@ -692,7 +734,8 @@ async function getLessonAssignmentActiveUserIds(tenantId, contentId) {
     .select("assigned_to, assigned_at")
     .eq("tenant_id", tenantId)
     .eq("content_type", "lesson")
-    .eq("content_id", contentId);
+    .eq("content_id", contentId)
+    .is("cancelled_at", null);   // cancelled assignments never block reassignment (063)
 
   const latestAssignedAtByUser = new Map();
   for (const row of rows ?? []) {
@@ -743,7 +786,8 @@ async function getCourseAssignmentActiveUserIds(tenantId, contentId) {
     .select("assigned_to, assigned_at")
     .eq("tenant_id", tenantId)
     .eq("content_type", "course")
-    .eq("content_id", contentId);
+    .eq("content_id", contentId)
+    .is("cancelled_at", null);   // cancelled assignments never block reassignment (063)
 
   const latestAssignedAtByUser = new Map();
   for (const row of rows ?? []) {
@@ -805,7 +849,8 @@ export async function getActiveAssignmentsByUser(tenantId, contentType, contentI
     .select("id, assigned_to, due_at, required")
     .eq("tenant_id", tenantId)
     .eq("content_type", contentType)
-    .eq("content_id", contentId);
+    .eq("content_id", contentId)
+    .is("cancelled_at", null);   // cancelled assignments are not active (063)
 
   const activeIds =
     contentType === "quiz"   ? await getQuizAssignmentActiveUserIds(tenantId, contentId)
@@ -925,16 +970,22 @@ export async function createAssignments(tenantId, assignment, assignedByUserId) 
 }
 
 /**
- * Delete an assignment by id.
+ * Unassign one learner's assignment (soft, history-preserving cancellation).
+ *
+ * Replaces the former hard-delete `deleteAssignment`. Delegates to the
+ * unassign_assignment RPC (064), which is the ONLY assignment-removal path
+ * available to the app: it cancels exactly this one row (server-controlled
+ * reason 'manager_unassigned', cancelled_by = the acting manager), never
+ * deletes, refuses a completed assignment, and is idempotent. The raw DELETE
+ * capability on tenant_assignments is closed at the policy/grant level by 064,
+ * so there is no client hard-delete path to fall back to.
+ *
  * @param {string} assignmentId
- * @returns {Promise<{ error: Object|null }>}
+ * @returns {Promise<{ data: Object|null, error: Object|null }>}
  */
-export async function deleteAssignment(assignmentId) {
-  const { error } = await supabase
-    .from("tenant_assignments")
-    .delete()
-    .eq("id", assignmentId);
-  return { error };
+export async function unassignAssignment(assignmentId) {
+  const { data, error } = await supabase.rpc("unassign_assignment", { p_assignment_id: assignmentId });
+  return { data, error };
 }
 
 
@@ -948,11 +999,10 @@ export async function deleteAssignment(assignmentId) {
  * @returns {Promise<{ error: Object|null }>}
  */
 export async function archiveCourse(courseId) {
-  const { error } = await supabase
-    .from("tenant_courses")
-    .update({ status: "archived", updated_at: new Date().toISOString() })
-    .eq("id", courseId);
-  return { error };
+  // archive_course() (063) archives AND cancels the course's active assignments
+  // in one server-side step, so no assignment is left stranded.
+  const { data, error } = await supabase.rpc("archive_course", { p_course_id: courseId });
+  return { data, error };
 }
 
 /**
@@ -961,11 +1011,12 @@ export async function archiveCourse(courseId) {
  * @returns {Promise<{ error: Object|null }>}
  */
 export async function archiveLesson(lessonId) {
-  const { error } = await supabase
-    .from("tenant_lessons")
-    .update({ status: "archived", updated_at: new Date().toISOString() })
-    .eq("id", lessonId);
-  return { error };
+  // archive_lesson() (063) archives AND cancels the lesson's active assignments,
+  // and BLOCKS archival while the lesson belongs to an active course (the manager
+  // must remove it from the course first) — so an active course can never contain
+  // an archived member. On block it returns an error the caller surfaces.
+  const { data, error } = await supabase.rpc("archive_lesson", { p_lesson_id: lessonId });
+  return { data, error };
 }
 
 /**
@@ -1086,13 +1137,14 @@ export async function getLessonCompletions(profileId) {
  * @returns {Promise<{ error: Object|null }>}
  */
 export async function markLessonComplete(profileId, lessonId, tenantId = null) {
-  const { error } = await supabase
-    .from("lesson_completions")
-    .upsert(
-      { profile_id: profileId, lesson_id: lessonId, tenant_id: tenantId, completed_at: new Date().toISOString() },
-      { onConflict: "profile_id,lesson_id" }
-    );
-  return { error };
+  // Server-authoritative (063): mark_lesson_complete() derives the tenant from the
+  // authenticated learner + the referenced lesson and rejects a cross-tenant or
+  // missing-content completion — the browser never supplies tenant_id. profileId/
+  // tenantId args are retained for call-site compatibility but intentionally
+  // ignored; identity comes from auth.uid() inside the RPC. Same single
+  // (profile,lesson) completion row is upserted (completed_at refreshed).
+  const { data, error } = await supabase.rpc("mark_lesson_complete", { p_lesson_id: lessonId });
+  return { data, error };
 }
 
 /**
@@ -1192,6 +1244,22 @@ export async function submitQuizAttemptAtomic(tenantId, userId, quizId, attempt,
 export async function listQuizzesForLearner() {
   const { data, error } = await supabase.rpc("list_quizzes_for_learner");
   return { data: data ?? null, error };
+}
+
+/**
+ * The caller's OWN completed (passed) quiz history — SAFE metadata only (id, name,
+ * status, passing_score, best_score, passed, last_passed_at), INCLUDING archived
+ * quizzes, so an archived-but-completed quiz keeps its title/score in the learner's
+ * Completed/All history (migration 067). Never returns questions/answers, never
+ * another learner's rows, and never makes archived content startable/searchable.
+ * Best-effort: returns [] if the RPC isn't present yet (pre-067) so the caller
+ * degrades gracefully (row stays visible with a generic label) instead of erroring.
+ * @returns {Promise<{ data: Array, error: Object|null }>}
+ */
+export async function listMyCompletedQuizHistory() {
+  const { data, error } = await supabase.rpc("list_my_completed_quiz_history");
+  if (error) return { data: [], error };
+  return { data: Array.isArray(data) ? data : [], error: null };
 }
 
 /** Playable, sanitized quiz (no answer keys) + question_revision for one assigned quiz. */

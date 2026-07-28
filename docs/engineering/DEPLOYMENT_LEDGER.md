@@ -287,3 +287,286 @@ raised-and-caught — no mutation):**
 
 Operator: applied by Claude Code via the controlled Supabase `apply_migration` tool, under explicit
 user production approval. Ledger row 26. This ledger update is intentionally left uncommitted.
+
+## 2026-07-25 — Learn lifecycle integrity (063)
+
+Branch `feature/learn-lifecycle-integrity` @ `80d5577c7703a973adb8ea7d75ed2d017cfa1daa`. Applied via
+one controlled `apply_migration` (Strategy A); SHA-256 re-confirmed against the committed blob
+immediately before application. Additive forward migration — does NOT edit applied migrations
+034/036/037/056–062.
+
+| Order | Prod version (ledger) | Prod name | Git file | Commit | SQL SHA-256 | Applied (UTC) | Verification |
+|---|---|---|---|---|---|---|---|
+| 27 | `20260725130139` | 063_learn_lifecycle_integrity | supabase/migrations/063_learn_lifecycle_integrity.sql | 80d5577 | 682fa4ae43e8bd1bc42dab7eef9946e3eb39129ca4a867bfc8e0a0bd5af0d4ad | 2026-07-25 13:01:39 | PASS |
+
+**What 063 adds:**
+- `tenant_assignments.cancelled_at`/`cancelled_reason` (additive, nullable). A cancelled assignment is
+  preserved for history but never active/overdue/pending and never blocks reassignment.
+- Three `_*_assignment_active_user_ids` helpers replaced as faithful supersets of 036/037 (identical
+  bodies + `AND ta.cancelled_at IS NULL`); `create_assignments_atomic` (034) delegates to them and is
+  itself unchanged.
+- Five `SECURITY DEFINER`, `search_path=''`, EXECUTE=authenticated (anon revoked) RPCs: `archive_lesson`
+  (archives + cancels active assignments; blocks while the lesson is in an active course),
+  `archive_course` (archives + cancels), `delete_lesson`/`delete_course` (block hard delete when
+  referenced), `mark_lesson_complete` (server-authoritative tenant; cross-tenant/missing rejected).
+- `lesson_completions_insert` RLS tightened to `WITH CHECK (profile_id = auth.uid() AND tenant_id =
+  get_my_tenant_id())`.
+- One-time, history-preserving backfill cancelling stranded/orphaned assignments.
+
+**Post-apply verification (read-only; production RPCs invoked with impersonation, raised-and-caught —
+no mutation):**
+- Recorded version `20260725130139` / name `063_learn_lifecycle_integrity`; exactly one ledger row.
+- `cancelled_at` + `cancelled_reason` present. All 5 RPCs present, `SECURITY DEFINER` + `search_path`,
+  EXECUTE granted to authenticated (anon = 0). All 3 helpers contain `cancelled_at IS NULL`;
+  `create_assignments_atomic` does NOT reference `cancelled_at` (unchanged). INSERT policy has both the
+  profile and tenant checks.
+- **Backfill cancelled exactly 7** stranded assignments: 4 archived-lesson, 1 missing-lesson,
+  2 archived-course, 0 missing-course. **19 valid assignments remain uncancelled** (2 active-lesson +
+  3 active-course + 14 quiz). NOTE: the preflight prose mis-summed these as "24"; the correct total is
+  19 uncancelled (the per-category counts 2/3/14 were always correct) — 19 + 7 = 26 total, unchanged.
+- **No rows deleted:** assignments 26, completions 5, quiz_attempts 28, lessons 8 (3 active / 5
+  archived), courses 3 — all unchanged. Active course membership unchanged (1 member, 0 non-active).
+- Learner archive/delete rejected ("only managers"); missing-content completion rejected ("lesson not
+  found"); non-own-tenant completion rejected ("no active tenant"). True two-tenant cross-tenant
+  rejection is proven by the 063 local harness.
+- **056–062 intact**: `get_knowledge_heatmap`, `submit_quiz_attempt_atomic_v2`, `get_quiz_review`,
+  `create_quiz_tag`, `merge_quiz_tags` all present. No quiz-grading/Ralli-Live/Heatmap/Readiness/Battle
+  Card change; no migration history rewritten.
+
+Operator: applied by Claude Code via the controlled Supabase `apply_migration` tool, under explicit
+user production approval. Ledger row 27. This ledger update is intentionally left uncommitted.
+
+## 2026-07-25 — Manager Unassign (064)
+
+Branch `feature/learn-lifecycle-integrity` @ `41beef5` (approved artifact commit). Applied via ONE
+controlled `apply_migration` (Strategy A); SHA-256 re-confirmed against the committed blob immediately
+before application. Additive forward migration — does NOT edit applied migrations 017/034/036/037/063.
+
+| Order | Prod version (ledger) | Prod name | Git file | Commit | SQL SHA-256 | Applied (UTC) | Verification |
+|---|---|---|---|---|---|---|---|
+| 28 | `20260725193232` | 064_manager_unassign | supabase/migrations/064_manager_unassign.sql | 41beef5 | 4b4e248432903a21fcabd54c9935430b738550207452591ec9bbf14a04fc5c84 | 2026-07-25 (version 20260725193232) | PASS |
+
+Pre-apply gate: working-tree + committed(41beef5) SHA-256 both `4b4e2484…5c84` = approved hash;
+byte-identical. Production had no `cancelled_by` column and no `unassign_assignment` function; 063
+present exactly once; 064 absent.
+
+Post-apply (read-only) evidence:
+- Recorded version `20260725193232` / name `064_manager_unassign`; **exactly one** ledger row. 063 still
+  exactly one row.
+- `cancelled_by uuid` present; FK to `profiles(id)` with `ON DELETE SET NULL` (confdeltype `n`) — same
+  retention model as `assigned_by`. 0 rows populated by the migration.
+- `unassign_assignment(p_assignment_id uuid)` present; `SECURITY DEFINER`; `search_path = ""` (empty).
+  EXECUTE granted to authenticated (+ owner/service_role); NOT anon/PUBLIC.
+- **Hard-delete closed:** `tenant_assignments_delete` policy dropped; DELETE grantees now only
+  `service_role, postgres` (authenticated + anon revoked). Tenant offboarding FK
+  (`tenant_id → tenants ON DELETE CASCADE`) unchanged; service_role retains delete for maintenance.
+- **No data mutated by the migration:** total cancelled = 13 (unchanged), manager_unassigned = 0,
+  cancelled_by non-null = 0; active individual lesson = 2, quiz = 13 (unchanged).
+- **063 objects intact:** `archive_lesson`, `mark_lesson_complete` present.
+
+Functional verification (production, single self-aborting transaction — synthetic fixtures, final RAISE
+forced full ROLLBACK, **zero residual data** confirmed afterward): all 12 checks PASS —
+(1) not-completed lesson unassigned + server-set reason/actor; (2) failed quiz unassigned; (3) partial
+course unassigned; (4) completed lesson refused; (5) full course refused; (6) passed quiz refused;
+(7) idempotent retry → already_cancelled, ender preserved; (8) team-originated learner unassigned,
+teammate row untouched; (9) source_* origin preserved; (10) learner refused ("only managers");
+(11) cross-tenant refused ("not in your tenant"); (12) raw authenticated DELETE denied
+("permission denied"), row intact. Residual synthetic tenants/profiles/assignments/auth.users = 0.
+
+Operator: applied by Claude Code via the controlled Supabase `apply_migration` tool, under explicit
+user production approval. Ledger row 28. Frontend NOT merged or deployed. This ledger update is
+intentionally left uncommitted.
+
+---
+
+## 2026-07-26 — Quiz Archive / Restore + content-assignability guard (065) — **APPLIED TO PRODUCTION**
+
+Branch `feature/learn-lifecycle-integrity`. Additive forward migration bringing quizzes to lifecycle
+parity with lessons/courses (063): soft, reversible ARCHIVE replaces permanent delete; the raw
+`tenant_quizzes` DELETE path is closed (RLS policy dropped + grant revoked); a restricted `delete_quiz`
+RPC refuses any referenced quiz; `list_quizzes_for_learner` excludes archived; a one-time
+history-preserving cleanup cancels active quiz assignments whose quiz is missing (`content_missing`).
+**Rev 2** added the canonical content-assignability guard (`_assert_assignment_content_assignable` +
+`BEFORE INSERT` trigger on `tenant_assignments`) covering lesson/course/quiz, after a preflight proved
+an archive-vs-assign race. The guard LOCKS the content row `FOR SHARE` by (id, tenant) then checks
+status='active', serializing with `archive_quiz`/`restore_quiz` (FOR UPDATE) and `archive_lesson`/
+`archive_course` (UPDATE = FOR NO KEY UPDATE).
+**Rev 3** closes two residual integrity gaps a further preflight found: (a) removed the `cancelled_at`
+carve-out — EVERY insert is now validated (a client-supplied column could otherwise fabricate historical
+rows against non-active content); (b) closed the raw client INSERT path — drop the `tenant_assignments_insert`
+RLS policy + REVOKE INSERT from authenticated/anon, so the ONLY assignment-creation path is
+`create_assignments_atomic` (SECURITY DEFINER, owner `postgres`/bypassrls), which alone enforces the
+instance-aware duplicate-active/eligibility rules. Mirrors 064's DELETE closure. Does NOT edit any applied migration.
+
+Applied via ONE controlled `apply_migration` (Strategy A); SHA-256 re-confirmed against the committed
+blob (`7844968`) immediately before application. No `db push`, no repair, no manual ledger SQL — a single
+production write call.
+
+| Order | Prod version (ledger) | Prod name | Git file | Commit | SQL SHA-256 | Applied (UTC) | Verification |
+|---|---|---|---|---|---|---|---|
+| 29 | `20260726145532` | 065_quiz_archive_restore | supabase/migrations/065_quiz_archive_restore.sql | 7844968 | b65d918c6fc7e331b724ad90d9a0983b57c81f95a6f67195657b27b0d0e01bb2 | 2026-07-26 (version 20260726145532) | PASS — see below |
+
+Pre-apply gate (read-only): working-tree + committed(`7844968`) SHA-256 both `b65d918c…1bb2` = approved
+hash. 065 absent; 063 & 064 each present once. Active-assignment→non-active-content = lesson 0 / course 0
+/ missing-quiz **2**; no active assignment to an existing non-active quiz.
+
+**Structural / security verification (all read-only, post-apply):**
+- Ledger version `20260726145532` / name `065_quiz_archive_restore`; **exactly one** row. 063 & 064 still
+  one each.
+- `tenant_quizzes_status_check` = `active|inactive|draft|archived` (additive; all existing rows still
+  `active` — no status rewritten).
+- `archive_quiz(p_quiz_id uuid)`, `restore_quiz(p_quiz_id uuid)`, `delete_quiz(p_quiz_id uuid)` — all
+  `SECURITY DEFINER`, approved signatures.
+- `_assert_assignment_content_assignable()` present **once**; trigger `trg_assert_assignment_content_assignable`
+  = BEFORE INSERT, enabled. Guard body covers `tenant_lessons` + `tenant_courses` + `tenant_quizzes`, has
+  **no** `cancelled_at` carve-out, uses `FOR SHARE` (lock-then-status-check).
+- **tenant_assignments INSERT**: grantees now `postgres, service_role` only (authenticated/anon revoked);
+  `tenant_assignments_insert` policy **gone**.
+- **tenant_quizzes DELETE**: grantees now `postgres, service_role` only (authenticated/anon revoked);
+  `tenant_quizzes_delete` policy **gone**.
+- `create_assignments_atomic` still `SECURITY DEFINER`, owner `postgres` — inserts unaffected.
+- `list_quizzes_for_learner` excludes archived (`status <> 'archived'`) and remains learner-safe (no answer
+  keys). `get_quiz_for_attempt` / `get_quiz_review` unchanged (no `correct`/`acceptedAnswers`/`tolerance`/`pairs`).
+- Data preserved: quizzes 4, quiz_attempts 29, attempt_solution_snapshots 7, quiz_tag_map 4,
+  quiz_attempt_tag_snapshots 27, quiz_attempt_tags 32, tenant_quiz_tags 3 — none deleted.
+
+**Cleanup evidence (exactly as predicted):** `content_missing` cancellations = **2** (rows preserved,
+`assigned_to` intact, no title fabricated); remaining active missing-quiz orphans = **0**; valid-quiz
+active assignments still **12**; non-quiz rows wrongly cancelled = **0**; no attempts/snapshots/tags/analytics
+removed. Idempotent (predicate now matches 0 candidates).
+
+**Functional verification (production, ONE self-aborting transaction — synthetic fixtures, final RAISE
+forced full ROLLBACK, zero residual data confirmed):** all 21 checks PASS — active lesson/course/quiz
+assign via `create_assignments_atomic`; archived/missing/cross-tenant content refused; same-learner
+duplicate skipped; different learner separate row; archive cancels 2 active; restore does not reactivate;
+reassign after restore succeeds; `delete_quiz` refuses referenced; learner cannot archive/restore/delete;
+cross-tenant archive/restore/delete refused; raw authenticated INSERT and raw authenticated quiz DELETE
+both `permission denied`. Residual synthetic users/tenants/quizzes/assignments = **0**.
+
+Operator: applied by Claude Code via the controlled Supabase `apply_migration` tool, under explicit user
+production approval. Ledger row 29. **Frontend NOT merged or deployed.** This ledger update is intentionally
+left uncommitted.
+
+---
+
+## 2026-07-28 — Archive must not cancel COMPLETED assignments (066) — **APPLIED TO PRODUCTION**
+
+Branch `feature/learn-lifecycle-integrity`. Forward, additive; does NOT edit applied 063/065.
+DEFECT (live QA): `archive_lesson`/`archive_course`/`archive_quiz` cancelled EVERY `cancelled_at IS NULL`
+row — including already-completed/passed ones — so the archive "cancelled" count was inflated (a quiz
+reported 11 when only 2 were unresolved) and completed history became `content_archived`, hiding manager
+scores. Production reconciliation of the archived quiz "Dre's Quiz" (`5a952aba…`): 12 instances, 11
+cancelled `content_archived`, of which **9 were Completed** (passing attempt ≥ assigned_at, before the
+archive) and only 2 were genuinely not-started.
+
+066: (1) CREATE OR REPLACE the three archive RPCs so the cancellation UPDATE cancels ONLY unresolved
+instances (instance-aware completion per row: quiz=passing attempt≥assigned_at, lesson=completion≥assigned_at,
+course=all member lessons completed≥assigned_at) and returns the true unresolved count; (2) one-time,
+idempotent repair clearing the wrongful `content_archived` cancellation on individual rows that were
+completed BEFORE their own cancelled_at.
+
+Applied via ONE controlled `apply_migration` (Strategy A); SHA-256 re-confirmed against the committed blob
+(`6603255`) immediately before application. No `db push`, no repair, no manual ledger SQL — a single
+production write call.
+
+| Order | Prod version (ledger) | Prod name | Git file | Commit | SQL SHA-256 | Applied (UTC) | Verification |
+|---|---|---|---|---|---|---|---|
+| 30 | `20260728024514` | 066_archive_completed_assignment_integrity | supabase/migrations/066_archive_completed_assignment_integrity.sql | 6603255 | fca97901e3c889994753105d8455d4adb998bb5ca3f7638b6cae92d52c8c9ac9 | 2026-07-28 (version 20260728024514) | PASS — see below |
+
+Pre-apply gate (read-only): working-tree + committed(`6603255`) SHA-256 both `fca97901…9ac9` = approved.
+066 absent; 063/064/065 each once; repair candidates lesson 1 / course 0 / quiz 9 (total 10).
+
+**Structural / security verification (read-only, post-apply):**
+- Ledger version `20260728024514`; **exactly one** row. 063/064/065 still one each.
+- `archive_quiz`/`archive_lesson`/`archive_course` now completion-aware (quiz `passed IS TRUE ≥ assigned_at`;
+  lesson completion `≥ assigned_at`; course `v_req>0 AND all member lessons ≥ assigned_at`). Auth, tenant
+  scope, `archive_quiz` `FOR UPDATE` lock, `search_path=''`, return shape, and EXECUTE grants
+  (authenticated + owner/service_role; anon/public revoked) all preserved.
+- 065 protections unchanged: guard trigger `trg_assert_assignment_content_assignable` present;
+  `tenant_assignments` INSERT = `postgres, service_role` only + policy gone; `tenant_quizzes` DELETE =
+  `postgres, service_role` only.
+
+**Repair evidence (read-only, post-apply):** exactly **lesson 1 / course 0 / quiz 9 = 10** rows repaired;
+`remaining_repairable = 0` (no completed-before-cancel `content_archived` row left). The 9 "Dre's Quiz"
+rows now resolve **Completed** (uncancelled + passing attempt); its 2 remaining `content_archived` rows are
+the 1 genuinely not-started + 1 legacy aggregate (untouched). Untouched globally: `manager_unassigned` = 8,
+`content_missing` = 2; attempts (30) and completions (6) preserved — 066 has no DELETE/DROP/ALTER, only 3
+`CREATE OR REPLACE` + 3 repair UPDATEs.
+
+**Functional verification (production, ONE self-aborting transaction — synthetic fixtures, final RAISE →
+full ROLLBACK, zero residual data confirmed):** all 17 checks PASS — quiz cancels only 2 unresolved
+(passed stays Completed with score 90); idempotent re-archive; restore does not reactivate; fresh
+reassignment after restore; lesson cancels only unresolved (completed stays); full course count 0 (stays),
+partial course 1, empty course 1 (never completed); learner cannot archive; cross-tenant archive refused.
+Residual synthetic users/tenants/assignments/quizzes = **0**.
+
+Operator: applied by Claude Code via the controlled Supabase `apply_migration` tool, under explicit user
+production approval. Ledger row 30. **Frontend NOT merged or deployed.** This ledger update is intentionally
+left uncommitted.
+
+---
+
+## 2026-07-28 — Learner-safe completed-quiz history (067) — **APPLIED TO PRODUCTION**
+
+Branch `feature/learn-lifecycle-integrity`. Additive forward; creates ONE function, changes no table/policy/RPC.
+WHY REQUIRED (live QA): after a manager archives a quiz, 065 correctly drops it from the learner ACTIVE
+catalog (`list_quizzes_for_learner` filters status<>'archived') and 057 forbids a learner from SELECTing
+`tenant_quizzes`; 066 keeps a learner's COMPLETED assignment active. The learner's browser then had no safe
+way to get the archived quiz's TITLE, so the completed row lost its content and vanished from Completed/All.
+Existing safe sources are insufficient: `list_quizzes_for_learner` (excludes archived), `list_my_quiz_attempts_safe`
+(no name/title), `get_quiz_review` (per-attempt, pass-gated, not a list). Lessons/courses DON'T need this —
+`tenant_lessons`/`tenant_courses` SELECT RLS already lets an in-tenant learner read archived rows; only quizzes
+are RLS-locked.
+
+067: `list_my_completed_quiz_history()` SECURITY DEFINER — the caller's OWN passed quizzes (incl archived) with
+**catalog metadata ONLY** (id, name, status, passing_score). **Rev 2 (misattribution audit):** removed the
+per-quiz `best_score`/`last_passed_at`/`passed` aggregate fields — an assignment-instance's score/date is NOT a
+lifetime-per-quiz value (a quiz can be reassigned and re-passed at a different score/date), so those are resolved
+CLIENT-SIDE from instance-scoped attempts (best PASSING attempt with created_at ≥ that instance's assigned_at,
+via `resolveLearnerAssignments`), never from this RPC. `name` is CURRENT catalog metadata (renameable), not an
+immutable historical title; immutable questions/answers stay behind the pass-gated `get_quiz_review` snapshot.
+No questions/answers, no other learner's rows, tenant+learner enforced server-side, HISTORY only (never makes
+archived content startable/searchable, never weakens 065's active-catalog exclusion).
+
+Applied via ONE controlled `apply_migration` (Strategy A); SHA-256 re-confirmed against the committed blob
+(`b579209`) immediately before application. No `db push`, no repair, no manual ledger SQL — a single production
+write call.
+
+| Order | Prod version (ledger) | Prod name | Git file | Commit | SQL SHA-256 | Applied (UTC) | Verification |
+|---|---|---|---|---|---|---|---|
+| 31 | `20260728131451` | 067_learner_completed_quiz_history | supabase/migrations/067_learner_completed_quiz_history.sql | b579209 | 3ec2fdc58e1ccd238fcad15718b3698b1a11f61ab85494c23899620397d72e72 | 2026-07-28 (version 20260728131451) | PASS — see below |
+
+Pre-apply gate (read-only): working-tree + committed(`b579209`) SHA-256 both `3ec2fdc5…d72e72` = approved. 067
+absent (ledger + function); deps present (tenant_quizzes 5 cols / profiles 3 / quiz_attempts 3). Exact
+predicted output = **3 distinct (user,quiz) rows** (1 distinct learner × 3 passed quizzes), 0 cross-tenant.
+
+**Structural / security verification (read-only, post-apply):**
+- Ledger version `20260728131451`; **exactly one** row. Function `list_my_completed_quiz_history()` present once,
+  `SECURITY DEFINER`, `search_path=""`, owner `postgres`. EXECUTE = `authenticated, postgres, service_role`
+  (anon/PUBLIC denied). No trigger/policy/table created (function-only); confidentiality/065/066 objects
+  untouched (`get_quiz_review` clean, `list_quizzes_for_learner` still excludes archived, guard trigger present,
+  `archive_quiz` completion-aware). 067 has **no DML** — no data rows/policies/triggers/unrelated schema changed.
+- Functional (production, ONE self-aborting read-only transaction — rolled back): called as the real passing
+  learner → returns **exactly 3 rows**, each with EXACTLY `{id,name,status,passing_score}`; every row is in the
+  caller's tenant AND a quiz the caller PASSED; a failed-only quiz is absent; a different/unknown authenticated
+  user gets `[]` (caller-only, tenant-only, passed-only; cross-user + cross-tenant excluded).
+- `name` is CURRENT catalog metadata (renameable), not an immutable historical title; immutable questions/answers
+  remain behind the pass-gated `get_quiz_review` snapshot. Per-attempt score/date are NOT returned (resolved
+  client-side, instance-scoped) — no reassignment misattribution.
+
+Regression: 067 SQL 2/2, 055/056/057/063/064/065/066 SQL suites, engine reassignment-trap tests, JS suites, and
+production build all PASS (this session, against the byte-identical 067). Operator: applied by Claude Code via
+the controlled `apply_migration` tool under explicit user approval. Ledger row 31. **Frontend NOT merged or
+deployed.** This ledger update is intentionally left uncommitted.
+
+## 2026-07-28 — Learn closeout: committing the applied-migration records (063–067)
+
+The per-migration blocks above (rows 27–31) each end with the standard apply-time footer "This ledger
+update is intentionally left uncommitted." That footer described the state at apply time. As part of the
+Learn merge-readiness closeout, those factual applied-migration records are now committed to the branch,
+which supersedes those per-block "left uncommitted" notes. Nothing in the records themselves changed —
+production migrations 063–067 remain applied exactly once each (versions `20260725130139`,
+`20260725193232`, `20260726145532`, `20260728024514`, `20260728131451`) and byte-identical to the
+committed migration files (SHA-256 parity re-verified at closeout; migration history unchanged, nothing
+rewritten/squashed/reordered). No new migration was applied during closeout; the only branch changes at
+closeout are frontend (sign-out navigation-state clearing) plus this ledger commit.

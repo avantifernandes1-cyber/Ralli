@@ -47,13 +47,15 @@ import {
   upsertCourse,
   upsertQuiz,
   deleteQuiz as dbDeleteQuiz,
+  archiveQuiz as dbArchiveQuiz,
+  restoreQuiz as dbRestoreQuiz,
   getLessonCompletions,
   getLessonCompletionsWithDates,
   markLessonComplete,
   getTenantAssignments,
   createAssignments as dbCreateAssignments,
   getActiveAssignmentsByUser,
-  deleteAssignment as dbDeleteAssignment,
+  unassignAssignment as dbUnassignAssignment,
   archiveCourse as archiveCourseService,
   archiveLesson as archiveLessonService,
   restoreCourse as restoreCourseService,
@@ -63,6 +65,7 @@ import {
   submitQuizAttemptAtomic,
   submitQuizAttemptAtomicV2,
   listQuizzesForLearner,
+  listMyCompletedQuizHistory,
   getQuizForAttempt,
   getQuizReview,
   getMyQuizAttemptsSafe,
@@ -78,7 +81,7 @@ import {
   updateLastSeenAssignmentsAt,
   subscribeToTenantAssignments,
 } from "./src/lib/contentService.js";
-import { resolveAssignmentStatus, resolveLatestQuizAssignment, isQualifyingEvent, daysUntilDue } from "./src/lib/assignmentEngine.js";
+import { resolveAssignmentStatus, resolveLatestQuizAssignment, resolveLearnerAssignments, lessonUnlockState, isQualifyingEvent, daysUntilDue } from "./src/lib/assignmentEngine.js";
 import {
   metaListToCatalog,
   questionCountOf,
@@ -839,67 +842,23 @@ function HomeScreen({ user, onNav, quizAssignments = [], onResumeLesson, onStart
         (a.assignedTo?.type === "individual" && a.assignedTo?.userId === user?.id)   ||
         (a.assignedTo?.type === "team"       && userTeamId && userTeamId === a.assignedTo?.teamId)
       );
-      // Dedupe quiz assignments to the LATEST per quiz (one actionable card per
-      // quiz) via the shared engine helper, so a resolved-by-failure original +
-      // its reassignment don't both count as pending. Lesson/course rows pass
-      // through unchanged.
-      const quizRowsByContent = new Map();
-      const dedupedMine = [];
-      for (const a of mine) {
-        if (a.contentType === "quiz") {
-          if (!quizRowsByContent.has(a.contentId)) quizRowsByContent.set(a.contentId, []);
-          quizRowsByContent.get(a.contentId).push(a);
-        } else {
-          dedupedMine.push(a);
-        }
-      }
-      for (const [contentId, rows] of quizRowsByContent) {
-        const latest = resolveLatestQuizAssignment(rows, homeQuizAttempts.filter(at => at.quiz_id === contentId)).latest;
-        if (latest) dedupedMine.push(latest);
-      }
-      return dedupedMine.map(a => {
-        const isCourse = a.contentType === "course";
-        const isLesson = a.contentType === "lesson";
-        const content  = isCourse ? homeCourses.find(c => c.id === a.contentId)
-                       : isLesson ? homeLessons.find(l => l.id === a.contentId)
-                       : quizzes.find(q => q.id === a.contentId);
-        if (!content) return null;
-        // Resolution (complete/pending, and % progress) now comes from the
-        // shared Resolved Assignment engine (src/lib/assignmentEngine.js) —
-        // see its header for why this used to be computed independently
-        // here, in LearnScreen, QuizzesScreen, and RepDrillDownModal, and how
-        // that drifted. Course/lesson/quiz all gate on THIS assignment row's
-        // own assigned_at, exactly like _course_assignment_active_user_ids() /
-        // _lesson_assignment_active_user_ids() / _quiz_assignment_active_user_ids()
-        // (037/036_*.sql) enforce server-side.
-        let pct, isComplete;
-        if (isCourse) {
-          const cls = (content.lessonIds ?? []).map(id => homeLessons.find(l => l.id === id)).filter(Boolean);
-          const engineResult = resolveAssignmentStatus("course", a, {
-            lessonIds: cls.map(l => l.id),
-            completedAtByLesson: homeCompletedAt,
-          });
-          pct = engineResult.progress;
-          isComplete = engineResult.status === "completed";
-        } else if (isLesson) {
-          const engineResult = resolveAssignmentStatus("lesson", a, { completedAt: homeCompletedAt.get(content.id) ?? null });
-          pct = engineResult.progress;
-          isComplete = engineResult.status === "completed";
-        } else {
-          // Quiz — complete once there's a PASSED attempt created at or after
-          // this assignment's assigned_at. See assignmentEngine.js's
-          // resolveQuizAssignment() for the full reasoning (an unresolved
-          // reassignment must never read as complete off a stale prior pass).
-          const engineResult = resolveAssignmentStatus("quiz", a, {
-            attempts: homeQuizAttempts.filter(at => at.quiz_id === content.id),
-          });
-          pct = engineResult.progress;
-          isComplete = engineResult.status === "completed";
-        }
-        const dueStatus = (a.dueAt && a.dueAt !== "Open") ? getDueStatus(a.dueAt) : null;
+      // THE canonical current-work set (lessons + courses + quizzes), from the
+      // one shared selector Learn also uses — so Home is a true preview of Learn.
+      // One latest instance per content, cancelled excluded, resolved by the
+      // shared engine. Missing content is dropped from the Home PREVIEW (it must
+      // not render a clickable fake card); Learn surfaces it as a non-clickable
+      // "unavailable" row.
+      const rows = resolveLearnerAssignments(mine, {
+        completedAtByLesson: homeCompletedAt,
+        quizAttempts: homeQuizAttempts,
+        courses: homeCourses, lessons: homeLessons, quizzes,
+      });
+      return rows.filter(r => !r.missing).map(r => {
+        const a = r.assignment;
+        const dueStatus = (!r.isCompleted && a.dueAt && a.dueAt !== "Open") ? getDueStatus(a.dueAt) : null;
         const isNew = !!lastSeenAt && !!a.assignedAtRaw && a.assignedAtRaw > lastSeenAt;
-        return { ...a, content, contentKind: isCourse ? "course" : isLesson ? "lesson" : "quiz", pct, isComplete, dueStatus, isNew };
-      }).filter(Boolean);
+        return { ...a, content: r.content, contentKind: r.contentType, pct: r.progress, isComplete: r.isCompleted, dueStatus, isNew };
+      });
     }
     // Demo: wrap quizAssignments (outstanding only shown, completed = has passed attempt)
     // + append the Continue Learning seed (in-progress course/lesson) — demo-only, unchanged quiz data.
@@ -962,6 +921,12 @@ function PersonalDashboardScreen({
   readinessThreshold = 80,
 }) {
   const mobile     = useMobile();
+  // Home "Assigned Learning" is a preview of the SAME unified current-work set
+  // Learn shows — lessons, courses AND quizzes — from the shared selector
+  // (enrichedAssignments in HomeScreen). Quiz assignments still route into the
+  // canonical Quizzes flow on click; Home never re-implements grading/attempts.
+  const learningPending   = pendingAssignments;
+  const learningCompleted = completedAssignments;
   const firstName  = (user.name ?? "").split(" ")[0];
   const hour       = new Date().getHours();
   const greeting   = hour < 12 ? "Good morning" : hour < 17 ? "Good afternoon" : "Good evening";
@@ -1359,7 +1324,9 @@ function PersonalDashboardScreen({
 
       {/* ── Continue Learning — in-progress assignments, resume where you left off ── */}
       {(() => {
-        const inProgress = pendingAssignments.filter(x => x.pct > 0);
+        // In-progress items from the unified current-work set (lessons/courses/
+        // quizzes). A quiz card routes into the canonical Quizzes flow on click.
+        const inProgress = learningPending.filter(x => x.pct > 0);
         if (!inProgress.length) return null;
         return (
           <div>
@@ -1400,14 +1367,14 @@ function PersonalDashboardScreen({
         {/* Left — Assigned + In Progress ─────────────── */}
         <div style={{ display: "flex", flexDirection: "column", gap: 12 }}>
           {SH("Assigned Learning",
-            pendingAssignments.length > 0
-              ? `${pendingAssignments.length} pending · ${completedAssignments.length} complete`
+            learningPending.length > 0
+              ? `${learningPending.length} pending · ${learningCompleted.length} complete`
               : "All caught up"
           )}
 
           {homeLoading ? (
             <Card><p style={{ margin: 0, fontSize: 14, color: C.textSub }}>Loading assignments…</p></Card>
-          ) : pendingAssignments.length === 0 ? (
+          ) : learningPending.length === 0 ? (
             <Card>
               <div style={{ display: "flex", alignItems: "center", gap: 6, marginBottom: 8 }}>
                 <div style={{ width: 8, height: 8, borderRadius: 2, background: C.trueGreen }} />
@@ -1417,7 +1384,7 @@ function PersonalDashboardScreen({
                 No outstanding assignments. Check the Learn or Quizzes tabs for more content.
               </p>
             </Card>
-          ) : pendingAssignments.slice(0, 3).map((item) => {
+          ) : learningPending.slice(0, 3).map((item) => {
             const { content, contentKind, pct, dueStatus } = item;
             const typeColor = contentKind === "course" ? (content.color ?? C.orange)
               : contentKind === "quiz" ? C.purple : LESSON_TYPE_COLORS[content.type] ?? C.blue;
@@ -1479,14 +1446,14 @@ function PersonalDashboardScreen({
             );
           })}
 
-          {pendingAssignments.length > 3 && (
+          {learningPending.length > 3 && (
             <button
               onClick={() => onNav?.("learn")}
               style={{ padding: "10px", borderRadius: 10, border: `1px solid ${C.border}`,
                 background: C.pageBg, color: C.orange, fontSize: 13, fontWeight: 600,
                 cursor: "pointer", textAlign: "center" }}
             >
-              +{pendingAssignments.length - 3} more — View all in Learn →
+              +{learningPending.length - 3} more — View all in Learn →
             </button>
           )}
         </div>
@@ -1505,11 +1472,11 @@ function PersonalDashboardScreen({
                     Your results will appear here after your first attempt.
                   </div>
                   <button
-                    onClick={() => onNav?.("quizzes")}
+                    onClick={() => onNav?.("learn")}
                     style={{ padding: "7px 14px", borderRadius: 8, border: `1px solid ${C.orangeBorder}`,
                       background: C.orangeLight, color: C.orange, fontSize: 12, fontWeight: 600, cursor: "pointer" }}
                   >
-                    Browse Quizzes →
+                    Go to Learn →
                   </button>
                 </div>
               ) : (isReal ? realQuizResults : demoQuizResults).map((q, i, arr) => (
@@ -8714,7 +8681,7 @@ function QuizBuilderScreen({ onNav, onSave, onDone, initialQuiz, isReal = false,
     <div style={{ display:"flex", flexDirection:"column", height:"100%", gap:0 }}>
       {/* Header */}
       <div style={{ display:"flex", alignItems:"center", gap:14, paddingBottom:20, marginBottom:20, borderBottom:`1px solid ${C.border}`, flexShrink:0 }}>
-        <button onClick={() => onNav("quizzes")} style={{ padding:"8px 14px", borderRadius:10, border:`1px solid ${C.border}`, background:C.white, color:C.textSub, fontSize:13, fontWeight:600, cursor:"pointer", flexShrink:0 }}>← Back</button>
+        <button onClick={() => (onDone ?? (() => onNav("quizzes")))()} style={{ padding:"8px 14px", borderRadius:10, border:`1px solid ${C.border}`, background:C.white, color:C.textSub, fontSize:13, fontWeight:600, cursor:"pointer", flexShrink:0 }}>← Back</button>
         <input value={name} onChange={e => setName(e.target.value)} placeholder="Quiz name…" style={{
           flex:1, fontSize:20, fontWeight:900, color:C.text, border:"none", background:"transparent", outline:"none", fontFamily:"inherit",
           borderBottom:`2px solid ${name.trim() ? C.orange : C.border}`, paddingBottom:4,
@@ -8977,15 +8944,44 @@ const INITIAL_ASSIGNMENTS = [
 const LESSON_TYPE_ICONS  = { video:"", text:"", image:"", flipcard:"", quiz:"", recording:"", interactive:"" };
 const LESSON_TYPE_COLORS = { video:C.blue, text:C.green, image:C.blue, flipcard:C.purple, quiz:C.purple, recording:C.red, interactive:C.orange };
 
-function LearnScreen({ role, user, orgUsers = [], orgs = [], onNav, onAwardXp, pendingLessonId, onClearPendingLesson, pendingCourseId, onClearPendingCourse, canCreate = true, canEdit = true, canDelete = true, canAssign = true, tenantId = null, isReal = false, quizzes = [], sharedAssignmentData = null }) {
-  const isAdmin = role === "admin";
+// "Last Updated" (063): format the authoritative tenant_lessons/tenant_courses
+// updated_at (ISO) for content cards. Returns "" for missing/invalid values so
+// we never display an invented date.
+function fmtUpdated(iso) {
+  if (!iso) return "";
+  const d = new Date(iso);
+  if (isNaN(d)) return "";
+  return d.toLocaleDateString("en-US", { month: "short", day: "numeric", year: "numeric" });
+}
+
+function LearnScreen({ role, canManageLearn, user, orgUsers = [], orgs = [], onNav, onStartQuiz, onReviewQuiz, onAwardXp, pendingLessonId, onClearPendingLesson, pendingCourseId, onClearPendingCourse, canCreate = true, canEdit = true, canDelete = true, canAssign = true, tenantId = null, isReal = false, quizzes = [], sharedAssignmentData = null, quizzesPanel = null, learnAssignRefreshKey = 0 }) {
+  // "Can manage Learn" (assignment tracking, assign/unassign, content CRUD/archive)
+  // is a Learn-scoped authority derived from the canonical profile role — it now
+  // includes the DB `manager` role, which the backend RLS/RPCs already authorize.
+  // Falls back to the old gameRole==="admin" signal for the demo/no-prop path.
+  const isAdmin = canManageLearn ?? (role === "admin");
   const toast   = useToast();
   const assignSkipPanel = useAssignmentSkipPanel(); // Sprint 2 Task 6 — "View details" on skipped users
-  const [tab, setTab]           = useState(isAdmin ? "courses" : "assigned");
+  // Manager subtab persists across refresh via the SAME sessionStorage pattern
+  // the app already uses for the top-level screen (LAST_SCREEN_KEY) — so a
+  // refresh on Manager → Learn → Assignments returns to Assignments, not Courses.
+  const [tab, setTab] = useState(() => {
+    if (!isAdmin) return "assigned";
+    try {
+      const saved = sessionStorage.getItem("ralli_learn_admin_tab");
+      if (saved && ["assignments", "courses", "lessons", "quizzes"].includes(saved)) return saved;
+    } catch {}
+    return "assignments"; // manager Learn defaults to Assignments (the primary view)
+  });
+  useEffect(() => {
+    if (!isAdmin) return;
+    try { sessionStorage.setItem("ralli_learn_admin_tab", tab); } catch {}
+  }, [isAdmin, tab]);
   // Real users start with empty arrays — seed data would flash before DB load completes
   const [courses, setCourses]   = useState(isReal ? [] : INITIAL_LEARN_COURSES);
   const [lessons, setLessons]   = useState(isReal ? [] : INITIAL_LEARN_LESSONS);
   const [catalogLoading, setCatalogLoading] = useState(isReal); // catalog/admin fetch only — cleared once DB load resolves
+  const learnLoadSeqRef = useRef(0); // stale-guard: only the newest load may write state
 
   // Task 13 — assignments and this user's lesson completions now come from
   // the shared hook (owned once in App(), see useSharedUserAssignmentData)
@@ -9003,6 +8999,20 @@ function LearnScreen({ role, user, orgUsers = [], orgs = [], onNav, onAwardXp, p
   });
   const [demoCompletedLessonsAt, setDemoCompletedLessonsAt] = useState(new Map());
 
+  // Manager assignment data is TENANT-WIDE and authoritative — it must NOT come
+  // from the learner-scoped shared hook (useSharedUserAssignmentData is enabled
+  // only for gameRole==="user", so for an orgAdmin it returns []). Loading it
+  // from there made the manager Assignments tab go empty after refresh once the
+  // profile role resolved to admin. Instead the manager's ACTIVE assignments,
+  // cancelled/unassigned history, tenant completions, and quiz attempts are all
+  // loaded together in loadLearnCatalog below (one retryable unit, isAdmin-gated,
+  // stale-guarded), so a refresh restores the same rows and counts.
+  const [managerActiveAssignments, setManagerActiveAssignments] = useState([]);
+  const [cancelledAssignments, setCancelledAssignments] = useState([]);
+  // Bumped after a manager mutation (unassign/archive) to force a fresh
+  // tenant-wide reload of the rows above.
+  const [managerRefreshKey, setManagerRefreshKey] = useState(0);
+
   const sharedCompletedLessonsAt = sharedAssignmentData?.lessonCompletionsAt ?? new Map();
   // lesson_id → completed_at (ISO), used only for assignment-instance-aware
   // Due/Complete classification in the ASSIGNED tab below — every other use
@@ -9014,7 +9024,9 @@ function LearnScreen({ role, user, orgUsers = [], orgs = [], onNav, onAwardXp, p
     [sharedCompletedLessonsAt]
   );
 
-  const assignments         = isReal ? (sharedAssignmentData?.assignments ?? []) : demoAssignments;
+  // Managers read tenant-wide active assignments (loaded in loadLearnCatalog);
+  // learners read their own set from the shared hook. Demo uses local seed.
+  const assignments         = isReal ? (isAdmin ? managerActiveAssignments : (sharedAssignmentData?.assignments ?? [])) : demoAssignments;
   const completedLessonsAt  = isReal ? sharedCompletedLessonsAt : demoCompletedLessonsAt;
   const completedLessons    = isReal ? sharedCompletedLessons   : demoCompletedLessons;
 
@@ -9024,19 +9036,54 @@ function LearnScreen({ role, user, orgUsers = [], orgs = [], onNav, onAwardXp, p
   const [assignModal, setAssignModal]   = useState(null); // null | { contentType, contentId }
   const [activeLesson, setActiveLesson] = useState(null); // { lesson, courseTitle?, nextLesson? }
   const [activeCourse, setActiveCourse] = useState(null); // course object for detail view
-  const [userTab,    setUserTab]    = useState("assigned");
-  const [learnFilter, setLearnFilter] = useState("due"); // "due" | "complete" | "all"
+  // Learner Learn subtab ("assigned" = To Do | "browse" = Knowledge Base). Persisted
+  // so launching a quiz and pressing in-app Back returns to the ORIGINATING subtab
+  // (To Do vs Knowledge Base) — one return-context mechanism, no per-launch plumbing.
+  // (A mid-quiz REFRESH is forced to To Do by getRestorableScreen, which overrides
+  // this key when it maps the retired "quizzes" screen back to Learn.)
+  const [userTab, setUserTab] = useState(() => {
+    try { const s = sessionStorage.getItem("ralli_learn_user_tab"); if (s === "browse" || s === "assigned") return s; } catch {}
+    return "assigned";
+  });
+  React.useEffect(() => { try { sessionStorage.setItem("ralli_learn_user_tab", userTab); } catch {} }, [userTab]);
+  // Persist the To Do / Completed / All filter so an in-app Back into Learn (e.g.
+  // after opening a completed quiz's Review) returns to the SAME subtab the learner
+  // launched from — Review from Learn → Completed comes Back to Learn → Completed.
+  const [learnFilter, setLearnFilter] = useState(() => {
+    try { const s = sessionStorage.getItem("ralli_learn_filter"); if (s === "todo" || s === "complete" || s === "all") return s; } catch {}
+    return "todo"; // "todo" | "complete" | "all"
+  });
+  React.useEffect(() => { try { sessionStorage.setItem("ralli_learn_filter", learnFilter); } catch {} }, [learnFilter]);
   const [search,     setSearch]     = useState("");
+  const [browseKind, setBrowseKind] = useState("all"); // Knowledge Base content-type filter: "all" | "lesson" | "course" | "quiz"
+  // Learner-only: safe titles for ARCHIVED content the learner has COMPLETED, so an
+  // archived-but-completed row keeps its Completed-history card (title/score/date) even
+  // though archived content is (correctly) absent from the active catalog/KB. Quizzes
+  // come from list_my_completed_quiz_history (067, RLS-safe, best-effort); archived
+  // lessons/courses are read via getArchivedContent (in-tenant learner RLS allows it).
+  // These are HISTORY only — never merged into the active catalog, KB, or To Do.
+  const [completedQuizHistory, setCompletedQuizHistory] = useState([]);
   const [archivedCourses,   setArchivedCourses]   = useState([]);
   const [archivedLessons,   setArchivedLessons]   = useState([]);
   const [confirmArchive,    setConfirmArchive]    = useState(null); // { type: "course"|"lesson", id, title }
   const [archiveInFlight,  setArchiveInFlight]  = useState(new Set()); // IDs currently being archived/restored
   const [tenantCompletions, setTenantCompletions] = useState([]); // manager/admin only
   const [tenantQuizAttempts, setTenantQuizAttempts] = useState([]); // manager/admin only — real quiz_attempts rows, powers Assignments tab quiz status
-  const [selectedAssignmentId, setSelectedAssignmentId] = useState(null); // manager click-through
+  const [selectedAssignmentId, setSelectedAssignmentId] = useState(null); // manager click-through (legacy; drill states below)
+  // Drilldowns keyed on STABLE ids (never display name / array index):
+  //   drillContent = { contentType, contentId } → every learner instance of one content
+  //   drillRep     = learner userId             → one learner's history across all content
+  const [drillContent, setDrillContent] = useState(null);
+  const [drillRep, setDrillRep] = useState(null);
   const [selectedRowKey, setSelectedRowKey] = useState(null); // manager per-rep drill-down (Task 11)
   const [assignTimeframe,  setAssignTimeframe]  = useState("all"); // "all" | "week" | "month" | "custom"
   const [assignDateRange,  setAssignDateRange]  = useState({ start: "", end: "" }); // ISO date strings for custom range
+  // One canonical Manager Assignment History (064). Defaults to "all"; the other
+  // filters map to the shared engine's resolved status (+ cancelled reason for
+  // the two ended states). Never a separate status calculation.
+  const [assignStatusFilter, setAssignStatusFilter] = useState("all"); // all|not_started|in_progress|completed|overdue|unassigned|content_archived
+  const [assignContentType, setAssignContentType] = useState("all");   // all|lesson|course|quiz
+  const [assignRep, setAssignRep] = useState("all");                    // all | learner userId
   // Assignment Experience Priority 1 — assignment removal. confirmRemove
   // holds the row pending confirmation (null = no dialog open);
   // removingId guards against a double-click firing two deletes for the
@@ -9044,37 +9091,50 @@ function LearnScreen({ role, user, orgUsers = [], orgs = [], onNav, onAwardXp, p
   const [confirmRemoveAssignment, setConfirmRemoveAssignment] = useState(null);
   const [removingAssignmentId, setRemovingAssignmentId] = useState(null);
 
-  // Assignment Experience Priority 1 — reuses the existing deleteAssignment()
-  // infrastructure (src/lib/contentService.js) rather than a new delete path.
-  // deleteAssignment() only removes the one tenant_assignments row by id —
-  // it never touches quiz_attempts, lesson_completions, or any other table,
-  // so historical completions/attempts are preserved by construction, not by
-  // anything this handler has to do. Scoped to `assignedTo.type ===
-  // "individual"` rows only (enforced by only ever being invoked from rows
-  // where the confirm dialog was allowed to open — see renderTable below) —
-  // legacy team/group aggregate rows are never offered a remove action here,
-  // since one such row can represent many reps at once and deleting it would
-  // silently unassign all of them, not just the one being viewed.
-  const handleRemoveAssignment = async () => {
+  // Unassign — soft, history-preserving cancellation via the unassign_assignment
+  // RPC (064). NOT a delete: the server cancels exactly this one row
+  // (cancelled_reason='manager_unassigned', cancelled_by=the manager), preserves
+  // all completions/attempts/scores/XP, refuses a COMPLETED assignment, and is
+  // idempotent. The old hard-delete path (deleteAssignment) is gone AND closed at
+  // the DB policy/grant level, so there is no destructive fallback. Offered only
+  // on active/in-progress/overdue individual rows (see canUnassign in renderTable);
+  // a legacy team/group aggregate row is never offered it, since one such row can
+  // represent many reps and unassigning it would affect all of them.
+  const handleUnassign = async () => {
     const row = confirmRemoveAssignment;
     if (!row) return;
     const { a, u } = row;
     setRemovingAssignmentId(a.id);
     try {
-      const { error } = await dbDeleteAssignment(a.id);
+      const { data, error } = await dbUnassignAssignment(a.id);
       if (error) {
-        console.error("[ralli] deleteAssignment failed:", error);
-        toast.error("Failed to remove assignment. Please try again.");
+        console.error("[ralli] unassignAssignment failed:", error);
+        // The RPC raises a precise reason; surface the completed-guard verbatim,
+        // otherwise a generic retry message. Reload truth either way.
+        const msg = String(error.message ?? "");
+        toast.error(
+          /completed assignment/i.test(msg)
+            ? `${u.name} has already completed this — a completed assignment can't be unassigned.`
+            : "Couldn't unassign. Please try again."
+        );
+        sharedAssignmentData?.retry?.();
         return;
       }
-      // Optimistic — Home/Learn/Quizzes (all fed by the same shared hook)
-      // update immediately; the realtime subscription is the backstop for
-      // any other open tab/session (Leadership Dashboard, Rep Drill-down,
-      // Quizzes' own tracking panel all have their own subscriptions).
+      // Optimistic — drop the now-cancelled row from the manager's active set
+      // immediately; the tenant-wide reload (managerRefreshKey) brings it back as
+      // an "Unassigned" history row and refreshes every status count. The shared
+      // hook is a no-op for admins but is patched too for the learner surfaces.
+      setManagerActiveAssignments(prev => prev.filter(x => x.id !== a.id));
+      setManagerRefreshKey(k => k + 1);
       sharedAssignmentData?.applyLocalAssignmentsRemoved?.(a.id);
+      sharedAssignmentData?.retry?.();
       if (selectedAssignmentId === a.id) setSelectedAssignmentId(null);
       if (selectedRowKey === `${a.id}-${u.id}`) setSelectedRowKey(null);
-      toast.success(`Assignment removed for ${u.name}.`);
+      toast.success(
+        data?.status === "already_cancelled"
+          ? `${u.name}'s assignment was already ended.`
+          : `Unassigned for ${u.name}. Their progress is kept in history.`
+      );
     } finally {
       setRemovingAssignmentId(null);
       setConfirmRemoveAssignment(null);
@@ -9091,15 +9151,30 @@ function LearnScreen({ role, user, orgUsers = [], orgs = [], onNav, onAwardXp, p
 
   const loadLearnCatalog = useCallback(() => {
     if (!isReal || !tenantId || !user?.id) { setCatalogLoading(false); return; }
+    // Stale-guard: only the most recent load may write state, so a slow response
+    // for an old tenant/role can never overwrite newer data (e.g. during auth
+    // restore when tenantId/isAdmin settle a beat apart).
+    const seq = ++learnLoadSeqRef.current;
+    setCatalogLoading(true);
     setCatalogError(null);
     const calls = [
       getTenantCourses(tenantId),
       getTenantLessons(tenantId),
     ];
     if (isAdmin) {
-      calls.push(getTenantLessonCompletions(tenantId), getTenantQuizAttempts(tenantId));
+      // Manager tenant-wide data — active assignments, cancelled/unassigned
+      // history, tenant completions, tenant quiz attempts. All required; a null
+      // (errored) result is treated as a FAILURE (retryable), never as an empty
+      // valid dataset.
+      calls.push(
+        getTenantLessonCompletions(tenantId),
+        getTenantQuizAttempts(tenantId),
+        getTenantAssignments(tenantId),
+        getTenantAssignments(tenantId, { includeCancelled: true }),
+      );
     }
     Promise.all(calls).then((results) => {
+      if (seq !== learnLoadSeqRef.current) return; // superseded by a newer load
       const [{ data: dbCourses }, { data: dbLessons }, ...adminResults] = results;
       const adminFailed = isAdmin && adminResults.some(r => !r.data);
       if (!dbCourses || !dbLessons || adminFailed) {
@@ -9110,25 +9185,44 @@ function LearnScreen({ role, user, orgUsers = [], orgs = [], onNav, onAwardXp, p
       setCourses(dbCourses);
       setLessons(dbLessons);
       if (isAdmin) {
-        const [{ data: dbTenantCompletions }, { data: dbTenantQuizAttempts }] = adminResults;
+        const [{ data: dbTenantCompletions }, { data: dbTenantQuizAttempts }, { data: dbActive }, { data: dbAll }] = adminResults;
         setTenantCompletions(dbTenantCompletions);
         setTenantQuizAttempts(dbTenantQuizAttempts);
+        setManagerActiveAssignments(dbActive);
+        setCancelledAssignments(dbAll.filter(a => a.cancelledAt));
       }
       setCatalogLoading(false);
     }).catch(() => {
+      if (seq !== learnLoadSeqRef.current) return;
       setCatalogError("Could not load your learning data. Please try again.");
       setCatalogLoading(false);
     });
-    // Archived content — content-library housekeeping, not assignment status;
-    // left out of the retryable chain above on purpose (see comment above).
-    if (isAdmin) {
-      getArchivedContent(tenantId).then(({ data }) => {
-        if (data) { setArchivedCourses(data.courses ?? []); setArchivedLessons(data.lessons ?? []); }
-      });
+    // Archived content — for the MANAGER it's content-library housekeeping; for the
+    // LEARNER it supplies safe titles so an archived-but-COMPLETED lesson/course keeps
+    // its Completed-history card (in-tenant learner RLS permits reading archived
+    // tenant_lessons/tenant_courses). Best-effort, non-retryable, HISTORY only — never
+    // merged into the active catalog or Knowledge Base.
+    getArchivedContent(tenantId).then(({ data }) => {
+      if (data) { setArchivedCourses(data.courses ?? []); setArchivedLessons(data.lessons ?? []); }
+    });
+    if (!isAdmin) {
+      // Archived quizzes are RLS-locked from learners, so a dedicated learner-safe RPC
+      // (067) provides titles/scores for the learner's OWN completed quizzes. Best-
+      // effort: [] if 067 isn't applied yet, so the row still shows (generic label).
+      listMyCompletedQuizHistory().then(({ data }) => setCompletedQuizHistory(data ?? []));
     }
-  }, [tenantId, isReal, isAdmin, user?.id]);
+  }, [tenantId, isReal, isAdmin, user?.id, managerRefreshKey, learnAssignRefreshKey]);
 
   useEffect(() => { loadLearnCatalog(); }, [loadLearnCatalog]);
+
+  // Manager realtime — a teammate (or another tab) assigning/unassigning/
+  // archiving shows up without a manual refresh. Tenant-scoped + RLS-guarded by
+  // subscribeToTenantAssignments; bumps the refresh key so the tenant-wide load
+  // above re-runs. Learners keep their own subscription in the shared hook.
+  useEffect(() => {
+    if (!isReal || !tenantId || !isAdmin) return;
+    return subscribeToTenantAssignments(tenantId, "learn-manager", () => setManagerRefreshKey(k => k + 1));
+  }, [isReal, tenantId, isAdmin]);
 
   // Composite loading/error/retry — same retryable-unit contract LearnScreen
   // always had (`isLearnLoading` / `learnDataError` / `loadLearnData` are the
@@ -9138,8 +9232,60 @@ function LearnScreen({ role, user, orgUsers = [], orgs = [], onNav, onAwardXp, p
   const learnDataError = isReal ? (catalogError ?? sharedAssignmentData?.error ?? null) : catalogError;
   const loadLearnData  = useCallback(() => { loadLearnCatalog(); sharedAssignmentData?.retry?.(); }, [loadLearnCatalog, sharedAssignmentData?.retry]);
 
+  // Issue 1 (live QA after 063) — instance-aware "is this lesson done for the
+  // learner's CURRENT assignment?" A lesson completed BEFORE a later
+  // reassignment must be re-completable: the new instance only resolves once a
+  // completion dated >= its assigned_at exists (the same rule the shared engine
+  // and _lesson_assignment_active_user_ids() enforce). `completedLessons` is
+  // ever-completed *membership*, so gating on it alone wrongly treats a
+  // reassigned lesson as already done — the learner's "Done" click no-ops,
+  // mark_lesson_complete (ON CONFLICT → completed_at = now()) never fires, and
+  // the assignment stays Due forever. This helper defers to the engine, so it
+  // does NOT introduce a second status rule — it just asks the engine whether
+  // THIS user's latest lesson-assignment instance is resolved.
+  // The learner's most recent assignment instance that this lesson counts
+  // toward: its own latest lesson assignment, OR the latest course assignment
+  // for any course containing it (a course reassignment is the same instance
+  // boundary — every member lesson must be re-completed after assigned_at for
+  // the course to resolve). Returns the assigned_at (ms) of that instance, or
+  // null when the learner has no active assignment driving this lesson.
+  const latestLessonInstanceAssignedAtMs = (lessonId) => {
+    const userTeamId = orgUsers.find(u => u.id === user?.id)?.teamId ?? null;
+    const mineFor = (a) => (
+      (a.assignedTo?.type === "group"      && a.assignedTo.orgId === user?.orgId) ||
+      (a.assignedTo?.type === "individual" && a.assignedTo.userId === user?.id)   ||
+      (a.assignedTo?.type === "team"       && userTeamId && a.assignedTo.teamId === userTeamId)
+    );
+    let latest = -Infinity;
+    assignments.forEach(a => {
+      if (a.cancelledAt || !mineFor(a)) return;
+      let relevant = false;
+      if (a.contentType === "lesson" && a.contentId === lessonId) relevant = true;
+      else if (a.contentType === "course") {
+        const course = courses.find(c => c.id === a.contentId);
+        if (course?.lessonIds?.includes(lessonId)) relevant = true;
+      }
+      if (!relevant) return;
+      const t = new Date(a.assignedAtRaw ?? a.assignedAt ?? 0).getTime();
+      if (!Number.isNaN(t) && t > latest) latest = t;
+    });
+    return latest === -Infinity ? null : latest;
+  };
+  const isLessonResolvedForCurrentInstance = (lessonId) => {
+    const lastCompletedIso = completedLessonsAt.get(lessonId) ?? null;
+    const instanceMs = latestLessonInstanceAssignedAtMs(lessonId);
+    // With an active assignment, "done" means the completion qualifies for THAT
+    // instance — evaluated by the engine's own gate isQualifyingEvent
+    // (completed_at >= assigned_at), the exact rule the SQL helpers and status
+    // resolvers use. Without one, fall back to ever-completed membership (free
+    // browsing: no reassignment to chase, so don't offer a pointless re-complete).
+    return instanceMs === null
+      ? completedLessons.has(lessonId)
+      : isQualifyingEvent(lastCompletedIso, new Date(instanceMs).toISOString());
+  };
+
   const handleCompleteLesson = (id) => {
-    if (completedLessons.has(id)) return;
+    if (isLessonResolvedForCurrentInstance(id)) return;
     const completedAtNow = new Date().toISOString();
     if (isReal) {
       // Shared hook owns the data — patch it optimistically so this screen
@@ -9156,12 +9302,28 @@ function LearnScreen({ role, user, orgUsers = [], orgs = [], onNav, onAwardXp, p
     }
     const lessonXp = lessons.find(l => l.id === id)?.xp ?? 0;
     if (lessonXp) onAwardXp?.(lessonXp);
-    // Persist to Supabase for real users (fire-and-forget)
+    // Persist to Supabase for real users. NOT fire-and-forget: a failed
+    // completion (e.g. a transient RPC/permission error) must NOT be left showing
+    // a false optimistic "complete" that silently reverts on the next refetch and
+    // never reaches the manager. On failure, surface an error and reload the
+    // authoritative completion state (which removes the optimistic entry) so the
+    // learner sees the true "still Due" state instead of a phantom completion.
     if (isReal && user?.id) {
       const uid = user.id;
       const tid = tenantId ?? null;
       markLessonComplete(uid, id, tid)
-        .then(({ error }) => { if (error) console.error("[ralli] markLessonComplete failed:", error); });
+        .then(({ error }) => {
+          if (error) {
+            console.error("[ralli] markLessonComplete failed:", error);
+            toast.error("We couldn't save your progress. Please try again.");
+            sharedAssignmentData?.retry?.();  // reload truth → drops the optimistic completion
+          }
+        })
+        .catch((e) => {
+          console.error("[ralli] markLessonComplete threw:", e);
+          toast.error("We couldn't save your progress. Please try again.");
+          sharedAssignmentData?.retry?.();
+        });
 
       // Award lesson XP — find any assignment for this lesson to check dueAt
       const userTeamId = orgUsers.find(u => u.id === uid)?.teamId ?? null;
@@ -9287,9 +9449,22 @@ function LearnScreen({ role, user, orgUsers = [], orgs = [], onNav, onAwardXp, p
     setArchiveInFlight(prev => new Set([...prev, courseId]));
     const { error } = await archiveCourseService(courseId);
     setArchiveInFlight(prev => { const s = new Set(prev); s.delete(courseId); return s; });
-    if (error) { console.error("[ralli] archiveCourse failed:", error); toast.error("Failed to archive course. Please try again."); return; }
+    if (error) {
+      console.error("[ralli] archiveCourse failed:", error);
+      // Surface a real, actionable message rather than a generic failure — an
+      // authority/tenant rejection reads differently from a transient error.
+      const msg = /not in caller tenant|only managers/i.test(error.message ?? "")
+        ? "You don't have permission to archive this course."
+        : "Couldn't archive the course. Please try again.";
+      toast.error(msg);
+      return;
+    }
+    // archive_course() also cancelled this course's active assignments server-side;
+    // the tenant_assignments subscription refreshes the affected lists automatically.
     setCourses(prev => prev.filter(c => c.id !== courseId));
     setArchivedCourses(prev => [{ ...course, status: "archived" }, ...prev]);
+    setManagerRefreshKey(k => k + 1); // reload tenant-wide assignments (some just became cancelled)
+    toast.success("Course archived. Its active assignments were cancelled.");
   };
 
   const handleArchiveLesson = async (lessonId) => {
@@ -9304,9 +9479,23 @@ function LearnScreen({ role, user, orgUsers = [], orgs = [], onNav, onAwardXp, p
     setArchiveInFlight(prev => new Set([...prev, lessonId]));
     const { error } = await archiveLessonService(lessonId);
     setArchiveInFlight(prev => { const s = new Set(prev); s.delete(lessonId); return s; });
-    if (error) { console.error("[ralli] archiveLesson failed:", error); toast.error("Failed to archive lesson. Please try again."); return; }
+    if (error) {
+      console.error("[ralli] archiveLesson failed:", error);
+      // archive_lesson() blocks archival while the lesson belongs to an active
+      // course — surface that specific reason so the manager knows to remove it
+      // from the course first, rather than a generic failure.
+      const msg = /active course/i.test(error.message ?? "")
+        ? "This lesson is being used in an active course, so it can't be archived. Remove it from the course first."
+        : "Failed to archive lesson. Please try again.";
+      toast.error(msg);
+      return;
+    }
+    // Its active assignments were cancelled server-side; the tenant_assignments
+    // subscription refreshes the affected lists automatically.
     setLessons(prev => prev.filter(l => l.id !== lessonId));
     setArchivedLessons(prev => [{ ...lesson, status: "archived" }, ...prev]);
+    setManagerRefreshKey(k => k + 1); // reload tenant-wide assignments (some just became cancelled)
+    toast.success("Lesson archived. Its active assignments were cancelled.");
   };
 
   const handleRestoreCourse = async (courseId) => {
@@ -9373,6 +9562,14 @@ function LearnScreen({ role, user, orgUsers = [], orgs = [], onNav, onAwardXp, p
       (a.assignedTo.type === "individual" && a.assignedTo.userId === user?.id)    ||
       (a.assignedTo.type === "team"       && userTeamId && userTeamId === a.assignedTo.teamId)
     );
+    // Honest "Assigned" count — the number of unified current cards shown in the
+    // Assigned tab (lessons + courses + quizzes), one per content via the shared
+    // selector. Matches the cards below and Home's Assigned Learning set exactly.
+    const myAssignedCount = resolveLearnerAssignments(myAssignments, {
+      completedAtByLesson: completedLessonsAt,
+      quizAttempts: sharedAssignmentData?.quizAttempts ?? [],
+      courses, lessons, quizzes,
+    }).filter(r => !r.missing || r.isCompleted).length; // include archived-completed history
     const xpEarned = [...completedLessons].reduce((s, id) => s + (lessons.find(x => x.id === id)?.xp ?? 0), 0);
 
     if (activeLesson) {
@@ -9384,7 +9581,7 @@ function LearnScreen({ role, user, orgUsers = [], orgs = [], onNav, onAwardXp, p
             if (activeLesson.course) { setActiveCourse(activeLesson.course); }
             setActiveLesson(null);
           }}
-          completed={completedLessons.has(activeLesson.lesson.id)}
+          completed={isLessonResolvedForCurrentInstance(activeLesson.lesson.id)}
           onComplete={handleCompleteLesson}
           nextLesson={activeLesson.nextLesson}
           onNextLesson={(next) => openLesson(next, activeLesson.course)}
@@ -9395,21 +9592,25 @@ function LearnScreen({ role, user, orgUsers = [], orgs = [], onNav, onAwardXp, p
     // Course detail view
     if (activeCourse) {
       const cls = activeCourse.lessonIds.map(id => lessons.find(l => l.id === id)).filter(Boolean);
-      const doneCount = cls.filter(l => completedLessons.has(l.id)).length;
       // Availability timing: find this user's assignment for the course and compute per-lesson unlock dates
       const courseAssignment = myAssignments.find(a => a.contentType === "course" && a.contentId === activeCourse.id);
+      // Completion is INSTANCE-AWARE for an assigned course (only completions
+      // dated at/after THIS assignment's assigned_at count) so a scheduled
+      // re-assignment never reads as complete off a prior instance's progress —
+      // matching the card/selector and the manager view. Free browsing (no
+      // assignment) keeps ever-completed membership. The denominator is always
+      // the FULL canonical lesson set (locked/scheduled lessons stay required).
+      const doneCount = courseAssignment
+        ? cls.filter(l => isQualifyingEvent(completedLessonsAt.get(l.id), courseAssignment.assignedAtRaw)).length
+        : cls.filter(l => completedLessons.has(l.id)).length;
       const assignedDate = courseAssignment?.assignedAtRaw
         ? new Date(courseAssignment.assignedAtRaw)
         : courseAssignment?.assignedAt ? new Date(courseAssignment.assignedAt) : null;
-      const todayMs = new Date().setHours(0, 0, 0, 0);
       const lessonSchedule = activeCourse.lessonSchedule ?? {};
-      const getLessonAvailability = (lessonId) => {
-        const days = lessonSchedule[lessonId]?.available_after_days ?? 0;
-        if (!assignedDate || days === 0) return { locked: false, availableDate: null };
-        const base = new Date(assignedDate); base.setHours(0, 0, 0, 0);
-        const availMs = base.getTime() + days * 86400000;
-        return { locked: todayMs < availMs, availableDate: new Date(availMs) };
-      };
+      // Shared, unit-tested unlock math (lessonUnlockState) — one implementation
+      // for the viewer, the card, and the tests.
+      const getLessonAvailability = (lessonId) =>
+        lessonUnlockState(assignedDate, lessonSchedule[lessonId]?.available_after_days ?? 0);
       // Task 16 — this pct/isComplete is ORGANIC browse progress (lessons
       // done ÷ lessons total), shown for any course a user opens whether or
       // not `courseAssignment` above resolved to a real row. That's
@@ -9420,10 +9621,22 @@ function LearnScreen({ role, user, orgUsers = [], orgs = [], onNav, onAwardXp, p
       // Assigned-course status elsewhere (Home, manager tracking) is always
       // computed separately via the shared engine (resolveAssignmentStatus),
       // never from this local pct.
-      const pct = Math.round((doneCount / Math.max(cls.length, 1)) * 100);
+      const pct = cls.length ? Math.round((doneCount / cls.length) * 100) : 0;
       const totalXp = cls.reduce((s, l) => s + (l.xp || 0), 0);
       const bonusXp = Math.round(totalXp * 0.2);
-      const isComplete = pct === 100;
+      // Complete ONLY when every canonical lesson is done — never via an empty
+      // set (0 lessons, or 0 currently-unlocked, must never read as complete).
+      const isComplete = cls.length > 0 && doneCount === cls.length;
+      // Scheduling: an assigned course whose lessons are all still locked and has
+      // no qualifying progress yet is "Scheduled", not complete and not 0%-in-
+      // progress. Surface the honest upcoming-unlock date.
+      const unlockedUndone = cls.filter(l => !completedLessons.has(l.id) && !getLessonAvailability(l.id).locked);
+      const nextUnlockDate = cls
+        .map(l => getLessonAvailability(l.id).availableDate)
+        .filter(Boolean)
+        .filter(d => d.getTime() > Date.now())
+        .sort((x, y) => x - y)[0] ?? null;
+      const isScheduledNotStarted = !!courseAssignment && !isComplete && doneCount === 0 && unlockedUndone.length === 0;
       return (
         <div style={{ display: "flex", flexDirection: "column", gap: 20 }}>
           <button onClick={() => setActiveCourse(null)} style={{ background: "none", border: "none", cursor: "pointer", color: C.textSub, fontSize: 13, fontWeight: 600, display: "flex", alignItems: "center", gap: 6, padding: 0, alignSelf: "flex-start" }}>
@@ -9440,6 +9653,11 @@ function LearnScreen({ role, user, orgUsers = [], orgs = [], onNav, onAwardXp, p
                   <span>⏱ {cls.reduce((s, l) => s + (parseInt(l.duration) || 0), 0)} min</span>
                   <span style={{ color: C.orange, fontWeight: 700 }}>{totalXp} XP{isComplete ? ` +${bonusXp} bonus` : ""}</span>
                   {isComplete && <span style={{ color: C.green, fontWeight: 700 }}>✓ Complete</span>}
+                  {isScheduledNotStarted && (
+                    <span style={{ color: C.blue, fontWeight: 700 }}>
+                      {nextUnlockDate ? `Scheduled · Starts ${nextUnlockDate.toLocaleDateString("en-US", { month: "short", day: "numeric" })}` : "Scheduled"}
+                    </span>
+                  )}
                 </div>
               </div>
               {!isComplete && cls.find(l => !completedLessons.has(l.id) && !getLessonAvailability(l.id).locked) && (
@@ -9495,15 +9713,36 @@ function LearnScreen({ role, user, orgUsers = [], orgs = [], onNav, onAwardXp, p
       );
     }
 
-    // Knowledge Base: all content, filterable
+    // Knowledge Base: all searchable content — lessons, courses, AND quizzes.
+    // Quizzes come from the learner-safe catalog (list_quizzes_for_learner →
+    // metaListToCatalog): metadata ONLY (title, tags, question count, passing
+    // score, revision) — never question bodies or answer keys. We additionally
+    // keep only status "active", so archived/inactive/draft quizzes never
+    // surface here; the RPC itself is tenant-scoped and eligibility-gated, so
+    // cross-tenant/ineligible quizzes never reach this browser to begin with.
+    const kbQuizAttempts = sharedAssignmentData?.quizAttempts ?? [];
+    const quizStatusOf = (quizId) => {
+      const attempts = kbQuizAttempts.filter(at => at.quiz_id === quizId);
+      if (attempts.length === 0) return "none";
+      return attempts.some(at => at.passed === true) ? "passed" : "attempted";
+    };
     const allContent = [
       ...courses.map(c => ({ ...c, _kind: "course" })),
       ...lessons.filter(l => l.status === "active").map(l => ({ ...l, _kind: "lesson" })),
+      ...quizzes
+        .filter(q => (q.status ?? "active") === "active")
+        .map(q => ({ ...q, _kind: "quiz", _quizStatus: quizStatusOf(q.id) })),
     ];
     const sq = search.toLowerCase();
+    const kindFiltered = browseKind === "all" ? allContent : allContent.filter(x => x._kind === browseKind);
     const browseResults = sq
-      ? allContent.filter(x => x.title.toLowerCase().includes(sq) || (x.description ?? "").toLowerCase().includes(sq))
-      : allContent;
+      ? kindFiltered.filter(x => {
+          const title = (x.title ?? x.name ?? "").toLowerCase();
+          const desc  = (x.description ?? "").toLowerCase();
+          const tags  = Array.isArray(x.tags) ? x.tags.join(" ").toLowerCase() : "";
+          return title.includes(sq) || desc.includes(sq) || tags.includes(sq);
+        })
+      : kindFiltered;
 
     return (
       <div style={{ display: "flex", flexDirection: "column", gap: 20 }}>
@@ -9512,14 +9751,14 @@ function LearnScreen({ role, user, orgUsers = [], orgs = [], onNav, onAwardXp, p
           <div>
             <h2 style={{ margin: 0, fontSize: 22, fontWeight: 800, color: C.text }}>My Learning</h2>
             <p style={{ margin: "4px 0 0", fontSize: 13, color: C.textSub }}>
-              {myAssignments.length} assigned · <span style={{ color: C.orange, fontWeight: 700 }}>{xpEarned.toLocaleString()} XP earned</span>
+              {myAssignedCount} assigned · <span style={{ color: C.orange, fontWeight: 700 }}>{xpEarned.toLocaleString()} XP earned</span>
             </p>
           </div>
         </div>
 
         {/* Tabs */}
         <div style={{ display: "flex", gap: 4, borderBottom: `1px solid ${C.border}` }}>
-          {[{ id: "assigned", label: "Assigned", count: myAssignments.length }, { id: "browse", label: "Knowledge Base" }].map(t => (
+          {[{ id: "assigned", label: "Assigned", count: myAssignedCount }, { id: "browse", label: "Knowledge Base" }].map(t => (
             <button key={t.id} onClick={() => { setUserTab(t.id); setSearch(""); }} style={{
               padding: "10px 18px", border: "none", cursor: "pointer", background: "transparent",
               fontWeight: userTab === t.id ? 700 : 500, color: userTab === t.id ? C.orange : C.textSub,
@@ -9534,66 +9773,78 @@ function LearnScreen({ role, user, orgUsers = [], orgs = [], onNav, onAwardXp, p
           ))}
         </div>
 
-        {/* ASSIGNED TAB */}
+        {/* ASSIGNED TAB — the unified learner assignment center: lessons,
+            courses AND quizzes, from the ONE shared selector Home also uses. */}
         {userTab === "assigned" && (() => {
-          // ── Deduplicate by contentType:contentId ──────────────────────────────
-          // The same content can be assigned to a user via multiple paths
-          // (individual + group + team). Count and display it only once.
-          const seenKeys = new Set();
-          const dedupedAssignments = myAssignments.filter(a => {
-            const key = `${a.contentType}:${a.contentId}`;
-            if (seenKeys.has(key)) return false;
-            seenKeys.add(key);
-            return true;
+          // Canonical current-work set: one latest instance per content, cancelled
+          // excluded, resolved by the shared engine. Identical to Home. A quiz
+          // card routes into the canonical Quizzes flow — Learn never duplicates
+          // quiz grading/attempt logic.
+          // HISTORY catalogs: the ACTIVE catalogs (quizzes/lessons/courses) plus safe
+          // ARCHIVED content the learner has completed — so a completed-then-archived
+          // row resolves its title for the Completed/All history WITHOUT ever entering
+          // the active catalog/KB/To Do (these locals are used ONLY for this selector
+          // call). Archived-UNRESOLVED assignments were cancelled on archive, so the
+          // selector already excludes them (cancelled) — only completed ones survive.
+          // Only augment with archived content THIS learner actually has an assignment
+          // to — never unrelated tenant archived content (rendering is already limited to
+          // myAssignments, and this keeps the augmented catalogs minimal + tenant-isolated).
+          const myContentIds = new Set((myAssignments ?? []).map(a => `${a.contentType}:${a.contentId}`));
+          const archQuizCatalog = (completedQuizHistory ?? [])
+            .filter(h => h?.id && myContentIds.has(`quiz:${h.id}`) && !quizzes.some(q => q.id === h.id))
+            .map(h => ({ id: h.id, name: h.name, title: h.name, status: h.status ?? "archived", passingScore: h.passing_score ?? null, questionCount: 0, _history: true }));
+          const histQuizzes = [...quizzes, ...archQuizCatalog];
+          const histLessons = [...lessons, ...(archivedLessons ?? []).filter(l => myContentIds.has(`lesson:${l.id}`) && !lessons.some(x => x.id === l.id))];
+          const histCourses = [...courses, ...(archivedCourses ?? []).filter(c => myContentIds.has(`course:${c.id}`) && !courses.some(x => x.id === c.id))];
+          const rows = resolveLearnerAssignments(myAssignments, {
+            completedAtByLesson: completedLessonsAt,
+            quizAttempts: sharedAssignmentData?.quizAttempts ?? [],
+            courses: histCourses, lessons: histLessons, quizzes: histQuizzes,
+          });
+          // Keep a row when its content resolves OR it is COMPLETED (archived-completed
+          // history stays honest). A NON-completed missing row (genuinely deleted active
+          // content) is still excluded — it is not actionable current work and lives in
+          // the manager history as a "(removed)" row (the system-of-record).
+          const enrichedAssigned = rows.filter(r => !r.missing || r.isCompleted).map(r => {
+            const a = r.assignment;
+            const isArchived = r.content?.status === "archived" || r.content?._history || (r.missing && r.isCompleted);
+            if (r.contentType === "course") {
+              const courseLessons = (r.content?.lessonIds ?? []).map(id => histLessons.find(l => l.id === id)).filter(Boolean);
+              const doneCount = courseLessons.filter(l => isQualifyingEvent(completedLessonsAt.get(l.id), a.assignedAtRaw)).length;
+              return { r, a, content: r.content, kind: "course", isCourse: true, courseLessons, doneCount, pct: r.progress, isComplete: r.isCompleted, status: r.status, missing: r.missing, isArchived };
+            }
+            if (r.contentType === "quiz") {
+              return { r, a, content: r.content, kind: "quiz", isQuiz: true, courseLessons: [], doneCount: 0, pct: r.progress, isComplete: r.isCompleted, status: r.status, missing: r.missing, isArchived, score: r.score, completedAt: r.completedAt, attemptId: r.attemptId };
+            }
+            return { r, a, content: r.content, kind: "lesson", isCourse: false, courseLessons: [], doneCount: 0, pct: r.progress, isComplete: r.isCompleted, status: r.status, missing: r.missing, isArchived };
           });
 
-          // ── Enrich each assignment with completion + availability ──────────────
-          const todayMsForFilter = new Date().setHours(0, 0, 0, 0);
-          // Resolution (pct/isComplete) now comes from the shared Resolved
-          // Assignment engine (src/lib/assignmentEngine.js) — course/lesson
-          // gate on THIS assignment row's own assigned_at, exactly like
-          // _lesson_assignment_active_user_ids() / _course_assignment_active_user_ids()
-          // (037_assignment_aware_lesson_course_eligibility.sql) enforce
-          // server-side. Scoped to this ASSIGNED tab only — the plain
-          // `completedLessons` Set above is still used everywhere else in
-          // LearnScreen (lesson viewer, "next up", course browsing progress)
-          // where assignment timing doesn't apply.
-          const enrichedAssigned = dedupedAssignments.map(a => {
-            const isCourse = a.contentType === "course";
-            const content  = isCourse ? courses.find(c => c.id === a.contentId) : lessons.find(l => l.id === a.contentId);
-            if (!content) return null;
-            const courseLessons = isCourse ? content.lessonIds.map(id => lessons.find(l => l.id === id)).filter(Boolean) : [];
-            const engineResult = isCourse
-              ? resolveAssignmentStatus("course", a, { lessonIds: courseLessons.map(l => l.id), completedAtByLesson: completedLessonsAt })
-              : resolveAssignmentStatus("lesson", a, { completedAt: completedLessonsAt.get(content.id) ?? null });
-            const doneCount = isCourse ? courseLessons.filter(l => isQualifyingEvent(completedLessonsAt.get(l.id), a.assignedAtRaw)).length : 0;
-            const pct = engineResult.progress;
-            const isComplete = engineResult.status === "completed";
-            // Availability: does the user have at least one lesson they can act on now?
-            // Locked-only courses are excluded from Due but still shown in All.
-            let isAvailable = true;
-            if (isCourse && !isComplete) {
-              const assignedDate = a.assignedAtRaw ? new Date(a.assignedAtRaw)
-                : a.assignedAt ? new Date(a.assignedAt) : null;
-              const lessonSched = content.lessonSchedule ?? {};
-              const isLockedForFilter = (lessonId) => {
-                const days = lessonSched[lessonId]?.available_after_days ?? 0;
-                if (!assignedDate || days === 0) return false;
-                const base = new Date(assignedDate); base.setHours(0, 0, 0, 0);
-                return todayMsForFilter < base.getTime() + days * 86400000;
-              };
-              isAvailable = courseLessons.some(l => !isQualifyingEvent(completedLessonsAt.get(l.id), a.assignedAtRaw) && !isLockedForFilter(l.id));
-            }
-            return { a, content, isCourse, courseLessons, doneCount, pct, isComplete, isAvailable };
-          }).filter(Boolean);
-
-          const dueItems      = enrichedAssigned.filter(e => !e.isComplete && e.isAvailable);
+          // To Do = not_started + in_progress + overdue; Completed = completed.
+          // All = To Do ∪ Completed (invariant guaranteed by the selector).
+          const toDoItems     = enrichedAssigned.filter(e => !e.isComplete);
           const completeItems = enrichedAssigned.filter(e => e.isComplete);
-          // Locked: assigned, not complete, but no lessons are available yet (schedule lock)
-          const lockedItems   = enrichedAssigned.filter(e => !e.isComplete && !e.isAvailable);
-          const filterItems   = learnFilter === "due" ? dueItems : learnFilter === "complete" ? completeItems : enrichedAssigned;
+          const filterItems   = learnFilter === "todo" ? toDoItems : learnFilter === "complete" ? completeItems : enrichedAssigned;
 
-          const AssignedCard = ({ a, content, isCourse, courseLessons, doneCount, pct, isComplete }) => {
+          // Degraded card for a COMPLETED row whose content can't be resolved even
+          // from the archived-history sources (e.g. a genuinely removed lesson/course,
+          // or a quiz before migration 067 is applied). Keeps history honest/visible.
+          const MissingCompletedCard = ({ kind }) => (
+            <Card>
+              <div style={{ display: "flex", alignItems: "center", gap: 16, opacity: 0.75 }}>
+                <div style={{ width: 52, height: 52, borderRadius: 12, flexShrink: 0, background: C.muted, display: "flex", alignItems: "center", justifyContent: "center", fontSize: 22 }}>{kind === "quiz" ? "📋" : kind === "course" ? "📚" : "📄"}</div>
+                <div style={{ flex: 1, minWidth: 0 }}>
+                  <div style={{ display: "flex", alignItems: "center", gap: 6, flexWrap: "wrap" }}>
+                    <span style={{ fontSize: 11, fontWeight: 700, color: C.textMuted, letterSpacing: "0.06em" }}>{(kind ?? "content").toUpperCase()}</span>
+                    <span style={{ fontSize: 10, fontWeight: 700, padding: "1px 6px", borderRadius: 4, background: C.greenBg, color: C.green }}>COMPLETE</span>
+                    <span style={{ fontSize: 10, fontWeight: 700, padding: "1px 6px", borderRadius: 4, background: C.muted, color: C.textMuted }}>ARCHIVED</span>
+                  </div>
+                  <div style={{ fontSize: 14, fontWeight: 700, color: C.text, marginTop: 2 }}>Archived {kind ?? "content"}</div>
+                  <div style={{ fontSize: 12, color: C.textSub, marginTop: 2 }}>Completed · content archived</div>
+                </div>
+              </div>
+            </Card>
+          );
+          const AssignedCard = ({ a, content, isCourse, courseLessons, doneCount, pct, isComplete, isArchived }) => {
             const totalXp   = isCourse ? courseLessons.reduce((s, l) => s + (l.xp || 0), 0) : (content.xp || 0);
             const bonusXp   = isCourse ? Math.round(totalXp * 0.2) : 0;
             const estMin    = isCourse ? courseLessons.reduce((s, l) => s + (parseInt(l.duration) || 0), 0) : (parseInt(content.duration) || 0);
@@ -9622,6 +9873,7 @@ function LearnScreen({ role, user, orgUsers = [], orgs = [], onNav, onAwardXp, p
                           Required/Recommended, never omit the badge. */}
                       <span style={{ fontSize: 10, fontWeight: 700, padding: "1px 6px", borderRadius: 4, background: a.required ? C.redBg : "#F1F5F9", color: a.required ? C.red : "#475569" }}>{a.required ? "REQUIRED" : "RECOMMENDED"}</span>
                       {isComplete && <span style={{ fontSize: 10, fontWeight: 700, padding: "1px 6px", borderRadius: 4, background: C.greenBg, color: C.green }}>COMPLETE</span>}
+                      {isArchived && <span style={{ fontSize: 10, fontWeight: 700, padding: "1px 6px", borderRadius: 4, background: C.muted, color: C.textMuted }}>ARCHIVED</span>}
                       {dueStatus && (
                         <span style={{ fontSize: 10, fontWeight: 700, padding: "1px 6px", borderRadius: 4,
                           background: dueStatus.color + "18", color: dueStatus.color, marginLeft: "auto" }}>
@@ -9650,17 +9902,11 @@ function LearnScreen({ role, user, orgUsers = [], orgs = [], onNav, onAwardXp, p
                       onClick={() => {
                         if (isComplete) { setActiveCourse(content); }
                         else {
-                          // Respect per-lesson availability schedule — don't open locked lessons
-                          const assignedDate = a.assignedAtRaw ? new Date(a.assignedAtRaw)
-                            : a.assignedAt ? new Date(a.assignedAt) : null;
-                          const todayMs = new Date().setHours(0, 0, 0, 0);
+                          // Respect per-lesson availability schedule — don't open locked
+                          // lessons (shared, unit-tested lessonUnlockState).
                           const lessonSched = content.lessonSchedule ?? {};
-                          const isLockedLesson = (lessonId) => {
-                            const days = lessonSched[lessonId]?.available_after_days ?? 0;
-                            if (!assignedDate || days === 0) return false;
-                            const base = new Date(assignedDate); base.setHours(0, 0, 0, 0);
-                            return todayMs < base.getTime() + days * 86400000;
-                          };
+                          const isLockedLesson = (lessonId) =>
+                            lessonUnlockState(a.assignedAtRaw ?? a.assignedAt ?? null, lessonSched[lessonId]?.available_after_days ?? 0).locked;
                           const next = courseLessons.find(l => !isQualifyingEvent(completedLessonsAt.get(l.id), a.assignedAtRaw) && !isLockedLesson(l.id));
                           if (next) openLesson(next, content);
                           else setActiveCourse(content); // all next lessons are still locked — show course detail
@@ -9691,22 +9937,69 @@ function LearnScreen({ role, user, orgUsers = [], orgs = [], onNav, onAwardXp, p
             );
           };
 
+          // Quiz assignment card — status from the shared quiz engine; the action
+          // routes into the canonical Quizzes flow (Take / Retry / Review). Learn
+          // never renders questions, answers, or scoring itself.
+          const QuizAssignedCard = ({ a, content, status, isArchived, score, completedAt, attemptId }) => {
+            const label = status === "completed" ? "Completed" : status === "overdue" ? "Overdue" : status === "in_progress" ? "In Progress" : "Not Started";
+            const labelColor = status === "completed" ? C.green : status === "overdue" ? C.red : status === "in_progress" ? C.blue : C.textSub;
+            // Archived content is HISTORY: a completed row keeps a safe Review only —
+            // never Start/Retry (you can't re-take archived content). Non-completed
+            // archived can't occur here (archive cancels unresolved rows).
+            const cta = status === "completed" ? "Review →" : status === "in_progress" || status === "overdue" ? "Retry →" : "Take quiz →";
+            const dueStatus = (!isArchived && status !== "completed" && a.dueAt && a.dueAt !== "Open") ? getDueStatus(a.dueAt) : null;
+            // Score/date are the engine's INSTANCE-SCOPED values (best PASSING attempt at/
+            // after THIS assignment's assigned_at), NOT a lifetime-per-quiz aggregate — so
+            // a reassignment never lets this instance inherit another instance's score/date.
+            const bestScore = score;
+            const doneOn = completedAt ? new Date(completedAt).toLocaleDateString("en-US", { month: "short", day: "numeric", year: "numeric" }) : null;
+            return (
+              <Card>
+                <div style={{ display: "flex", alignItems: "flex-start", gap: 16 }}>
+                  <div style={{ width: 52, height: 52, borderRadius: 12, flexShrink: 0, background: C.purple + "20", border: `1px solid ${C.purple}30`, display: "flex", alignItems: "center", justifyContent: "center", fontSize: 24, opacity: status === "completed" ? 0.55 : 1 }}>📋</div>
+                  <div style={{ flex: 1, minWidth: 0 }}>
+                    <div style={{ display: "flex", alignItems: "center", gap: 6, marginBottom: 2, flexWrap: "wrap" }}>
+                      <span style={{ fontSize: 11, fontWeight: 700, color: C.purple, letterSpacing: "0.06em" }}>QUIZ</span>
+                      <span style={{ fontSize: 10, fontWeight: 700, padding: "1px 6px", borderRadius: 4, background: a.required ? C.redBg : "#F1F5F9", color: a.required ? C.red : "#475569" }}>{a.required ? "REQUIRED" : "RECOMMENDED"}</span>
+                      <span style={{ fontSize: 10, fontWeight: 700, padding: "1px 6px", borderRadius: 4, background: labelColor + "18", color: labelColor }}>{label}</span>
+                      {isArchived && <span style={{ fontSize: 10, fontWeight: 700, padding: "1px 6px", borderRadius: 4, background: C.muted, color: C.textMuted }}>ARCHIVED</span>}
+                      {dueStatus && <span style={{ fontSize: 10, fontWeight: 700, padding: "1px 7px", borderRadius: 4, background: dueStatus.color + "18", color: dueStatus.color, marginLeft: "auto" }}>{dueStatus.label}</span>}
+                    </div>
+                    <div style={{ fontSize: 15, fontWeight: 700, color: C.text }}>{content?.name ?? content?.title ?? "Quiz"}</div>
+                    {status === "completed" && (bestScore != null || doneOn) && (
+                      <div style={{ fontSize: 12, color: C.textSub, marginTop: 2 }}>
+                        {bestScore != null ? `Score ${bestScore}%` : ""}
+                        {doneOn ? `${bestScore != null ? " · " : ""}Completed ${doneOn}` : ""}
+                        {isArchived ? " · content archived" : ""}
+                      </div>
+                    )}
+                    <div style={{ display: "flex", justifyContent: "flex-end", marginTop: 12 }}>
+                      {/* Completed → safe pass-gated Review (immutable snapshot, works for
+                          archived quizzes). Active-content non-completed → canonical launch. */}
+                      <button onClick={() => status === "completed" ? onReviewQuiz?.(a.contentId, attemptId) : onStartQuiz?.(a.contentId)} style={{ padding: "8px 16px", borderRadius: 8, border: "none", cursor: "pointer", background: status === "completed" ? C.white : C.purple, color: status === "completed" ? C.textSub : "#fff", borderWidth: status === "completed" ? 1 : 0, borderStyle: "solid", borderColor: C.border, fontSize: 13, fontWeight: 700 }}>{cta}</button>
+                    </div>
+                  </div>
+                </div>
+              </Card>
+            );
+          };
+
           return (
             <div style={{ display: "flex", flexDirection: "column", gap: 14 }}>
               {/* Empty state — no assignments at all */}
-              {dedupedAssignments.length === 0 && (
+              {enrichedAssigned.length === 0 && (
                 <div style={{ padding: 60, textAlign: "center", background: C.white, borderRadius: 12, border: `1px solid ${C.border}` }}>
                   <p style={{ margin: 0, fontSize: 15, fontWeight: 700, color: C.text }}>No assignments yet</p>
-                  <p style={{ margin: "6px 0 0", fontSize: 13, color: C.textSub }}>Your manager will assign courses and lessons here</p>
+                  <p style={{ margin: "6px 0 0", fontSize: 13, color: C.textSub }}>Your manager will assign lessons, courses, and quizzes here</p>
                 </div>
               )}
 
-              {/* Due / Complete / All pills */}
-              {dedupedAssignments.length > 0 && (
+              {/* To Do / Completed / All pills */}
+              {enrichedAssigned.length > 0 && (
                 <div style={{ display: "flex", gap: 6 }}>
                   {[
-                    ["due",      `Due (${dueItems.length})`],
-                    ["complete", `Complete (${completeItems.length})`],
+                    ["todo",     `To Do (${toDoItems.length})`],
+                    ["complete", `Completed (${completeItems.length})`],
                     ["all",      `All (${enrichedAssigned.length})`],
                   ].map(([id, label]) => (
                     <button key={id} onClick={() => setLearnFilter(id)} style={{
@@ -9721,32 +10014,31 @@ function LearnScreen({ role, user, orgUsers = [], orgs = [], onNav, onAwardXp, p
               )}
 
               {/* Per-tab empty state */}
-              {dedupedAssignments.length > 0 && filterItems.length === 0 && (
+              {enrichedAssigned.length > 0 && filterItems.length === 0 && (
                 <div style={{ padding: 48, textAlign: "center", background: C.white, borderRadius: 16, border: `1px solid ${C.border}` }}>
                   <p style={{ fontSize: 15, fontWeight: 700, color: C.text, margin: "0 0 4px" }}>
-                    {learnFilter === "complete"
-                      ? "Nothing completed yet"
-                      : (learnFilter === "due" && lockedItems.length > 0)
-                        ? "Nothing due right now"
-                        : "All caught up!"}
+                    {learnFilter === "complete" ? "Nothing completed yet" : "All caught up!"}
                   </p>
                   <p style={{ fontSize: 13, color: C.textSub, margin: 0 }}>
                     {learnFilter === "complete"
-                      ? "Complete a lesson or course to see it here."
-                      : (learnFilter === "due" && lockedItems.length > 0)
-                        ? `${lockedItems.length} assignment${lockedItems.length === 1 ? "" : "s"} unlock on a schedule — check the All tab to see what's coming.`
-                        : learnFilter === "all"
-                          ? "No assignments found."
-                          : "No pending work — you're all done!"}
+                      ? "Complete a lesson, course, or quiz to see it here."
+                      : "No To Do items — you're all done!"}
                   </p>
                 </div>
               )}
 
-              {/* Assignment cards */}
-              {filterItems.map(e => <AssignedCard key={e.a.id} {...e} />)}
+              {/* Assignment cards — lesson/course use the existing viewer/course
+                  flow; quiz routes into the canonical Quizzes flow. */}
+              {filterItems.map(e => (
+                e.isQuiz
+                  ? <QuizAssignedCard key={e.a.id} a={e.a} content={e.content} status={e.status} isArchived={e.isArchived} score={e.score} completedAt={e.completedAt} attemptId={e.attemptId} />
+                  : e.missing
+                    ? <MissingCompletedCard key={e.a.id} kind={e.kind} />
+                    : <AssignedCard key={e.a.id} {...e} />
+              ))}
 
-              {/* Course suggestions — only in Due and All tabs */}
-              {(learnFilter === "due" || learnFilter === "all") && (() => {
+              {/* Course suggestions — only in To Do and All tabs */}
+              {(learnFilter === "todo" || learnFilter === "all") && (() => {
                 const suggestions = courses.filter(c => !myAssignments.some(a => a.contentType === "course" && a.contentId === c.id)).slice(0, 3);
                 if (!suggestions.length) return null;
                 return (
@@ -9781,38 +10073,90 @@ function LearnScreen({ role, user, orgUsers = [], orgs = [], onNav, onAwardXp, p
             <input
               value={search}
               onChange={e => setSearch(e.target.value)}
-              placeholder="Search courses, lessons, and content..."
+              placeholder="Search courses, lessons, and quizzes..."
               autoFocus
               style={{
                 width: "100%", padding: "10px 14px", borderRadius: 10, border: `1px solid ${C.border}`,
                 fontSize: 14, color: C.text, background: C.white, boxSizing: "border-box",
               }}
             />
-            {search && browseResults.length === 0 && (
-              <div style={{ padding: 40, textAlign: "center", color: C.textSub }}>No results for "{search}"</div>
+            {/* Content Type filter — lets a learner narrow the Knowledge Base to
+                Lessons, Courses, or Quizzes. Quizzes are searchable here from the
+                learner-safe catalog; the answer key is never present client-side. */}
+            <div style={{ display: "flex", gap: 8, flexWrap: "wrap" }}>
+              {[{ id: "all", label: "All" }, { id: "lesson", label: "Lessons" }, { id: "course", label: "Courses" }, { id: "quiz", label: "Quizzes" }].map(f => (
+                <button key={f.id} onClick={() => setBrowseKind(f.id)} style={{
+                  padding: "6px 14px", borderRadius: 999, cursor: "pointer", fontSize: 12, fontWeight: 700,
+                  border: `1px solid ${browseKind === f.id ? C.orange : C.border}`,
+                  background: browseKind === f.id ? C.orangeLight : C.white,
+                  color: browseKind === f.id ? C.orange : C.textSub,
+                }}>{f.label}</button>
+              ))}
+            </div>
+            {browseResults.length === 0 && (
+              <div style={{ padding: 40, textAlign: "center", color: C.textSub }}>
+                {search ? `No results for "${search}"` : "No content available."}
+              </div>
             )}
-            {browseResults.map(item => (
+            {browseResults.map(item => {
+              const isQuiz = item._kind === "quiz";
+              // Quiz result-status → badge + CTA. The action ALWAYS routes into
+              // the canonical quiz-launch flow (onStartQuiz); the flow decides
+              // start vs. safe review/results based on the learner's attempts.
+              const qStatus = item._quizStatus; // "passed" | "attempted" | "none"
+              const quizBadge = qStatus === "passed" ? { label: "Completed", color: C.green }
+                              : qStatus === "attempted" ? { label: "In Progress", color: C.blue }
+                              : null;
+              const quizCta = qStatus === "passed" ? "Review →" : qStatus === "attempted" ? "Retry →" : "Take quiz →";
+              // A PASSED quiz here is read-only history: Review opens the pass-gated
+              // immutable review (no exact instance id on this catalog surface, so the
+              // review payload resolves the passing attempt) and NEVER starts a new
+              // attempt. Only attempted/none route into the canonical launch flow.
+              const onClick = isQuiz
+                ? (qStatus === "passed" ? () => onReviewQuiz?.(item.id, null) : () => onStartQuiz?.(item.id))
+                : () => item._kind === "lesson" ? openLesson(item) : setActiveCourse(item);
+              return (
               <Card key={item.id} style={{ display: "flex", alignItems: "center", gap: 14, cursor: "pointer" }}
-                onClick={() => item._kind === "lesson" ? openLesson(item) : setActiveCourse(item)}>
+                onClick={onClick}>
                 <div style={{
                   width: 44, height: 44, borderRadius: 10, flexShrink: 0,
-                  background: ((item._kind === "course" ? item.color : LESSON_TYPE_COLORS[item.type]) ?? C.orange) + "20",
+                  background: (isQuiz ? C.purple : ((item._kind === "course" ? item.color : LESSON_TYPE_COLORS[item.type]) ?? C.orange)) + "20",
                   display: "flex", alignItems: "center", justifyContent: "center", fontSize: 22,
                 }}>
-                  {item._kind === "course" ? item.emoji : LESSON_TYPE_ICONS[item.type]}
+                  {isQuiz ? "📋" : item._kind === "course" ? item.emoji : LESSON_TYPE_ICONS[item.type]}
                 </div>
                 <div style={{ flex: 1, minWidth: 0 }}>
-                  <div style={{ fontSize: 11, fontWeight: 700, color: C.textMuted, letterSpacing: "0.06em", marginBottom: 2 }}>
-                    {item._kind === "course" ? `COURSE · ${item.lessonIds?.length ?? 0} LESSONS` : `LESSON · ${(item.type ?? "").toUpperCase()}`}
+                  <div style={{ display: "flex", alignItems: "center", gap: 6, marginBottom: 2, flexWrap: "wrap" }}>
+                    <span style={{ fontSize: 11, fontWeight: 700, color: isQuiz ? C.purple : C.textMuted, letterSpacing: "0.06em" }}>
+                      {isQuiz ? `QUIZ · ${item.questionCount ?? 0} QUESTION${(item.questionCount ?? 0) === 1 ? "" : "S"}`
+                             : item._kind === "course" ? `COURSE · ${item.lessonIds?.length ?? 0} LESSONS`
+                             : `LESSON · ${(item.type ?? "").toUpperCase()}`}
+                    </span>
+                    {isQuiz && typeof item.passingScore === "number" && (
+                      <span style={{ fontSize: 10, fontWeight: 700, padding: "1px 6px", borderRadius: 4, background: C.muted, color: C.textSub }}>Pass {item.passingScore}%</span>
+                    )}
+                    {isQuiz && quizBadge && (
+                      <span style={{ fontSize: 10, fontWeight: 700, padding: "1px 6px", borderRadius: 4, background: quizBadge.color + "18", color: quizBadge.color }}>{quizBadge.label}</span>
+                    )}
                   </div>
-                  <div style={{ fontSize: 14, fontWeight: 700, color: C.text }}>{item.title}</div>
-                  <div style={{ fontSize: 12, color: C.textSub, marginTop: 2, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
-                    {item.description?.slice(0, 90)}{(item.description?.length ?? 0) > 90 ? "…" : ""}
-                  </div>
+                  <div style={{ fontSize: 14, fontWeight: 700, color: C.text }}>{item.title ?? item.name}</div>
+                  {!isQuiz && (
+                    <div style={{ fontSize: 12, color: C.textSub, marginTop: 2, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
+                      {item.description?.slice(0, 90)}{(item.description?.length ?? 0) > 90 ? "…" : ""}
+                    </div>
+                  )}
+                  {isQuiz && Array.isArray(item.tags) && item.tags.length > 0 && (
+                    <div style={{ fontSize: 12, color: C.textSub, marginTop: 2, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
+                      {item.tags.slice(0, 4).map(t => `#${t}`).join("  ")}
+                    </div>
+                  )}
                 </div>
-                {item._kind === "lesson" && <span style={{ fontSize: 12, color: C.textSub, flexShrink: 0 }}>⏱ {item.duration}</span>}
+                {isQuiz
+                  ? <span style={{ fontSize: 12, color: C.purple, fontWeight: 700, flexShrink: 0 }}>{quizCta}</span>
+                  : item._kind === "lesson" && <span style={{ fontSize: 12, color: C.textSub, flexShrink: 0 }}>⏱ {item.duration}</span>}
               </Card>
-            ))}
+              );
+            })}
           </div>
         )}
       </div>
@@ -9877,11 +10221,15 @@ function LearnScreen({ role, user, orgUsers = [], orgs = [], onNav, onAwardXp, p
     });
   }).length;
 
+  // Quiz-content counts (active tab count vs archived section count) — mirrors the
+  // Courses/Lessons active/archived split; never mixes in assignment counts.
+  const activeQuizzes   = quizzes.filter(q => (q.status ?? "active") !== "archived");
+  const archivedQuizzes = quizzes.filter(q => q.status === "archived");
   const TABS = [
+    { id: "assignments", label: "Assignments", count: activeAssignmentCount },
     { id: "courses",     label: "Courses",     count: filteredCourses.length },
     { id: "lessons",     label: "Lessons",     count: filteredLessons.length },
-    { id: "assignments", label: "Assignments", count: activeAssignmentCount },
-    { id: "archived",    label: "Archived",    count: archivedCourses.length + archivedLessons.length },
+    { id: "quizzes",     label: "Quizzes",     count: activeQuizzes.length },
   ];
 
   const getAssignedLabel = (a) => {
@@ -9948,40 +10296,34 @@ function LearnScreen({ role, user, orgUsers = [], orgs = [], onNav, onAwardXp, p
 
       {/* COURSES TAB */}
       {tab === "courses" && (
-        <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fill, minmax(240px, 1fr))", gap: 16 }}>
+        <>
+        {/* Vertical list — one course per row (matches the Quizzes/Lessons list). */}
+        <div style={{ display: "flex", flexDirection: "column", gap: 10 }}>
           {filteredCourses.map(course => {
             const courseLessons = course.lessonIds.map(id => lessons.find(l => l.id === id)).filter(Boolean);
             const totalMin = courseLessons.reduce((sum, l) => sum + (parseInt(l.duration) || 0), 0);
             return (
-              <Card key={course.id} style={{ display: "flex", flexDirection: "column", gap: 0, padding: 0, overflow: "hidden" }}>
-                {/* Color header */}
-                <div style={{ height: 5, background: course.color }} />
-                <div style={{ padding: 20, display: "flex", flexDirection: "column", flex: 1 }}>
-                  <h3 style={{ margin: "0 0 6px", fontSize: 15, fontWeight: 700, color: C.text, lineHeight: 1.3 }}>{course.title}</h3>
-                  <p style={{ margin: "0 0 12px", fontSize: 12, color: C.textMuted, lineHeight: 1.55 }}>{course.description}</p>
-                  <div style={{ display: "flex", gap: 12, fontSize: 12, color: C.textSub, marginBottom: 14 }}>
+              <div key={course.id} style={{ display: "flex", alignItems: "center", gap: 14, flexWrap: "wrap", padding: "16px 20px", borderRadius: 14, border: `1.5px solid ${C.border}`, background: C.white }}>
+                <div style={{ width: 6, alignSelf: "stretch", minHeight: 40, borderRadius: 4, background: course.color ?? C.orange, flexShrink: 0 }} />
+                <div style={{ flex: 1, minWidth: 180 }}>
+                  <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
+                    {course.emoji && <span style={{ fontSize: 15 }}>{course.emoji}</span>}
+                    <span style={{ fontSize: 14, fontWeight: 700, color: C.text }}>{course.title}</span>
+                  </div>
+                  {course.description && <div style={{ fontSize: 12, color: C.textSub, marginTop: 2, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{course.description}</div>}
+                  <div style={{ display: "flex", gap: 10, fontSize: 11, color: C.textMuted, marginTop: 3, flexWrap: "wrap" }}>
                     <span>{courseLessons.length} lessons</span>
                     <span>{totalMin} min</span>
                     <span>{courseLessons.reduce((s, l) => s + (l.xp || 0), 0)} XP</span>
-                  </div>
-                  {/* Lesson list preview */}
-                  <div style={{ display: "flex", flexDirection: "column", gap: 5, marginBottom: 16 }}>
-                    {courseLessons.map((l, i) => (
-                      <div key={l.id} style={{ display: "flex", alignItems: "center", gap: 8, padding: "6px 10px", background: C.pageBg, borderRadius: 8, border: `1px solid ${C.border}` }}>
-                        <span style={{ fontSize: 11, fontWeight: 600, color: C.textMuted, width: 16, flexShrink: 0 }}>{i + 1}</span>
-                        <span style={{ fontSize: 12, fontWeight: 500, color: C.text, flex: 1, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{l.title}</span>
-                        <span style={{ fontSize: 11, color: C.textMuted, flexShrink: 0 }}>{l.duration}</span>
-                      </div>
-                    ))}
-                  </div>
-                  {/* Actions — bottom aligned */}
-                  <div style={{ display: "flex", gap: 6, marginTop: "auto", paddingTop: 4 }}>
-                    {canEdit && <button onClick={() => setCourseModal(course)} style={{ flex: 1, padding: "6px 0", borderRadius: 8, border: `1px solid ${C.border}`, background: C.white, color: C.textSub, fontSize: 12, fontWeight: 600, cursor: "pointer" }}>Edit</button>}
-                    {canAssign && <button onClick={() => setAssignModal({ contentType: "course", contentId: course.id })} style={{ flex: 1, padding: "6px 0", borderRadius: 8, border: "none", background: C.orange, color: "#fff", fontSize: 12, fontWeight: 700, cursor: "pointer" }}>Assign</button>}
-                    {canEdit && <button onClick={() => setConfirmArchive({ type: "course", id: course.id, title: course.title })} style={{ flex: 1, padding: "6px 0", borderRadius: 8, border: `1px solid rgba(239,68,68,0.2)`, background: "transparent", color: C.red, fontSize: 12, fontWeight: 600, cursor: "pointer" }}>Archive</button>}
+                    {course.updatedAt && <span title="Last updated">Updated {fmtUpdated(course.updatedAt)}</span>}
                   </div>
                 </div>
-              </Card>
+                <div style={{ display: "flex", alignItems: "center", gap: 6, flexShrink: 0 }}>
+                  {canEdit && <button onClick={() => setCourseModal(course)} style={{ padding: "6px 14px", borderRadius: 8, border: `1px solid ${C.border}`, background: C.white, color: C.textSub, fontSize: 12, fontWeight: 600, cursor: "pointer" }}>Edit</button>}
+                  {canAssign && <button onClick={() => setAssignModal({ contentType: "course", contentId: course.id })} style={{ padding: "6px 14px", borderRadius: 8, border: "none", background: C.orange, color: "#fff", fontSize: 12, fontWeight: 700, cursor: "pointer" }}>Assign</button>}
+                  {canEdit && <button onClick={() => setConfirmArchive({ type: "course", id: course.id, title: course.title })} style={{ padding: "6px 14px", borderRadius: 8, border: `1px solid rgba(239,68,68,0.2)`, background: "transparent", color: C.red, fontSize: 12, fontWeight: 600, cursor: "pointer" }}>Archive</button>}
+                </div>
+              </div>
             );
           })}
 
@@ -9996,62 +10338,141 @@ function LearnScreen({ role, user, orgUsers = [], orgs = [], onNav, onAwardXp, p
             </button>
           )}
         </div>
+        {/* Archived courses — clearly separated below active; Restore available.
+            Archived content never counts toward the active tab count or assignment choices. */}
+        {archivedCourses.length > 0 && (
+          <div style={{ marginTop: 24 }}>
+            <div style={{ display: "flex", alignItems: "center", gap: 8, marginBottom: 12 }}>
+              <span style={{ fontSize: 12, fontWeight: 800, color: C.textMuted, letterSpacing: "0.06em" }}>ARCHIVED ({archivedCourses.length})</span>
+              <div style={{ flex: 1, height: 1, background: C.border }} />
+            </div>
+            <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
+              {archivedCourses.map(c => (
+                <Card key={c.id} style={{ display: "flex", alignItems: "center", gap: 14, opacity: 0.72 }}>
+                  {c.emoji && <div style={{ width: 36, height: 36, borderRadius: 8, background: (c.color ?? C.orange) + "20", flexShrink: 0, display: "flex", alignItems: "center", justifyContent: "center", fontSize: 18 }}>{c.emoji}</div>}
+                  <div style={{ flex: 1, minWidth: 0 }}>
+                    <div style={{ fontSize: 13, fontWeight: 700, color: C.text }}>{c.title}</div>
+                    <div style={{ fontSize: 11, color: C.textSub }}>Course · {c.lessonIds?.length ?? 0} lessons</div>
+                  </div>
+                  <span style={{ fontSize: 10, fontWeight: 700, padding: "2px 7px", borderRadius: 4, background: C.muted, color: C.textMuted }}>Archived</span>
+                  {canEdit && <button onClick={() => handleRestoreCourse(c.id)} disabled={archiveInFlight.has(c.id)} style={{ padding: "6px 14px", borderRadius: 8, border: `1px solid ${C.orange}`, background: C.orangeLight, color: archiveInFlight.has(c.id) ? C.textMuted : C.orange, fontSize: 12, fontWeight: 700, cursor: archiveInFlight.has(c.id) ? "not-allowed" : "pointer", flexShrink: 0 }}>{archiveInFlight.has(c.id) ? "Restoring…" : "Restore"}</button>}
+                </Card>
+              ))}
+            </div>
+          </div>
+        )}
+        </>
       )}
 
       {/* LESSONS TAB */}
       {tab === "lessons" && (
-        <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fill, minmax(300px, 1fr))", gap: 16 }}>
+        <>
+        {/* Vertical list — one lesson per row (matches the Quizzes/Courses list). */}
+        <div style={{ display: "flex", flexDirection: "column", gap: 10 }}>
           {filteredLessons.map(lesson => (
-            <Card key={lesson.id} style={{ opacity: lesson.status === "inactive" ? 0.6 : 1, display: "flex", flexDirection: "column" }}>
-              <h3 style={{ margin: "0 0 6px", fontSize: 14, fontWeight: 700, color: C.text, lineHeight: 1.3 }}>{lesson.title}</h3>
-              <p style={{ margin: "0 0 12px", fontSize: 12, color: C.textMuted, lineHeight: 1.55, flex: 1 }}>{lesson.description}</p>
-              <div style={{ display: "flex", gap: 12, fontSize: 12, color: C.textSub, marginBottom: 14 }}>
-                <span>{lesson.duration}</span>
-                <span>{lesson.xp} XP</span>
+            <div key={lesson.id} style={{ display: "flex", alignItems: "center", gap: 14, flexWrap: "wrap", padding: "16px 20px", borderRadius: 14, border: `1.5px solid ${C.border}`, background: C.white, opacity: lesson.status === "inactive" ? 0.6 : 1 }}>
+              <div style={{ flex: 1, minWidth: 180 }}>
+                <div style={{ fontSize: 14, fontWeight: 700, color: C.text }}>{lesson.title}</div>
+                {lesson.description && <div style={{ fontSize: 12, color: C.textSub, marginTop: 2, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{lesson.description}</div>}
+                <div style={{ display: "flex", gap: 10, fontSize: 11, color: C.textMuted, marginTop: 3, flexWrap: "wrap" }}>
+                  {lesson.type && <span>{(lesson.type ?? "").toUpperCase()}</span>}
+                  <span>{lesson.duration}</span>
+                  <span>{lesson.xp} XP</span>
+                  {lesson.updatedAt && <span title="Last updated">Updated {fmtUpdated(lesson.updatedAt)}</span>}
+                </div>
               </div>
-              {/* Actions — bottom aligned */}
-              <div style={{ display: "flex", gap: 6 }}>
-                {canEdit && <button onClick={() => setLessonModal(lesson)} style={{ flex: 1, padding: "6px 0", borderRadius: 8, border: `1px solid ${C.border}`, background: C.white, color: C.textSub, fontSize: 11, fontWeight: 600, cursor: "pointer" }}>Edit</button>}
-                {canAssign && lesson.type !== "recording" && <button onClick={() => setAssignModal({ contentType: "lesson", contentId: lesson.id })} style={{ flex: 1, padding: "6px 0", borderRadius: 8, border: "none", background: C.orange, color: "#fff", fontSize: 11, fontWeight: 700, cursor: "pointer" }}>Assign</button>}
-                {canEdit && <button onClick={() => setConfirmArchive({ type: "lesson", id: lesson.id, title: lesson.title })} style={{ flex: 1, padding: "6px 0", borderRadius: 8, border: `1px solid rgba(239,68,68,0.2)`, background: "transparent", color: C.red, fontSize: 11, fontWeight: 600, cursor: "pointer" }}>Archive</button>}
+              <div style={{ display: "flex", alignItems: "center", gap: 6, flexShrink: 0 }}>
+                {canEdit && <button onClick={() => setLessonModal(lesson)} style={{ padding: "6px 14px", borderRadius: 8, border: `1px solid ${C.border}`, background: C.white, color: C.textSub, fontSize: 12, fontWeight: 600, cursor: "pointer" }}>Edit</button>}
+                {canAssign && lesson.type !== "recording" && <button onClick={() => setAssignModal({ contentType: "lesson", contentId: lesson.id })} style={{ padding: "6px 14px", borderRadius: 8, border: "none", background: C.orange, color: "#fff", fontSize: 12, fontWeight: 700, cursor: "pointer" }}>Assign</button>}
+                {canEdit && <button onClick={() => setConfirmArchive({ type: "lesson", id: lesson.id, title: lesson.title })} style={{ padding: "6px 14px", borderRadius: 8, border: `1px solid rgba(239,68,68,0.2)`, background: "transparent", color: C.red, fontSize: 12, fontWeight: 600, cursor: "pointer" }}>Archive</button>}
               </div>
-            </Card>
+            </div>
           ))}
 
           {lessons.length === 0 && (
             <button onClick={() => setLessonModal("new")} style={{
               padding: 40, borderRadius: 12, border: `2px dashed ${C.border}`, background: "transparent",
-              color: C.textSub, fontSize: 14, cursor: "pointer", textAlign: "center", gridColumn: "1/-1",
+              color: C.textSub, fontSize: 14, cursor: "pointer", textAlign: "center",
             }}>
               <div style={{ fontWeight: 700, color: C.text, marginBottom: 4 }}>No lessons yet</div>
               <div>Click "+ New Lesson" to create a standalone lesson</div>
             </button>
           )}
         </div>
+        {/* Archived lessons — separated below active; Restore available. */}
+        {archivedLessons.length > 0 && (
+          <div style={{ marginTop: 24 }}>
+            <div style={{ display: "flex", alignItems: "center", gap: 8, marginBottom: 12 }}>
+              <span style={{ fontSize: 12, fontWeight: 800, color: C.textMuted, letterSpacing: "0.06em" }}>ARCHIVED ({archivedLessons.length})</span>
+              <div style={{ flex: 1, height: 1, background: C.border }} />
+            </div>
+            <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
+              {archivedLessons.map(l => (
+                <Card key={l.id} style={{ display: "flex", alignItems: "center", gap: 14, opacity: 0.72 }}>
+                  <div style={{ flex: 1, minWidth: 0 }}>
+                    <div style={{ fontSize: 13, fontWeight: 700, color: C.text }}>{l.title}</div>
+                    <div style={{ fontSize: 11, color: C.textSub }}>{(l.type ?? "").toUpperCase()} · {l.duration}</div>
+                  </div>
+                  <span style={{ fontSize: 10, fontWeight: 700, padding: "2px 7px", borderRadius: 4, background: C.muted, color: C.textMuted }}>Archived</span>
+                  {canEdit && <button onClick={() => handleRestoreLesson(l.id)} disabled={archiveInFlight.has(l.id)} style={{ padding: "6px 14px", borderRadius: 8, border: `1px solid ${C.orange}`, background: C.orangeLight, color: archiveInFlight.has(l.id) ? C.textMuted : C.orange, fontSize: 12, fontWeight: 700, cursor: archiveInFlight.has(l.id) ? "not-allowed" : "pointer", flexShrink: 0 }}>{archiveInFlight.has(l.id) ? "Restoring…" : "Restore"}</button>}
+                </Card>
+              ))}
+            </div>
+          </div>
+        )}
+        </>
       )}
 
-      {/* ASSIGNMENTS TAB — manager assignment portal */}
+      {/* QUIZZES TAB — the existing canonical manager quiz library, embedded
+          here (Learn is now the unified area). App passes the ready-configured
+          <QuizzesScreen role="admin" …/> element as `quizzesPanel`, so there is
+          ONE quiz-manager implementation, mounted only when this tab is active —
+          no duplicated services/state/hooks, no second copy. */}
+      {tab === "quizzes" && (quizzesPanel ?? (
+        <div style={{ padding: 60, textAlign: "center", color: C.textMuted, fontSize: 14 }}>Quiz library unavailable.</div>
+      ))}
+
+      {/* ASSIGNMENTS TAB — manager assignment portal.
+          Honest states: error (retryable) → loading → data/empty. A refresh shows
+          "Loading…" until the tenant-wide data resolves, never a false "No
+          assignments yet" built from a not-yet-loaded (empty) dataset. */}
       {tab === "assignments" && learnDataError && (
         <ErrorState message={learnDataError} onRetry={loadLearnData} />
       )}
-      {tab === "assignments" && !learnDataError && (() => {
+      {tab === "assignments" && !learnDataError && isLearnLoading && (
+        <div style={{ padding: 60, textAlign: "center", color: C.textMuted, fontSize: 14 }}>Loading assignments…</div>
+      )}
+      {tab === "assignments" && !learnDataError && !isLearnLoading && (() => {
         const STATUS_CONFIG = {
           not_started: { label: "Not Started", bg: C.muted,    text: C.textSub  },
           in_progress: { label: "In Progress", bg: C.blueBg,   text: C.blue     },
           completed:   { label: "Completed",   bg: C.greenBg,  text: C.green    },
           overdue:     { label: "Overdue",     bg: C.redBg,    text: C.red      },
+          // 063/064 lifecycle: a cancelled row is history only — never active.
+          // The reason distinguishes the two ways an assignment ends:
+          // manager_unassigned (a deliberate Unassign) vs archive/removal.
+          cancelled:   { label: "Unassigned",  bg: C.muted,    text: C.textMuted },
         };
 
-        // Expand assignments into per-rep rows
-        const allRows = uniqueAssignments.flatMap(a => {
+        // Manager history = EVERY assignment INSTANCE (not deduped by content).
+        // A reassignment is its own instance with its own assigned_at; collapsing
+        // instances hid completed history and made Not Started/In Progress wrong.
+        // Each instance is resolved against its OWN assigned_at by the shared
+        // engine, so old resolved instances read as Completed and the current
+        // one reads by its own evidence. (The learner-facing "current work" views
+        // still collapse to one latest card per content — that's Home/Learn, not
+        // this manager history.) Missing/archived content degrades to an honest
+        // "(removed)" label rather than being silently dropped.
+        const allRows = assignments.flatMap(a => {
           const isCourse = a.contentType === "course";
           const isQuiz   = a.contentType === "quiz";
-          const content  = isCourse
+          const foundContent = isCourse
             ? courses.find(c => c.id === a.contentId)
             : isQuiz
               ? quizzes.find(q => q.id === a.contentId)
               : lessons.find(l => l.id === a.contentId);
-          if (!content) return [];
+          const content = foundContent ?? { id: a.contentId, title: `${isCourse ? "Course" : isQuiz ? "Quiz" : "Lesson"} (removed)`, _missing: true, lessonIds: [] };
+          const missingContent = !foundContent;
 
           let users = [];
           if (a.assignedTo?.type === "individual") {
@@ -10099,9 +10520,40 @@ function LearnScreen({ role, user, orgUsers = [], orgs = [], onNav, onAwardXp, p
               completedAt = engineResult.completedAt;
             }
 
-            return { a, content, isCourse, isQuiz, u, progress, status, completedAt, courseLessons, completedAtByLesson, userAttempts };
+            return { a, content, isCourse, isQuiz, u, progress, status, completedAt, courseLessons, completedAtByLesson, userAttempts, _missingContent: missingContent };
           });
         });
+
+        // ENDED rows — cancelled assignments (Unassigned via 064, or Content
+        // Archived via 063) folded into the SAME dataset so the history is one
+        // canonical list, not a separate table. Status comes from the shared
+        // engine (resolveAssignmentStatus → 'cancelled' for a cancelled row);
+        // the reason splits the two ended filters. Missing/archived content
+        // degrades to an honest "(removed)" label, never a fabricated title.
+        const cancelledRows = (cancelledAssignments ?? []).map(ca => {
+          const isCourse = ca.contentType === "course";
+          const isQuiz   = ca.contentType === "quiz";
+          const found = isCourse
+            ? (courses.find(c => c.id === ca.contentId) ?? archivedCourses.find(c => c.id === ca.contentId))
+            : isQuiz
+              ? quizzes.find(q => q.id === ca.contentId)
+              : (lessons.find(l => l.id === ca.contentId) ?? archivedLessons.find(l => l.id === ca.contentId));
+          const content = found ?? { title: `${isCourse ? "Course" : isQuiz ? "Quiz" : "Lesson"} (removed)`, _missing: true };
+          const foundUser = orgUsers.find(x => x.id === ca.assignedTo?.userId);
+          const u = foundUser ?? { id: ca.assignedTo?.userId ?? "__ended__", name: ca.assignedTo?.userName ?? "—", initials: (ca.assignedTo?.userName?.[0] ?? "?").toUpperCase(), color: C.textMuted };
+          const engineResult = resolveAssignmentStatus(ca.contentType, ca, { completedAt: null, lessonIds: [], attempts: [], completedAtByLesson: new Map() });
+          return {
+            a: ca, content, isCourse, isQuiz, u,
+            progress: engineResult.progress, status: engineResult.status, completedAt: null,
+            courseLessons: [], completedAtByLesson: null, userAttempts: [],
+            _cancelSub: ca.cancelledReason === "manager_unassigned" ? "unassigned" : "content_archived",
+            _missingContent: !found,
+          };
+        });
+        // Cancelled rows never overwrite an active one for the same (assignment,
+        // rep): they carry distinct (cancelled) assignment ids, so concatenation
+        // keeps one row per instance — active instances AND ended history.
+        allRows.push(...cancelledRows);
 
         if (allRows.length === 0 && !sq) {
           return (
@@ -10135,31 +10587,70 @@ function LearnScreen({ role, user, orgUsers = [], orgs = [], onNav, onAwardXp, p
           return true;
         };
 
-        const filteredRows = allRows.filter(timeframeFilter);
+        const timeframeRows = allRows.filter(timeframeFilter);
 
-        // Summary stats — computed from timeframe-filtered rows (not raw assignment count).
-        // "Active" = not_started + in_progress + overdue (excludes completed).
+        // Status-filter tabs (one canonical dataset). Each maps to the shared
+        // engine's resolved status; the two ended states additionally split on
+        // the cancellation reason. No separate status math.
+        const isUnassigned      = (r) => r.status === "cancelled" && r._cancelSub === "unassigned";
+        const isContentArchived = (r) => r.status === "cancelled" && r._cancelSub === "content_archived";
+        const statusMatch = (r) => {
+          switch (assignStatusFilter) {
+            case "not_started":      return r.status === "not_started";
+            case "in_progress":      return r.status === "in_progress";
+            case "completed":        return r.status === "completed";
+            case "overdue":          return r.status === "overdue";
+            case "unassigned":       return isUnassigned(r);
+            case "content_archived": return isContentArchived(r);
+            default:                 return true; // "all"
+          }
+        };
+        // All four dropdown filters combine (AND) over the SAME canonical dataset.
+        const contentTypeMatch = (r) => assignContentType === "all" || r.a.contentType === assignContentType;
+        const repMatch = (r) => assignRep === "all" || r.u?.id === assignRep;
+        // Rep options — every learner with any assignment history in the current
+        // timeframe (individual rows only; stable userId as the value).
+        const repOptions = (() => {
+          const seen = new Map();
+          timeframeRows.forEach(r => { if (r.u?.id && !r.u._isAggregate && !seen.has(r.u.id)) seen.set(r.u.id, r.u.name ?? "—"); });
+          return [...seen.entries()].map(([id, name]) => ({ id, name })).sort((a, b) => a.name.localeCompare(b.name));
+        })();
+        const filteredRows = timeframeRows.filter(r => statusMatch(r) && contentTypeMatch(r) && repMatch(r));
+
+        // Tab counts — from the timeframe-filtered set (not the status-filtered
+        // one), so each tab shows its own total. "Active" excludes completed AND
+        // ended rows.
         const statCounts = {
-          active:      filteredRows.filter(r => r.status !== "completed").length,
-          not_started: filteredRows.filter(r => r.status === "not_started").length,
-          in_progress: filteredRows.filter(r => r.status === "in_progress").length,
-          completed:   filteredRows.filter(r => r.status === "completed").length,
-          overdue:     filteredRows.filter(r => r.status === "overdue").length,
+          all:              timeframeRows.length,
+          active:           timeframeRows.filter(r => r.status !== "completed" && r.status !== "cancelled").length,
+          not_started:      timeframeRows.filter(r => r.status === "not_started").length,
+          in_progress:      timeframeRows.filter(r => r.status === "in_progress").length,
+          completed:        timeframeRows.filter(r => r.status === "completed").length,
+          overdue:          timeframeRows.filter(r => r.status === "overdue").length,
+          unassigned:       timeframeRows.filter(isUnassigned).length,
+          content_archived: timeframeRows.filter(isContentArchived).length,
         };
 
-        // Detail view when an assignment is selected
-        const detailAssignment = selectedAssignmentId ? assignments.find(a => a.id === selectedAssignmentId) : null;
-        const detailContent = detailAssignment
-          ? (detailAssignment.contentType === "course" ? courses.find(c => c.id === detailAssignment.contentId) : lessons.find(l => l.id === detailAssignment.contentId))
+        // Content drilldown context (resolved by STABLE contentType+contentId).
+        const isDrilled = !!drillContent || !!drillRep;
+        const drillContentTitle = drillContent
+          ? ((drillContent.contentType === "course" ? courses.find(c => c.id === drillContent.contentId)
+             : drillContent.contentType === "quiz" ? quizzes.find(q => q.id === drillContent.contentId)
+             : lessons.find(l => l.id === drillContent.contentId))?.title
+             ?? (drillContent.contentType === "course" ? "Course" : drillContent.contentType === "quiz" ? "Quiz" : "Lesson") + " (removed)")
           : null;
+        const drillRepName = drillRep ? (timeframeRows.find(r => r.u?.id === drillRep)?.u?.name ?? "Learner") : null;
 
-        // Rows to show: timeframe + search filtered, or detail-drilled
+        // Rows to show: content drilldown (all learner instances of one content) →
+        // rep drilldown (one learner's history) → timeframe/status/search filtered.
         const searchedRows = sq
           ? filteredRows.filter(r => r.content?.title.toLowerCase().includes(sq) || r.u?.name?.toLowerCase().includes(sq))
           : filteredRows;
-        const visibleRows = selectedAssignmentId
-          ? filteredRows.filter(r => r.a.id === selectedAssignmentId)
-          : searchedRows;
+        const visibleRows = drillContent
+          ? filteredRows.filter(r => r.a.contentType === drillContent.contentType && r.a.contentId === drillContent.contentId)
+          : drillRep
+            ? filteredRows.filter(r => r.u?.id === drillRep)
+            : searchedRows;
 
         // Per-rep drill-down (Task 11) — reuses QuizAttemptDrilldown for
         // quizzes (same component QuizzesScreen's tracking panel uses) and
@@ -10194,7 +10685,13 @@ function LearnScreen({ role, user, orgUsers = [], orgs = [], onNav, onAwardXp, p
             </div>
             {rows.map((row, i) => {
               const { a, content, isCourse, isQuiz, u, progress, status, completedAt, userAttempts } = row;
+              const missingContent = row._missingContent;
+              const isEnded = status === "cancelled";
               const sc     = STATUS_CONFIG[status] ?? STATUS_CONFIG.not_started;
+              // Ended rows read their true reason: Unassigned vs Content Archived.
+              const statusLabel = isEnded
+                ? (row._cancelSub === "unassigned" ? "Unassigned" : "Content Archived")
+                : sc.label;
               const tColor = isCourse ? (content.color ?? C.orange) : isQuiz ? C.purple : (LESSON_TYPE_COLORS[content.type] ?? C.orange);
               const contentLabel = isCourse ? "Course" : isQuiz ? "Quiz" : "Lesson";
               const contentIcon  = isCourse ? content.emoji : isQuiz ? "📋" : LESSON_TYPE_ICONS[content.type];
@@ -10207,17 +10704,16 @@ function LearnScreen({ role, user, orgUsers = [], orgs = [], onNav, onAwardXp, p
               const sortedAttempts = isQuiz ? [...userAttempts].sort((x, y) => new Date(y.created_at) - new Date(x.created_at)) : [];
               const latestAttempt  = sortedAttempts[0] ?? null;
               const bestScore      = sortedAttempts.length ? Math.max(...sortedAttempts.map(at => at.score ?? 0)) : null;
-              const canDrilldown   = !u._isAggregate;
+              const canDrilldown   = !u._isAggregate && !isEnded && !missingContent;  // history / removed content: no drill-in
               const rowKey = `${a.id}-${u.id}`;
-              // Assignment Experience Priority 1 — remove is offered only for
-              // true per-user assignment rows (the current, default shape
-              // every new assignment now takes — see contentService.js's
-              // ASSIGNMENTS header). A legacy assigned_to.type === "team"/
-              // "group" aggregate row can still expand to multiple reps
-              // sharing one row id; deleting that id would unassign all of
-              // them, not just the one in this row, so those rows don't get a
-              // remove control here.
-              const canRemove = canDrilldown && a.assignedTo?.type === "individual";
+              // Unassign is offered only for true per-user rows that are still
+              // actionable — active / in-progress / overdue. A COMPLETED row is
+              // never unassignable (the RPC also refuses it server-side), and a
+              // cancelled row is already ended. A legacy team/group aggregate
+              // row (one id → many reps) is excluded so we never cancel a whole
+              // group by accident.
+              const canUnassign = canDrilldown && a.assignedTo?.type === "individual"
+                && status !== "completed" && status !== "cancelled";
               const isRemoving = removingAssignmentId === a.id;
               return (
                 <div
@@ -10225,7 +10721,8 @@ function LearnScreen({ role, user, orgUsers = [], orgs = [], onNav, onAwardXp, p
                   onClick={canDrilldown ? () => setSelectedRowKey(rowKey) : undefined}
                   style={{ minWidth: 940, display: "grid", gridTemplateColumns: TRACKING_GRID, gap: 10, padding: "13px 16px", background: C.white, borderTop: `1px solid ${C.border}`, alignItems: "center", cursor: canDrilldown ? "pointer" : "default" }}
                 >
-                  {/* Content — also independently clickable to drill into this assignment across all reps */}
+                  {/* Content — clicking the title/type drills into this CONTENT
+                      (all learner instances), keyed on stable contentType+contentId. */}
                   <div style={{ display: "flex", alignItems: "center", gap: 10, minWidth: 0 }}>
                     {contentIcon && (
                       <div style={{ width: 30, height: 30, borderRadius: 7, background: tColor + "20", flexShrink: 0, display: "flex", alignItems: "center", justifyContent: "center", fontSize: 13 }}>
@@ -10234,34 +10731,67 @@ function LearnScreen({ role, user, orgUsers = [], orgs = [], onNav, onAwardXp, p
                     )}
                     <div style={{ minWidth: 0 }}>
                       <button
-                        onClick={(e) => { e.stopPropagation(); setSelectedAssignmentId(selectedAssignmentId === a.id ? null : a.id); }}
-                        style={{ background: "none", border: "none", padding: 0, cursor: "pointer", textAlign: "left" }}
+                        onClick={(e) => { e.stopPropagation(); setDrillRep(null); setDrillContent(drillContent && drillContent.contentId === a.contentId && drillContent.contentType === a.contentType ? null : { contentType: a.contentType, contentId: a.contentId }); }}
+                        style={{ background: "none", border: "none", padding: 0, cursor: missingContent ? "default" : "pointer", textAlign: "left" }}
+                        disabled={missingContent}
+                        title={missingContent ? undefined : "See every learner assigned this"}
                       >
-                        <div style={{ fontSize: 13, fontWeight: 700, color: C.text, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap", textDecoration: "underline", textDecorationColor: C.border }}>{contentTitle}</div>
+                        <div style={{ fontSize: 13, fontWeight: 700, color: missingContent ? C.textMuted : C.text, fontStyle: missingContent ? "italic" : "normal", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap", textDecoration: missingContent ? "none" : "underline", textDecorationColor: C.border }}>{contentTitle}</div>
                       </button>
-                      <div style={{ fontSize: 11, color: C.textSub }}>{contentLabel}{a.required ? " · Required" : " · Recommended"}</div>
+                      <div style={{ fontSize: 11, color: C.textSub }}>
+                        {contentLabel}{a.required ? " · Required" : " · Recommended"}
+                        {/* Content archived but the assignment history (incl. completed
+                            scores) stays intact and viewable — honest historical truth. */}
+                        {content?.status === "archived" && <span style={{ marginLeft: 6, fontSize: 9, fontWeight: 700, padding: "1px 5px", borderRadius: 4, background: C.muted, color: C.textMuted, letterSpacing: "0.04em" }}>ARCHIVED</span>}
+                      </div>
                     </div>
                   </div>
-                  {/* Rep */}
-                  <div style={{ display: "flex", alignItems: "center", gap: 7, minWidth: 0 }}>
-                    <div style={{ width: 24, height: 24, borderRadius: "50%", background: u.color ?? C.orange, display: "flex", alignItems: "center", justifyContent: "center", fontSize: 10, fontWeight: 700, color: "#fff", flexShrink: 0 }}>
-                      {(u.initials ?? u.name?.[0] ?? "?").toUpperCase()}
-                    </div>
-                    <span style={{ fontSize: 13, fontWeight: 600, color: C.text, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{u.name}</span>
-                  </div>
+                  {/* Rep — the individual learner is ALWAYS the primary assignee,
+                      one row per learner instance. When the assignment was fanned
+                      out from a team/group/all target, the origin shows only as a
+                      secondary "via [Team]" line; the team is never the assignee. */}
+                  {(() => {
+                    const originLabel = (a.source?.type && a.source.type !== "individual")
+                      ? (a.source.label ?? (a.source.type === "group" ? "Everyone" : a.source.type === "all" ? "All users" : "Team"))
+                      : (a.assignedTo?.type === "team" ? (a.assignedTo.teamName ?? "Team") : a.assignedTo?.type === "group" ? "Everyone" : null);
+                    // Clicking the learner drills into THAT learner's history
+                    // (all content), keyed on stable userId. Aggregate rows aren't
+                    // an individual, so they're not drillable.
+                    const canDrillRep = !u._isAggregate && !!u.id;
+                    return (
+                      <div style={{ display: "flex", alignItems: "center", gap: 7, minWidth: 0 }}>
+                        <div style={{ width: 24, height: 24, borderRadius: "50%", background: u.color ?? C.orange, display: "flex", alignItems: "center", justifyContent: "center", fontSize: 10, fontWeight: 700, color: "#fff", flexShrink: 0 }}>
+                          {(u.initials ?? u.name?.[0] ?? "?").toUpperCase()}
+                        </div>
+                        <div style={{ minWidth: 0 }}>
+                          <button
+                            onClick={(e) => { e.stopPropagation(); if (!canDrillRep) return; setDrillContent(null); setDrillRep(drillRep === u.id ? null : u.id); }}
+                            disabled={!canDrillRep}
+                            title={canDrillRep ? "See this learner's assignment history" : undefined}
+                            style={{ background: "none", border: "none", padding: 0, cursor: canDrillRep ? "pointer" : "default", textAlign: "left", fontSize: 13, fontWeight: 600, color: C.text, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap", maxWidth: "100%", textDecoration: canDrillRep ? "underline" : "none", textDecorationColor: C.border }}
+                          >{u.name}</button>
+                          {originLabel && <div style={{ fontSize: 10, color: C.textMuted, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>via {originLabel}</div>}
+                        </div>
+                      </div>
+                    );
+                  })()}
                   {/* Assigned */}
                   <span style={{ fontSize: 13, color: C.textSub }}>{assignedLabel}</span>
                   {/* Due */}
                   <span style={{ fontSize: 13, color: status === "overdue" ? C.red : C.textSub, fontWeight: status === "overdue" ? 700 : 400 }}>{dueLabel}</span>
-                  {/* Status badge */}
-                  <div><span style={{ fontSize: 11, fontWeight: 700, padding: "3px 8px", borderRadius: 6, background: sc.bg, color: sc.text }}>{sc.label}</span></div>
-                  {/* Progress bar */}
+                  {/* Status badge — reason-aware for ended rows */}
+                  <div><span style={{ fontSize: 11, fontWeight: 700, padding: "3px 8px", borderRadius: 6, background: sc.bg, color: sc.text }}>{statusLabel}</span></div>
+                  {/* Progress bar — an ended row shows its dash, not a stale % */}
+                  {isEnded ? (
+                    <span style={{ fontSize: 12, color: C.textMuted }}>—</span>
+                  ) : (
                   <div style={{ display: "flex", alignItems: "center", gap: 5 }}>
                     <div style={{ flex: 1, height: 5, background: C.muted, borderRadius: 3, overflow: "hidden" }}>
                       <div style={{ height: "100%", width: `${progress}%`, background: status === "completed" ? C.green : status === "overdue" ? C.red : C.orange, borderRadius: 3 }} />
                     </div>
                     <span style={{ fontSize: 11, fontWeight: 700, color: C.textSub, flexShrink: 0 }}>{progress}%</span>
                   </div>
+                  )}
                   {/* Score — quiz only */}
                   <div style={{ fontSize: 11, color: C.textSub, lineHeight: 1.4 }}>
                     {isQuiz && latestAttempt ? (
@@ -10271,25 +10801,29 @@ function LearnScreen({ role, user, orgUsers = [], orgs = [], onNav, onAwardXp, p
                       </>
                     ) : "—"}
                   </div>
-                  {/* Completed at */}
-                  <span style={{ fontSize: 12, color: C.textSub }}>{completedAt ? fmtShort(completedAt) : "—"}</span>
-                  {/* Assignment Experience Priority 1 — Remove action.
-                      Individual rows only (see canRemove above); legacy
-                      team/group aggregate rows show nothing here rather than
-                      a control that would silently remove the whole group. */}
+                  {/* DONE — completion date, or the ended date for a cancelled row */}
+                  <span style={{ fontSize: 12, color: C.textSub }}>
+                    {isEnded
+                      ? (a.cancelledAt ? `Ended ${fmtShort(a.cancelledAt)}` : "Ended")
+                      : (completedAt ? fmtShort(completedAt) : "—")}
+                  </span>
+                  {/* Unassign action — cancels only THIS learner's active
+                      assignment (soft, history-preserving via 064's RPC). Not
+                      Archive: archiving is a content action on the Courses/
+                      Lessons cards. Individual, still-actionable rows only. */}
                   <div onClick={e => e.stopPropagation()}>
-                    {canRemove ? (
+                    {canUnassign ? (
                       <button
                         onClick={() => setConfirmRemoveAssignment(row)}
                         disabled={isRemoving}
-                        title={`Remove this assignment for ${u.name}`}
+                        title={`Unassign this from ${u.name} (keeps their history)`}
                         style={{
                           padding: "5px 10px", borderRadius: 7, border: "1px solid #fca5a5",
                           background: "#fef2f2", color: "#ef4444", fontSize: 11, fontWeight: 600,
                           cursor: isRemoving ? "default" : "pointer", opacity: isRemoving ? 0.6 : 1,
                         }}
                       >
-                        {isRemoving ? "…" : "Remove"}
+                        {isRemoving ? "…" : "Unassign"}
                       </button>
                     ) : null}
                   </div>
@@ -10302,76 +10836,99 @@ function LearnScreen({ role, user, orgUsers = [], orgs = [], onNav, onAwardXp, p
 
         return (
           <div>
-            {/* Timeframe filters + summary stats — list view only */}
-            {!selectedAssignmentId && (
-              <>
-                {/* Timeframe filter row */}
-                <div style={{ display: "flex", alignItems: "center", gap: 8, marginBottom: 16, flexWrap: "wrap" }}>
-                  {[
-                    { id: "all",   label: "All time" },
-                    { id: "week",  label: "This week" },
-                    { id: "month", label: "This month" },
-                    { id: "custom", label: "Custom range" },
-                  ].map(({ id, label }) => (
-                    <button key={id} onClick={() => setAssignTimeframe(id)} style={{
-                      padding: "5px 12px", borderRadius: 99, border: `1.5px solid ${assignTimeframe === id ? C.orange : C.border}`,
-                      background: assignTimeframe === id ? C.orangeLight : C.white,
-                      fontSize: 12, fontWeight: 600, color: assignTimeframe === id ? C.orange : C.textSub,
-                      cursor: "pointer", transition: "all 0.15s",
-                    }}>{label}</button>
-                  ))}
+            {/* Compact dropdown filters (Status / Content Type / Rep / Timeframe)
+                — replaces the tab rows. All combine over the one canonical history
+                dataset; defaults show every row. Unassigned stays a Status option. */}
+            {!isDrilled && (() => {
+              const selStyle = { padding: "7px 10px", borderRadius: 8, border: `1px solid ${C.border}`, background: C.white, color: C.text, fontSize: 12, fontWeight: 600, cursor: "pointer" };
+              const labelStyle = { fontSize: 10, fontWeight: 700, color: C.textMuted, letterSpacing: "0.04em", marginBottom: 4, display: "block" };
+              const cnt = (n) => (n > 0 ? ` (${n})` : "");
+              return (
+                <div style={{ display: "flex", alignItems: "flex-end", gap: 12, marginBottom: 18, flexWrap: "wrap" }}>
+                  <label>
+                    <span style={labelStyle}>STATUS</span>
+                    <select value={assignStatusFilter} onChange={e => setAssignStatusFilter(e.target.value)} style={selStyle}>
+                      <option value="all">All statuses{cnt(statCounts.all)}</option>
+                      <option value="not_started">Not Started{cnt(statCounts.not_started)}</option>
+                      <option value="in_progress">In Progress{cnt(statCounts.in_progress)}</option>
+                      <option value="completed">Completed{cnt(statCounts.completed)}</option>
+                      <option value="overdue">Overdue{cnt(statCounts.overdue)}</option>
+                      <option value="unassigned">Unassigned{cnt(statCounts.unassigned)}</option>
+                      <option value="content_archived">Content Archived{cnt(statCounts.content_archived)}</option>
+                    </select>
+                  </label>
+                  <label>
+                    <span style={labelStyle}>CONTENT TYPE</span>
+                    <select value={assignContentType} onChange={e => setAssignContentType(e.target.value)} style={selStyle}>
+                      <option value="all">All types</option>
+                      <option value="lesson">Lesson</option>
+                      <option value="course">Course</option>
+                      <option value="quiz">Quiz</option>
+                    </select>
+                  </label>
+                  <label>
+                    <span style={labelStyle}>REP</span>
+                    <select value={assignRep} onChange={e => setAssignRep(e.target.value)} style={{ ...selStyle, maxWidth: 200 }}>
+                      <option value="all">All reps</option>
+                      {repOptions.map(r => <option key={r.id} value={r.id}>{r.name}</option>)}
+                    </select>
+                  </label>
+                  <label>
+                    <span style={labelStyle}>TIMEFRAME</span>
+                    <select value={assignTimeframe} onChange={e => setAssignTimeframe(e.target.value)} style={selStyle}>
+                      <option value="all">All time</option>
+                      <option value="week">This week</option>
+                      <option value="month">This month</option>
+                      <option value="custom">Custom range</option>
+                    </select>
+                  </label>
                   {assignTimeframe === "custom" && (
-                    <div style={{ display: "flex", alignItems: "center", gap: 6, marginLeft: 4 }}>
-                      <input
-                        type="date" value={assignDateRange.start}
-                        onChange={e => setAssignDateRange(p => ({ ...p, start: e.target.value }))}
-                        style={{ padding: "4px 8px", borderRadius: 7, border: `1px solid ${C.border}`, fontSize: 12, color: C.text, background: C.white }}
-                      />
+                    <div style={{ display: "flex", alignItems: "center", gap: 6 }}>
+                      <input type="date" value={assignDateRange.start} onChange={e => setAssignDateRange(p => ({ ...p, start: e.target.value }))} style={{ padding: "6px 8px", borderRadius: 7, border: `1px solid ${C.border}`, fontSize: 12, color: C.text, background: C.white }} />
                       <span style={{ fontSize: 12, color: C.textSub }}>to</span>
-                      <input
-                        type="date" value={assignDateRange.end}
-                        onChange={e => setAssignDateRange(p => ({ ...p, end: e.target.value }))}
-                        style={{ padding: "4px 8px", borderRadius: 7, border: `1px solid ${C.border}`, fontSize: 12, color: C.text, background: C.white }}
-                      />
+                      <input type="date" value={assignDateRange.end} onChange={e => setAssignDateRange(p => ({ ...p, end: e.target.value }))} style={{ padding: "6px 8px", borderRadius: 7, border: `1px solid ${C.border}`, fontSize: 12, color: C.text, background: C.white }} />
                     </div>
                   )}
+                  {/* Reset filters — clears every dropdown AND any active content/rep
+                      drilldown together, returning to the full default history dataset. */}
+                  {(() => {
+                    const isDefault = assignStatusFilter === "all" && assignContentType === "all"
+                      && assignRep === "all" && assignTimeframe === "all" && !drillContent && !drillRep && !selectedRowKey;
+                    return (
+                      <button
+                        onClick={() => { setAssignStatusFilter("all"); setAssignContentType("all"); setAssignRep("all"); setAssignTimeframe("all"); setAssignDateRange({ start: "", end: "" }); setDrillContent(null); setDrillRep(null); setSelectedRowKey(null); }}
+                        disabled={isDefault}
+                        style={{ padding: "7px 14px", borderRadius: 8, border: `1px solid ${C.border}`, background: isDefault ? C.pageBg : C.white, color: isDefault ? C.textMuted : C.textSub, fontSize: 12, fontWeight: 700, cursor: isDefault ? "default" : "pointer" }}
+                      >Reset filters</button>
+                    );
+                  })()}
                 </div>
+              );
+            })()}
 
-                {/* Summary stat cards */}
-                <div style={{ display: "grid", gridTemplateColumns: "repeat(5, 1fr)", gap: 10, marginBottom: 20 }}>
-                  {[
-                    { label: "Active",      count: statCounts.active,       color: C.text,    title: "Not started + in progress + overdue" },
-                    { label: "Not Started", count: statCounts.not_started,  color: C.textSub, title: "Assigned, no progress yet" },
-                    { label: "In Progress", count: statCounts.in_progress,  color: C.blue,    title: "Started but not complete" },
-                    { label: "Completed",   count: statCounts.completed,    color: C.green,   title: "Finished" },
-                    { label: "Overdue",     count: statCounts.overdue,      color: C.red,     title: "Past due date, not complete" },
-                  ].map(({ label, count, color, title }) => (
-                    <div key={label} title={title} style={{ background: C.white, borderRadius: 10, padding: "14px 16px", border: `1px solid ${C.border}` }}>
-                      <div style={{ fontSize: 22, fontWeight: 800, color, marginBottom: 3 }}>{count}</div>
-                      <div style={{ fontSize: 11, fontWeight: 600, color: C.textSub, lineHeight: 1.3 }}>{label}</div>
-                    </div>
-                  ))}
-                </div>
-              </>
-            )}
-
-            {/* Detail view header */}
-            {selectedAssignmentId && detailContent && (
+            {/* Drilldown header — content (all learners) or rep (all content) */}
+            {isDrilled && (
               <div style={{ display: "flex", alignItems: "center", gap: 12, marginBottom: 16, padding: "12px 16px", background: C.white, borderRadius: 10, border: `1px solid ${C.border}` }}>
-                <button onClick={() => setSelectedAssignmentId(null)} style={{ background: "none", border: "none", cursor: "pointer", color: C.textSub, fontSize: 13, fontWeight: 700, display: "flex", alignItems: "center", gap: 6, padding: 0, flexShrink: 0 }}>← All Assignments</button>
+                <button onClick={() => { setDrillContent(null); setDrillRep(null); }} style={{ background: "none", border: "none", cursor: "pointer", color: C.textSub, fontSize: 13, fontWeight: 700, display: "flex", alignItems: "center", gap: 6, padding: 0, flexShrink: 0 }}>← All Assignments</button>
                 <span style={{ color: C.border, fontSize: 18 }}>|</span>
-                {(detailAssignment?.contentType === "quiz" || (detailAssignment?.contentType === "course" && detailContent.emoji)) && (
-                  <span style={{ fontSize: 15 }}>{detailAssignment?.contentType === "course" ? detailContent.emoji : "📋"}</span>
-                )}
                 <div style={{ flex: 1, minWidth: 0 }}>
-                  <div style={{ fontSize: 14, fontWeight: 700, color: C.text }}>{detailContent.title ?? detailContent.name}</div>
-                  <div style={{ fontSize: 11, color: C.textSub }}>{detailAssignment?.contentType === "course" ? "Course" : detailAssignment?.contentType === "quiz" ? "Quiz" : "Lesson"} · {detailAssignment?.required ? "Required" : "Recommended"} · {visibleRows.length} rep{visibleRows.length !== 1 ? "s" : ""}</div>
+                  {drillContent ? (
+                    <>
+                      <div style={{ fontSize: 14, fontWeight: 700, color: C.text }}>{drillContentTitle}</div>
+                      <div style={{ fontSize: 11, color: C.textSub }}>{drillContent.contentType === "course" ? "Course" : drillContent.contentType === "quiz" ? "Quiz" : "Lesson"} · every learner assigned · {visibleRows.length} instance{visibleRows.length !== 1 ? "s" : ""}</div>
+                    </>
+                  ) : (
+                    <>
+                      <div style={{ fontSize: 14, fontWeight: 700, color: C.text }}>{drillRepName}</div>
+                      <div style={{ fontSize: 11, color: C.textSub }}>Learner assignment history · {visibleRows.length} item{visibleRows.length !== 1 ? "s" : ""}</div>
+                    </>
+                  )}
                 </div>
               </div>
             )}
 
             {/* Row count label */}
-            {!selectedAssignmentId && (
+            {!isDrilled && (
               <p style={{ margin: "0 0 14px", fontSize: 13, color: C.textSub }}>{visibleRows.length} rep assignment{visibleRows.length !== 1 ? "s" : ""}</p>
             )}
 
@@ -10384,51 +10941,6 @@ function LearnScreen({ role, user, orgUsers = [], orgs = [], onNav, onAwardXp, p
       })()}
 
       {/* ARCHIVED TAB */}
-      {tab === "archived" && (
-        <div style={{ display: "flex", flexDirection: "column", gap: 20 }}>
-          {archivedCourses.length === 0 && archivedLessons.length === 0 && (
-            <div style={{ padding: 60, textAlign: "center", background: C.white, borderRadius: 12, border: `1px solid ${C.border}` }}>
-              <div style={{ fontSize: 32, marginBottom: 12 }}>📦</div>
-              <p style={{ margin: 0, fontSize: 15, fontWeight: 700, color: C.text }}>Nothing archived</p>
-              <p style={{ margin: "6px 0 0", fontSize: 13, color: C.textSub }}>Archived courses and lessons will appear here. Use the Archive button on any course or lesson to move it here.</p>
-            </div>
-          )}
-          {archivedCourses.length > 0 && (
-            <div>
-              <h3 style={{ margin: "0 0 10px", fontSize: 12, fontWeight: 800, color: C.textMuted, letterSpacing: "0.06em" }}>COURSES ({archivedCourses.length})</h3>
-              <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
-                {archivedCourses.map(c => (
-                  <Card key={c.id} style={{ display: "flex", alignItems: "center", gap: 14, opacity: 0.72 }}>
-                    {c.emoji && <div style={{ width: 36, height: 36, borderRadius: 8, background: (c.color ?? C.orange) + "20", flexShrink: 0, display: "flex", alignItems: "center", justifyContent: "center", fontSize: 18 }}>{c.emoji}</div>}
-                    <div style={{ flex: 1, minWidth: 0 }}>
-                      <div style={{ fontSize: 13, fontWeight: 700, color: C.text }}>{c.title}</div>
-                      <div style={{ fontSize: 11, color: C.textSub }}>Course · {c.lessonIds?.length ?? 0} lessons</div>
-                    </div>
-                    <button onClick={() => handleRestoreCourse(c.id)} disabled={archiveInFlight.has(c.id)} style={{ padding: "6px 14px", borderRadius: 8, border: `1px solid ${C.border}`, background: C.white, color: archiveInFlight.has(c.id) ? C.textMuted : C.textSub, fontSize: 12, fontWeight: 700, cursor: archiveInFlight.has(c.id) ? "not-allowed" : "pointer", flexShrink: 0 }}>{archiveInFlight.has(c.id) ? "Restoring…" : "Restore"}</button>
-                  </Card>
-                ))}
-              </div>
-            </div>
-          )}
-          {archivedLessons.length > 0 && (
-            <div>
-              <h3 style={{ margin: "0 0 10px", fontSize: 12, fontWeight: 800, color: C.textMuted, letterSpacing: "0.06em" }}>LESSONS ({archivedLessons.length})</h3>
-              <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
-                {archivedLessons.map(l => (
-                  <Card key={l.id} style={{ display: "flex", alignItems: "center", gap: 14, opacity: 0.72 }}>
-                    <div style={{ flex: 1, minWidth: 0 }}>
-                      <div style={{ fontSize: 13, fontWeight: 700, color: C.text }}>{l.title}</div>
-                      <div style={{ fontSize: 11, color: C.textSub }}>{(l.type ?? "").toUpperCase()} · {l.duration}</div>
-                    </div>
-                    <button onClick={() => handleRestoreLesson(l.id)} disabled={archiveInFlight.has(l.id)} style={{ padding: "6px 14px", borderRadius: 8, border: `1px solid ${C.border}`, background: C.white, color: archiveInFlight.has(l.id) ? C.textMuted : C.textSub, fontSize: 12, fontWeight: 700, cursor: archiveInFlight.has(l.id) ? "not-allowed" : "pointer", flexShrink: 0 }}>{archiveInFlight.has(l.id) ? "Restoring…" : "Restore"}</button>
-                  </Card>
-                ))}
-              </div>
-            </div>
-          )}
-        </div>
-      )}
-
       {/* ARCHIVE CONFIRMATION MODAL */}
       {confirmArchive && (
         <div style={{ position: "fixed", inset: 0, background: "rgba(0,0,0,0.5)", display: "flex", alignItems: "center", justifyContent: "center", zIndex: 1001 }}
@@ -10437,7 +10949,7 @@ function LearnScreen({ role, user, orgUsers = [], orgs = [], onNav, onAwardXp, p
             <div style={{ fontSize: 32, marginBottom: 12, textAlign: "center" }}>⚠️</div>
             <h3 style={{ margin: "0 0 8px", fontSize: 17, fontWeight: 800, color: C.text, textAlign: "center" }}>Archive {confirmArchive.type === "course" ? "Course" : "Lesson"}?</h3>
             <p style={{ margin: "0 0 24px", fontSize: 13, color: C.textSub, textAlign: "center", lineHeight: 1.6 }}>
-              <strong>{confirmArchive.title}</strong> will be archived and learners will lose access. You can restore it from the Archived tab.
+              <strong>{confirmArchive.title}</strong> will be archived and learners will lose access. Completed history is preserved; you can restore it from the Archived section on this tab.
             </p>
             <div style={{ display: "flex", gap: 10 }}>
               <button onClick={() => setConfirmArchive(null)} style={{ flex: 1, padding: "11px", borderRadius: 10, border: `1px solid ${C.border}`, background: C.white, color: C.text, fontSize: 13, fontWeight: 700, cursor: "pointer" }}>Cancel</button>
@@ -10546,8 +11058,12 @@ function LearnScreen({ role, user, orgUsers = [], orgs = [], onNav, onAwardXp, p
                 return; // keep modal open — manager can adjust and retry
               }
               // created is one row per eligible fanned-out user (1 for individual, N for team/group).
-              // Patches the shared hook's assignments optimistically (Task 13) —
-              // real assignments now live there, not in local LearnScreen state.
+              // Manager view reads tenant-wide managerActiveAssignments — patch it
+              // optimistically and bump the refresh key so the authoritative
+              // tenant-wide reload confirms it. Also patch the shared hook for the
+              // learner surfaces (no-op for admins).
+              if (created?.length) setManagerActiveAssignments(prev => [...prev, ...created]);
+              setManagerRefreshKey(k => k + 1);
               sharedAssignmentData?.applyLocalAssignmentsCreated?.(created);
               if (skippedCount > 0) {
                 if (assignedCount === 0) {
@@ -10593,11 +11109,11 @@ function LearnScreen({ role, user, orgUsers = [], orgs = [], onNav, onAwardXp, p
         >
           <div style={{ background: C.white, borderRadius: 16, padding: 28, width: "100%", maxWidth: 420, boxShadow: "0 24px 60px rgba(0,0,0,0.2)", boxSizing: "border-box" }}>
             <h3 style={{ margin: "0 0 8px", fontSize: 17, fontWeight: 800, color: C.text, textAlign: "center" }}>
-              Remove this assignment?
+              Unassign from {confirmRemoveAssignment.u?.name ?? "this rep"}?
             </h3>
             <p style={{ margin: "0 0 20px", fontSize: 13, color: C.textSub, textAlign: "center", lineHeight: 1.6 }}>
-              {(confirmRemoveAssignment.content?.title ?? confirmRemoveAssignment.content?.name ?? "This content")} will no longer be assigned to {confirmRemoveAssignment.u?.name ?? "this rep"}.
-              Their completed quiz attempts, lesson completions, and course progress are never deleted — only the assignment itself is removed. This cannot be undone, but the content can be reassigned at any time.
+              This unassigns <strong>{confirmRemoveAssignment.content?.title ?? confirmRemoveAssignment.content?.name ?? "this content"}</strong> from {confirmRemoveAssignment.u?.name ?? "this rep"} only — no one else is affected, and the content itself is not archived.
+              Their completed quiz attempts, lesson completions, and course progress are kept; the assignment stays in history as <em>Unassigned</em>. You can reassign it later, which starts a fresh assignment.
             </p>
             <div style={{ display: "flex", gap: 10 }}>
               <button
@@ -10606,11 +11122,11 @@ function LearnScreen({ role, user, orgUsers = [], orgs = [], onNav, onAwardXp, p
                 style={{ flex: 1, padding: "11px", borderRadius: 10, border: `1px solid ${C.border}`, background: C.white, color: C.text, fontSize: 13, fontWeight: 700, cursor: removingAssignmentId ? "default" : "pointer" }}
               >Cancel</button>
               <button
-                onClick={handleRemoveAssignment}
+                onClick={handleUnassign}
                 disabled={!!removingAssignmentId}
                 style={{ flex: 1, padding: "11px", borderRadius: 10, border: "none", background: "#ef4444", color: "#fff", fontSize: 13, fontWeight: 700, cursor: removingAssignmentId ? "not-allowed" : "pointer", opacity: removingAssignmentId ? 0.7 : 1 }}
               >
-                {removingAssignmentId ? "Removing…" : "Yes, remove"}
+                {removingAssignmentId ? "Unassigning…" : "Yes, unassign"}
               </button>
             </div>
           </div>
@@ -11649,7 +12165,11 @@ function AssignContentModal({ contentType, contentId, content, orgUsers, orgs, c
   const [selectedTeamId, setSelectedTeamId] = useState("");
   const [selectedUserId, setSelectedUserId] = useState("");
   const [dueDate, setDueDate]   = useState("");
-  const [required, setRequired] = useState(false);
+  // F7 — quiz assignments default to Required (a quiz is a knowledge check, not
+  // optional reading); lessons/courses keep the Recommended default. The manager
+  // can still toggle either way, and existing saved assignments are untouched
+  // (this only seeds the modal for a NEW assignment). Same `required` field/options.
+  const [required, setRequired] = useState(contentType === "quiz");
 
   // Loaded from Supabase for real users; fall back to passed props for demo
   const [tenantUsers,  setTenantUsers]  = useState(null); // null = loading
@@ -12494,6 +13014,9 @@ function QuizTakingView({ quiz, onComplete, onExit, revealFeedback = false }) {
       ? crypto.randomUUID()
       : `sub-${Date.now()}-${Math.random().toString(36).slice(2)}`;
   }
+  // Timestamp of the last auto-advance — used to swallow a physical double-click
+  // that would otherwise land a second commit on the freshly-shown next question.
+  const advanceGuardRef = useRef(0);
 
   const q        = quiz.questions[qIdx];
   const total    = quiz.questions.length;
@@ -12597,26 +13120,31 @@ function QuizTakingView({ quiz, onComplete, onExit, revealFeedback = false }) {
   const fb = revealed && showFeedback;
   const isCorrect = fb && isAnswerCorrect(q, selected);
 
+  // Swallow a physical double-click that lands just after an auto-advance (so it
+  // can't answer+advance the freshly-shown next question). Same-question double
+  // commits are already no-ops via the `revealed` guard.
+  const justAdvanced = () => advanceGuardRef.current && (Date.now() - advanceGuardRef.current < 350);
+
   const choose = (idx) => {
-    if (revealed) return;
+    if (revealed || justAdvanced()) return;
     setAnswers(prev => ({ ...prev, [q.id]: idx }));
     setRevealed(true);
   };
 
   const commitSlider = () => {
-    if (revealed) return;
+    if (revealed || justAdvanced()) return;
     setAnswers(prev => ({ ...prev, [q.id]: sliderVal }));
     setRevealed(true);
   };
 
   const commitType = () => {
-    if (revealed || !textDraft.trim()) return;
+    if (revealed || justAdvanced() || !textDraft.trim()) return;
     setAnswers(prev => ({ ...prev, [q.id]: textDraft }));
     setRevealed(true);
   };
 
   const commitOpen = () => {
-    if (revealed || !textDraft.trim()) return;
+    if (revealed || justAdvanced() || !textDraft.trim()) return;
     setAnswers(prev => ({ ...prev, [q.id]: textDraft }));
     setRevealed(true);
   };
@@ -12659,7 +13187,7 @@ function QuizTakingView({ quiz, onComplete, onExit, revealFeedback = false }) {
   };
 
   const commitMatch = () => {
-    if (revealed || !matchAllDone) return;
+    if (revealed || justAdvanced() || !matchAllDone) return;
     setRevealed(true);
   };
 
@@ -12794,6 +13322,22 @@ function QuizTakingView({ quiz, onComplete, onExit, revealFeedback = false }) {
       setRevealed(false);
     }
   };
+
+  // Learner-mode auto-advance: when NO feedback is shown (real learner attempt),
+  // a committed answer must advance to the next question immediately — no
+  // separate "Next Question" click (which, with feedback hidden, read as the
+  // same question being asked twice). The answer is already committed to
+  // `answers`/`revealed` before this runs, so the FINAL question's submit builds
+  // the complete answer list through the existing canonical path. When feedback
+  // IS shown (demo/authorized preview), Submit → feedback → Next is preserved.
+  // useLayoutEffect advances before paint, so the locked-but-unadvanced frame
+  // never flashes. Fires exactly once per commit (guarded on `revealed`); the
+  // last question routes through next()→onComplete (double-submit-safe upstream).
+  React.useLayoutEffect(() => {
+    if (!revealed || showFeedback) return;
+    advanceGuardRef.current = Date.now();
+    next();
+  }, [revealed]); // eslint-disable-line react-hooks/exhaustive-deps
 
   // Learner mode shows NO per-question message once an answer is locked — the
   // learner's own selection stays visible (highlighted option / disabled input /
@@ -13512,15 +14056,21 @@ function SnapshotQuizReview({
 }
 
 // ── QuizLibraryGrid ──────────────────────────────────────────────────────────
-// Admin/Manager quiz list. Displays each quiz with edit, delete, favorite, and
-// active-toggle actions. Production hook: replace callbacks with API mutations.
-function QuizLibraryGrid({ quizzes, onEditQuiz, onNav, onDeleteQuiz, onToggleFavorite, onToggleActive, onAssign, onLaunchQuiz, canEdit = true, canDelete = true, canAssign = true, canLaunch = false, tagModelByQuiz = null, tagCatalogById = new Map() }) {
-  const [confirmDelete, setConfirmDelete] = useState(null); // quiz id pending delete confirm
+// Admin/Manager quiz list. Displays each quiz with edit, favorite, active-toggle,
+// and — instead of a permanent delete — Archive (active quizzes) / Restore
+// (archived quizzes). Archiving is soft and reversible (migration 065): it
+// preserves every attempt/score/result and cancels the quiz's active assignments
+// server-side. Archived quizzes render in a separate, dimmed section at the
+// bottom and are never assignable/launchable until restored.
+function QuizLibraryGrid({ quizzes, onEditQuiz, onNav, onArchiveQuiz, onRestoreQuiz, onToggleFavorite, onToggleActive, onAssign, onLaunchQuiz, canEdit = true, canDelete = true, canAssign = true, canLaunch = false, tagModelByQuiz = null, tagCatalogById = new Map() }) {
+  const [confirmArchive, setConfirmArchive] = useState(null); // quiz id pending archive confirm
 
-  return (
-    <div style={{ display: "flex", flexDirection: "column", gap: 10 }}>
-      {quizzes.map(quiz => {
+  const activeQuizzes   = quizzes.filter(q => q.status !== "archived");
+  const archivedQuizzes = quizzes.filter(q => q.status === "archived");
+
+  const renderRow = (quiz) => {
         const qCount   = quiz.questions?.length ?? 0;
+        const archived = quiz.status === "archived";
         const inactive = quiz.status === "inactive";
         const fav      = !!quiz.favorite;
         return (
@@ -13528,13 +14078,15 @@ function QuizLibraryGrid({ quizzes, onEditQuiz, onNav, onDeleteQuiz, onToggleFav
             display: "flex", alignItems: "center", gap: 16,
             padding: "16px 20px", borderRadius: 14,
             border: `1.5px solid ${C.border}`, background: C.white,
-            opacity: inactive ? 0.6 : 1, transition: "opacity 0.15s",
+            opacity: archived ? 0.6 : inactive ? 0.6 : 1, transition: "opacity 0.15s",
           }}>
             <div style={{ flex: 1, minWidth: 0 }}>
               <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
                 <span style={{ fontSize: 14, fontWeight: 700, color: C.text }}>{quiz.name}</span>
-                {fav && <span style={{ fontSize: 11, color: C.orange }}>★</span>}
-                {inactive && (
+                {fav && !archived && <span style={{ fontSize: 11, color: C.orange }}>★</span>}
+                {archived ? (
+                  <span style={{ fontSize: 10, fontWeight: 700, padding: "2px 7px", borderRadius: 4, background: C.muted, color: C.textMuted }}>Archived</span>
+                ) : inactive && (
                   <span style={{ fontSize: 10, fontWeight: 700, padding: "2px 7px", borderRadius: 4, background: C.muted, color: C.textMuted }}>Inactive</span>
                 )}
               </div>
@@ -13549,6 +14101,18 @@ function QuizLibraryGrid({ quizzes, onEditQuiz, onNav, onDeleteQuiz, onToggleFav
 
             {/* Actions */}
             <div style={{ display: "flex", alignItems: "center", gap: 6, flexShrink: 0 }}>
+              {archived ? (
+                /* Archived quiz: only Restore. No assign/launch/edit/toggle — an
+                   archived quiz is out of circulation until restored. Its
+                   attempts/results remain accessible via drilldowns. */
+                canDelete && (
+                  <button
+                    onClick={() => onRestoreQuiz?.(quiz.id)}
+                    style={{ fontSize: 12, fontWeight: 700, padding: "6px 14px", borderRadius: 8, border: `1px solid ${C.orange}`, background: C.orangeLight, color: C.orange, cursor: "pointer" }}
+                  >Restore</button>
+                )
+              ) : (
+              <>
               {/* Favorite */}
               <button
                 onClick={() => onToggleFavorite(quiz.id)}
@@ -13588,28 +14152,45 @@ function QuizLibraryGrid({ quizzes, onEditQuiz, onNav, onDeleteQuiz, onToggleFav
                 >Edit</button>
               )}
 
-              {/* Delete */}
-              {canDelete && (confirmDelete === quiz.id ? (
+              {/* Archive (replaces permanent Delete): soft + reversible, preserves
+                  all attempts/results and cancels this quiz's active assignments. */}
+              {canDelete && (confirmArchive === quiz.id ? (
                 <div style={{ display: "flex", gap: 4 }}>
                   <button
-                    onClick={() => { onDeleteQuiz(quiz.id); setConfirmDelete(null); }}
-                    style={{ fontSize: 11, fontWeight: 700, padding: "5px 10px", borderRadius: 6, border: "none", background: C.red, color: "#fff", cursor: "pointer" }}
-                  >Confirm</button>
+                    onClick={() => { onArchiveQuiz?.(quiz.id); setConfirmArchive(null); }}
+                    style={{ fontSize: 11, fontWeight: 700, padding: "5px 10px", borderRadius: 6, border: "none", background: C.orange, color: "#fff", cursor: "pointer" }}
+                  >Archive</button>
                   <button
-                    onClick={() => setConfirmDelete(null)}
+                    onClick={() => setConfirmArchive(null)}
                     style={{ fontSize: 11, fontWeight: 700, padding: "5px 10px", borderRadius: 6, border: `1px solid ${C.border}`, background: C.white, color: C.textSub, cursor: "pointer" }}
                   >Cancel</button>
                 </div>
               ) : (
                 <button
-                  onClick={() => setConfirmDelete(quiz.id)}
-                  style={{ fontSize: 12, fontWeight: 700, padding: "6px 10px", borderRadius: 8, border: `1px solid ${C.border}`, background: C.white, color: C.red, cursor: "pointer" }}
-                >✕</button>
+                  onClick={() => setConfirmArchive(quiz.id)}
+                  title="Archive quiz"
+                  style={{ fontSize: 12, fontWeight: 700, padding: "6px 14px", borderRadius: 8, border: `1px solid ${C.border}`, background: C.white, color: C.textSub, cursor: "pointer" }}
+                >Archive</button>
               ))}
+              </>
+              )}
             </div>
           </div>
         );
-      })}
+  };
+
+  return (
+    <div style={{ display: "flex", flexDirection: "column", gap: 10 }}>
+      {activeQuizzes.map(renderRow)}
+      {archivedQuizzes.length > 0 && (
+        <>
+          <div style={{ display: "flex", alignItems: "center", gap: 8, marginTop: 8 }}>
+            <span style={{ fontSize: 12, fontWeight: 700, color: C.textMuted, letterSpacing: "0.04em" }}>ARCHIVED ({archivedQuizzes.length})</span>
+            <div style={{ flex: 1, height: 1, background: C.border }} />
+          </div>
+          {archivedQuizzes.map(renderRow)}
+        </>
+      )}
     </div>
   );
 }
@@ -13857,8 +14438,31 @@ function ContentAssignmentDrilldown({ row, onBack }) {
         // Course — per-lesson breakdown, so a manager can see exactly which
         // lessons are blocking completion, same "progress" data the table's
         // percentage is built from.
+        (() => {
+        // Durable "Next lesson" + remaining, derived only from persisted
+        // completions gated on THIS instance's assigned_at (same rule as the
+        // rows below). Honest by construction: it's the first course member
+        // with no qualifying completion — never a "current lesson" / live
+        // position, which we do not persist (see durable-data audit).
+        const isDone = (l) => {
+          const lc = completedAtByLesson?.get(l.id);
+          return !!lc && (!a.assignedAtRaw || new Date(lc) >= new Date(a.assignedAtRaw));
+        };
+        const nextLesson = status === "completed" ? null : courseLessons.find(l => !isDone(l)) ?? null;
+        const remaining  = courseLessons.filter(l => !isDone(l)).length;
+        return (
         <div>
           <div style={{ fontWeight: 700, fontSize: 13, color: C.text, marginBottom: 10 }}>Lesson Breakdown ({progress}% complete)</div>
+          {status !== "completed" && courseLessons.length > 0 && (
+            <div style={{ display: "flex", flexWrap: "wrap", gap: 8, marginBottom: 12, fontSize: 12 }}>
+              <span style={{ padding: "6px 12px", background: C.orangeLight, border: `1px solid ${C.orange}30`, borderRadius: 8, color: C.text }}>
+                <strong style={{ color: C.orange }}>Next lesson:</strong> {nextLesson ? nextLesson.title : "—"}
+              </span>
+              <span style={{ padding: "6px 12px", background: C.pageBg, borderRadius: 8, color: C.textSub }}>
+                {remaining} of {courseLessons.length} lesson{courseLessons.length !== 1 ? "s" : ""} remaining
+              </span>
+            </div>
+          )}
           <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
             {courseLessons.map(l => {
               const lc = completedAtByLesson?.get(l.id);
@@ -13874,6 +14478,8 @@ function ContentAssignmentDrilldown({ row, onBack }) {
             })}
           </div>
         </div>
+        );
+        })()
       )}
     </div>
   );
@@ -14122,7 +14728,7 @@ function QuizTrackingPanel({ quizzes, orgUsers, tenantId, isReal, refreshKey, on
 }
 
 // ── QuizzesScreen (user branch rewritten, admin branch preserved) ─────────────
-function QuizzesScreen({ role, onNav, quizzes, onEditQuiz, onDeleteQuiz, onToggleFavorite, onToggleActive, pendingQuizId, onClearPendingQuiz, canCreate = true, canEdit = true, canDelete = true, canLaunch = true, canAssign = true, onAssignQuiz, onLaunchQuiz, orgUsers = [], orgs = [], currentUser = null, tenantId = null, isReal = false, quizzesReady = false, sharedAssignmentData = null, onRefreshQuizzes = null }) {
+function QuizzesScreen({ role, onNav, quizzes, onEditQuiz, onDeleteQuiz, onArchiveQuiz, onRestoreQuiz, onToggleFavorite, onToggleActive, pendingQuizId, onClearPendingQuiz, canCreate = true, canEdit = true, canDelete = true, canLaunch = true, canAssign = true, onAssignQuiz, onLaunchQuiz, orgUsers = [], orgs = [], currentUser = null, tenantId = null, isReal = false, quizzesReady = false, sharedAssignmentData = null, onRefreshQuizzes = null, onExitQuiz = null, pendingQuizReview = null }) {
 
   // ── USER VIEW ─────────────────────────────────────────────────────────────
   if (role === "user") {
@@ -14336,6 +14942,23 @@ function QuizzesScreen({ role, onNav, quizzes, onEditQuiz, onDeleteQuiz, onToggl
       onClearPendingQuiz?.(); // clear only after definitive outcome
     }, [pendingQuizId, assignmentsLoaded]); // eslint-disable-line react-hooks/exhaustive-deps
 
+    // Deep-link: REVIEW a specific past attempt navigated here from Learn → Completed.
+    // This is read-only and NEVER starts a new attempt — it routes straight into the
+    // canonical viewResults() review flow (get_quiz_review, immutable snapshot) for the
+    // EXACT attempt id carried on the history row. Archived quizzes review fine because
+    // the review RPC reads the immutable attempt snapshot, not the live/mutable quiz.
+    // A missing attemptId still opens review-loading (viewResults resolves the attempt
+    // from the pass-gated review payload) but never falls through to starting the quiz.
+    // The intent is deliberately NOT cleared here: it stays persisted (App state +
+    // sessionStorage) so a refresh WHILE reviewing re-mounts and restores the SAME
+    // attempt. It is cleared on exit (onExitQuiz → Back to Learn) or when a quiz Start
+    // supersedes it — see the mutually-exclusive App handlers — so a stale review
+    // marker can never hijack a fresh Start or a mid-take refresh.
+    useEffect(() => {
+      if (!pendingQuizReview?.quizId) return;
+      viewResults(pendingQuizReview.quizId, pendingQuizReview.attemptId ? { id: pendingQuizReview.attemptId } : null);
+    }, [pendingQuizReview?.quizId, pendingQuizReview?.attemptId]); // eslint-disable-line react-hooks/exhaustive-deps
+
     const onComplete = (attempt) => {
       if (!isReal) {
         // Demo only — no server; keep the optimistic local results (canonical
@@ -14408,6 +15031,13 @@ function QuizzesScreen({ role, onNav, quizzes, onEditQuiz, onDeleteQuiz, onToggl
         .finally(() => { submittingRef.current = false; });
     };
 
+    // Back/Exit destination. For a learner who deep-launched from Learn, onExitQuiz
+    // returns to the ORIGINATING Learn context (To Do / Knowledge Base) and NEVER
+    // renders the retired Quizzes dashboard. In the manager quiz-library panel (no
+    // onExitQuiz) "back" means the library list, as before.
+    const backToList = onExitQuiz ?? (() => setView("list"));
+    const backLabel  = onExitQuiz ? "← Back to Learn" : "← Back to Quizzes";
+
     // ── Loading the sanitized quiz for a real learner (Start / Retake) ──
     if (view === "starting") {
       return <LoadingState rows={2} message="Loading quiz…" />;
@@ -14417,7 +15047,7 @@ function QuizzesScreen({ role, onNav, quizzes, onEditQuiz, onDeleteQuiz, onToggl
     if (view === "start_error") {
       return (
         <div style={{ display: "flex", flexDirection: "column", gap: 20 }}>
-          <button onClick={() => setView("list")} style={{ background: "none", border: "none", cursor: "pointer", fontSize: 13, fontWeight: 600, color: C.textSub, padding: 0, alignSelf: "flex-start" }}>← Back to Quizzes</button>
+          <button onClick={backToList} style={{ background: "none", border: "none", cursor: "pointer", fontSize: 13, fontWeight: 600, color: C.textSub, padding: 0, alignSelf: "flex-start" }}>{backLabel}</button>
           <ErrorState message="We couldn't load this quiz. Please try again." onRetry={() => startQuiz(activeId)} />
         </div>
       );
@@ -14428,7 +15058,7 @@ function QuizzesScreen({ role, onNav, quizzes, onEditQuiz, onDeleteQuiz, onToggl
     if (view === "review_loading") {
       return (
         <div style={{ display: "flex", flexDirection: "column", gap: 20 }}>
-          <button onClick={() => setView("list")} style={{ background: "none", border: "none", cursor: "pointer", fontSize: 13, fontWeight: 600, color: C.textSub, padding: 0, alignSelf: "flex-start" }}>← Back to Quizzes</button>
+          <button onClick={backToList} style={{ background: "none", border: "none", cursor: "pointer", fontSize: 13, fontWeight: 600, color: C.textSub, padding: 0, alignSelf: "flex-start" }}>{backLabel}</button>
           <LoadingState rows={2} message="Loading your results…" />
         </div>
       );
@@ -14436,7 +15066,7 @@ function QuizzesScreen({ role, onNav, quizzes, onEditQuiz, onDeleteQuiz, onToggl
     if (view === "review_error") {
       return (
         <div style={{ display: "flex", flexDirection: "column", gap: 20 }}>
-          <button onClick={() => setView("list")} style={{ background: "none", border: "none", cursor: "pointer", fontSize: 13, fontWeight: 600, color: C.textSub, padding: 0, alignSelf: "flex-start" }}>← Back to Quizzes</button>
+          <button onClick={backToList} style={{ background: "none", border: "none", cursor: "pointer", fontSize: 13, fontWeight: 600, color: C.textSub, padding: 0, alignSelf: "flex-start" }}>{backLabel}</button>
           <ErrorState message="We couldn't load these results. Please try again." onRetry={() => reviewTarget && viewResults(reviewTarget.id, reviewTarget.attempt)} />
         </div>
       );
@@ -14455,7 +15085,7 @@ function QuizzesScreen({ role, onNav, quizzes, onEditQuiz, onDeleteQuiz, onToggl
     // ── Quiz taking — sanitized quiz for real learners (no answer keys, no
     //    client feedback); demo keeps its canonical seed + teach-as-you-go. ──
     if (view === "taking" && takeQuiz) {
-      return <QuizTakingView quiz={takeQuiz} onComplete={onComplete} onExit={() => setView("list")} revealFeedback={!isReal} />;
+      return <QuizTakingView quiz={takeQuiz} onComplete={onComplete} onExit={backToList} revealFeedback={!isReal} />;
     }
 
     // ── Results ──
@@ -14472,12 +15102,12 @@ function QuizzesScreen({ role, onNav, quizzes, onEditQuiz, onDeleteQuiz, onToggl
             reviewStatus={reviewModel.status ?? "ready"}
             onRetryReview={() => loadReview(reviewModel.attemptId)}
             onRetake={() => retakeQuiz(activeId)}
-            onBack={() => setView("list")}
+            onBack={backToList}
           />
         );
       }
       if (!isReal && takeQuiz && activeAttempt) {
-        return <QuizResultsView quiz={takeQuiz} attempt={activeAttempt} onRetake={() => retakeQuiz(activeId)} onBack={() => setView("list")} />;
+        return <QuizResultsView quiz={takeQuiz} attempt={activeAttempt} onRetake={() => retakeQuiz(activeId)} onBack={backToList} />;
       }
     }
 
@@ -14814,7 +15444,8 @@ function QuizzesScreen({ role, onNav, quizzes, onEditQuiz, onDeleteQuiz, onToggl
                 tagCatalogById={tagCatalogById}
                 onEditQuiz={onEditQuiz}
                 onNav={onNav}
-                onDeleteQuiz={onDeleteQuiz}
+                onArchiveQuiz={onArchiveQuiz}
+                onRestoreQuiz={onRestoreQuiz}
                 onToggleFavorite={onToggleFavorite}
                 onToggleActive={onToggleActive}
                 onAssign={canAssign ? (quiz) => setAssignModal(quiz) : null}
@@ -22581,7 +23212,8 @@ const NAV_ITEMS = [
   { id: "rankd",       label: "Ralli",   icon: "", badge: "LIVE", featureKey: "games", permKey: "games" },
   { id: "learn",       label: "Learn",        icon: "", featureKey: "learn",       permKey: "learn" },
   { id: "battlecards", label: "Battle Cards", icon: "", featureKey: "learn",       permKey: "battlecards" },
-  { id: "quizzes",     label: "Quizzes",      icon: "", featureKey: "learn",       permKey: "quizzes" },
+  // Quizzes is no longer a standalone nav item for ANY role — it lives under
+  // Learn (manager: Learn → Quizzes tab; learner: assigned quizzes in Learn/Home).
   { id: "settings",    label: "Settings",     icon: "", permKey: "settings" },
 ];
 
@@ -22601,6 +23233,25 @@ const RESTORABLE_SCREENS = new Set([
 ]);
 const LAST_SCREEN_KEY = "ralli_last_screen";
 
+// Per-tab navigation state persisted in sessionStorage. ALL of it is account-scoped
+// context (which screen, which Learn subtab, which pending quiz review) and MUST be
+// wiped on sign-out so it can never bleed into the next account signed in on the same
+// tab. `ralli_pending_quiz_review` is the security-relevant one — it carries a quizId
+// + attemptId; the review RPC is auth-scoped so no data could leak, but the stale
+// intent must not survive an account switch. The Learn subtab keys are UI prefs, but
+// clearing them also gives every fresh login the canonical default (managers →
+// Assignments; learners → To Do).
+const LEARN_NAV_SESSION_KEYS = [
+  LAST_SCREEN_KEY,
+  "ralli_pending_quiz_review",
+  "ralli_learn_filter",
+  "ralli_learn_user_tab",
+  "ralli_learn_admin_tab",
+];
+function clearLearnNavSessionState() {
+  try { for (const k of LEARN_NAV_SESSION_KEYS) sessionStorage.removeItem(k); } catch {}
+}
+
 // Fallback when there's no valid persisted screen to restore (first login,
 // stale/invalid value, or role no longer matches). Ralli platform admins land
 // on Organizations; everyone else lands on "home", which itself renders the
@@ -22614,7 +23265,28 @@ function defaultScreenForRestore(isSuperAdminUser) {
 function getRestorableScreen() {
   try {
     const saved = sessionStorage.getItem(LAST_SCREEN_KEY);
-    return saved && RESTORABLE_SCREENS.has(saved) ? saved : null;
+    if (!saved || !RESTORABLE_SCREENS.has(saved)) return null;
+    // A mid-quiz refresh can't durably restore the in-progress attempt (current
+    // answers/index are never persisted), and the standalone Quizzes screen is
+    // retired from navigation. Route to Learn instead — the learner lands on
+    // their To Do with the quiz assignment visible once, restartable via the
+    // canonical Start/Retry. No attempt/XP is created until the real final
+    // submission, so nothing is lost. (pendingQuizId and the quiz-player view
+    // state are React-only and start fresh on reload, so there's no stale
+    // selected-answer or auto-launch to clear.) The quiz builder maps here too.
+    if (saved === "quizzes" || saved === "rankd-quiz-builder") {
+      // Mid-REVIEW refresh: keep the learner on "quizzes" so the persisted historical
+      // attempt (ralli_pending_quiz_review) re-opens read-only — never a new attempt.
+      let reviewing = false;
+      try { reviewing = !!sessionStorage.getItem("ralli_pending_quiz_review"); } catch {}
+      if (saved === "quizzes" && reviewing) return "quizzes";
+      // Mid-TAKING refresh is approved to land on Learn → To Do specifically — force
+      // the learner subtab to "assigned", overriding any persisted Knowledge Base
+      // context (which is only for in-app Back, not a page reload).
+      try { sessionStorage.setItem("ralli_learn_user_tab", "assigned"); } catch {}
+      return "learn";
+    }
+    return saved;
   } catch { return null; }
 }
 
@@ -23266,6 +23938,17 @@ export default function App() {
   const [pendingLessonId,  setPendingLessonId]  = useState(null);
   const [pendingCourseId,  setPendingCourseId]  = useState(null);
   const [pendingQuizId,    setPendingQuizId]    = useState(null);
+  // Review deep-link: opening a COMPLETED quiz's EXACT historical attempt (never a
+  // new attempt). Persisted so a refresh mid-Review restores the same attempt (a
+  // refresh mid-TAKING still routes to Learn → To Do — see getRestorableScreen).
+  // Shape: { quizId, attemptId }.
+  const [pendingQuizReview, setPendingQuizReviewState] = useState(() => {
+    try { const s = sessionStorage.getItem("ralli_pending_quiz_review"); return s ? JSON.parse(s) : null; } catch { return null; }
+  });
+  const setPendingQuizReview = (v) => {
+    setPendingQuizReviewState(v);
+    try { if (v) sessionStorage.setItem("ralli_pending_quiz_review", JSON.stringify(v)); else sessionStorage.removeItem("ralli_pending_quiz_review"); } catch {}
+  };
   const deletingQuizIdsRef = useRef(new Set()); // tracks IDs with an in-flight DB delete
   const [orgs,             setOrgs]             = useState(INITIAL_ORGS);
   const [orgUsers,         setOrgUsers]         = useState(INITIAL_ORG_USERS);
@@ -23323,6 +24006,14 @@ export default function App() {
   // QuizzesScreen waits for this before merging assignments so the race is avoided.
   const [quizzesReady, setQuizzesReady] = useState(false);
 
+  // Bumped after a quiz archive/restore so the manager Learn → Assignments dataset
+  // (managerActiveAssignments/cancelled history/counts/drilldowns, loaded by
+  // LearnScreen.loadLearnCatalog) reloads immediately — the archive cancels the
+  // quiz's unresolved assignments server-side, and without this signal those rows
+  // would keep rendering as active (with Unassign) until a full browser refresh.
+  // Reuses the ONE canonical manager loader; not a second assignment-state path.
+  const [learnAssignRefreshKey, setLearnAssignRefreshKey] = useState(0);
+
   // Battle card categories — demo: localStorage; real users: Supabase tenant_bc_categories
   const [bcCategories, setBcCategories] = useState(() => {
     if (/* real user check deferred to useEffect */ false) return [];
@@ -23351,6 +24042,13 @@ export default function App() {
   const isSuperAdmin = isRalliAdmin(role);
   const isOrgAdmin   = role === "orgAdmin";
   const isAdminType  = isSuperAdmin || isOrgAdmin; // any admin-type user
+  // Learn management authority — mirrors the canonical backend rule enforced by
+  // RLS/RPCs (017/026/034/063/064): is_ralli_admin() OR role IN ('orgAdmin','manager').
+  // A DB-role `manager` is authorized for Learn assignment tracking + assign/
+  // unassign + lesson/course CRUD/archive, but is deliberately NOT isAdminType, so
+  // this scopes their access to Learn without unlocking Battle Cards / Insights /
+  // Progress admin or tenant settings. Reuses the isRalliAdmin() helper.
+  const canManageLearn = isSuperAdmin || isOrgAdmin || role === "manager";
   const currentOrg   = orgs.find(o => o.id === user?.orgId) ?? null;
   // Normalized role for game/lobby screens — they only need "admin" vs "user"
   const gameRole = isAdminType ? "admin" : "user";
@@ -23467,6 +24165,15 @@ export default function App() {
   const perm = (scope, key) => hasPermission(rolePermissions, role, scope, key);
 
   const navigate = (s) => setScreen(s);
+  // A FRESH click of a top-level nav item. Clicking "Learn" always opens its
+  // primary view (manager: Assignments) — we seed the persisted subtab so a
+  // deliberate nav is distinguishable from a browser refresh (which restores the
+  // last subtab from sessionStorage untouched). Programmatic returns (e.g. the
+  // quiz builder → Learn → Quizzes) set their own subtab and don't go through here.
+  const navigateFromNav = (s) => {
+    if (s === "learn") { try { sessionStorage.setItem("ralli_learn_admin_tab", "assignments"); } catch {} }
+    navigate(s);
+  };
 
   // Persist the current screen (when it's a safe-to-restore destination) so a
   // page refresh can return the user to where they were instead of always
@@ -23564,7 +24271,7 @@ export default function App() {
         setPastSessions([]);                     // prevent real past sessions leaking to next demo user
         setBattleCards(INITIAL_BATTLE_CARDS);    // prevent real BC data leaking to next demo user
         setBcCategories(INITIAL_BC_CATEGORIES);  // prevent real BC categories leaking to next demo user
-        try { sessionStorage.removeItem(LAST_SCREEN_KEY); } catch {} // don't leak screen into the next login
+        clearLearnNavSessionState();              // don't leak screen / Learn subtab / pending quiz review into the next login
         window.location.replace("/login");        // hard-navigate so URL matches the login screen
       }
     });
@@ -24168,7 +24875,12 @@ export default function App() {
 
   // Navigate away + clear the editing quiz once the builder's full save
   // (content + tags) has succeeded.
-  const handleQuizBuilderDone = () => { setEditingQuiz(null); setScreen("quizzes"); };
+  // Quiz authoring now lives under Learn → Quizzes. The builder is a focused
+  // full-screen editor; finishing/cancelling returns to Learn → Quizzes (not the
+  // retired standalone Quizzes screen). We seed the Learn admin subtab via the
+  // same sessionStorage key LearnScreen reads on mount.
+  const returnToLearnQuizzes = () => { setEditingQuiz(null); try { sessionStorage.setItem("ralli_learn_admin_tab", "quizzes"); } catch {} setScreen("learn"); };
+  const handleQuizBuilderDone = () => returnToLearnQuizzes();
 
   const handleEditQuiz = (quiz) => {
     setEditingQuiz(quiz);
@@ -24219,6 +24931,59 @@ export default function App() {
       // Only remove from state after DB confirms success
       setQuizzes(prev => prev.filter(q => q.id !== id));
       toast.success("Quiz deleted.");
+    } finally {
+      deletingQuizIdsRef.current.delete(id);
+    }
+  };
+
+  // Archive a quiz (soft, reversible) — replaces permanent delete in the manager
+  // UI. Archiving cancels the quiz's active assignments server-side (migration
+  // 065 archive_quiz, reason 'content_archived'); attempts/scores/results are
+  // preserved. Pessimistic: the DB must confirm before local state flips.
+  const handleArchiveQuiz = async (id) => {
+    if (!user?._isReal || !id || id.startsWith("quiz_") || id.startsWith("sq_")) {
+      setQuizzes(prev => prev.map(q => q.id === id ? { ...q, status: "archived" } : q));
+      toast.success("Quiz archived.");
+      return;
+    }
+    if (deletingQuizIdsRef.current.has(id)) return;
+    deletingQuizIdsRef.current.add(id);
+    try {
+      const { data, error } = await dbArchiveQuiz(id);
+      if (error) {
+        console.error("[ralli] archiveQuiz failed:", error);
+        toast.error("Failed to archive quiz. Please try again.");
+        return;
+      }
+      setQuizzes(prev => prev.map(q => q.id === id ? { ...q, status: "archived" } : q));
+      setLearnAssignRefreshKey(k => k + 1); // reload manager assignments/counts/drilldowns now
+      const n = Number(data?.cancelled_assignments ?? 0);
+      toast.success(n > 0 ? `Quiz archived. ${n} active assignment${n === 1 ? "" : "s"} cancelled.` : "Quiz archived.");
+    } finally {
+      deletingQuizIdsRef.current.delete(id);
+    }
+  };
+
+  // Restore an archived quiz to the active library (migration 065 restore_quiz).
+  // Does NOT reactivate the assignments archive cancelled.
+  const handleRestoreQuiz = async (id) => {
+    if (!user?._isReal || !id || id.startsWith("quiz_") || id.startsWith("sq_")) {
+      setQuizzes(prev => prev.map(q => q.id === id ? { ...q, status: "active" } : q));
+      toast.success("Quiz restored.");
+      return;
+    }
+    if (deletingQuizIdsRef.current.has(id)) return;
+    deletingQuizIdsRef.current.add(id);
+    try {
+      const { error } = await dbRestoreQuiz(id);
+      if (error) {
+        console.error("[ralli] restoreQuiz failed:", error);
+        toast.error("Failed to restore quiz. Please try again.");
+        return;
+      }
+      setQuizzes(prev => prev.map(q => q.id === id ? { ...q, status: "active" } : q));
+      setLearnAssignRefreshKey(k => k + 1); // reload manager assignments/counts/drilldowns now
+      toast.success("Quiz restored to the active library.");
     } finally {
       deletingQuizIdsRef.current.delete(id);
     }
@@ -24278,13 +25043,12 @@ export default function App() {
         }
         return { blocked: true };
       }
-      // Task 13 — no explicit optimistic patch needed here: the created row(s)
-      // reach the shared assignment hook (useSharedUserAssignmentData, owned
-      // once in App() and passed to Home/Quizzes/Learn) via Task 12's realtime
-      // subscription within a short debounce window. This handler isn't the
-      // shared hook's own creation path (LearnScreen's course/lesson assign
-      // flow patches it directly for instant feedback), so a small delay here
-      // is an acceptable, unchanged tradeoff versus this task's actual scope.
+      // Refresh the canonical manager assignment dataset immediately — the SAME
+      // shared signal archive/restore use (learnAssignRefreshKey → LearnScreen.
+      // loadLearnCatalog), so a newly assigned quiz appears in Learn → Assignments
+      // (with counts/drilldowns) without a browser refresh. Realtime is a best-
+      // effort backup, not the source of truth here. Only fire on a real creation.
+      if (assignedCount > 0) setLearnAssignRefreshKey(k => k + 1);
       if (skippedCount > 0) {
         if (assignedCount === 0) {
           // Whole team/group already had this quiz — same safety-net scenario
@@ -24703,7 +25467,7 @@ export default function App() {
       }} />;
       case "home":              return isAdminType
         ? <LeadershipDashboardScreen currentOrg={currentOrg} orgUsers={orgUsers} isReal={!!user?._isReal} readinessThreshold={readinessThreshold} />
-        : <HomeScreen user={user} onNav={navigate} quizAssignments={user?._isReal ? [] : USER_QUIZ_ASSIGNMENTS_SEED} onResumeLesson={(id) => { setPendingLessonId(id); navigate("learn"); }} onStartCourse={(id) => { setPendingCourseId(id); navigate("learn"); }} onStartQuiz={(id) => { setPendingQuizId(id); navigate("quizzes"); }} orgUsers={orgUsers} isReal={!!user?._isReal} tenantId={currentOrg?.id ?? null} quizzes={quizzes} lastSeenAt={lastSeenAt} onNewAssignments={(n) => setNewAssignmentCount(n)} sharedAssignmentData={sharedAssignmentData} readinessThreshold={readinessThreshold} />;
+        : <HomeScreen user={user} onNav={navigate} quizAssignments={user?._isReal ? [] : USER_QUIZ_ASSIGNMENTS_SEED} onResumeLesson={(id) => { setPendingLessonId(id); navigate("learn"); }} onStartCourse={(id) => { setPendingCourseId(id); navigate("learn"); }} onStartQuiz={(id) => { setPendingQuizReview(null); setPendingQuizId(id); navigate("quizzes"); }} orgUsers={orgUsers} isReal={!!user?._isReal} tenantId={currentOrg?.id ?? null} quizzes={quizzes} lastSeenAt={lastSeenAt} onNewAssignments={(n) => setNewAssignmentCount(n)} sharedAssignmentData={sharedAssignmentData} readinessThreshold={readinessThreshold} />;
       case "rankd":             return <RankdScreen onNav={navigate} onJoin={handleEnterPin} sessions={sessions} pastSessions={pastSessions} onLaunch={handleLaunch} onViewResults={handleViewResults} onRelaunch={handleRelaunch} role={gameRole} currentUser={currentUser} />;
       case "rankd-new":         return <NewSessionScreen onNav={navigate} quizzes={quizzes} onCreateSession={handleCreateSession} />;
       case "rankd-quiz-builder":return <QuizBuilderScreen onNav={navigate} onSave={handleSaveQuiz} onDone={handleQuizBuilderDone} initialQuiz={editingQuiz} onEditQuiz={handleEditQuiz} isReal={!!user?._isReal} tenantId={currentOrg?.id ?? null} role={currentUser?.role ?? null} />;
@@ -24738,8 +25502,11 @@ export default function App() {
       }} />;
       case "rankd-game":        return <RankdGameScreen onNav={navigate} sessionName={lobbySessionName} role={gameRole} playerName={lobbyPlayerName ?? user.name} playerEmoji={lobbyPlayerEmoji} questions={gameQuestions ?? GAME_QUESTIONS} demoMode={gameRole === "admin" && activeGameIsDemo} pin={lobbyPin} sessionDbId={activeGameSessionDbId} tenantId={currentOrg?.id ?? user?.orgId ?? null} broadcast={broadcast} trackPlayerPresence={trackPlayerPresence} chMsg={chMsg} chStatus={chStatus} chAnswers={chAnswers} chPlayers={chPlayers} playerId={gamePlayerId} onGameEnd={handleGameEnd} setChAnswers={setChAnswers} />;
       case "rankd-results":     return <RankdResultsScreen onNav={navigate} sessionDbId={viewResultsDbId} sessionCode={viewResultsCode} sessions={[...sessions, ...pastSessions]} gameData={gameResultsData} />;
-      case "learn":             return <LearnScreen role={gameRole} user={user} orgUsers={orgUsers} orgs={orgs} onNav={navigate} onAwardXp={handleAwardXp} pendingLessonId={pendingLessonId} onClearPendingLesson={() => setPendingLessonId(null)} pendingCourseId={pendingCourseId} onClearPendingCourse={() => setPendingCourseId(null)} canCreate={perm("actions","create")} canEdit={perm("actions","edit")} canDelete={perm("actions","delete")} canAssign={perm("actions","assign")} tenantId={currentOrg?.id ?? null} isReal={!!user?._isReal} quizzes={quizzes} sharedAssignmentData={sharedAssignmentData} />;
-      case "quizzes":           return <QuizzesScreen role={gameRole} onNav={navigate} quizzes={quizzes} onEditQuiz={handleEditQuiz} onDeleteQuiz={handleDeleteQuiz} onToggleFavorite={handleToggleFavorite} onToggleActive={handleToggleActive} pendingQuizId={pendingQuizId} onClearPendingQuiz={() => setPendingQuizId(null)} canCreate={perm("actions","create")} canEdit={perm("actions","edit")} canDelete={perm("actions","delete")} canLaunch={perm("actions","launch")} canAssign={perm("actions","assign")} onAssignQuiz={handleAssignQuiz} onLaunchQuiz={handleCreateSession} orgUsers={orgUsers} orgs={orgs} currentUser={currentUser} tenantId={currentOrg?.id ?? null} isReal={!!user?._isReal} quizzesReady={quizzesReady} sharedAssignmentData={sharedAssignmentData} onRefreshQuizzes={refreshQuizzes} />;
+      case "learn":             return <LearnScreen role={gameRole} canManageLearn={canManageLearn} user={user} orgUsers={orgUsers} orgs={orgs} onNav={navigate} onStartQuiz={(id) => { setPendingQuizReview(null); setPendingQuizId(id); navigate("quizzes"); }} onReviewQuiz={(quizId, attemptId) => { setPendingQuizId(null); setPendingQuizReview({ quizId, attemptId }); navigate("quizzes"); }} onAwardXp={handleAwardXp} pendingLessonId={pendingLessonId} onClearPendingLesson={() => setPendingLessonId(null)} pendingCourseId={pendingCourseId} onClearPendingCourse={() => setPendingCourseId(null)} canCreate={perm("actions","create")} canEdit={perm("actions","edit")} canDelete={perm("actions","delete")} canAssign={perm("actions","assign")} tenantId={currentOrg?.id ?? null} isReal={!!user?._isReal} quizzes={quizzes} sharedAssignmentData={sharedAssignmentData} learnAssignRefreshKey={learnAssignRefreshKey}
+        quizzesPanel={canManageLearn ? (
+          <QuizzesScreen role="admin" onNav={navigate} quizzes={quizzes} onEditQuiz={handleEditQuiz} onDeleteQuiz={handleDeleteQuiz} onArchiveQuiz={handleArchiveQuiz} onRestoreQuiz={handleRestoreQuiz} onToggleFavorite={handleToggleFavorite} onToggleActive={handleToggleActive} pendingQuizId={null} onClearPendingQuiz={() => {}} canCreate={perm("actions","create")} canEdit={perm("actions","edit")} canDelete={perm("actions","delete")} canLaunch={perm("actions","launch")} canAssign={perm("actions","assign")} onAssignQuiz={handleAssignQuiz} onLaunchQuiz={handleCreateSession} orgUsers={orgUsers} orgs={orgs} currentUser={currentUser} tenantId={currentOrg?.id ?? null} isReal={!!user?._isReal} quizzesReady={quizzesReady} sharedAssignmentData={sharedAssignmentData} onRefreshQuizzes={refreshQuizzes} />
+        ) : null} />;
+      case "quizzes":           return <QuizzesScreen role={gameRole} onNav={navigate} quizzes={quizzes} onEditQuiz={handleEditQuiz} onDeleteQuiz={handleDeleteQuiz} onArchiveQuiz={handleArchiveQuiz} onRestoreQuiz={handleRestoreQuiz} onToggleFavorite={handleToggleFavorite} onToggleActive={handleToggleActive} pendingQuizId={pendingQuizId} onClearPendingQuiz={() => setPendingQuizId(null)} canCreate={perm("actions","create")} canEdit={perm("actions","edit")} canDelete={perm("actions","delete")} canLaunch={perm("actions","launch")} canAssign={perm("actions","assign")} onAssignQuiz={handleAssignQuiz} onLaunchQuiz={handleCreateSession} orgUsers={orgUsers} orgs={orgs} currentUser={currentUser} tenantId={currentOrg?.id ?? null} isReal={!!user?._isReal} quizzesReady={quizzesReady} sharedAssignmentData={sharedAssignmentData} onRefreshQuizzes={refreshQuizzes} pendingQuizReview={pendingQuizReview} onExitQuiz={() => { setPendingQuizId(null); setPendingQuizReview(null); navigate("learn"); }} />;
       case "battlecards":       return (isAdminType && perm("actions","edit"))
         ? <BattleCardsAdminScreen categories={bcCategories} cards={battleCards} onSaveCategory={handleSaveBcCategory} onDeleteCategory={handleDeleteBcCategory} onSaveCard={handleSaveBattleCard} onDeleteCard={handleDeleteBattleCard} />
         : <BattleCardsScreen categories={bcCategories} cards={battleCards} isLoading={bcLoading} isReal={!!user?._isReal} />;
@@ -24755,7 +25522,7 @@ export default function App() {
       case "settings":
         if (isSuperAdmin)  return <RoleAccessScreen rolePermissions={rolePermissions} onSave={handleSaveRolePermissions} currentOrg={currentOrg} />;
         if (isOrgAdmin)    return <OrgAdminSettingsScreen rolePermissions={rolePermissions} onSaveRolePermissions={handleSaveRolePermissions} currentOrg={currentOrg} orgId={user.orgId} orgName={currentOrg?.name ?? "Your Team"} orgUsers={orgUsers} onAddUser={handleAddUser} readinessThreshold={readinessThreshold} onSaveReadinessThreshold={handleSaveReadinessThreshold} />;
-        return <UserSettingsScreen user={user} profile={userProfile} notifPrefs={notifPrefs} onSaveProfile={handleSaveProfile} onSaveNotifs={handleSaveNotifs} currentOrg={currentOrg} onSignOut={async () => { if (user?._isReal) { await supabase.auth.signOut(); /* SIGNED_OUT handler redirects */ } else { setCurrentUser(null); setLastSeenAt(null); setNewAssignmentCount(0); setPendingLessonId(null); setPendingCourseId(null); setPendingQuizId(null); setOrgs(INITIAL_ORGS); setOrgUsers(INITIAL_ORG_USERS); setQuizzesReady(false); setSessions(INITIAL_SESSIONS); setBattleCards(INITIAL_BATTLE_CARDS); setBcCategories(INITIAL_BC_CATEGORIES); window.location.replace("/login"); } }} />;
+        return <UserSettingsScreen user={user} profile={userProfile} notifPrefs={notifPrefs} onSaveProfile={handleSaveProfile} onSaveNotifs={handleSaveNotifs} currentOrg={currentOrg} onSignOut={async () => { if (user?._isReal) { await supabase.auth.signOut(); /* SIGNED_OUT handler redirects */ } else { setCurrentUser(null); setLastSeenAt(null); setNewAssignmentCount(0); setPendingLessonId(null); setPendingCourseId(null); setPendingQuizId(null); setOrgs(INITIAL_ORGS); setOrgUsers(INITIAL_ORG_USERS); setQuizzesReady(false); setSessions(INITIAL_SESSIONS); setBattleCards(INITIAL_BATTLE_CARDS); setBcCategories(INITIAL_BC_CATEGORIES); clearLearnNavSessionState(); window.location.replace("/login"); } }} />;
       default:                  return <HomeScreen user={user} />;
     }
   };
@@ -24813,11 +25580,11 @@ export default function App() {
                 { id: "organizations", label: "Organizations", icon: "" },
                 { id: "rankd",         label: "Ralli",   icon: "", badge: "LIVE" },
                 { id: "learn",         label: "Learn",         icon: "" },
-                { id: "quizzes",       label: "Quizzes",       icon: "" },
                 { id: "battlecards",   label: "Battle Cards",  icon: "" },
                 { id: "settings",      label: "Settings",      icon: "" },
               ] : [
                 // Filter nav items by (1) subscription plan and (2) admin-controlled role permission.
+                // (Quizzes is not in NAV_ITEMS — it lives under Learn for every role.)
                 ...NAV_ITEMS.filter(item =>
                   (!item.featureKey || canAccessTenant(item.featureKey)) &&
                   perm("features", item.permKey ?? item.id)
@@ -24827,7 +25594,7 @@ export default function App() {
             ].map(item => {
               const active = screen === item.id || (screen.startsWith("rankd-") && item.id === "rankd");
               return (
-                <button key={item.id} onClick={() => navigate(item.id)}
+                <button key={item.id} onClick={() => navigateFromNav(item.id)}
                   onMouseEnter={e => { if (!active) e.currentTarget.style.background = C.pageBg; }}
                   onMouseLeave={e => { if (!active) e.currentTarget.style.background = "transparent"; }}
                   style={{
@@ -24901,7 +25668,7 @@ export default function App() {
                     setSessions(INITIAL_SESSIONS);
                     setBattleCards(INITIAL_BATTLE_CARDS);
                     setBcCategories(INITIAL_BC_CATEGORIES);
-                    try { sessionStorage.removeItem(LAST_SCREEN_KEY); } catch {}
+                    clearLearnNavSessionState();
                     window.location.replace("/login");
                   }
                   // Real users: SIGNED_OUT event fires window.location.replace("/login")
@@ -25035,7 +25802,6 @@ export default function App() {
             { id: "organizations", label: "Organizations", icon: "" },
             { id: "rankd",         label: "Ralli",    icon: "", badge: "LIVE" },
             { id: "learn",         label: "Learn",         icon: "" },
-            { id: "quizzes",       label: "Quizzes",       icon: "" },
             { id: "battlecards",   label: "Battle Cards",  icon: "" },
             { id: "settings",      label: "Settings",      icon: "" },
           ] : NAV_ITEMS.filter(item =>
@@ -25044,7 +25810,7 @@ export default function App() {
           )).map(item => {
             const active = screen === item.id || (screen.startsWith("rankd-") && item.id === "rankd");
             return (
-              <button key={item.id} onClick={() => navigate(item.id)} style={{
+              <button key={item.id} onClick={() => navigateFromNav(item.id)} style={{
                 flex: 1, display: "flex", flexDirection: "column", alignItems: "center", justifyContent: "center", gap: 3,
                 border: "none", cursor: "pointer",
                 background: active ? C.sidebarAccent : "transparent",

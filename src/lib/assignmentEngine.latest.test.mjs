@@ -1,6 +1,9 @@
 // Focused tests for resolveLatestQuizAssignment (one card per user+quiz).
 // Run: node src/lib/assignmentEngine.latest.test.mjs   (no creds, no DB)
-import { resolveLatestQuizAssignment } from "./assignmentEngine.js";
+// Pin to UTC so the day-boundary unlock assertions are deterministic regardless
+// of the machine timezone (lessonUnlockState uses local day boundaries by design).
+process.env.TZ = "UTC";
+import { resolveLatestQuizAssignment, resolveAssignmentStatus, resolveLearnerAssignments, lessonUnlockState } from "./assignmentEngine.js";
 let pass = 0, fail = 0;
 const eq = (n, got, want) => { const a=JSON.stringify(got), b=JSON.stringify(want);
   if (a===b){pass++;console.log("PASS  "+n);} else {fail++;console.log(`FAIL  ${n}\n  got ${a}\n  want ${b}`);} };
@@ -125,6 +128,136 @@ const at = (created_at, passed, score) => ({ created_at, passed, score });
   eq("manager: Done scoped = null", r.completedAt, null);
   eq("manager: history preserved (2 older instances)", r.older.length, 2);
   eq("manager: full attempt history available (2, not scoped 0)", allAttempts.length, 2);
+}
+
+// ── 10. Cancelled assignments (063): never active/overdue/resolved ───────────
+{
+  const cancelled = { cancelledAt: "2026-07-25T00:00:00Z", dueAt: "2026-01-01" }; // past due, but cancelled
+  const rL = resolveAssignmentStatus("lesson", cancelled, { completedAt: null });
+  eq("cancelled lesson → status cancelled", rL.status, "cancelled");
+  eq("cancelled lesson → not active", rL.isActive, false);
+  eq("cancelled lesson → not resolved (not reassignable-by-completion)", rL.isResolved, false);
+  eq("cancelled → no fabricated overdue despite past due date", rL.status !== "overdue", true);
+  const rC = resolveAssignmentStatus("course", cancelled, { lessonIds: ["a","b"], completedAtByLesson: new Map() });
+  eq("cancelled course → status cancelled", rC.status, "cancelled");
+  eq("cancelled course → progress 0", rC.progress, 0);
+  // A non-cancelled assignment is unaffected (regression guard)
+  const active = resolveAssignmentStatus("lesson", { dueAt: "Open" }, { completedAt: null });
+  eq("non-cancelled lesson still resolves normally", active.status, "not_started");
+}
+
+// ── 11. Shared learner selector — one card per content, All = ToDo + Completed ─
+{
+  const now = "2026-07-25T00:00:00Z";
+  const assignments = [
+    // lesson: one instance, completed
+    { id: "L1a", contentType: "lesson", contentId: "L1", assigned_at: "2026-07-01T00:00:00Z" },
+    // course: latest instance, 1 of 2 members done -> in_progress
+    { id: "C1a", contentType: "course", contentId: "C1", assigned_at: "2026-07-01T00:00:00Z" },
+    { id: "C1b", contentType: "course", contentId: "C1", assigned_at: "2026-07-10T00:00:00Z" },
+    // quiz: reassigned, latest not_started
+    { id: "Q1a", contentType: "quiz", contentId: "Q1", assigned_at: "2026-07-01T00:00:00Z" },
+    { id: "Q1b", contentType: "quiz", contentId: "Q1", assigned_at: "2026-07-10T00:00:00Z" },
+    // cancelled -> excluded
+    { id: "X1",  contentType: "lesson", contentId: "L2", assigned_at: "2026-07-01T00:00:00Z", cancelledAt: now },
+    // missing content -> kept, flagged
+    { id: "M1",  contentType: "quiz", contentId: "GONE", assigned_at: "2026-07-01T00:00:00Z" },
+  ];
+  const rows = resolveLearnerAssignments(assignments, {
+    completedAtByLesson: new Map([["L1", "2026-07-02T00:00:00Z"], ["c1L1", "2026-07-11T00:00:00Z"]]),
+    quizAttempts: [{ quiz_id: "Q1", created_at: "2026-07-02T00:00:00Z", passed: true, score: 100 }], // BEFORE Q1b -> not qualifying
+    lessons: [{ id: "L1" }, { id: "c1L1" }, { id: "c1L2" }],
+    courses: [{ id: "C1", lessonIds: ["c1L1", "c1L2"] }],
+    quizzes: [{ id: "Q1" }], // GONE missing on purpose
+  });
+  eq("selector: one row per content (L1,C1,Q1,GONE; L2 cancelled excluded)", rows.length, 4);
+  const byId = Object.fromEntries(rows.map(r => [r.contentId, r]));
+  eq("selector: lesson L1 completed", byId.L1.status, "completed");
+  eq("selector: course C1 latest instance in_progress (1/2)", byId.C1.status, "in_progress");
+  eq("selector: quiz Q1 not_started (pass predates latest instance)", byId.Q1.status, "not_started");
+  eq("selector: missing content flagged", byId.GONE.missing, true);
+  const all = rows.length, todo = rows.filter(r => r.isToDo).length, done = rows.filter(r => r.isCompleted).length;
+  eq("selector: All === ToDo + Completed", all, todo + done);
+  eq("selector: exactly one Completed (L1)", done, 1);
+}
+
+// ── 12. Course-unlock BOUNDARIES (deterministic controlled timestamps) ───────
+{
+  const assignedAt = "2026-07-01T00:00:00Z"; // day boundary
+  const days = 5; // unlocks on 2026-07-06
+  // Before first unlock
+  eq("unlock: before (day 2) → locked", lessonUnlockState(assignedAt, days, new Date("2026-07-03T09:00:00Z")).locked, true);
+  // Exact unlock boundary (start of unlock day)
+  eq("unlock: exact boundary (day 5) → unlocked", lessonUnlockState(assignedAt, days, new Date("2026-07-06T00:00:00Z")).locked, false);
+  // After unlock
+  eq("unlock: after (day 6) → unlocked", lessonUnlockState(assignedAt, days, new Date("2026-07-07T12:00:00Z")).locked, false);
+  // Day-before boundary still locked
+  eq("unlock: day-before boundary (day 4) → locked", lessonUnlockState(assignedAt, days, new Date("2026-07-05T23:00:00Z")).locked, true);
+  // No schedule ⇒ always unlocked
+  eq("unlock: days=0 → unlocked", lessonUnlockState(assignedAt, 0, new Date("2026-07-01T00:00:00Z")).locked, false);
+  eq("unlock: availableDate is the unlock day", lessonUnlockState(assignedAt, days).availableDate.toISOString().slice(0,10), "2026-07-06");
+}
+
+// ── 13. Course completion: empty never complete; partial→in_progress; full→completed;
+//        pre-assignment completions never count (scheduled reassignment) ───────
+{
+  const A = { assigned_at: "2026-07-05T00:00:00Z" };
+  const empty = resolveAssignmentStatus("course", A, { lessonIds: [], completedAtByLesson: new Map() });
+  eq("course empty: NOT completed (no 0===0)", empty.status !== "completed", true);
+  eq("course empty: progress 0", empty.progress, 0);
+
+  const partial = resolveAssignmentStatus("course", A, { lessonIds: ["a","b"], completedAtByLesson: new Map([["a","2026-07-06T00:00:00Z"]]) });
+  eq("course partial: in_progress", partial.status, "in_progress");
+  eq("course partial: progress 50", partial.progress, 50);
+
+  const full = resolveAssignmentStatus("course", A, { lessonIds: ["a","b"], completedAtByLesson: new Map([["a","2026-07-06T00:00:00Z"],["b","2026-07-07T00:00:00Z"]]) });
+  eq("course full: completed", full.status, "completed");
+  eq("course full: progress 100", full.progress, 100);
+
+  // A scheduled RE-assignment: the lessons were completed BEFORE this assigned_at
+  // (prior instance) — must NOT count, so the course is not_started, not complete.
+  const scheduled = resolveAssignmentStatus("course", A, { lessonIds: ["a","b"], completedAtByLesson: new Map([["a","2026-07-01T00:00:00Z"],["b","2026-07-02T00:00:00Z"]]) });
+  eq("course scheduled reassignment: pre-assignment completions ignored → not_started", scheduled.status, "not_started");
+  eq("course scheduled reassignment: progress 0", scheduled.progress, 0);
+}
+
+// ── Reassignment score/date MISATTRIBUTION trap (learner Completed history) ────
+// A quiz reassigned after being passed must never let the displayed (latest) instance
+// inherit an EARLIER instance's score/date. The selector's `score` is instance-scoped
+// (best PASSING attempt with created_at >= the latest instance's assigned_at).
+{
+  const Q = "QT";
+  const base = { contentType: "quiz", contentId: Q, assignedTo: { type: "individual", userId: "u" } };
+  // Trap A: first pass HIGHER (100), reassign, second pass LOWER (80). Latest instance
+  // must resolve to 80 — NOT the earlier 100.
+  const rowsA = resolveLearnerAssignments(
+    [ { ...base, id: "a1", assigned_at: "2026-01-01T00:00:00Z" },
+      { ...base, id: "a2", assigned_at: "2026-02-01T00:00:00Z" } ],
+    { quizAttempts: [
+        { id: "att-100", quiz_id: Q, passed: true, score: 100, created_at: "2026-01-05T00:00:00Z" }, // for a1
+        { id: "att-80",  quiz_id: Q, passed: true, score: 80,  created_at: "2026-02-05T00:00:00Z" }, // for a2 (latest)
+      ], quizzes: [{ id: Q, title: "QT" }] });
+  eq("trap A: one deduped row (latest instance)", rowsA.length, 1);
+  eq("trap A: latest instance score = 80 (own qualifying pass, NOT inherited 100)", rowsA[0].score, 80);
+  eq("trap A: latest instance is the newer assignment", rowsA[0].assignment.id, "a2");
+  eq("trap A: Review opens the INSTANCE attempt att-80, NOT the earlier att-100", rowsA[0].attemptId, "att-80");
+
+  // Trap B: first pass LOWER (80), reassign, second pass HIGHER (100). Latest = 100.
+  const rowsB = resolveLearnerAssignments(
+    [ { ...base, id: "b1", assigned_at: "2026-01-01T00:00:00Z" },
+      { ...base, id: "b2", assigned_at: "2026-02-01T00:00:00Z" } ],
+    { quizAttempts: [
+        { quiz_id: Q, passed: true, score: 80,  created_at: "2026-01-05T00:00:00Z" },
+        { quiz_id: Q, passed: true, score: 100, created_at: "2026-02-05T00:00:00Z" },
+      ], quizzes: [{ id: Q, title: "QT" }] });
+  eq("trap B: latest instance score = 100 (its own qualifying pass)", rowsB[0].score, 100);
+
+  // Failed attempt after assigned_at must not set a passing score.
+  const rowsC = resolveLearnerAssignments(
+    [ { ...base, id: "c1", assigned_at: "2026-02-01T00:00:00Z" } ],
+    { quizAttempts: [ { quiz_id: Q, passed: false, score: 55, created_at: "2026-02-05T00:00:00Z" } ], quizzes: [{ id: Q, title: "QT" }] });
+  eq("trap C: failed-only instance is not completed", rowsC[0].isCompleted, false);
+  eq("trap C: failed-only instance score = null (no passing attempt)", rowsC[0].score, null);
 }
 
 console.log(`\n${pass} passed, ${fail} failed`);
