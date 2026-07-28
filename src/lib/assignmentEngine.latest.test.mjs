@@ -234,12 +234,13 @@ const at = (created_at, passed, score) => ({ created_at, passed, score });
     [ { ...base, id: "a1", assigned_at: "2026-01-01T00:00:00Z" },
       { ...base, id: "a2", assigned_at: "2026-02-01T00:00:00Z" } ],
     { quizAttempts: [
-        { quiz_id: Q, passed: true, score: 100, created_at: "2026-01-05T00:00:00Z" }, // for a1
-        { quiz_id: Q, passed: true, score: 80,  created_at: "2026-02-05T00:00:00Z" }, // for a2 (latest)
+        { id: "att-100", quiz_id: Q, passed: true, score: 100, created_at: "2026-01-05T00:00:00Z" }, // for a1
+        { id: "att-80",  quiz_id: Q, passed: true, score: 80,  created_at: "2026-02-05T00:00:00Z" }, // for a2 (latest)
       ], quizzes: [{ id: Q, title: "QT" }] });
   eq("trap A: one deduped row (latest instance)", rowsA.length, 1);
   eq("trap A: latest instance score = 80 (own qualifying pass, NOT inherited 100)", rowsA[0].score, 80);
   eq("trap A: latest instance is the newer assignment", rowsA[0].assignment.id, "a2");
+  eq("trap A: Review opens the INSTANCE attempt att-80, NOT the earlier att-100", rowsA[0].attemptId, "att-80");
 
   // Trap B: first pass LOWER (80), reassign, second pass HIGHER (100). Latest = 100.
   const rowsB = resolveLearnerAssignments(

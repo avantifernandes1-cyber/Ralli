@@ -8954,7 +8954,7 @@ function fmtUpdated(iso) {
   return d.toLocaleDateString("en-US", { month: "short", day: "numeric", year: "numeric" });
 }
 
-function LearnScreen({ role, canManageLearn, user, orgUsers = [], orgs = [], onNav, onStartQuiz, onAwardXp, pendingLessonId, onClearPendingLesson, pendingCourseId, onClearPendingCourse, canCreate = true, canEdit = true, canDelete = true, canAssign = true, tenantId = null, isReal = false, quizzes = [], sharedAssignmentData = null, quizzesPanel = null, learnAssignRefreshKey = 0 }) {
+function LearnScreen({ role, canManageLearn, user, orgUsers = [], orgs = [], onNav, onStartQuiz, onReviewQuiz, onAwardXp, pendingLessonId, onClearPendingLesson, pendingCourseId, onClearPendingCourse, canCreate = true, canEdit = true, canDelete = true, canAssign = true, tenantId = null, isReal = false, quizzes = [], sharedAssignmentData = null, quizzesPanel = null, learnAssignRefreshKey = 0 }) {
   // "Can manage Learn" (assignment tracking, assign/unassign, content CRUD/archive)
   // is a Learn-scoped authority derived from the canonical profile role — it now
   // includes the DB `manager` role, which the backend RLS/RPCs already authorize.
@@ -9046,7 +9046,14 @@ function LearnScreen({ role, canManageLearn, user, orgUsers = [], orgs = [], onN
     return "assigned";
   });
   React.useEffect(() => { try { sessionStorage.setItem("ralli_learn_user_tab", userTab); } catch {} }, [userTab]);
-  const [learnFilter, setLearnFilter] = useState("todo"); // "todo" | "complete" | "all"
+  // Persist the To Do / Completed / All filter so an in-app Back into Learn (e.g.
+  // after opening a completed quiz's Review) returns to the SAME subtab the learner
+  // launched from — Review from Learn → Completed comes Back to Learn → Completed.
+  const [learnFilter, setLearnFilter] = useState(() => {
+    try { const s = sessionStorage.getItem("ralli_learn_filter"); if (s === "todo" || s === "complete" || s === "all") return s; } catch {}
+    return "todo"; // "todo" | "complete" | "all"
+  });
+  React.useEffect(() => { try { sessionStorage.setItem("ralli_learn_filter", learnFilter); } catch {} }, [learnFilter]);
   const [search,     setSearch]     = useState("");
   const [browseKind, setBrowseKind] = useState("all"); // Knowledge Base content-type filter: "all" | "lesson" | "course" | "quiz"
   // Learner-only: safe titles for ARCHIVED content the learner has COMPLETED, so an
@@ -9807,7 +9814,7 @@ function LearnScreen({ role, canManageLearn, user, orgUsers = [], orgs = [], onN
               return { r, a, content: r.content, kind: "course", isCourse: true, courseLessons, doneCount, pct: r.progress, isComplete: r.isCompleted, status: r.status, missing: r.missing, isArchived };
             }
             if (r.contentType === "quiz") {
-              return { r, a, content: r.content, kind: "quiz", isQuiz: true, courseLessons: [], doneCount: 0, pct: r.progress, isComplete: r.isCompleted, status: r.status, missing: r.missing, isArchived, score: r.score, completedAt: r.completedAt };
+              return { r, a, content: r.content, kind: "quiz", isQuiz: true, courseLessons: [], doneCount: 0, pct: r.progress, isComplete: r.isCompleted, status: r.status, missing: r.missing, isArchived, score: r.score, completedAt: r.completedAt, attemptId: r.attemptId };
             }
             return { r, a, content: r.content, kind: "lesson", isCourse: false, courseLessons: [], doneCount: 0, pct: r.progress, isComplete: r.isCompleted, status: r.status, missing: r.missing, isArchived };
           });
@@ -9933,7 +9940,7 @@ function LearnScreen({ role, canManageLearn, user, orgUsers = [], orgs = [], onN
           // Quiz assignment card — status from the shared quiz engine; the action
           // routes into the canonical Quizzes flow (Take / Retry / Review). Learn
           // never renders questions, answers, or scoring itself.
-          const QuizAssignedCard = ({ a, content, status, isArchived, score, completedAt }) => {
+          const QuizAssignedCard = ({ a, content, status, isArchived, score, completedAt, attemptId }) => {
             const label = status === "completed" ? "Completed" : status === "overdue" ? "Overdue" : status === "in_progress" ? "In Progress" : "Not Started";
             const labelColor = status === "completed" ? C.green : status === "overdue" ? C.red : status === "in_progress" ? C.blue : C.textSub;
             // Archived content is HISTORY: a completed row keeps a safe Review only —
@@ -9969,7 +9976,7 @@ function LearnScreen({ role, canManageLearn, user, orgUsers = [], orgs = [], onN
                     <div style={{ display: "flex", justifyContent: "flex-end", marginTop: 12 }}>
                       {/* Completed → safe pass-gated Review (immutable snapshot, works for
                           archived quizzes). Active-content non-completed → canonical launch. */}
-                      <button onClick={() => onStartQuiz?.(a.contentId)} style={{ padding: "8px 16px", borderRadius: 8, border: "none", cursor: "pointer", background: status === "completed" ? C.white : C.purple, color: status === "completed" ? C.textSub : "#fff", borderWidth: status === "completed" ? 1 : 0, borderStyle: "solid", borderColor: C.border, fontSize: 13, fontWeight: 700 }}>{cta}</button>
+                      <button onClick={() => status === "completed" ? onReviewQuiz?.(a.contentId, attemptId) : onStartQuiz?.(a.contentId)} style={{ padding: "8px 16px", borderRadius: 8, border: "none", cursor: "pointer", background: status === "completed" ? C.white : C.purple, color: status === "completed" ? C.textSub : "#fff", borderWidth: status === "completed" ? 1 : 0, borderStyle: "solid", borderColor: C.border, fontSize: 13, fontWeight: 700 }}>{cta}</button>
                     </div>
                   </div>
                 </div>
@@ -10024,7 +10031,7 @@ function LearnScreen({ role, canManageLearn, user, orgUsers = [], orgs = [], onN
                   flow; quiz routes into the canonical Quizzes flow. */}
               {filterItems.map(e => (
                 e.isQuiz
-                  ? <QuizAssignedCard key={e.a.id} a={e.a} content={e.content} status={e.status} isArchived={e.isArchived} score={e.score} completedAt={e.completedAt} />
+                  ? <QuizAssignedCard key={e.a.id} a={e.a} content={e.content} status={e.status} isArchived={e.isArchived} score={e.score} completedAt={e.completedAt} attemptId={e.attemptId} />
                   : e.missing
                     ? <MissingCompletedCard key={e.a.id} kind={e.kind} />
                     : <AssignedCard key={e.a.id} {...e} />
@@ -10101,8 +10108,12 @@ function LearnScreen({ role, canManageLearn, user, orgUsers = [], orgs = [], onN
                               : qStatus === "attempted" ? { label: "In Progress", color: C.blue }
                               : null;
               const quizCta = qStatus === "passed" ? "Review →" : qStatus === "attempted" ? "Retry →" : "Take quiz →";
+              // A PASSED quiz here is read-only history: Review opens the pass-gated
+              // immutable review (no exact instance id on this catalog surface, so the
+              // review payload resolves the passing attempt) and NEVER starts a new
+              // attempt. Only attempted/none route into the canonical launch flow.
               const onClick = isQuiz
-                ? () => onStartQuiz?.(item.id)
+                ? (qStatus === "passed" ? () => onReviewQuiz?.(item.id, null) : () => onStartQuiz?.(item.id))
                 : () => item._kind === "lesson" ? openLesson(item) : setActiveCourse(item);
               return (
               <Card key={item.id} style={{ display: "flex", alignItems: "center", gap: 14, cursor: "pointer" }}
@@ -14717,7 +14728,7 @@ function QuizTrackingPanel({ quizzes, orgUsers, tenantId, isReal, refreshKey, on
 }
 
 // ── QuizzesScreen (user branch rewritten, admin branch preserved) ─────────────
-function QuizzesScreen({ role, onNav, quizzes, onEditQuiz, onDeleteQuiz, onArchiveQuiz, onRestoreQuiz, onToggleFavorite, onToggleActive, pendingQuizId, onClearPendingQuiz, canCreate = true, canEdit = true, canDelete = true, canLaunch = true, canAssign = true, onAssignQuiz, onLaunchQuiz, orgUsers = [], orgs = [], currentUser = null, tenantId = null, isReal = false, quizzesReady = false, sharedAssignmentData = null, onRefreshQuizzes = null, onExitQuiz = null }) {
+function QuizzesScreen({ role, onNav, quizzes, onEditQuiz, onDeleteQuiz, onArchiveQuiz, onRestoreQuiz, onToggleFavorite, onToggleActive, pendingQuizId, onClearPendingQuiz, canCreate = true, canEdit = true, canDelete = true, canLaunch = true, canAssign = true, onAssignQuiz, onLaunchQuiz, orgUsers = [], orgs = [], currentUser = null, tenantId = null, isReal = false, quizzesReady = false, sharedAssignmentData = null, onRefreshQuizzes = null, onExitQuiz = null, pendingQuizReview = null, onClearPendingQuizReview = null }) {
 
   // ── USER VIEW ─────────────────────────────────────────────────────────────
   if (role === "user") {
@@ -14930,6 +14941,23 @@ function QuizzesScreen({ role, onNav, quizzes, onEditQuiz, onDeleteQuiz, onArchi
       }
       onClearPendingQuiz?.(); // clear only after definitive outcome
     }, [pendingQuizId, assignmentsLoaded]); // eslint-disable-line react-hooks/exhaustive-deps
+
+    // Deep-link: REVIEW a specific past attempt navigated here from Learn → Completed.
+    // This is read-only and NEVER starts a new attempt — it routes straight into the
+    // canonical viewResults() review flow (get_quiz_review, immutable snapshot) for the
+    // EXACT attempt id carried on the history row. Archived quizzes review fine because
+    // the review RPC reads the immutable attempt snapshot, not the live/mutable quiz.
+    // A missing attemptId still opens review-loading (viewResults resolves the attempt
+    // from the pass-gated review payload) but never falls through to starting the quiz.
+    // The intent is deliberately NOT cleared here: it stays persisted (App state +
+    // sessionStorage) so a refresh WHILE reviewing re-mounts and restores the SAME
+    // attempt. It is cleared on exit (onExitQuiz → Back to Learn) or when a quiz Start
+    // supersedes it — see the mutually-exclusive App handlers — so a stale review
+    // marker can never hijack a fresh Start or a mid-take refresh.
+    useEffect(() => {
+      if (!pendingQuizReview?.quizId) return;
+      viewResults(pendingQuizReview.quizId, pendingQuizReview.attemptId ? { id: pendingQuizReview.attemptId } : null);
+    }, [pendingQuizReview?.quizId, pendingQuizReview?.attemptId]); // eslint-disable-line react-hooks/exhaustive-deps
 
     const onComplete = (attempt) => {
       if (!isReal) {
@@ -23228,7 +23256,12 @@ function getRestorableScreen() {
     // state are React-only and start fresh on reload, so there's no stale
     // selected-answer or auto-launch to clear.) The quiz builder maps here too.
     if (saved === "quizzes" || saved === "rankd-quiz-builder") {
-      // Mid-quiz refresh is approved to land on Learn → To Do specifically — force
+      // Mid-REVIEW refresh: keep the learner on "quizzes" so the persisted historical
+      // attempt (ralli_pending_quiz_review) re-opens read-only — never a new attempt.
+      let reviewing = false;
+      try { reviewing = !!sessionStorage.getItem("ralli_pending_quiz_review"); } catch {}
+      if (saved === "quizzes" && reviewing) return "quizzes";
+      // Mid-TAKING refresh is approved to land on Learn → To Do specifically — force
       // the learner subtab to "assigned", overriding any persisted Knowledge Base
       // context (which is only for in-app Back, not a page reload).
       try { sessionStorage.setItem("ralli_learn_user_tab", "assigned"); } catch {}
@@ -23886,6 +23919,17 @@ export default function App() {
   const [pendingLessonId,  setPendingLessonId]  = useState(null);
   const [pendingCourseId,  setPendingCourseId]  = useState(null);
   const [pendingQuizId,    setPendingQuizId]    = useState(null);
+  // Review deep-link: opening a COMPLETED quiz's EXACT historical attempt (never a
+  // new attempt). Persisted so a refresh mid-Review restores the same attempt (a
+  // refresh mid-TAKING still routes to Learn → To Do — see getRestorableScreen).
+  // Shape: { quizId, attemptId }.
+  const [pendingQuizReview, setPendingQuizReviewState] = useState(() => {
+    try { const s = sessionStorage.getItem("ralli_pending_quiz_review"); return s ? JSON.parse(s) : null; } catch { return null; }
+  });
+  const setPendingQuizReview = (v) => {
+    setPendingQuizReviewState(v);
+    try { if (v) sessionStorage.setItem("ralli_pending_quiz_review", JSON.stringify(v)); else sessionStorage.removeItem("ralli_pending_quiz_review"); } catch {}
+  };
   const deletingQuizIdsRef = useRef(new Set()); // tracks IDs with an in-flight DB delete
   const [orgs,             setOrgs]             = useState(INITIAL_ORGS);
   const [orgUsers,         setOrgUsers]         = useState(INITIAL_ORG_USERS);
@@ -25404,7 +25448,7 @@ export default function App() {
       }} />;
       case "home":              return isAdminType
         ? <LeadershipDashboardScreen currentOrg={currentOrg} orgUsers={orgUsers} isReal={!!user?._isReal} readinessThreshold={readinessThreshold} />
-        : <HomeScreen user={user} onNav={navigate} quizAssignments={user?._isReal ? [] : USER_QUIZ_ASSIGNMENTS_SEED} onResumeLesson={(id) => { setPendingLessonId(id); navigate("learn"); }} onStartCourse={(id) => { setPendingCourseId(id); navigate("learn"); }} onStartQuiz={(id) => { setPendingQuizId(id); navigate("quizzes"); }} orgUsers={orgUsers} isReal={!!user?._isReal} tenantId={currentOrg?.id ?? null} quizzes={quizzes} lastSeenAt={lastSeenAt} onNewAssignments={(n) => setNewAssignmentCount(n)} sharedAssignmentData={sharedAssignmentData} readinessThreshold={readinessThreshold} />;
+        : <HomeScreen user={user} onNav={navigate} quizAssignments={user?._isReal ? [] : USER_QUIZ_ASSIGNMENTS_SEED} onResumeLesson={(id) => { setPendingLessonId(id); navigate("learn"); }} onStartCourse={(id) => { setPendingCourseId(id); navigate("learn"); }} onStartQuiz={(id) => { setPendingQuizReview(null); setPendingQuizId(id); navigate("quizzes"); }} orgUsers={orgUsers} isReal={!!user?._isReal} tenantId={currentOrg?.id ?? null} quizzes={quizzes} lastSeenAt={lastSeenAt} onNewAssignments={(n) => setNewAssignmentCount(n)} sharedAssignmentData={sharedAssignmentData} readinessThreshold={readinessThreshold} />;
       case "rankd":             return <RankdScreen onNav={navigate} onJoin={handleEnterPin} sessions={sessions} pastSessions={pastSessions} onLaunch={handleLaunch} onViewResults={handleViewResults} onRelaunch={handleRelaunch} role={gameRole} currentUser={currentUser} />;
       case "rankd-new":         return <NewSessionScreen onNav={navigate} quizzes={quizzes} onCreateSession={handleCreateSession} />;
       case "rankd-quiz-builder":return <QuizBuilderScreen onNav={navigate} onSave={handleSaveQuiz} onDone={handleQuizBuilderDone} initialQuiz={editingQuiz} onEditQuiz={handleEditQuiz} isReal={!!user?._isReal} tenantId={currentOrg?.id ?? null} role={currentUser?.role ?? null} />;
@@ -25439,11 +25483,11 @@ export default function App() {
       }} />;
       case "rankd-game":        return <RankdGameScreen onNav={navigate} sessionName={lobbySessionName} role={gameRole} playerName={lobbyPlayerName ?? user.name} playerEmoji={lobbyPlayerEmoji} questions={gameQuestions ?? GAME_QUESTIONS} demoMode={gameRole === "admin" && activeGameIsDemo} pin={lobbyPin} sessionDbId={activeGameSessionDbId} tenantId={currentOrg?.id ?? user?.orgId ?? null} broadcast={broadcast} trackPlayerPresence={trackPlayerPresence} chMsg={chMsg} chStatus={chStatus} chAnswers={chAnswers} chPlayers={chPlayers} playerId={gamePlayerId} onGameEnd={handleGameEnd} setChAnswers={setChAnswers} />;
       case "rankd-results":     return <RankdResultsScreen onNav={navigate} sessionDbId={viewResultsDbId} sessionCode={viewResultsCode} sessions={[...sessions, ...pastSessions]} gameData={gameResultsData} />;
-      case "learn":             return <LearnScreen role={gameRole} canManageLearn={canManageLearn} user={user} orgUsers={orgUsers} orgs={orgs} onNav={navigate} onStartQuiz={(id) => { setPendingQuizId(id); navigate("quizzes"); }} onAwardXp={handleAwardXp} pendingLessonId={pendingLessonId} onClearPendingLesson={() => setPendingLessonId(null)} pendingCourseId={pendingCourseId} onClearPendingCourse={() => setPendingCourseId(null)} canCreate={perm("actions","create")} canEdit={perm("actions","edit")} canDelete={perm("actions","delete")} canAssign={perm("actions","assign")} tenantId={currentOrg?.id ?? null} isReal={!!user?._isReal} quizzes={quizzes} sharedAssignmentData={sharedAssignmentData} learnAssignRefreshKey={learnAssignRefreshKey}
+      case "learn":             return <LearnScreen role={gameRole} canManageLearn={canManageLearn} user={user} orgUsers={orgUsers} orgs={orgs} onNav={navigate} onStartQuiz={(id) => { setPendingQuizReview(null); setPendingQuizId(id); navigate("quizzes"); }} onReviewQuiz={(quizId, attemptId) => { setPendingQuizId(null); setPendingQuizReview({ quizId, attemptId }); navigate("quizzes"); }} onAwardXp={handleAwardXp} pendingLessonId={pendingLessonId} onClearPendingLesson={() => setPendingLessonId(null)} pendingCourseId={pendingCourseId} onClearPendingCourse={() => setPendingCourseId(null)} canCreate={perm("actions","create")} canEdit={perm("actions","edit")} canDelete={perm("actions","delete")} canAssign={perm("actions","assign")} tenantId={currentOrg?.id ?? null} isReal={!!user?._isReal} quizzes={quizzes} sharedAssignmentData={sharedAssignmentData} learnAssignRefreshKey={learnAssignRefreshKey}
         quizzesPanel={canManageLearn ? (
           <QuizzesScreen role="admin" onNav={navigate} quizzes={quizzes} onEditQuiz={handleEditQuiz} onDeleteQuiz={handleDeleteQuiz} onArchiveQuiz={handleArchiveQuiz} onRestoreQuiz={handleRestoreQuiz} onToggleFavorite={handleToggleFavorite} onToggleActive={handleToggleActive} pendingQuizId={null} onClearPendingQuiz={() => {}} canCreate={perm("actions","create")} canEdit={perm("actions","edit")} canDelete={perm("actions","delete")} canLaunch={perm("actions","launch")} canAssign={perm("actions","assign")} onAssignQuiz={handleAssignQuiz} onLaunchQuiz={handleCreateSession} orgUsers={orgUsers} orgs={orgs} currentUser={currentUser} tenantId={currentOrg?.id ?? null} isReal={!!user?._isReal} quizzesReady={quizzesReady} sharedAssignmentData={sharedAssignmentData} onRefreshQuizzes={refreshQuizzes} />
         ) : null} />;
-      case "quizzes":           return <QuizzesScreen role={gameRole} onNav={navigate} quizzes={quizzes} onEditQuiz={handleEditQuiz} onDeleteQuiz={handleDeleteQuiz} onArchiveQuiz={handleArchiveQuiz} onRestoreQuiz={handleRestoreQuiz} onToggleFavorite={handleToggleFavorite} onToggleActive={handleToggleActive} pendingQuizId={pendingQuizId} onClearPendingQuiz={() => setPendingQuizId(null)} canCreate={perm("actions","create")} canEdit={perm("actions","edit")} canDelete={perm("actions","delete")} canLaunch={perm("actions","launch")} canAssign={perm("actions","assign")} onAssignQuiz={handleAssignQuiz} onLaunchQuiz={handleCreateSession} orgUsers={orgUsers} orgs={orgs} currentUser={currentUser} tenantId={currentOrg?.id ?? null} isReal={!!user?._isReal} quizzesReady={quizzesReady} sharedAssignmentData={sharedAssignmentData} onRefreshQuizzes={refreshQuizzes} onExitQuiz={() => { setPendingQuizId(null); navigate("learn"); }} />;
+      case "quizzes":           return <QuizzesScreen role={gameRole} onNav={navigate} quizzes={quizzes} onEditQuiz={handleEditQuiz} onDeleteQuiz={handleDeleteQuiz} onArchiveQuiz={handleArchiveQuiz} onRestoreQuiz={handleRestoreQuiz} onToggleFavorite={handleToggleFavorite} onToggleActive={handleToggleActive} pendingQuizId={pendingQuizId} onClearPendingQuiz={() => setPendingQuizId(null)} canCreate={perm("actions","create")} canEdit={perm("actions","edit")} canDelete={perm("actions","delete")} canLaunch={perm("actions","launch")} canAssign={perm("actions","assign")} onAssignQuiz={handleAssignQuiz} onLaunchQuiz={handleCreateSession} orgUsers={orgUsers} orgs={orgs} currentUser={currentUser} tenantId={currentOrg?.id ?? null} isReal={!!user?._isReal} quizzesReady={quizzesReady} sharedAssignmentData={sharedAssignmentData} onRefreshQuizzes={refreshQuizzes} pendingQuizReview={pendingQuizReview} onClearPendingQuizReview={() => setPendingQuizReview(null)} onExitQuiz={() => { setPendingQuizId(null); setPendingQuizReview(null); navigate("learn"); }} />;
       case "battlecards":       return (isAdminType && perm("actions","edit"))
         ? <BattleCardsAdminScreen categories={bcCategories} cards={battleCards} onSaveCategory={handleSaveBcCategory} onDeleteCategory={handleDeleteBcCategory} onSaveCard={handleSaveBattleCard} onDeleteCard={handleDeleteBattleCard} />
         : <BattleCardsScreen categories={bcCategories} cards={battleCards} isLoading={bcLoading} isReal={!!user?._isReal} />;

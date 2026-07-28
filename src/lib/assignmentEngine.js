@@ -387,17 +387,22 @@ export function resolveLearnerAssignments(assignments = [], ctx = {}) {
   for (const instances of groups.values()) {
     const contentType = instances[0].contentType;
     const contentId   = instances[0].contentId;
-    let latest, status, progress, completedAt, score = null;
+    let latest, status, progress, completedAt, score = null, attemptId = null;
 
     if (contentType === "quiz") {
       const r = resolveLatestQuizAssignment(instances, (quizAttempts ?? []).filter(at => at.quiz_id === contentId));
       latest = r.latest; status = r.status; progress = r.progress; completedAt = r.completedAt;
-      // INSTANCE-SCOPED score — best PASSING attempt among those already scoped to THIS
-      // (latest) instance's assigned_at (resolveLatestQuizAssignment.scopedAttempts uses
-      // isQualifyingEvent). Never a lifetime-per-quiz aggregate, so a reassignment can't
-      // let one instance inherit another instance's score.
+      // INSTANCE-SCOPED score + the exact representative attempt — best PASSING attempt
+      // among those already scoped to THIS (latest) instance's assigned_at
+      // (resolveLatestQuizAssignment.scopedAttempts uses isQualifyingEvent, newest-first).
+      // Never a lifetime-per-quiz aggregate, so a reassignment can't let one instance
+      // inherit another instance's score/attempt. attemptId is what Review opens (exact
+      // historical attempt for THIS assignment instance, not merely the latest).
       const passingScoped = (r.scopedAttempts ?? []).filter(at => at.passed);
-      score = passingScoped.length ? Math.max(...passingScoped.map(at => at.score ?? 0)) : null;
+      let rep = null;
+      for (const at of passingScoped) { if (!rep || (at.score ?? 0) > (rep.score ?? 0)) rep = at; }
+      score = rep ? (rep.score ?? 0) : null;
+      attemptId = rep?.id ?? null;
     } else {
       latest = instances.reduce((m, a) =>
         (new Date(assignedAtOf(a) ?? 0).getTime() >= new Date(assignedAtOf(m) ?? 0).getTime() ? a : m), instances[0]);
@@ -418,7 +423,7 @@ export function resolveLearnerAssignments(assignments = [], ctx = {}) {
     const isCompleted = status === "completed";
     out.push({
       contentType, contentId, assignment: latest, content: content ?? null, missing: !content,
-      status, progress, completedAt, score, // score: instance-scoped best PASSING (quiz); null otherwise
+      status, progress, completedAt, score, attemptId, // score/attemptId: instance-scoped (quiz); null otherwise
       isCompleted, isToDo: !isCompleted, isOverdue: status === "overdue",
     });
   }
