@@ -76,7 +76,7 @@ import {
   saveBcCategory   as dbSaveBcCategory,
   deleteBcCategory as dbDeleteBcCategory,
   saveBattleCard   as dbSaveBattleCard,
-  deleteBattleCard as dbDeleteBattleCard,
+  setBattleCardArchived as dbSetBattleCardArchived,
   updateUserProfile as dbUpdateUserProfile,
   updateLastSeenAssignmentsAt,
   subscribeToTenantAssignments,
@@ -15729,7 +15729,7 @@ const INITIAL_BATTLE_CARDS = [
 // Production hook: replace onSave*/onDelete* callbacks with API calls.
 // ─────────────────────────────────────────────────────────────────────────────
 
-function BattleCardsAdminScreen({ categories, cards, onSaveCategory, onDeleteCategory, onSaveCard, onDeleteCard }) {
+function BattleCardsAdminScreen({ categories, cards, onSaveCategory, onDeleteCategory, onSaveCard, onSetArchived, isReal = false, isLoading = false, loadError = null, onRetry }) {
   // view: "home" | "category" | "detail" | "editCard"
   const mobile         = useMobile();
   const [view,         setView]         = useState("home");
@@ -15739,7 +15739,8 @@ function BattleCardsAdminScreen({ categories, cards, onSaveCategory, onDeleteCat
   const [editingCard,  setEditingCard]  = useState(null);
   const [editingCat,   setEditingCat]   = useState(null);
   const [showCatForm,  setShowCatForm]  = useState(false);
-  const [confirmDel,   setConfirmDel]   = useState(null); // { type, id }
+  const [confirm,      setConfirm]      = useState(null); // { kind: "archiveCard"|"deleteCategory", id }
+  const [tagInput,     setTagInput]     = useState("");
 
   // ── Navigation ──────────────────────────────────────────────────────────────
   const openCategory = (catId) => { setActiveCatId(catId); setView("category"); };
@@ -15747,41 +15748,85 @@ function BattleCardsAdminScreen({ categories, cards, onSaveCategory, onDeleteCat
   const goHome       = () => { setView("home"); setActiveCatId(null); setActiveCardId(null); setSearch(""); };
   const goCategory   = () => { setView("category"); setActiveCardId(null); };
 
+  const isArchived     = (c) => (c.status ?? "active") === "archived";
   const selectedCard   = cards.find(c => c.id === activeCardId);
   const selectedCat    = categories.find(c => c.id === activeCatId);
-  const cardsInCat     = cards.filter(c => c.categoryId === activeCatId).sort((a, b) => a.title.localeCompare(b.title));
-  const allCardsSorted = [...cards].sort((a, b) => a.title.localeCompare(b.title));
+  // Active cards are the working set (matches the approved Quiz archive pattern);
+  // archived cards live in their own section below and never inflate counts/search.
+  const activeCards    = cards.filter(c => !isArchived(c));
+  const archivedCards  = [...cards.filter(isArchived)].sort((a, b) => a.title.localeCompare(b.title));
+  const cardsInCat     = activeCards.filter(c => c.categoryId === activeCatId).sort((a, b) => a.title.localeCompare(b.title));
+  const archivedInCat  = archivedCards.filter(c => c.categoryId === activeCatId);
+  const allCardsSorted = [...activeCards].sort((a, b) => a.title.localeCompare(b.title));
+  const catLabel       = (id) => categories.find(c => c.id === id)?.label ?? "Uncategorized";
   const filtered = search.trim()
-    ? allCardsSorted.filter(c =>
-        c.title.toLowerCase().includes(search.toLowerCase()) ||
-        c.subtitle.toLowerCase().includes(search.toLowerCase()) ||
-        c.summary.toLowerCase().includes(search.toLowerCase()) ||
-        c.tags?.some(t => t.includes(search.toLowerCase()))
-      )
+    ? allCardsSorted.filter(c => {
+        const q = search.toLowerCase();
+        return c.title.toLowerCase().includes(q) ||
+          c.subtitle.toLowerCase().includes(q) ||
+          c.summary.toLowerCase().includes(q) ||
+          (c.tags ?? []).some(t => t.toLowerCase().includes(q));
+      })
     : allCardsSorted;
 
   // ── Card editor state ───────────────────────────────────────────────────────
+  // New cards default to Uncategorized ("") unless created inside a category —
+  // never silently the first category.
   const blankCard = () => ({
     id: `card-${Date.now()}`,
-    categoryId: activeCatId ?? categories[0]?.id ?? "",
+    categoryId: activeCatId ?? "",
     title: "", subtitle: "", summary: "",
     strength: "", weakness: "", ourWin: "", talkTrack: "",
-    tags: [], updatedAt: new Date().toISOString().slice(0,10), content: [],
+    tags: [], content: [],
   });
   const [draft, setDraft] = useState(blankCard);
   const [cardSaving, setCardSaving] = useState(false);
   const setF = (field) => (e) => setDraft(d => ({ ...d, [field]: e.target.value }));
 
-  const openNewCard  = () => { setDraft(blankCard()); setEditingCard("new"); setView("editCard"); };
-  const openEditCard = (card) => { setDraft({ ...card }); setEditingCard(card.id); setView("editCard"); };
+  // Tags: trim, drop blanks, de-dupe case-insensitively (mirrors the service-side
+  // normalizeCardTags so authoring and search agree). Existing tags are preserved.
+  const addTag = (raw) => {
+    const t = String(raw ?? "").trim();
+    if (!t) return;
+    setDraft(d => (d.tags ?? []).some(x => x.toLowerCase() === t.toLowerCase())
+      ? d : { ...d, tags: [...(d.tags ?? []), t] });
+    setTagInput("");
+  };
+  const removeTag = (t) => setDraft(d => ({ ...d, tags: (d.tags ?? []).filter(x => x !== t) }));
+
+  const openNewCard  = () => { setDraft(blankCard()); setTagInput(""); setEditingCard("new"); setView("editCard"); };
+  const openEditCard = (card) => { setDraft({ ...card, tags: card.tags ?? [] }); setTagInput(""); setEditingCard(card.id); setView("editCard"); };
   const saveCard = async () => {
     if (!draft.title.trim() || cardSaving) return;
     setCardSaving(true);
-    const ok = await onSaveCard({ ...draft, title: draft.title.trim(), updatedAt: new Date().toISOString().slice(0,10) });
+    // Fold any half-typed tag in the input into the card before saving.
+    const pending = tagInput.trim();
+    const tags = pending && !(draft.tags ?? []).some(x => x.toLowerCase() === pending.toLowerCase())
+      ? [...(draft.tags ?? []), pending] : (draft.tags ?? []);
+    const ok = await onSaveCard({ ...draft, title: draft.title.trim(), tags });
     setCardSaving(false);
-    if (ok) setView(activeCatId ? "category" : "home");
+    if (ok) { setTagInput(""); setView(activeCatId ? "category" : "home"); }
   };
   const cancelEditCard = () => setView(activeCardId ? "detail" : activeCatId ? "category" : "home");
+
+  // ── Archive / restore (canonical: onSetArchived) ─────────────────────────────
+  const doArchive  = () => {
+    if (!confirm || confirm.kind !== "archiveCard") return;
+    onSetArchived(confirm.id, true);
+    if (activeCardId === confirm.id) (activeCatId ? goCategory() : goHome());
+    setConfirm(null);
+  };
+  const restoreCard = (id) => onSetArchived(id, false);
+
+  // Reusable card-row action buttons (Edit + Archive/Restore, never Delete).
+  const cardRowActions = (card) => (
+    <>
+      <button onClick={() => { setActiveCatId(card.categoryId); openEditCard(card); }} title="Edit" style={{ width:34, height:34, borderRadius:8, border:`1px solid ${C.border}`, background:C.white, fontSize:12, cursor:"pointer", color:C.textSub, flexShrink:0 }}>✎</button>
+      {isArchived(card)
+        ? <button onClick={() => restoreCard(card.id)} title="Restore" style={{ height:34, padding:"0 12px", borderRadius:8, border:`1px solid ${C.border}`, background:C.white, fontSize:12, fontWeight:700, cursor:"pointer", color:C.text, flexShrink:0 }}>Restore</button>
+        : <button onClick={() => setConfirm({ kind:"archiveCard", id:card.id })} title="Archive" style={{ height:34, padding:"0 12px", borderRadius:8, border:`1px solid ${C.border}`, background:C.white, fontSize:12, fontWeight:700, cursor:"pointer", color:C.textSub, flexShrink:0 }}>Archive</button>}
+    </>
+  );
 
   // content sections
   const addSection    = () => setDraft(d => ({ ...d, content: [...d.content, { heading: "", body: "" }] }));
@@ -15809,18 +15854,12 @@ function BattleCardsAdminScreen({ categories, cards, onSaveCategory, onDeleteCat
     if (editingCat === "new") setActiveCatId(saved?.id ?? catDraft.id);
   };
 
-  // ── Confirm delete ──────────────────────────────────────────────────────────
-  const doDelete = () => {
-    if (!confirmDel) return;
-    if (confirmDel.type === "card") {
-      onDeleteCard(confirmDel.id);
-      if (activeCardId === confirmDel.id) goCategory();
-    }
-    if (confirmDel.type === "category") {
-      onDeleteCategory(confirmDel.id);
-      if (activeCatId === confirmDel.id) goHome();
-    }
-    setConfirmDel(null);
+  // ── Confirm category delete (cards are archived, never deleted) ───────────────
+  const doDeleteCategory = () => {
+    if (!confirm || confirm.kind !== "deleteCategory") return;
+    onDeleteCategory(confirm.id);
+    if (activeCatId === confirm.id) goHome();
+    setConfirm(null);
   };
 
   const inputStyle = { width:"100%", boxSizing:"border-box", padding:"10px 14px", borderRadius:10, border:`1.5px solid ${C.border}`, background:C.cardBg, fontSize:14, color:C.text, outline:"none", fontFamily:"inherit" };
@@ -15859,24 +15898,50 @@ function BattleCardsAdminScreen({ categories, cards, onSaveCategory, onDeleteCat
           </div>
         </div>
       )}
-      {confirmDel && (
+      {confirm?.kind === "archiveCard" && (
         <div style={{ position:"fixed", inset:0, background:"rgba(0,0,0,0.45)", display:"flex", alignItems:"center", justifyContent:"center", zIndex:9999 }}>
-          <div style={{ background:C.cardBg, borderRadius:20, padding:"32px 36px", width:360, maxWidth:"90vw", textAlign:"center", border:`1px solid ${C.creamBorder}` }}>
-            <h3 style={{ margin:"0 0 8px", fontSize:18, fontWeight:900, color:C.text }}>Delete {confirmDel.type === "card" ? "card" : "category"}?</h3>
+          <div style={{ background:C.cardBg, borderRadius:20, padding:"32px 36px", width:380, maxWidth:"90vw", textAlign:"center", border:`1px solid ${C.creamBorder}` }}>
+            <h3 style={{ margin:"0 0 8px", fontSize:18, fontWeight:900, color:C.text }}>Archive this card?</h3>
             <p style={{ margin:"0 0 24px", fontSize:13, color:C.textSub }}>
-              {confirmDel.type === "category"
-                ? "This will delete the category. Cards inside it will lose their category assignment."
-                : "This card will be permanently removed."}
+              It will be hidden from reps and removed from search and category counts. Nothing is deleted — you can restore it anytime from the Archived section.
             </p>
             <div style={{ display:"flex", gap:10 }}>
-              <button onClick={() => setConfirmDel(null)} style={{ flex:1, padding:"11px 0", borderRadius:10, border:`1px solid ${C.border}`, background:C.cardBg, fontSize:13, fontWeight:700, cursor:"pointer", color:C.text }}>Cancel</button>
-              <button onClick={doDelete} style={{ flex:1, padding:"11px 0", borderRadius:10, border:"none", background:"#ef4444", color:"#fff", fontSize:13, fontWeight:700, cursor:"pointer" }}>Delete</button>
+              <button onClick={() => setConfirm(null)} style={{ flex:1, padding:"11px 0", borderRadius:10, border:`1px solid ${C.border}`, background:C.cardBg, fontSize:13, fontWeight:700, cursor:"pointer", color:C.text }}>Cancel</button>
+              <button onClick={doArchive} style={{ flex:1, padding:"11px 0", borderRadius:10, border:"none", background:C.orange, color:"#fff", fontSize:13, fontWeight:700, cursor:"pointer" }}>Archive</button>
+            </div>
+          </div>
+        </div>
+      )}
+      {confirm?.kind === "deleteCategory" && (
+        <div style={{ position:"fixed", inset:0, background:"rgba(0,0,0,0.45)", display:"flex", alignItems:"center", justifyContent:"center", zIndex:9999 }}>
+          <div style={{ background:C.cardBg, borderRadius:20, padding:"32px 36px", width:380, maxWidth:"90vw", textAlign:"center", border:`1px solid ${C.creamBorder}` }}>
+            <h3 style={{ margin:"0 0 8px", fontSize:18, fontWeight:900, color:C.text }}>Delete this category?</h3>
+            <p style={{ margin:"0 0 24px", fontSize:13, color:C.textSub }}>
+              The category is removed. Its cards are kept and become Uncategorized — no card or content is lost.
+            </p>
+            <div style={{ display:"flex", gap:10 }}>
+              <button onClick={() => setConfirm(null)} style={{ flex:1, padding:"11px 0", borderRadius:10, border:`1px solid ${C.border}`, background:C.cardBg, fontSize:13, fontWeight:700, cursor:"pointer", color:C.text }}>Cancel</button>
+              <button onClick={doDeleteCategory} style={{ flex:1, padding:"11px 0", borderRadius:10, border:"none", background:"#ef4444", color:"#fff", fontSize:13, fontWeight:700, cursor:"pointer" }}>Delete category</button>
             </div>
           </div>
         </div>
       )}
     </>
   );
+
+  // ── Honest load states (real tenants) ────────────────────────────────────────
+  if (loadError) {
+    return (
+      <div style={{ padding:"48px 32px", textAlign:"center", borderRadius:16, border:`1px solid ${C.creamBorder}`, background:C.cardBg, maxWidth:520, margin:"0 auto" }}>
+        <p style={{ margin:"0 0 6px", fontSize:15, fontWeight:800, color:C.text }}>Couldn't load battle cards</p>
+        <p style={{ margin:"0 0 20px", fontSize:13, color:C.textSub }}>Something went wrong reaching the server. This is not the same as an empty library.</p>
+        <button onClick={() => onRetry?.()} style={{ padding:"10px 22px", borderRadius:10, border:"none", background:C.orange, color:"#fff", fontSize:13, fontWeight:700, cursor:"pointer" }}>Retry</button>
+      </div>
+    );
+  }
+  if (isReal && isLoading) {
+    return <LoadingState rows={4} message="Loading battle cards…" />;
+  }
 
   // ── CARD EDITOR VIEW ────────────────────────────────────────────────────────
   if (view === "editCard") {
@@ -15904,12 +15969,37 @@ function BattleCardsAdminScreen({ categories, cards, onSaveCategory, onDeleteCat
               <div>{lbl("Subtitle / Type")}<input style={inputStyle} value={draft.subtitle} onChange={setF("subtitle")} placeholder="e.g. CRM" /></div>
             </div>
             <div style={{ marginBottom:14 }}>
-              {lbl("Category", true)}
-              <select value={draft.categoryId} onChange={setF("categoryId")} style={{ ...inputStyle }}>
+              {lbl("Category")}
+              {/* Explicit Uncategorized option — the select always reflects the real
+                  state (value ""), never silently showing the first category. */}
+              <select value={draft.categoryId ?? ""} onChange={setF("categoryId")} style={{ ...inputStyle }}>
+                <option value="">Uncategorized</option>
                 {categories.map(c => <option key={c.id} value={c.id}>{c.label}</option>)}
               </select>
             </div>
-            <div>{lbl("Summary")}<input style={inputStyle} value={draft.summary} onChange={setF("summary")} placeholder="One-line description shown in lists" /></div>
+            <div style={{ marginBottom:14 }}>{lbl("Summary")}<input style={inputStyle} value={draft.summary} onChange={setF("summary")} placeholder="One-line description shown in lists" /></div>
+            <div>
+              {lbl("Tags")}
+              <div style={{ display:"flex", flexWrap:"wrap", gap:6, marginBottom:(draft.tags?.length ? 8 : 0) }}>
+                {(draft.tags ?? []).map(t => (
+                  <span key={t} style={{ display:"inline-flex", alignItems:"center", gap:6, padding:"4px 10px", borderRadius:999, background:C.orangeLight, color:C.orange, fontSize:12, fontWeight:700 }}>
+                    {t}
+                    <button onClick={() => removeTag(t)} title="Remove tag" style={{ background:"none", border:"none", cursor:"pointer", color:C.orange, fontSize:13, lineHeight:1, padding:0 }}>✕</button>
+                  </span>
+                ))}
+              </div>
+              <input
+                style={inputStyle}
+                value={tagInput}
+                onChange={e => setTagInput(e.target.value)}
+                onKeyDown={e => {
+                  if (e.key === "Enter" || e.key === ",") { e.preventDefault(); addTag(tagInput); }
+                  else if (e.key === "Backspace" && !tagInput && (draft.tags?.length)) { removeTag(draft.tags[draft.tags.length - 1]); }
+                }}
+                onBlur={() => addTag(tagInput)}
+                placeholder="Add a tag and press Enter (reps can search these)"
+              />
+            </div>
           </Card>
 
           <Card>
@@ -15966,7 +16056,9 @@ function BattleCardsAdminScreen({ categories, cards, onSaveCategory, onDeleteCat
           actions={
             <>
               <button onClick={() => openEditCard(selectedCard)} style={{ padding:"7px 16px", borderRadius:8, border:`1px solid ${C.border}`, background:C.white, fontSize:12, fontWeight:700, cursor:"pointer", color:C.text }}>Edit</button>
-              <button onClick={() => setConfirmDel({ type:"card", id:selectedCard.id })} style={{ padding:"7px 16px", borderRadius:8, border:"1px solid rgba(239,68,68,0.3)", background:"rgba(239,68,68,0.05)", fontSize:12, fontWeight:700, cursor:"pointer", color:"#ef4444" }}>Delete</button>
+              {isArchived(selectedCard)
+                ? <button onClick={() => restoreCard(selectedCard.id)} style={{ padding:"7px 16px", borderRadius:8, border:`1px solid ${C.border}`, background:C.white, fontSize:12, fontWeight:700, cursor:"pointer", color:C.text }}>Restore</button>
+                : <button onClick={() => setConfirm({ kind:"archiveCard", id:selectedCard.id })} style={{ padding:"7px 16px", borderRadius:8, border:`1px solid ${C.border}`, background:C.white, fontSize:12, fontWeight:700, cursor:"pointer", color:C.textSub }}>Archive</button>}
             </>
           }
         />
@@ -16020,10 +16112,29 @@ function BattleCardsAdminScreen({ categories, cards, onSaveCategory, onDeleteCat
                   </div>
                   <span style={{ fontSize:16, color:C.textMuted, flexShrink:0, marginLeft:16 }}>→</span>
                 </button>
-                <button onClick={() => openEditCard(card)} title="Edit" style={{ width:34, height:34, borderRadius:8, border:`1px solid ${C.border}`, background:C.white, fontSize:12, cursor:"pointer", color:C.textSub, flexShrink:0 }}>✎</button>
-                <button onClick={() => setConfirmDel({ type:"card", id:card.id })} title="Delete" style={{ width:34, height:34, borderRadius:8, border:"1px solid rgba(239,68,68,0.3)", background:"rgba(239,68,68,0.05)", fontSize:12, cursor:"pointer", color:"#ef4444", flexShrink:0 }}>✕</button>
+                {cardRowActions(card)}
               </div>
             ))}
+          </div>
+        )}
+
+        {archivedInCat.length > 0 && (
+          <div>
+            <p style={{ margin:"4px 0 10px", fontSize:12, fontWeight:700, color:C.textMuted, letterSpacing:"0.06em", textTransform:"uppercase" }}>Archived · {archivedInCat.length}</p>
+            <div style={{ display:"flex", flexDirection:"column", gap:6 }}>
+              {archivedInCat.map(card => (
+                <div key={card.id} style={{ display:"flex", alignItems:"center", gap:8, opacity:0.72 }}>
+                  <button onClick={() => openCard(card.id)} style={{ flex:1, display:"flex", alignItems:"center", justifyContent:"space-between", padding:"14px 18px", borderRadius:12, border:`1px dashed ${C.creamBorder}`, background:C.cardBg, cursor:"pointer", textAlign:"left" }}>
+                    <div>
+                      <div style={{ fontSize:14, fontWeight:700, color:C.text }}>{card.title}</div>
+                      <div style={{ fontSize:12, color:C.textSub, marginTop:2 }}>{card.subtitle}</div>
+                    </div>
+                    <span style={{ fontSize:11, fontWeight:700, color:C.textMuted, flexShrink:0, marginLeft:16 }}>ARCHIVED</span>
+                  </button>
+                  {cardRowActions(card)}
+                </div>
+              ))}
+            </div>
           </div>
         )}
         {modals}
@@ -16082,12 +16193,11 @@ function BattleCardsAdminScreen({ categories, cards, onSaveCategory, onDeleteCat
                   >
                     <div>
                       <div style={{ fontSize:14, fontWeight:700, color:C.text }}>{card.title}</div>
-                      <div style={{ fontSize:12, color:C.textSub, marginTop:2 }}>{card.subtitle} · {categories.find(c => c.id === card.categoryId)?.label}</div>
+                      <div style={{ fontSize:12, color:C.textSub, marginTop:2 }}>{card.subtitle} · {catLabel(card.categoryId)}</div>
                     </div>
                     <span style={{ fontSize:16, color:C.textMuted, flexShrink:0, marginLeft:16 }}>→</span>
                   </button>
-                  <button onClick={() => { setActiveCatId(card.categoryId); openEditCard(card); }} title="Edit" style={{ width:34, height:34, borderRadius:8, border:`1px solid ${C.border}`, background:C.white, fontSize:12, cursor:"pointer", color:C.textSub, flexShrink:0 }}>✎</button>
-                  <button onClick={() => setConfirmDel({ type:"card", id:card.id })} title="Delete" style={{ width:34, height:34, borderRadius:8, border:"1px solid rgba(239,68,68,0.3)", background:"rgba(239,68,68,0.05)", fontSize:12, cursor:"pointer", color:"#ef4444", flexShrink:0 }}>✕</button>
+                  {cardRowActions(card)}
                 </div>
               ))}
             </div>
@@ -16107,7 +16217,7 @@ function BattleCardsAdminScreen({ categories, cards, onSaveCategory, onDeleteCat
             ) : (
               <div style={{ display:"grid", gridTemplateColumns: mobile ? "1fr" : "repeat(2, 1fr)", gap:12 }}>
                 {categories.map(cat => {
-                  const count = cards.filter(c => c.categoryId === cat.id).length;
+                  const count = activeCards.filter(c => c.categoryId === cat.id).length;
                   return (
                     <div key={cat.id} style={{ position:"relative" }}>
                       <button onClick={() => openCategory(cat.id)} style={{
@@ -16125,7 +16235,7 @@ function BattleCardsAdminScreen({ categories, cards, onSaveCategory, onDeleteCat
                       {/* Manager edit/delete overlay */}
                       <div style={{ position:"absolute", top:10, right:10, display:"flex", gap:4, zIndex:1 }}>
                         <button onClick={e => { e.stopPropagation(); openEditCat(cat); }} title="Edit category" style={{ width:26, height:26, borderRadius:6, border:`1px solid ${C.border}`, background:"rgba(255,255,255,0.92)", fontSize:11, cursor:"pointer", color:C.textSub }}>✎</button>
-                        <button onClick={e => { e.stopPropagation(); setConfirmDel({ type:"category", id:cat.id }); }} title="Delete category" style={{ width:26, height:26, borderRadius:6, border:"1px solid rgba(239,68,68,0.3)", background:"rgba(255,255,255,0.92)", fontSize:11, cursor:"pointer", color:"#ef4444" }}>✕</button>
+                        <button onClick={e => { e.stopPropagation(); setConfirm({ kind:"deleteCategory", id:cat.id }); }} title="Delete category" style={{ width:26, height:26, borderRadius:6, border:"1px solid rgba(239,68,68,0.3)", background:"rgba(255,255,255,0.92)", fontSize:11, cursor:"pointer", color:"#ef4444" }}>✕</button>
                       </div>
                     </div>
                   );
@@ -16152,12 +16262,32 @@ function BattleCardsAdminScreen({ categories, cards, onSaveCategory, onDeleteCat
                     >
                       <div>
                         <div style={{ fontSize:14, fontWeight:700, color:C.text }}>{card.title}</div>
-                        <div style={{ fontSize:12, color:C.textSub, marginTop:2 }}>{card.subtitle} · {categories.find(c => c.id === card.categoryId)?.label}</div>
+                        <div style={{ fontSize:12, color:C.textSub, marginTop:2 }}>{card.subtitle} · {catLabel(card.categoryId)}</div>
                       </div>
                       <span style={{ fontSize:16, color:C.textMuted, flexShrink:0, marginLeft:16 }}>→</span>
                     </button>
-                    <button onClick={() => { setActiveCatId(card.categoryId); openEditCard(card); }} title="Edit" style={{ width:34, height:34, borderRadius:8, border:`1px solid ${C.border}`, background:C.white, fontSize:12, cursor:"pointer", color:C.textSub, flexShrink:0 }}>✎</button>
-                    <button onClick={() => setConfirmDel({ type:"card", id:card.id })} title="Delete" style={{ width:34, height:34, borderRadius:8, border:"1px solid rgba(239,68,68,0.3)", background:"rgba(239,68,68,0.05)", fontSize:12, cursor:"pointer", color:"#ef4444", flexShrink:0 }}>✕</button>
+                    {cardRowActions(card)}
+                  </div>
+                ))}
+              </div>
+            </div>
+          )}
+
+          {/* Archived — always below the active working set, never in counts/search */}
+          {archivedCards.length > 0 && (
+            <div>
+              <p style={{ margin:"0 0 12px", fontSize:12, fontWeight:700, color:C.textMuted, letterSpacing:"0.06em", textTransform:"uppercase" }}>Archived · {archivedCards.length}</p>
+              <div style={{ display:"flex", flexDirection:"column", gap:6 }}>
+                {archivedCards.map(card => (
+                  <div key={card.id} style={{ display:"flex", alignItems:"center", gap:8, opacity:0.72 }}>
+                    <button onClick={() => { setActiveCatId(card.categoryId); openCard(card.id); }} style={{ flex:1, display:"flex", alignItems:"center", justifyContent:"space-between", padding:"14px 18px", borderRadius:12, border:`1px dashed ${C.creamBorder}`, background:C.cardBg, cursor:"pointer", textAlign:"left" }}>
+                      <div>
+                        <div style={{ fontSize:14, fontWeight:700, color:C.text }}>{card.title}</div>
+                        <div style={{ fontSize:12, color:C.textSub, marginTop:2 }}>{card.subtitle} · {catLabel(card.categoryId)}</div>
+                      </div>
+                      <span style={{ fontSize:11, fontWeight:700, color:C.textMuted, flexShrink:0, marginLeft:16 }}>ARCHIVED</span>
+                    </button>
+                    {cardRowActions(card)}
                   </div>
                 ))}
               </div>
@@ -16203,7 +16333,9 @@ function BattleCardDetail({ card, onBack, actions }) {
       </div>
 
       {/* ── PRESERVED DETAIL UI ── */}
-      <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr 1fr", gap: 14 }}>
+      {/* Responsive: auto-fit reflows the strength/weakness/win panels from 3 columns
+          (desktop) to 2 (tablet) to 1 (mobile) so nothing is clipped or crushed. */}
+      <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(240px, 1fr))", gap: 14 }}>
         <Card style={{ borderTop: `3px solid ${C.red}` }}>
           <div style={{ fontSize: 12, fontWeight: 700, color: C.red, letterSpacing: "0.06em", marginBottom: 12 }}>THEIR STRENGTHS</div>
           <p style={{ margin: 0, fontSize: 14, color: C.text, lineHeight: 1.6 }}>{card.strength}</p>
@@ -16245,7 +16377,7 @@ function BattleCardDetail({ card, onBack, actions }) {
   );
 }
 
-function BattleCardsScreen({ categories = INITIAL_BC_CATEGORIES, cards = INITIAL_BATTLE_CARDS, isLoading = false, isReal = false }) {
+function BattleCardsScreen({ categories = INITIAL_BC_CATEGORIES, cards = INITIAL_BATTLE_CARDS, isLoading = false, loadError = null, onRetry, isReal = false }) {
   // view: "home" | "category" | "detail"
   const mobile       = useMobile();
   const [view,       setView]       = useState("home");
@@ -16258,10 +16390,15 @@ function BattleCardsScreen({ categories = INITIAL_BC_CATEGORIES, cards = INITIAL
   const goHome       = ()       => { setView("home"); setActiveCat(null); setActiveCard(null); setSearch(""); };
   const goCategory   = ()       => { setView("category"); setActiveCard(null); };
 
-  const selectedCard = cards.find(c => c.id === activeCard);
+  // Learners only ever see ACTIVE cards. RLS already excludes archived rows for the
+  // learner role (migration 068); this client filter is defense-in-depth and also
+  // covers demo mode, so archived cards never appear in the list, categories,
+  // counts, or search.
+  const visibleCards = cards.filter(c => (c.status ?? "active") !== "archived");
+  const selectedCard = visibleCards.find(c => c.id === activeCard);
   const selectedCat  = categories.find(c => c.id === activeCat);
-  const cardsInCat   = cards.filter(c => c.categoryId === activeCat).sort((a, b) => a.title.localeCompare(b.title));
-  const allCardsSorted = [...cards].sort((a, b) => a.title.localeCompare(b.title));
+  const cardsInCat   = visibleCards.filter(c => c.categoryId === activeCat).sort((a, b) => a.title.localeCompare(b.title));
+  const allCardsSorted = [...visibleCards].sort((a, b) => a.title.localeCompare(b.title));
 
   const filtered = search.trim()
     ? (() => {
@@ -16339,7 +16476,24 @@ function BattleCardsScreen({ categories = INITIAL_BC_CATEGORIES, cards = INITIAL
     );
   }
 
-  // ── LOADING / EMPTY GUARDS (real users only) ──
+  // ── ERROR / LOADING / EMPTY GUARDS (real users only) ──
+  // A failed load is NOT an empty library: show an error with Retry, never "none yet".
+  if (loadError) {
+    return (
+      <div style={{ display: "flex", flexDirection: "column", gap: 20 }}>
+        <div>
+          <h2 style={{ margin: 0, fontSize: 22, fontWeight: 800, color: C.text }}>Battle Cards</h2>
+          <p style={{ margin: "4px 0 0", fontSize: 13, color: C.textSub }}>Competitive intelligence at your fingertips</p>
+        </div>
+        <div style={{ padding: "48px 32px", textAlign: "center", borderRadius: 16, border: `1px solid ${C.creamBorder}`, background: C.cardBg }}>
+          <p style={{ margin: "0 0 6px", fontSize: 15, fontWeight: 800, color: C.text }}>Couldn't load battle cards</p>
+          <p style={{ margin: "0 0 20px", fontSize: 13, color: C.textSub }}>Something went wrong reaching the server. Please try again.</p>
+          <button onClick={() => onRetry?.()} style={{ padding: "10px 22px", borderRadius: 10, border: "none", background: C.orange, color: "#fff", fontSize: 13, fontWeight: 700, cursor: "pointer" }}>Retry</button>
+        </div>
+      </div>
+    );
+  }
+
   if (isLoading) {
     return (
       <div style={{ display: "flex", flexDirection: "column", gap: 20 }}>
@@ -16352,7 +16506,7 @@ function BattleCardsScreen({ categories = INITIAL_BC_CATEGORIES, cards = INITIAL
     );
   }
 
-  if (isReal && categories.length === 0 && cards.length === 0) {
+  if (isReal && categories.length === 0 && visibleCards.length === 0) {
     return (
       <div style={{ display: "flex", flexDirection: "column", gap: 20 }}>
         <div>
@@ -16431,7 +16585,7 @@ function BattleCardsScreen({ categories = INITIAL_BC_CATEGORIES, cards = INITIAL
             <p style={{ margin: "0 0 12px", fontSize: 12, fontWeight: 700, color: C.textMuted, letterSpacing: "0.06em", textTransform: "uppercase" }}>Categories</p>
             <div style={{ display: "grid", gridTemplateColumns: mobile ? "1fr" : "repeat(2, 1fr)", gap: 12 }}>
               {categories.map(cat => {
-                const count = cards.filter(c => c.categoryId === cat.id).length;
+                const count = visibleCards.filter(c => c.categoryId === cat.id).length;
                 return (
                   <button key={cat.id} onClick={() => openCategory(cat.id)} style={{
                     padding: "18px 20px", borderRadius: 14, textAlign: "left", cursor: "pointer",
@@ -24032,6 +24186,12 @@ export default function App() {
   });
   // Loading flag for BattleCardsScreen — true while Supabase BC fetch is in flight.
   const [bcLoading, setBcLoading] = useState(false);
+  // Load lifecycle for honest states: bcError distinguishes a failed load from a
+  // genuinely empty library; bcLoaded gates rendering so a real tenant never flashes
+  // demo seed content before the first successful fetch; bcReloadKey drives Retry.
+  const [bcError,     setBcError]     = useState(null);
+  const [bcLoaded,    setBcLoaded]    = useState(false);
+  const [bcReloadKey, setBcReloadKey] = useState(0);
 
   // BC data loaded after const user/currentOrg are declared (see useEffect below line 13866)
 
@@ -24080,14 +24240,27 @@ export default function App() {
   useEffect(() => {
     const tid = currentOrg?.id ?? user?.orgId ?? null;
     if (!user?._isReal || !tid) return;
+    let cancelled = false;
     setBcCategories([]);  // clear seed immediately; DB result fills in below
     setBattleCards([]);
+    setBcError(null);
+    setBcLoaded(false);   // gate rendering until this load resolves — no demo flash
     setBcLoading(true);
-    Promise.allSettled([
-      getTenantBcCategories(tid).then(({ data }) => { if (data) setBcCategories(data); }),
-      getTenantBattleCards(tid).then(({ data }) => { if (data) setBattleCards(data); }),
-    ]).finally(() => setBcLoading(false));
-  }, [user?._isReal, currentOrg?.id, user?.orgId]); // eslint-disable-line react-hooks/exhaustive-deps
+    Promise.allSettled([getTenantBcCategories(tid), getTenantBattleCards(tid)])
+      .then(([catRes, cardRes]) => {
+        if (cancelled) return;
+        const catErr  = catRes.status  === "fulfilled" ? catRes.value.error  : catRes.reason;
+        const cardErr = cardRes.status === "fulfilled" ? cardRes.value.error : cardRes.reason;
+        // A load FAILURE must never masquerade as an empty library — surface an
+        // error (learner/admin screens render Retry) instead of silently showing "none".
+        if (catErr || cardErr) { setBcError(cardErr || catErr); return; }
+        setBcCategories(catRes.value.data ?? []);
+        setBattleCards(cardRes.value.data ?? []);
+        setBcLoaded(true);
+      })
+      .finally(() => { if (!cancelled) setBcLoading(false); });
+    return () => { cancelled = true; };
+  }, [user?._isReal, currentOrg?.id, user?.orgId, bcReloadKey]); // eslint-disable-line react-hooks/exhaustive-deps
 
   // Map NAV featureKey → tenant_settings.feature_access key
   const FEATURE_KEY_MAP = { games: "games", learn: "learn", leaderboard: "learn", progress: "analytics", battlecards: "battle_cards", quizzes: "learn", dashboard: null };
@@ -24762,7 +24935,7 @@ export default function App() {
   const handleSaveBcCategory = async (cat) => {
     const tid = currentOrg?.id ?? user?.orgId ?? null;
     if (user?._isReal && tid) {
-      const { data, error } = await dbSaveBcCategory(tid, cat, user.id);
+      const { data, error } = await dbSaveBcCategory(tid, cat);
       if (error) { console.error("[ralli] saveBcCategory failed:", error); toast.error("Failed to save category. Please try again."); return null; }
       // data may be null if RLS blocks SELECT after INSERT; treat as success and use local cat shape
       const canonical = data ?? { ...cat, id: cat.id };
@@ -24797,6 +24970,14 @@ export default function App() {
       if (!user?._isReal) { try { localStorage.setItem(bcCatKey, JSON.stringify(next)); } catch {} }
       return next;
     });
+    // Cards in the deleted category become honestly uncategorized (DB does this via
+    // ON DELETE SET NULL; mirror it locally so counts/filters refresh immediately
+    // without a round-trip). Cards themselves are never lost.
+    setBattleCards(prev => {
+      const next = prev.map(c => c.categoryId === id ? { ...c, categoryId: "" } : c);
+      if (!user?._isReal) { try { localStorage.setItem(bcCardsKey, JSON.stringify(next)); } catch {} }
+      return next;
+    });
     toast.success("Category deleted.");
   };
 
@@ -24804,7 +24985,7 @@ export default function App() {
   const handleSaveBattleCard = async (card) => {
     const tid = currentOrg?.id ?? user?.orgId ?? null;
     if (user?._isReal && tid) {
-      const { data, error } = await dbSaveBattleCard(tid, card, user.id);
+      const { data, error } = await dbSaveBattleCard(tid, card);
       if (error) { console.error("[ralli] saveBattleCard failed:", error); toast.error("Failed to save battle card. Please try again."); return false; }
       if (data) {
         setBattleCards(prev => prev.find(c => c.id === data.id) ? prev.map(c => c.id === data.id ? data : c) : [...prev, data]);
@@ -24816,27 +24997,34 @@ export default function App() {
       toast.error("Failed to save battle card. Please try again.");
       return false;
     }
-    // Demo fallback
+    // Demo fallback (new cards default to active)
+    const localCard = { status: "active", ...card };
     setBattleCards(prev => {
-      const next = prev.find(c => c.id === card.id) ? prev.map(c => c.id === card.id ? card : c) : [...prev, card];
+      const next = prev.find(c => c.id === card.id) ? prev.map(c => c.id === card.id ? { ...c, ...card } : c) : [...prev, localCard];
       try { localStorage.setItem(bcCardsKey, JSON.stringify(next)); } catch {}
       return next;
     });
     toast.success("Battle card saved.");
     return true;
   };
-  const handleDeleteBattleCard = async (id) => {
+  // Archive/restore — the ONE UI path to the canonical service. No permanent delete.
+  const handleSetBattleCardArchived = async (id, archived) => {
     const tid = currentOrg?.id ?? user?.orgId ?? null;
     if (user?._isReal && tid) {
-      const { error } = await dbDeleteBattleCard(tid, id);
-      if (error) { console.error("[ralli] deleteBattleCard failed:", error); toast.error("Failed to delete battle card. Please try again."); return; }
+      const { data, error } = await dbSetBattleCardArchived(tid, id, archived);
+      if (error) { console.error("[ralli] setBattleCardArchived failed:", error); toast.error(`Failed to ${archived ? "archive" : "restore"} battle card. Please try again.`); return false; }
+      if (data) setBattleCards(prev => prev.map(c => c.id === data.id ? data : c));
+      toast.success(archived ? "Battle card archived." : "Battle card restored.");
+      return true;
     }
+    // Demo fallback — flip local status so the active/archived split refreshes immediately
     setBattleCards(prev => {
-      const next = prev.filter(c => c.id !== id);
-      if (!user?._isReal) { try { localStorage.setItem(bcCardsKey, JSON.stringify(next)); } catch {} }
+      const next = prev.map(c => c.id === id ? { ...c, status: archived ? "archived" : "active" } : c);
+      try { localStorage.setItem(bcCardsKey, JSON.stringify(next)); } catch {}
       return next;
     });
-    toast.success("Battle card deleted.");
+    toast.success(archived ? "Battle card archived." : "Battle card restored.");
+    return true;
   };
 
   // ── Quiz CRUD ──
@@ -25508,8 +25696,8 @@ export default function App() {
         ) : null} />;
       case "quizzes":           return <QuizzesScreen role={gameRole} onNav={navigate} quizzes={quizzes} onEditQuiz={handleEditQuiz} onDeleteQuiz={handleDeleteQuiz} onArchiveQuiz={handleArchiveQuiz} onRestoreQuiz={handleRestoreQuiz} onToggleFavorite={handleToggleFavorite} onToggleActive={handleToggleActive} pendingQuizId={pendingQuizId} onClearPendingQuiz={() => setPendingQuizId(null)} canCreate={perm("actions","create")} canEdit={perm("actions","edit")} canDelete={perm("actions","delete")} canLaunch={perm("actions","launch")} canAssign={perm("actions","assign")} onAssignQuiz={handleAssignQuiz} onLaunchQuiz={handleCreateSession} orgUsers={orgUsers} orgs={orgs} currentUser={currentUser} tenantId={currentOrg?.id ?? null} isReal={!!user?._isReal} quizzesReady={quizzesReady} sharedAssignmentData={sharedAssignmentData} onRefreshQuizzes={refreshQuizzes} pendingQuizReview={pendingQuizReview} onExitQuiz={() => { setPendingQuizId(null); setPendingQuizReview(null); navigate("learn"); }} />;
       case "battlecards":       return (isAdminType && perm("actions","edit"))
-        ? <BattleCardsAdminScreen categories={bcCategories} cards={battleCards} onSaveCategory={handleSaveBcCategory} onDeleteCategory={handleDeleteBcCategory} onSaveCard={handleSaveBattleCard} onDeleteCard={handleDeleteBattleCard} />
-        : <BattleCardsScreen categories={bcCategories} cards={battleCards} isLoading={bcLoading} isReal={!!user?._isReal} />;
+        ? <BattleCardsAdminScreen categories={bcCategories} cards={battleCards} onSaveCategory={handleSaveBcCategory} onDeleteCategory={handleDeleteBcCategory} onSaveCard={handleSaveBattleCard} onSetArchived={handleSetBattleCardArchived} isReal={!!user?._isReal} isLoading={bcLoading || (!!user?._isReal && !bcLoaded && !bcError)} loadError={bcError} onRetry={() => setBcReloadKey(k => k + 1)} />
+        : <BattleCardsScreen categories={bcCategories} cards={battleCards} isLoading={bcLoading || (!!user?._isReal && !bcLoaded && !bcError)} loadError={bcError} onRetry={() => setBcReloadKey(k => k + 1)} isReal={!!user?._isReal} />;
       case "insights":           return <InsightsScreen user={user} isReal={!!user?._isReal} tenantId={currentOrg?.id ?? null} orgUsers={orgUsers} isAdmin={isAdminType} readinessThreshold={readinessThreshold} />;
       case "progress":          return isAdminType
         ? <LeadershipDashboardScreen currentOrg={currentOrg} orgUsers={orgUsers} isReal={!!user?._isReal} readinessThreshold={readinessThreshold} />

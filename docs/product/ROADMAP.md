@@ -63,6 +63,26 @@ Completed:
 
 ---
 
+### Battle Cards
+
+Status: Beta candidate (lifecycle slice — pending live QA + migration 068 apply)
+
+Completed (this slice):
+
+- Archive / restore (status active|archived, archived_at) instead of hard delete; permanent delete not exposed
+- Learners read active cards only (RLS-enforced); managers see active + archived; archived excluded from learner search, categories, and counts
+- Tag authoring/editing with whitespace normalization + case-insensitive de-dupe; learner search matches tags
+- Manager preview; Uncategorized honesty on category delete; honest loading / error+Retry / empty states; no demo-content flash for real tenants
+- Server-authoritative provenance: created_by immutable on edit, updated_by + updated_at set by DB trigger; UPDATE RLS `WITH CHECK` blocks cross-tenant moves
+
+Readiness / analytics boundary (for the later Leadership Dashboard overhaul — do NOT treat as production evidence):
+
+- No learner Battle Card activity (viewed/opened/completed) is tracked. There is no event source.
+- Real tenants receive NO Battle Card readiness contribution today; the `battlecards` weight is fed only by demo seed (`LEADERSHIP_SEED`) in demo mode.
+- No Battle Card readiness contribution may be added until a trustworthy event source exists. The demo-only seeded values are deferred to the Leadership overhaul and must never be shown as real data.
+
+---
+
 ### Ralli Live
 
 Status: Beta Complete

@@ -1401,15 +1401,33 @@ function dbToCategory(row) {
   };
 }
 
-/** Normalise app category → DB insert/update shape */
-function categoryToDb(tenantId, cat, userId) {
+/** Normalise app category → DB insert/update shape.
+ *  created_by / updated_by / updated_at are server-authoritative (set by the
+ *  BEFORE INSERT/UPDATE trigger in migration 068) — never sent from the client,
+ *  so an edit can never overwrite the original creator or trust the browser clock. */
+function categoryToDb(tenantId, cat) {
   return {
     tenant_id:   tenantId,
     label:       cat.label,
     description: cat.description ?? "",
-    created_by:  userId ?? null,
-    updated_at:  new Date().toISOString(),
   };
+}
+
+/** Canonical Battle Card tag normalisation: trim each tag, drop blanks, and
+ *  de-duplicate case-insensitively while preserving the first-seen casing/order.
+ *  One source of truth so authoring, editing and search agree on tag identity. */
+function normalizeCardTags(tags) {
+  const seen = new Set();
+  const out = [];
+  for (const raw of Array.isArray(tags) ? tags : []) {
+    const t = String(raw ?? "").trim();
+    if (!t) continue;
+    const key = t.toLowerCase();
+    if (seen.has(key)) continue;
+    seen.add(key);
+    out.push(t);
+  }
+  return out;
 }
 
 /** Normalise a DB card row → app shape */
@@ -1426,12 +1444,18 @@ function dbToCard(row) {
     talkTrack:   row.talk_track ?? "",
     tags:        row.tags ?? [],
     content:     row.content ?? [],
+    status:      row.status ?? "active",
+    archivedAt:  row.archived_at?.split("T")[0] ?? "",
     updatedAt:   row.updated_at?.split("T")[0] ?? "",
   };
 }
 
-/** Normalise app card → DB insert/update shape */
-function cardToDb(tenantId, card, userId) {
+/** Normalise app card → DB insert/update shape.
+ *  created_by / updated_by / updated_at / archived_at are server-authoritative
+ *  (migration 068 trigger) — never sent from the client. `status` is intentionally
+ *  omitted here too: creation always defaults to 'active', and archive/restore go
+ *  through the single setBattleCardArchived path, so a normal save never changes it. */
+function cardToDb(tenantId, card) {
   return {
     tenant_id:   tenantId,
     category_id: card.categoryId || null,
@@ -1442,10 +1466,8 @@ function cardToDb(tenantId, card, userId) {
     weakness:    card.weakness ?? "",
     our_win:     card.ourWin ?? "",
     talk_track:  card.talkTrack ?? "",
-    tags:        card.tags ?? [],
+    tags:        normalizeCardTags(card.tags),
     content:     card.content ?? [],
-    created_by:  userId ?? null,
-    updated_at:  new Date().toISOString(),
   };
 }
 
@@ -1473,7 +1495,7 @@ export async function getTenantBattleCards(tenantId) {
   if (!tenantId) return { data: [], error: null };
   const { data, error } = await supabase
     .from("tenant_battle_cards")
-    .select("id, category_id, title, subtitle, summary, strength, weakness, our_win, talk_track, tags, content, updated_at")
+    .select("id, category_id, title, subtitle, summary, strength, weakness, our_win, talk_track, tags, content, status, archived_at, updated_at")
     .eq("tenant_id", tenantId)
     .order("title", { ascending: true });
   return { data: data ? data.map(dbToCard) : null, error };
@@ -1488,9 +1510,9 @@ export async function getTenantBattleCards(tenantId) {
  * @param {string} [userId]
  * @returns {Promise<{ data: Object|null, error: Object|null }>}
  */
-export async function saveBcCategory(tenantId, cat, userId) {
+export async function saveBcCategory(tenantId, cat) {
   const isExisting = cat.id && !cat.id.startsWith("cat_") && cat.id.length === 36;
-  const payload = categoryToDb(tenantId, cat, userId);
+  const payload = categoryToDb(tenantId, cat);
 
   if (isExisting) {
     const { data, error } = await supabase
@@ -1549,11 +1571,11 @@ export async function deleteBcCategory(tenantId, catId) {
  * @param {string} [userId]
  * @returns {Promise<{ data: Object|null, error: Object|null }>}
  */
-export async function saveBattleCard(tenantId, card, userId) {
+export async function saveBattleCard(tenantId, card) {
   const isExisting = card.id && !card.id.startsWith("bc_") && card.id.length === 36;
-  const payload = cardToDb(tenantId, card, userId);
+  const payload = cardToDb(tenantId, card);
 
-  const selectCols = "id, category_id, title, subtitle, summary, strength, weakness, our_win, talk_track, tags, content, updated_at";
+  const selectCols = "id, category_id, title, subtitle, summary, strength, weakness, our_win, talk_track, tags, content, status, archived_at, updated_at";
 
   if (isExisting) {
     const { data, error } = await supabase
@@ -1575,19 +1597,28 @@ export async function saveBattleCard(tenantId, card, userId) {
 }
 
 /**
- * Delete a battle card by ID.
+ * Archive or restore a battle card — the ONE canonical status path (no other
+ * component flips status). Archiving hides the card from learners; restoring
+ * brings it back with the same id and content. `status` is the only field sent;
+ * archived_at / updated_by / updated_at are derived server-side (migration 068
+ * trigger). Both directions are idempotent (re-archiving/re-restoring is a safe
+ * no-op). Permanent deletion is intentionally NOT exposed.
  *
  * @param {string} tenantId
  * @param {string} cardId
- * @returns {Promise<{ error: Object|null }>}
+ * @param {boolean} archived  true → archive, false → restore
+ * @returns {Promise<{ data: Object|null, error: Object|null }>}
  */
-export async function deleteBattleCard(tenantId, cardId) {
-  const { error } = await supabase
+export async function setBattleCardArchived(tenantId, cardId, archived) {
+  const selectCols = "id, category_id, title, subtitle, summary, strength, weakness, our_win, talk_track, tags, content, status, archived_at, updated_at";
+  const { data, error } = await supabase
     .from("tenant_battle_cards")
-    .delete()
+    .update({ status: archived ? "archived" : "active" })
     .eq("id", cardId)
-    .eq("tenant_id", tenantId);
-  return { error };
+    .eq("tenant_id", tenantId)
+    .select(selectCols)
+    .single();
+  return { data: data ? dbToCard(data) : null, error };
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
