@@ -21,13 +21,14 @@ const grab = (re) => { const m = app.match(re); if (!m) throw new Error("could n
 // ── Extract + eval the pure helpers together ─────────────────────────────────
 const src = [
   grab(/function bcCardTags\([\s\S]*?\n\}/),
+  grab(/function bcPlainText\([\s\S]*?\n\}/),   // rich-text bodies: readable text for search + meaningful-empty validation
   grab(/function bcMatchesSearch\([\s\S]*?\n\}/),
   grab(/function bcMatchesTags\([\s\S]*?\n\}/),
   grab(/function bcDistinctTags\([\s\S]*?\n\}/),
   grab(/const BC_REQUIRED_TEXT_FIELDS = \[[\s\S]*?\];/),
   grab(/function bcInvalidFields\([\s\S]*?\n\}/),
 ].join("\n");
-const H = new Function(`${src}; return { bcMatchesSearch, bcMatchesTags, bcDistinctTags, bcInvalidFields };`)(); // eslint-disable-line no-new-func
+const H = new Function(`${src}; return { bcPlainText, bcMatchesSearch, bcMatchesTags, bcDistinctTags, bcInvalidFields };`)(); // eslint-disable-line no-new-func
 
 // Production-like data (post-069): the reported card set.
 const cards = [
@@ -87,8 +88,12 @@ ok("production card 'without a tag' (blank core fields) would be invalid",
 // ── (6) Structural: picker + wiring ──────────────────────────────────────────
 ok("BcTagPicker component exists (create + no-dup logic)",
    /function BcTagPicker\(/.test(app) && /const canCreate = typed && !alreadySelected && !exactMatch/.test(app));
-ok("picker distinguishes selected (filled) vs available (add existing)",
-   /Add existing/.test(app) && /No tags selected yet/.test(app));
+// Reuses the ACTUAL Quiz builder surface: TagChip for selected tags, the same
+// ClassificationBadge state, and the "+ Add a tag…" <select> for existing tags.
+ok("picker reuses Quiz TagChip for selected tags",
+   /\(selected \?\? \[\]\)\.map\(t => <TagChip key=\{t\} label=\{t\} onRemove/.test(app));
+ok("picker reuses Quiz '+ Add a tag…' select + tagged/tag_required badge",
+   /\+ Add a tag…/.test(app) && /<ClassificationBadge state=\{hasTags \? "tagged" : "tag_required"\}/.test(app));
 const admin = app.slice(app.indexOf("function BattleCardsAdminScreen("), app.indexOf("function BattleCardsScreen("));
 ok("editor uses BcTagPicker with tenant suggestions", /<BcTagPicker/.test(admin) && /const tagSuggestions = /.test(admin));
 ok("suggestions include the edited card's own tags (archived-only-it-uses shown)", /for \(const t of \(draft\.tags \?\? \[\]\)\)/.test(admin));

@@ -11234,47 +11234,11 @@ function LessonBlock({ block, cardStyle }) {
 
   if (block.type === "text") {
     if (!c.body) return null;
-    // Minimal markdown renderer: **bold**, *italic*, __underline__, - bullets, 1. numbered
-    const parseInline = (text) => {
-      const parts = [];
-      let rest = text, k = 0;
-      while (rest) {
-        const m = rest.match(/(\*\*(.+?)\*\*)|(__(.+?)__)|(\*(.+?)\*)/);
-        if (!m) { parts.push(rest); break; }
-        if (m.index > 0) parts.push(rest.slice(0, m.index));
-        if (m[1]) parts.push(<strong key={k++}>{m[2]}</strong>);
-        else if (m[3]) parts.push(<u key={k++}>{m[4]}</u>);
-        else parts.push(<em key={k++}>{m[6]}</em>);
-        rest = rest.slice(m.index + m[0].length);
-      }
-      return parts;
-    };
-    const renderBody = (text) => {
-      const lines = text.split("\n");
-      const out = [];
-      let i = 0;
-      while (i < lines.length) {
-        if (lines[i].startsWith("- ")) {
-          const items = [];
-          while (i < lines.length && lines[i].startsWith("- ")) { items.push(lines[i].slice(2)); i++; }
-          out.push(<ul key={i} style={{ margin: "4px 0 8px", paddingLeft: 22 }}>{items.map((t, j) => <li key={j} style={{ fontSize: 14, lineHeight: 1.8, color: C.text }}>{parseInline(t)}</li>)}</ul>);
-        } else if (/^\d+\.\s/.test(lines[i])) {
-          const items = [];
-          while (i < lines.length && /^\d+\.\s/.test(lines[i])) { items.push(lines[i].replace(/^\d+\.\s/, "")); i++; }
-          out.push(<ol key={i} style={{ margin: "4px 0 8px", paddingLeft: 22 }}>{items.map((t, j) => <li key={j} style={{ fontSize: 14, lineHeight: 1.8, color: C.text }}>{parseInline(t)}</li>)}</ol>);
-        } else if (lines[i] === "") {
-          out.push(<br key={i} />);
-          i++;
-        } else {
-          out.push(<p key={i} style={{ margin: "0 0 6px", fontSize: 14, lineHeight: 1.8, color: C.text }}>{parseInline(lines[i])}</p>);
-          i++;
-        }
-      }
-      return out;
-    };
+    // Shared safe markdown-subset renderer (see renderMarkdown): **bold**, *italic*,
+    // __underline__, - bullets, 1. numbered — emitted as escaped React elements.
     return withHeader(
       <div style={style}>
-        <div style={{ wordBreak: "break-word" }}>{renderBody(c.body)}</div>
+        <div style={{ wordBreak: "break-word" }}>{renderMarkdown(c.body)}</div>
       </div>
     );
   }
@@ -11778,6 +11742,116 @@ function htmlToMd(el) {
   return raw.replace(/\n{3,}/g, "\n\n").replace(/^\n+|\n+$/g, "");
 }
 
+// ── Shared markdown-subset renderer (extracted from LessonBlock so Lessons AND
+// Battle Cards render the SAME safe React-element output — never raw HTML, so
+// script/event-handler injection is impossible by construction). ────────────────
+function parseInlineMarkdown(text) {
+  const parts = [];
+  let rest = text, k = 0;
+  while (rest) {
+    const m = rest.match(/(\*\*(.+?)\*\*)|(__(.+?)__)|(\*(.+?)\*)/);
+    if (!m) { parts.push(rest); break; }
+    if (m.index > 0) parts.push(rest.slice(0, m.index));
+    if (m[1]) parts.push(<strong key={k++}>{m[2]}</strong>);
+    else if (m[3]) parts.push(<u key={k++}>{m[4]}</u>);
+    else parts.push(<em key={k++}>{m[6]}</em>);
+    rest = rest.slice(m.index + m[0].length);
+  }
+  return parts;
+}
+function renderMarkdown(text) {
+  const lines = String(text ?? "").split("\n");
+  const out = [];
+  let i = 0;
+  while (i < lines.length) {
+    if (lines[i].startsWith("- ")) {
+      const items = [];
+      while (i < lines.length && lines[i].startsWith("- ")) { items.push(lines[i].slice(2)); i++; }
+      out.push(<ul key={i} style={{ margin: "4px 0 8px", paddingLeft: 22 }}>{items.map((t, j) => <li key={j} style={{ fontSize: 14, lineHeight: 1.8, color: C.text }}>{parseInlineMarkdown(t)}</li>)}</ul>);
+    } else if (/^\d+\.\s/.test(lines[i])) {
+      const items = [];
+      while (i < lines.length && /^\d+\.\s/.test(lines[i])) { items.push(lines[i].replace(/^\d+\.\s/, "")); i++; }
+      out.push(<ol key={i} style={{ margin: "4px 0 8px", paddingLeft: 22 }}>{items.map((t, j) => <li key={j} style={{ fontSize: 14, lineHeight: 1.8, color: C.text }}>{parseInlineMarkdown(t)}</li>)}</ol>);
+    } else if (lines[i] === "") {
+      out.push(<br key={i} />);
+      i++;
+    } else {
+      out.push(<p key={i} style={{ margin: "0 0 6px", fontSize: 14, lineHeight: 1.8, color: C.text }}>{parseInlineMarkdown(lines[i])}</p>);
+      i++;
+    }
+  }
+  return out;
+}
+// Plain visible text from the markdown subset — for search + meaningful-empty
+// validation (strips list markers and *,_,` bold/italic/underline markup).
+function bcPlainText(md) {
+  return String(md ?? "")
+    .split("\n")
+    .map(l => l.replace(/^\s*(?:-\s+|\d+\.\s+)/, ""))
+    .join(" ")
+    .replace(/\*\*(.+?)\*\*/g, "$1").replace(/__(.+?)__/g, "$1").replace(/\*(.+?)\*/g, "$1")
+    .replace(/[*_]/g, "")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+// Shared rich-text EDITOR (extracted from BlockEditor's text branch) — one
+// implementation for Lessons and Battle Cards: contentEditable + the same five
+// execCommand formats, seeding from mdToHtml and syncing back via htmlToMd.
+// `seedKey` reseeds the editor from `value` on mount and whenever it changes
+// (e.g. Lesson block-type switch, or a Battle Card open/resume).
+function MarkdownEditor({ value = "", onChange, placeholder = "", minHeight = 120, seedKey, invalid = false }) {
+  const editRef = React.useRef(null);
+  const [empty, setEmpty] = React.useState(!String(value ?? "").trim());
+  React.useEffect(() => {
+    if (!editRef.current) return;
+    editRef.current.innerHTML = mdToHtml(value ?? "");
+    setEmpty(!String(value ?? "").trim());
+  }, [seedKey]); // eslint-disable-line react-hooks/exhaustive-deps
+  const sync = () => {
+    if (!editRef.current) return;
+    const md = htmlToMd(editRef.current);
+    setEmpty(!md.trim());
+    onChange?.(md);
+  };
+  const execFmt = (cmd) => { editRef.current?.focus(); document.execCommand(cmd, false, null); setTimeout(sync, 0); };
+  const fmtBtn = (label, title, action) => (
+    <button key={title} type="button" onMouseDown={e => e.preventDefault()} onClick={action} title={title} style={{
+      padding: "3px 8px", borderRadius: 5, border: `1px solid ${C.border}`,
+      background: C.white, fontSize: 12, cursor: "pointer", color: C.textSub, lineHeight: 1.4,
+    }}>{label}</button>
+  );
+  return (
+    <div>
+      <div style={{ display: "flex", gap: 5, marginBottom: 6, flexWrap: "wrap" }}>
+        {fmtBtn(<b>B</b>, "Bold", () => execFmt("bold"))}
+        {fmtBtn(<i>I</i>, "Italic", () => execFmt("italic"))}
+        {fmtBtn(<u>U</u>, "Underline", () => execFmt("underline"))}
+        {fmtBtn("•—", "Bullet list", () => execFmt("insertUnorderedList"))}
+        {fmtBtn("1.", "Numbered list", () => execFmt("insertOrderedList"))}
+      </div>
+      <div style={{ position: "relative" }}>
+        {placeholder && empty && (
+          <div style={{ position: "absolute", top: 10, left: 14, fontSize: 14, color: C.textMuted, pointerEvents: "none" }}>{placeholder}</div>
+        )}
+        <div
+          ref={editRef}
+          contentEditable
+          suppressContentEditableWarning
+          onInput={sync}
+          onBlur={sync}
+          style={{
+            width: "100%", boxSizing: "border-box", padding: "10px 14px", borderRadius: 10,
+            border: `1.5px solid ${invalid ? C.red : C.border}`, background: C.cardBg, fontSize: 14, color: C.text,
+            minHeight, outline: "none", overflowY: "auto", whiteSpace: "pre-wrap", wordBreak: "break-word",
+            lineHeight: 1.7, cursor: "text", fontFamily: "inherit",
+          }}
+        />
+      </div>
+    </div>
+  );
+}
+
 // Used inside LessonBuilderModal.
 function BlockEditor({ block, onChange, onRemove, onMoveUp, onMoveDown, isFirst, isLast }) {
   const BLOCK_TYPES   = ["text", "image", "video", "flipcard", "quiz", "recording"];
@@ -11786,30 +11860,6 @@ function BlockEditor({ block, onChange, onRemove, onMoveUp, onMoveDown, isFirst,
   const setC          = (key, val) => onChange({ ...block, content: { ...c, [key]: val } });
   const setHeader     = (val)      => onChange({ ...block, header: val });
   const setType       = (t)        => onChange({ ...block, type: t, content: {} });
-
-  // WYSIWYG rich-text for text blocks — contenteditable + execCommand
-  const editRef   = React.useRef(null);
-  // Initialize (or re-initialize when block type switches to "text")
-  React.useEffect(() => {
-    if (block.type !== "text" || !editRef.current) return;
-    editRef.current.innerHTML = mdToHtml(c.body ?? "");
-  }, [block.type]); // eslint-disable-line react-hooks/exhaustive-deps
-  // Sync contenteditable DOM → markdown state
-  const syncToMd = () => {
-    if (!editRef.current) return;
-    setC("body", htmlToMd(editRef.current));
-  };
-  const execFmt = (cmd) => {
-    editRef.current?.focus();
-    document.execCommand(cmd, false, null);
-    setTimeout(syncToMd, 0);
-  };
-  const fmtBtn = (label, title, action) => (
-    <button key={title} type="button" onClick={action} title={title} style={{
-      padding: "3px 8px", borderRadius: 5, border: `1px solid ${C.border}`,
-      background: C.white, fontSize: 12, cursor: "pointer", color: C.textSub, lineHeight: 1.4,
-    }}>{label}</button>
-  );
 
   const inputStyle = { width: "100%", padding: "9px 12px", borderRadius: 8, border: `1px solid ${C.border}`, fontSize: 13, color: C.text, background: C.pageBg, boxSizing: "border-box" };
   const taStyle    = { ...inputStyle, resize: "vertical", lineHeight: 1.5 };
@@ -11858,32 +11908,7 @@ function BlockEditor({ block, onChange, onRemove, onMoveUp, onMoveDown, isFirst,
 
       {/* Type-specific fields */}
       {block.type === "text" && (
-        <>
-          <div style={{ display: "flex", gap: 5, marginBottom: 6, flexWrap: "wrap" }}>
-            {fmtBtn(<b>B</b>,  "Bold",          () => execFmt("bold"))}
-            {fmtBtn(<i>I</i>,  "Italic",        () => execFmt("italic"))}
-            {fmtBtn(<u>U</u>,  "Underline",     () => execFmt("underline"))}
-            {fmtBtn("•—",      "Bullet list",   () => execFmt("insertUnorderedList"))}
-            {fmtBtn("1.",      "Numbered list", () => execFmt("insertOrderedList"))}
-          </div>
-          <div
-            ref={editRef}
-            contentEditable
-            suppressContentEditableWarning
-            onInput={syncToMd}
-            onBlur={syncToMd}
-            style={{
-              ...inputStyle,
-              minHeight: 120,
-              outline: "none",
-              overflowY: "auto",
-              whiteSpace: "pre-wrap",
-              wordBreak: "break-word",
-              lineHeight: 1.7,
-              cursor: "text",
-            }}
-          />
-        </>
+        <MarkdownEditor value={c.body ?? ""} onChange={v => setC("body", v)} seedKey={block.type} minHeight={120} />
       )}
       {block.type === "image" && (
         <>
@@ -15725,9 +15750,10 @@ function bcDistinctTags(cards) {
 function bcMatchesSearch(c, q) {
   if (!q) return true;
   const s = q.toLowerCase();
+  // Summary is rich text (markdown subset) — search its READABLE text, not markup.
   return (c.title ?? "").toLowerCase().includes(s)
     || (c.subtitle ?? "").toLowerCase().includes(s)
-    || (c.summary ?? "").toLowerCase().includes(s)
+    || bcPlainText(c.summary).toLowerCase().includes(s)
     || bcCardTags(c).some(t => String(t).toLowerCase().includes(s));
 }
 // selectedLower: lowercased Set. Empty = All. Otherwise a card matches if it
@@ -15751,20 +15777,61 @@ const BC_REQUIRED_TEXT_FIELDS = [
 // title, then tags (>=1), then the required competitive-detail text fields.
 function bcInvalidFields(draft, tags) {
   const invalid = [];
-  if (!String(draft?.title ?? "").trim()) invalid.push("title");
+  if (!String(draft?.title ?? "").trim()) invalid.push("title");  // title is plain text
   if (!(Array.isArray(tags) ? tags : []).length) invalid.push("tags");
   for (const f of BC_REQUIRED_TEXT_FIELDS) {
     if (f.key === "title") continue;
-    if (!String(draft?.[f.key] ?? "").trim()) invalid.push(f.key);
+    // Rich-text bodies: require MEANINGFUL visible text — empty HTML, whitespace,
+    // <p><br></p>/empty lists all serialize to "" and formatting-only markup
+    // strips to "" via bcPlainText, so none of them satisfy a required field.
+    if (!bcPlainText(draft?.[f.key])) invalid.push(f.key);
   }
   return invalid;
 }
 
-// Quiz-style Battle Card tag picker: shows the tenant's existing active tags as
-// selectable pills, lets the manager create a new normalized tag (no blanks, no
-// case-insensitive duplicates), and clearly separates SELECTED from AVAILABLE.
-// Keyboard (Enter creates/selects, Backspace removes last) + mouse. Source of truth
-// is tenant_battle_cards.tags[] — derived, not a second taxonomy. `suggestions`
+// ── Durable unsaved-draft persistence (Battle Card editor) ───────────────────
+// Draft state is scoped by tenant + authenticated user + editor target (a new
+// card vs a specific card id) so one account's/tenant's draft can NEVER surface
+// in another account, and an unsaved create draft never collides with an unsaved
+// edit of an existing card. Stored in localStorage (the app's scoped-key
+// convention, ralli_bc_*) so an interrupted session — reload, crash, accidental
+// nav — can be resumed. Cleared on sign-out (see clearBattleCardDrafts).
+const BC_DRAFT_PREFIX = "ralli_bc_draft_";
+function bcDraftKey(tenant, user, target) {
+  return `${BC_DRAFT_PREFIX}${tenant || "demo"}_${user || "guest"}_${target === "new" ? "new" : target}`;
+}
+// Human-readable "when the draft was saved" for the Resume banner.
+function bcRelativeTime(ms) {
+  if (!ms) return "just now";
+  const diff = Date.now() - ms;
+  if (diff < 60_000) return "just now";
+  const mins = Math.floor(diff / 60_000);
+  if (mins < 60) return `${mins} minute${mins === 1 ? "" : "s"} ago`;
+  const hrs = Math.floor(mins / 60);
+  if (hrs < 24) return `${hrs} hour${hrs === 1 ? "" : "s"} ago`;
+  const days = Math.floor(hrs / 24);
+  if (days < 7) return `${days} day${days === 1 ? "" : "s"} ago`;
+  try { return `on ${new Date(ms).toLocaleDateString()}`; } catch { return "earlier"; }
+}
+// Clears EVERY Battle Card draft on this device — used only on sign-out so a
+// signed-out session leaves no unsaved draft behind for the next account.
+function clearBattleCardDrafts() {
+  try {
+    const del = [];
+    for (let i = 0; i < localStorage.length; i++) {
+      const k = localStorage.key(i);
+      if (k && k.startsWith(BC_DRAFT_PREFIX)) del.push(k);
+    }
+    for (const k of del) localStorage.removeItem(k);
+  } catch {}
+}
+
+// Quiz-style Battle Card tag picker. Reuses the actual Quiz builder tag surface:
+// the same TagChip component for selected tags, the same ClassificationBadge
+// (tagged / tag_required) and the same "+ Add a tag…" <select> for adding an
+// existing tag. Battle Card tags are free text stored in tenant_battle_cards.tags[]
+// (NOT the governed Quiz taxonomy), so the one addition Quiz doesn't need is an
+// inline create input (no blanks, no case-insensitive duplicates). `suggestions`
 // already excludes archived-only tags (unless the edited card already uses one).
 function BcTagPicker({ selected, suggestions, onAdd, onRemove, error }) {
   const [input, setInput] = useState("");
@@ -15780,43 +15847,52 @@ function BcTagPicker({ selected, suggestions, onAdd, onRemove, error }) {
     if (!selLower.has(t.toLowerCase())) onAdd(t);  // onAdd normalizes + dedupes
     setInput("");
   };
+  const hasTags = (selected ?? []).length > 0;
+  // Same bordered-card shell + header + badge as the Quiz builder's tag section.
   return (
-    <div>
-      <div style={{ fontSize: 11, fontWeight: 700, color: C.textMuted, marginBottom: 6 }}>Selected {selected?.length ? `· ${selected.length}` : ""}</div>
-      <div style={{ display: "flex", flexWrap: "wrap", gap: 6, marginBottom: 10, minHeight: 28 }}>
-        {(selected ?? []).length === 0
-          ? <span style={{ fontSize: 12, color: C.textMuted }}>No tags selected yet</span>
-          : (selected ?? []).map(t => (
-              <span key={t} style={{ display: "inline-flex", alignItems: "center", gap: 6, padding: "4px 10px", borderRadius: 999, background: C.orange, color: "#fff", fontSize: 12, fontWeight: 700 }}>
-                {t}
-                <button onClick={() => onRemove(t)} title="Remove tag" style={{ background: "none", border: "none", cursor: "pointer", color: "#fff", fontSize: 13, lineHeight: 1, padding: 0 }}>✕</button>
-              </span>
-            ))}
+    <div style={{ border: `1px solid ${error ? C.red : C.border}`, borderRadius: 12, padding: 16, background: C.white }}>
+      <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
+        <span style={{ fontSize: 13, fontWeight: 800, color: C.text }}>Tags</span>
+        <ClassificationBadge state={hasTags ? "tagged" : "tag_required"} />
       </div>
-      <input
-        style={{ width: "100%", boxSizing: "border-box", padding: "10px 14px", borderRadius: 10, border: `1.5px solid ${error ? C.red : C.border}`, background: C.cardBg, fontSize: 14, color: C.text, outline: "none", fontFamily: "inherit" }}
-        value={input}
-        onChange={e => setInput(e.target.value)}
-        onKeyDown={e => {
-          if (e.key === "Enter" || e.key === ",") { e.preventDefault(); commit(); }
-          else if (e.key === "Backspace" && !input && (selected?.length)) { onRemove(selected[selected.length - 1]); }
-        }}
-        placeholder="Type a tag and press Enter to add or create"
-      />
-      {canCreate && (
-        <button onClick={commit} style={{ marginTop: 8, padding: "6px 12px", borderRadius: 999, border: `1px dashed ${C.orange}`, background: C.orangeLight, color: C.orange, fontSize: 12, fontWeight: 700, cursor: "pointer" }}>+ Create “{typed}”</button>
+
+      {/* Selected tags — the exact Quiz TagChip component (filled pill + × remove) */}
+      {hasTags && (
+        <div style={{ display: "flex", flexWrap: "wrap", gap: 8, marginTop: 12 }}>
+          {(selected ?? []).map(t => <TagChip key={t} label={t} onRemove={() => onRemove(t)} />)}
+        </div>
       )}
-      {available.length > 0 && (
-        <>
-          <div style={{ fontSize: 11, fontWeight: 700, color: C.textMuted, margin: "12px 0 6px" }}>Add existing</div>
-          <div style={{ display: "flex", flexWrap: "wrap", gap: 6 }}>
-            {available.map(s => (
-              <button key={s} onClick={() => onAdd(s)} style={{ ...bcChipStyle(false), cursor: "pointer" }}>+ {s}</button>
-            ))}
-          </div>
-        </>
+
+      {/* Add existing — the Quiz "+ Add a tag…" <select> — plus an inline create
+          input, since Battle Card tags are free text (not governed taxonomy). */}
+      <div style={{ display: "flex", alignItems: "center", gap: 10, marginTop: 12, flexWrap: "wrap" }}>
+        <select value="" onChange={e => { if (e.target.value) onAdd(e.target.value); }}
+          disabled={available.length === 0}
+          style={{ padding: "8px 10px", borderRadius: 8, border: `1px solid ${C.border}`, background: C.inputBg, fontSize: 13, color: C.text, minWidth: 180, cursor: available.length === 0 ? "default" : "pointer" }}>
+          <option value="">{available.length === 0 ? "No existing tags" : "+ Add a tag…"}</option>
+          {available.map(s => <option key={s} value={s}>{s}</option>)}
+        </select>
+        <input
+          style={{ flex: 1, minWidth: 160, boxSizing: "border-box", padding: "8px 10px", borderRadius: 8, border: `1px solid ${C.border}`, background: C.inputBg, fontSize: 13, color: C.text, outline: "none", fontFamily: "inherit" }}
+          value={input}
+          onChange={e => setInput(e.target.value)}
+          onKeyDown={e => {
+            if (e.key === "Enter" || e.key === ",") { e.preventDefault(); commit(); }
+            else if (e.key === "Backspace" && !input && (selected?.length)) { onRemove(selected[selected.length - 1]); }
+          }}
+          placeholder="Create a tag…"
+        />
+        {canCreate && (
+          <button onClick={commit} style={{ padding: "8px 12px", borderRadius: 8, border: `1px solid ${C.orange}`, background: C.orangeLight, color: C.orange, fontSize: 12, fontWeight: 700, cursor: "pointer" }}>+ Create “{typed}”</button>
+        )}
+      </div>
+
+      {/* One guidance line (mirrors Quiz): validation error when nothing selected. */}
+      {!hasTags && (
+        <div style={{ fontSize: 12, marginTop: 10, fontWeight: error ? 700 : 400, color: error ? C.red : C.textMuted }}>
+          {error ? "Add at least one tag before saving — Battle Cards are organized by tags." : "Select at least one tag to classify this card."}
+        </div>
       )}
-      {error && <div style={{ fontSize: 12, color: C.red, fontWeight: 700, marginTop: 8 }}>Add at least one tag before saving — Battle Cards are organized by tags.</div>}
     </div>
   );
 }
@@ -15893,29 +15969,32 @@ function BattleCardDetail({ card, onBack, actions }) {
           )}
           {card.updatedAt && <div style={{ fontSize: 11, color: C.textMuted, marginTop: 10 }}>Updated {card.updatedAt}</div>}
         </div>
-        {card.summary && <p style={{ margin: "14px 4px 0", fontSize: 14, color: C.text, lineHeight: 1.6, maxWidth: 640 }}>{card.summary}</p>}
+        {card.summary && <div style={{ margin: "14px 4px 0", maxWidth: 640 }}>{renderMarkdown(card.summary)}</div>}
       </div>
 
-      {/* Content panels — accent borders + auto-fit so they read as detail, not list rows */}
+      {/* Content panels — accent borders + auto-fit so they read as detail, not list rows.
+          Bodies render via the shared safe markdown renderer (identical for learners). */}
       <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(240px, 1fr))", gap: 14 }}>
         <Card style={{ borderTop: `3px solid ${C.red}` }}>
           <div style={{ fontSize: 12, fontWeight: 700, color: C.red, letterSpacing: "0.06em", marginBottom: 12 }}>THEIR STRENGTHS</div>
-          <p style={{ margin: 0, fontSize: 14, color: C.text, lineHeight: 1.6 }}>{card.strength}</p>
+          <div>{renderMarkdown(card.strength)}</div>
         </Card>
         <Card style={{ borderTop: `3px solid ${C.yellow}` }}>
           <div style={{ fontSize: 12, fontWeight: 700, color: C.yellow, letterSpacing: "0.06em", marginBottom: 12 }}>THEIR WEAKNESSES</div>
-          <p style={{ margin: 0, fontSize: 14, color: C.text, lineHeight: 1.6 }}>{card.weakness}</p>
+          <div>{renderMarkdown(card.weakness)}</div>
         </Card>
         <Card style={{ borderTop: `3px solid ${C.green}` }}>
           <div style={{ fontSize: 12, fontWeight: 700, color: C.green, letterSpacing: "0.06em", marginBottom: 12 }}>WHY WE WIN</div>
-          <p style={{ margin: 0, fontSize: 14, color: C.text, lineHeight: 1.6 }}>{card.ourWin}</p>
+          <div>{renderMarkdown(card.ourWin)}</div>
         </Card>
       </div>
 
-      <Card style={{ background: C.pageBg }}>
-        <div style={{ fontSize: 12, fontWeight: 700, color: C.textSub, letterSpacing: "0.06em", marginBottom: 12 }}>TALK TRACK</div>
-        <p style={{ margin: 0, fontSize: 14, color: C.text, lineHeight: 1.7, fontStyle: "italic" }}>"{card.talkTrack}"</p>
-      </Card>
+      {card.talkTrack && (
+        <Card style={{ background: C.pageBg }}>
+          <div style={{ fontSize: 12, fontWeight: 700, color: C.textSub, letterSpacing: "0.06em", marginBottom: 12 }}>TALK TRACK</div>
+          <div style={{ fontStyle: "italic" }}>{renderMarkdown(card.talkTrack)}</div>
+        </Card>
+      )}
 
       {card.content?.length > 0 && (
         <div>
@@ -15923,8 +16002,8 @@ function BattleCardDetail({ card, onBack, actions }) {
           <div style={{ display: "flex", flexDirection: "column", gap: 14 }}>
             {card.content.map((section, i) => (
               <Card key={i}>
-                <h3 style={{ margin: "0 0 10px", fontSize: 15, fontWeight: 800, color: C.text }}>{section.heading}</h3>
-                <p style={{ margin: 0, fontSize: 14, color: C.text, lineHeight: 1.7 }}>{section.body}</p>
+                {section.heading && <h3 style={{ margin: "0 0 10px", fontSize: 15, fontWeight: 800, color: C.text }}>{section.heading}</h3>}
+                <div>{renderMarkdown(section.body)}</div>
               </Card>
             ))}
           </div>
@@ -15935,7 +16014,7 @@ function BattleCardDetail({ card, onBack, actions }) {
 }
 
 // ── BattleCardsAdminScreen — manager: one list (active + archived), tags only ───
-function BattleCardsAdminScreen({ cards, onSaveCard, onSetArchived, isReal = false, isLoading = false, loadError = null, onRetry }) {
+function BattleCardsAdminScreen({ cards, onSaveCard, onSetArchived, isReal = false, isLoading = false, loadError = null, onRetry, tenantId = null, userId = null }) {
   const mobile = useMobile();
   const [view,         setView]         = useState("list"); // list | detail | editCard
   const [activeCardId, setActiveCardId] = useState(null);
@@ -15948,13 +16027,26 @@ function BattleCardsAdminScreen({ cards, onSaveCard, onSetArchived, isReal = fal
   const [saveError,    setSaveError]    = useState(false); // top-level "fix required fields" banner
   const fieldRefs = React.useRef({});
 
+  // ── Durable unsaved-draft persistence (scoped by tenant + user + target) ──
+  const draftTenant = tenantId ?? "demo";
+  const draftUser   = userId ?? "guest";
+  const [resumeInfo, setResumeInfo]   = useState(null);  // {savedAt, serverNewer} | null (banner for open editor)
+  const [editorSeed, setEditorSeed]   = useState(0);     // bumped on open/resume to reseed rich editors
+  const editorBaselineRef = React.useRef(null);          // server content (JSON) at editor-open time
+  const pendingResumeRef  = React.useRef(null);          // the stored draft snapshot offered for Resume
+
   const blankCard = () => ({ id: `card-${Date.now()}`, title: "", subtitle: "", summary: "", strength: "", weakness: "", ourWin: "", talkTrack: "", tags: [], content: [] });
   const [draft, setDraft] = useState(blankCard);
-  // Setting a field clears its own inline error as soon as it becomes non-blank.
+  // Setting a plain-text field clears its own inline error as soon as it becomes non-blank.
   const setF = (field) => (e) => {
     const val = e.target.value;
     setDraft(d => ({ ...d, [field]: val }));
     if (errors[field] && String(val).trim()) setErrors(er => ({ ...er, [field]: false }));
+  };
+  // Setting a RICH-text field (markdown). Error clears once meaningful visible text exists.
+  const setRich = (field) => (val) => {
+    setDraft(d => ({ ...d, [field]: val }));
+    if (errors[field] && bcPlainText(val)) setErrors(er => ({ ...er, [field]: false }));
   };
 
   const activeCards   = cards.filter(c => !bcIsArchived(c));
@@ -15995,9 +16087,77 @@ function BattleCardsAdminScreen({ cards, onSaveCard, onSetArchived, isReal = fal
     return [...seen.values()].sort((a, b) => a.localeCompare(b));
   })();
 
-  const openNewCard  = () => { setDraft(blankCard()); setErrors({}); setSaveError(false); setEditingCard("new"); setView("editCard"); };
-  const openEditCard = (card) => { setDraft({ ...card, tags: card.tags ?? [] }); setErrors({}); setSaveError(false); setEditingCard(card.id); setView("editCard"); };
+  // Sections carry a UI-only stable _id so rich-text editors keep their content on
+  // reorder; it is stripped before save (never persisted to the DB content JSON).
+  const withSecIds = (content) => (content ?? []).map((s, i) => ({ _id: s._id ?? `sec-${Date.now()}-${i}`, ...s }));
+
+  // Opening the editor: set the server baseline, then look for a durable draft for
+  // THIS exact target (new vs this card id, this tenant+user). If one exists and
+  // differs from the server content, offer Resume/Discard — we never silently
+  // replace the (possibly newer) server content with an older local draft.
+  const openEditor = (target, baseCard) => {
+    const base = { ...baseCard, tags: baseCard.tags ?? [], content: withSecIds(baseCard.content) };
+    editorBaselineRef.current = JSON.stringify(base);
+    pendingResumeRef.current = null;
+    let resume = null;
+    try {
+      const raw = localStorage.getItem(bcDraftKey(draftTenant, draftUser, target));
+      if (raw) {
+        const parsed = JSON.parse(raw);
+        const stored = parsed?.draft;
+        if (stored && JSON.stringify({ ...stored, content: withSecIds(stored.content) }) !== editorBaselineRef.current) {
+          pendingResumeRef.current = { ...stored, content: withSecIds(stored.content) };
+          // Newer-server-content guard: the card's authoritative Last Updated date is
+          // after the day this draft was saved → resuming would drop newer changes.
+          const savedDay = new Date(parsed.savedAt).toISOString().slice(0, 10);
+          const serverNewer = target !== "new" && !!baseCard.updatedAt && savedDay < baseCard.updatedAt;
+          resume = { savedAt: parsed.savedAt, serverNewer };
+        } else {
+          localStorage.removeItem(bcDraftKey(draftTenant, draftUser, target)); // stale/no-op draft
+        }
+      }
+    } catch {}
+    setDraft(base);
+    setErrors({}); setSaveError(false);
+    setResumeInfo(resume);
+    setEditingCard(target);
+    setEditorSeed(s => s + 1);
+    setView("editCard");
+  };
+  const openNewCard  = () => openEditor("new", blankCard());
+  const openEditCard = (card) => openEditor(card.id, card);
   const cancelEditCard = () => setView(activeCardId ? "detail" : "list");
+
+  // Autosave: while editing, persist the draft to localStorage whenever it differs
+  // from the server baseline. A clean (unchanged) editor stores nothing.
+  React.useEffect(() => {
+    if (view !== "editCard" || !editingCard) return;
+    const key = bcDraftKey(draftTenant, draftUser, editingCard);
+    try {
+      const dirty = editorBaselineRef.current == null || JSON.stringify(draft) !== editorBaselineRef.current;
+      if (dirty) localStorage.setItem(key, JSON.stringify({ draft, savedAt: Date.now() }));
+      else localStorage.removeItem(key);
+    } catch {}
+  }, [draft, view, editingCard, draftTenant, draftUser]);
+
+  // If the manager starts editing (draft diverges from baseline) while a Resume
+  // offer is still showing, they've chosen to start fresh — dismiss the offer.
+  React.useEffect(() => {
+    if (resumeInfo && editorBaselineRef.current != null && JSON.stringify(draft) !== editorBaselineRef.current) setResumeInfo(null);
+  }, [draft]); // eslint-disable-line react-hooks/exhaustive-deps
+
+  const resumeDraft = () => {
+    const d = pendingResumeRef.current;
+    if (d) { setDraft(d); setEditorSeed(s => s + 1); }
+    setResumeInfo(null); setErrors({}); setSaveError(false);
+  };
+  const discardDraft = () => {
+    // Clears ONLY this targeted draft; unrelated drafts are untouched.
+    try { localStorage.removeItem(bcDraftKey(draftTenant, draftUser, editingCard)); } catch {}
+    pendingResumeRef.current = null;
+    setResumeInfo(null);
+  };
+
   const saveCard = async () => {
     if (cardSaving) return;
     const tags = draft.tags ?? [];
@@ -16005,6 +16165,7 @@ function BattleCardsAdminScreen({ cards, onSaveCard, onSetArchived, isReal = fal
     if (invalid.length > 0) {
       // Honest failure: mark every invalid field, show a top message, keep the
       // manager in the editor with all content, and focus/scroll the first invalid.
+      // The draft is preserved (autosave already stored it) — nothing is discarded.
       setErrors(Object.fromEntries(invalid.map(k => [k, true])));
       setSaveError(true);
       const first = fieldRefs.current[invalid[0]];
@@ -16013,13 +16174,21 @@ function BattleCardsAdminScreen({ cards, onSaveCard, onSetArchived, isReal = fal
     }
     setErrors({}); setSaveError(false);
     setCardSaving(true);
-    const ok = await onSaveCard({ ...draft, title: draft.title.trim(), tags });
+    // Strip UI-only section _id before persisting (keep DB content JSON clean).
+    const content = (draft.content ?? []).map(({ heading, body }) => ({ heading, body }));
+    const ok = await onSaveCard({ ...draft, title: draft.title.trim(), tags, content });
     setCardSaving(false);
-    if (ok) goList();
+    if (ok) {
+      // Successful save clears this card's draft (nothing left to resume).
+      try { localStorage.removeItem(bcDraftKey(draftTenant, draftUser, editingCard)); } catch {}
+      pendingResumeRef.current = null; setResumeInfo(null);
+      goList();
+    }
+    // A failed save keeps the draft (autosave retains it) so nothing is lost.
   };
 
   // content sections
-  const addSection    = () => setDraft(d => ({ ...d, content: [...d.content, { heading: "", body: "" }] }));
+  const addSection    = () => setDraft(d => ({ ...d, content: [...d.content, { _id: `sec-${Date.now()}-${d.content.length}`, heading: "", body: "" }] }));
   const removeSection = (i) => setDraft(d => ({ ...d, content: d.content.filter((_, j) => j !== i) }));
   const setSection    = (i, field, val) => setDraft(d => ({ ...d, content: d.content.map((s, j) => j === i ? { ...s, [field]: val } : s) }));
   const moveSection   = (i, dir) => setDraft(d => { const c = [...d.content]; const t = i + dir; if (t < 0 || t >= c.length) return d; [c[i], c[t]] = [c[t], c[i]]; return { ...d, content: c }; });
@@ -16086,6 +16255,19 @@ function BattleCardsAdminScreen({ cards, onSaveCard, onSetArchived, isReal = fal
           </div>
         )}
 
+        {resumeInfo && (
+          <div style={{ marginBottom: 16, padding: "12px 16px", borderRadius: 10, background: C.orangeLight, border: `1px solid ${C.orangeBorder}`, display: "flex", alignItems: "center", justifyContent: "space-between", flexWrap: "wrap", gap: 10 }}>
+            <div style={{ fontSize: 13, color: C.text }}>
+              <b>Unsaved draft found</b> — saved {bcRelativeTime(resumeInfo.savedAt)}.
+              {resumeInfo.serverNewer && <span style={{ display: "block", marginTop: 4, color: "#b45309", fontWeight: 700 }}>⚠ This card was updated on the server after your draft was saved — resuming will replace those newer changes.</span>}
+            </div>
+            <div style={{ display: "flex", gap: 8, flexShrink: 0 }}>
+              <button onClick={resumeDraft} style={{ padding: "7px 14px", borderRadius: 8, border: "none", background: C.orange, color: "#fff", fontSize: 12, fontWeight: 700, cursor: "pointer" }}>Resume draft</button>
+              <button onClick={discardDraft} style={{ padding: "7px 14px", borderRadius: 8, border: `1px solid ${C.border}`, background: C.white, color: C.text, fontSize: 12, fontWeight: 700, cursor: "pointer" }}>Discard</button>
+            </div>
+          </div>
+        )}
+
         <div style={{ display: "flex", flexDirection: "column", gap: 16 }}>
           <Card>
             <div style={{ fontSize: 13, fontWeight: 800, color: C.text, marginBottom: 16 }}>Basic Info</div>
@@ -16093,9 +16275,8 @@ function BattleCardsAdminScreen({ cards, onSaveCard, onSetArchived, isReal = fal
               <div>{lbl("Title", true)}<input ref={el => (fieldRefs.current.title = el)} style={{ ...inputStyle, borderColor: errors.title ? C.red : C.border }} value={draft.title} onChange={setF("title")} placeholder="e.g. Salesforce" />{errText("title")}</div>
               <div>{lbl("Subtitle / Type")}<input style={inputStyle} value={draft.subtitle} onChange={setF("subtitle")} placeholder="e.g. CRM" /></div>
             </div>
-            <div style={{ marginBottom: 14 }}>{lbl("Summary")}<input style={inputStyle} value={draft.summary} onChange={setF("summary")} placeholder="One-line description shown in lists" /></div>
+            <div style={{ marginBottom: 14 }}>{lbl("Summary")}<MarkdownEditor value={draft.summary ?? ""} onChange={setRich("summary")} seedKey={editorSeed} minHeight={80} placeholder="Short description shown at the top of the card" /></div>
             <div ref={el => (fieldRefs.current.tags = el)}>
-              {lbl("Tags", true)}
               <BcTagPicker selected={draft.tags ?? []} suggestions={tagSuggestions} onAdd={addTag} onRemove={removeTag} error={errors.tags} />
             </div>
           </Card>
@@ -16103,10 +16284,10 @@ function BattleCardsAdminScreen({ cards, onSaveCard, onSetArchived, isReal = fal
           <Card>
             <div style={{ fontSize: 13, fontWeight: 800, color: C.text, marginBottom: 16 }}>Competitive Detail</div>
             <div style={{ display: "flex", flexDirection: "column", gap: 14 }}>
-              <div>{lbl("Their Strengths", true)}<textarea ref={el => (fieldRefs.current.strength = el)} style={{ ...taStyle, borderColor: errors.strength ? C.red : C.border }} value={draft.strength} onChange={setF("strength")} placeholder="What they do well..." />{errText("strength")}</div>
-              <div>{lbl("Their Weaknesses", true)}<textarea ref={el => (fieldRefs.current.weakness = el)} style={{ ...taStyle, borderColor: errors.weakness ? C.red : C.border }} value={draft.weakness} onChange={setF("weakness")} placeholder="Where they fall short..." />{errText("weakness")}</div>
-              <div>{lbl("Why We Win", true)}<textarea ref={el => (fieldRefs.current.ourWin = el)} style={{ ...taStyle, borderColor: errors.ourWin ? C.red : C.border }} value={draft.ourWin} onChange={setF("ourWin")} placeholder="Our differentiated value..." />{errText("ourWin")}</div>
-              <div>{lbl("Talk Track")}<textarea style={{ ...taStyle, minHeight: 110 }} value={draft.talkTrack} onChange={setF("talkTrack")} placeholder="The rep's suggested script..." /></div>
+              <div ref={el => (fieldRefs.current.strength = el)}>{lbl("Their Strengths", true)}<MarkdownEditor value={draft.strength ?? ""} onChange={setRich("strength")} seedKey={editorSeed} minHeight={90} invalid={!!errors.strength} placeholder="What they do well..." />{errText("strength")}</div>
+              <div ref={el => (fieldRefs.current.weakness = el)}>{lbl("Their Weaknesses", true)}<MarkdownEditor value={draft.weakness ?? ""} onChange={setRich("weakness")} seedKey={editorSeed} minHeight={90} invalid={!!errors.weakness} placeholder="Where they fall short..." />{errText("weakness")}</div>
+              <div ref={el => (fieldRefs.current.ourWin = el)}>{lbl("Why We Win", true)}<MarkdownEditor value={draft.ourWin ?? ""} onChange={setRich("ourWin")} seedKey={editorSeed} minHeight={90} invalid={!!errors.ourWin} placeholder="Our differentiated value..." />{errText("ourWin")}</div>
+              <div>{lbl("Talk Track")}<MarkdownEditor value={draft.talkTrack ?? ""} onChange={setRich("talkTrack")} seedKey={editorSeed} minHeight={110} placeholder="The rep's suggested script..." /></div>
             </div>
           </Card>
 
@@ -16122,7 +16303,7 @@ function BattleCardsAdminScreen({ cards, onSaveCard, onSetArchived, isReal = fal
             ) : (
               <div style={{ display: "flex", flexDirection: "column", gap: 12 }}>
                 {draft.content.map((sec, i) => (
-                  <div key={i} style={{ borderRadius: 12, border: `1px solid ${C.creamBorder}`, padding: 16, background: C.pageBg }}>
+                  <div key={sec._id ?? i} style={{ borderRadius: 12, border: `1px solid ${C.creamBorder}`, padding: 16, background: C.pageBg }}>
                     <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", marginBottom: 10 }}>
                       <span style={{ fontSize: 11, fontWeight: 700, color: C.textMuted }}>SECTION {i + 1}</span>
                       <div style={{ display: "flex", gap: 6 }}>
@@ -16131,8 +16312,9 @@ function BattleCardsAdminScreen({ cards, onSaveCard, onSetArchived, isReal = fal
                         <button onClick={() => removeSection(i)} style={{ background: "none", border: `1px solid rgba(239,68,68,0.3)`, borderRadius: 6, width: 26, height: 26, cursor: "pointer", fontSize: 12, color: "#ef4444" }}>✕</button>
                       </div>
                     </div>
+                    {/* Heading stays plain text; body reuses the shared Lesson rich-text editor. */}
                     <input style={{ ...inputStyle, marginBottom: 8 }} value={sec.heading} onChange={e => setSection(i, "heading", e.target.value)} placeholder="Section heading" />
-                    <textarea style={{ ...taStyle, minHeight: 80 }} value={sec.body} onChange={e => setSection(i, "body", e.target.value)} placeholder="Section body..." />
+                    <MarkdownEditor value={sec.body ?? ""} onChange={v => setSection(i, "body", v)} seedKey={`${editorSeed}:${sec._id ?? i}`} minHeight={80} placeholder="Section body..." />
                   </div>
                 ))}
               </div>
@@ -24104,6 +24286,7 @@ export default function App() {
         setPastSessions([]);                     // prevent real past sessions leaking to next demo user
         setBattleCards(INITIAL_BATTLE_CARDS);    // prevent real BC data leaking to next demo user
         clearLearnNavSessionState();              // don't leak screen / Learn subtab / pending quiz review into the next login
+        clearBattleCardDrafts();                  // don't leak an unsaved Battle Card draft into the next login
         window.location.replace("/login");        // hard-navigate so URL matches the login screen
       }
     });
@@ -25304,7 +25487,7 @@ export default function App() {
         ) : null} />;
       case "quizzes":           return <QuizzesScreen role={gameRole} onNav={navigate} quizzes={quizzes} onEditQuiz={handleEditQuiz} onDeleteQuiz={handleDeleteQuiz} onArchiveQuiz={handleArchiveQuiz} onRestoreQuiz={handleRestoreQuiz} onToggleFavorite={handleToggleFavorite} onToggleActive={handleToggleActive} pendingQuizId={pendingQuizId} onClearPendingQuiz={() => setPendingQuizId(null)} canCreate={perm("actions","create")} canEdit={perm("actions","edit")} canDelete={perm("actions","delete")} canLaunch={perm("actions","launch")} canAssign={perm("actions","assign")} onAssignQuiz={handleAssignQuiz} onLaunchQuiz={handleCreateSession} orgUsers={orgUsers} orgs={orgs} currentUser={currentUser} tenantId={currentOrg?.id ?? null} isReal={!!user?._isReal} quizzesReady={quizzesReady} sharedAssignmentData={sharedAssignmentData} onRefreshQuizzes={refreshQuizzes} pendingQuizReview={pendingQuizReview} onExitQuiz={() => { setPendingQuizId(null); setPendingQuizReview(null); navigate("learn"); }} />;
       case "battlecards":       return (isAdminType && perm("actions","edit"))
-        ? <BattleCardsAdminScreen cards={battleCards} onSaveCard={handleSaveBattleCard} onSetArchived={handleSetBattleCardArchived} isReal={!!user?._isReal} isLoading={bcLoading || (!!user?._isReal && !bcLoaded && !bcError)} loadError={bcError} onRetry={() => setBcReloadKey(k => k + 1)} />
+        ? <BattleCardsAdminScreen cards={battleCards} onSaveCard={handleSaveBattleCard} onSetArchived={handleSetBattleCardArchived} isReal={!!user?._isReal} isLoading={bcLoading || (!!user?._isReal && !bcLoaded && !bcError)} loadError={bcError} onRetry={() => setBcReloadKey(k => k + 1)} tenantId={currentOrg?.id ?? user?.orgId ?? null} userId={user?.id ?? null} />
         : <BattleCardsScreen cards={battleCards} isLoading={bcLoading || (!!user?._isReal && !bcLoaded && !bcError)} loadError={bcError} onRetry={() => setBcReloadKey(k => k + 1)} isReal={!!user?._isReal} />;
       case "insights":           return <InsightsScreen user={user} isReal={!!user?._isReal} tenantId={currentOrg?.id ?? null} orgUsers={orgUsers} isAdmin={isAdminType} readinessThreshold={readinessThreshold} />;
       case "progress":          return isAdminType
@@ -25318,7 +25501,7 @@ export default function App() {
       case "settings":
         if (isSuperAdmin)  return <RoleAccessScreen rolePermissions={rolePermissions} onSave={handleSaveRolePermissions} currentOrg={currentOrg} />;
         if (isOrgAdmin)    return <OrgAdminSettingsScreen rolePermissions={rolePermissions} onSaveRolePermissions={handleSaveRolePermissions} currentOrg={currentOrg} orgId={user.orgId} orgName={currentOrg?.name ?? "Your Team"} orgUsers={orgUsers} onAddUser={handleAddUser} readinessThreshold={readinessThreshold} onSaveReadinessThreshold={handleSaveReadinessThreshold} />;
-        return <UserSettingsScreen user={user} profile={userProfile} notifPrefs={notifPrefs} onSaveProfile={handleSaveProfile} onSaveNotifs={handleSaveNotifs} currentOrg={currentOrg} onSignOut={async () => { if (user?._isReal) { await supabase.auth.signOut(); /* SIGNED_OUT handler redirects */ } else { setCurrentUser(null); setLastSeenAt(null); setNewAssignmentCount(0); setPendingLessonId(null); setPendingCourseId(null); setPendingQuizId(null); setOrgs(INITIAL_ORGS); setOrgUsers(INITIAL_ORG_USERS); setQuizzesReady(false); setSessions(INITIAL_SESSIONS); setBattleCards(INITIAL_BATTLE_CARDS); clearLearnNavSessionState(); window.location.replace("/login"); } }} />;
+        return <UserSettingsScreen user={user} profile={userProfile} notifPrefs={notifPrefs} onSaveProfile={handleSaveProfile} onSaveNotifs={handleSaveNotifs} currentOrg={currentOrg} onSignOut={async () => { if (user?._isReal) { await supabase.auth.signOut(); /* SIGNED_OUT handler redirects */ } else { setCurrentUser(null); setLastSeenAt(null); setNewAssignmentCount(0); setPendingLessonId(null); setPendingCourseId(null); setPendingQuizId(null); setOrgs(INITIAL_ORGS); setOrgUsers(INITIAL_ORG_USERS); setQuizzesReady(false); setSessions(INITIAL_SESSIONS); setBattleCards(INITIAL_BATTLE_CARDS); clearLearnNavSessionState(); clearBattleCardDrafts(); window.location.replace("/login"); } }} />;
       default:                  return <HomeScreen user={user} />;
     }
   };
@@ -25463,8 +25646,9 @@ export default function App() {
                     setQuizzesReady(false);
                     setSessions(INITIAL_SESSIONS);
                     setBattleCards(INITIAL_BATTLE_CARDS);
-                   
+
                     clearLearnNavSessionState();
+                    clearBattleCardDrafts();
                     window.location.replace("/login");
                   }
                   // Real users: SIGNED_OUT event fires window.location.replace("/login")
