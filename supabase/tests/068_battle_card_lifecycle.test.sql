@@ -54,8 +54,12 @@ BEGIN
   -- Creator (ac, orgAdmin) creates a card as authenticated → created_by=ac via trigger.
   PERFORM set_config('request.jwt.claims','{"sub":"00000000-0000-0000-0000-0000000000ac","role":"authenticated"}',true);
   SET LOCAL ROLE authenticated;
-  INSERT INTO public.tenant_battle_cards (id, tenant_id, category_id, title, subtitle, content, status, archived_at, created_by, updated_at)
+  -- Required content added (tags + strength/weakness/our_win) so this authenticated
+  -- INSERT satisfies migration 070's required-content trigger; the provenance
+  -- assertions below are unchanged.
+  INSERT INTO public.tenant_battle_cards (id, tenant_id, category_id, title, subtitle, content, tags, strength, weakness, our_win, status, archived_at, created_by, updated_at)
     VALUES ('00000000-0000-0000-0000-00000000f001','00000000-0000-0000-0000-0000000000a0','00000000-0000-0000-0000-0000000000ca','Salesforce','CRM','[{"heading":"h","body":"b"}]'::jsonb,
+            ARRAY['crm'], 'Brand and ecosystem', 'Complex and costly', 'Faster time to value',
             'active', now(), '00000000-0000-0000-0000-0000000000a1', '2000-01-01T00:00:00Z');  -- client-supplied provenance must be ignored
   RESET ROLE;
   SELECT created_by, archived_at INTO v_created0, v_arch FROM public.tenant_battle_cards WHERE id='00000000-0000-0000-0000-00000000f001';
