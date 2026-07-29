@@ -44,6 +44,54 @@ Completed:
 
 ---
 
+### Learn Lifecycle (Lessons / Courses / Quizzes)
+
+Status: Beta Complete
+
+Merged to production: commit `6e1c7474fc7145f71fa3b22915ba7016c242dd29`; Vercel deployment `BCvnfz6hharkZHESKNpu8f8Fc7er`. Migrations 063–067 applied and verified.
+
+Completed:
+
+- Unified learner Learn (To Do / Completed / All) + manager Learn tabs (Assignments / Courses / Lessons / Quizzes); standalone Quizzes nav retired
+- Lifecycle integrity: archive cancels only unresolved assignments, blocks hard delete of referenced content, server-authoritative completion (063)
+- Manager Unassign + one canonical assignment history preserving cancelled/unassigned instances (064)
+- Quiz archive/restore with a canonical assignment-assignability guard closing the archive-vs-assign race (065)
+- Archive never cancels completed history; completed-history repair (066)
+- Learner-safe completed-quiz history incl. archived, catalog-only metadata (067)
+- Instance-scoped assignment score/attempt identity (no reassignment misattribution); Review opens the exact historical attempt (never starts a new one); sign-out clears pending quiz/start/review navigation state
+- "Last Updated" on lesson and course cards from authoritative `updated_at` (empty when missing — no invented dates)
+
+---
+
+### Battle Cards
+
+Status: Beta Complete (ready to merge — awaiting merge approval)
+
+Migrations 068, 069, 070 applied and verified in production (versions `20260728175949`, `20260728232125`, `20260729151513`). Live QA passed; frontend on `feature/battle-cards-audit`, not yet merged.
+
+Completed (full beta scope):
+
+- Create / edit cards (Title, Subtitle, Summary, Their Strengths, Their Weaknesses, Why We Win, Talk Track, In-Depth sections)
+- Tags-only organization: categories retired from the UI/service; `tenant_battle_cards.tags[]` is the source of truth (data-only category→tag conversion, migration 069, provenance preserved)
+- Search + exact tag filters (free-text scope title/subtitle/summary/tags; tag chips are exact normalized matches; archived-only tags excluded from suggestions)
+- Rich-text authoring reusing the Lesson editor/renderer (bold/italic/underline/lists) for the body fields; injection-safe markdown-subset rendering shared with Lessons; plain text for Title/Subtitle/Tags/section headings
+- Durable unsaved drafts scoped by tenant + user + create-vs-edit + card id, with Resume/Discard, in-editor Discard, and Back-with-unsaved-changes warning; cleared on save/discard and on sign-out
+- Archive / restore (status active|archived, archived_at) instead of hard delete; permanent delete not exposed
+- Learners read active cards only (RLS-enforced); managers/orgAdmins see active + archived; archived excluded from learner search and counts
+- Tenant isolation (SELECT/INSERT/UPDATE RLS + `WITH CHECK` block cross-tenant moves)
+- Server-authoritative provenance: created_by / created_at immutable on edit; updated_by / updated_at / archived_at set by DB trigger (068)
+- Hard-delete prevention: no client-role DELETE (policy dropped + grant revoked; service_role/owner retain emergency access) (068)
+- Required-content enforcement server-side (070): Title, ≥1 meaningful tag, Their Strengths, Their Weaknesses, Why We Win — validated for direct authenticated API writes; INSERT full-validity, UPDATE non-regression (legacy incomplete rows can still be archived/corrected but valid content cannot regress)
+- Responsive list + detail experience; Quiz-consistent white card surfaces and yellow tag pills
+
+Readiness / analytics boundary (for the later Leadership Dashboard overhaul — do NOT treat as production evidence):
+
+- No learner Battle Card activity (viewed/opened/completed) is tracked. There is no event source.
+- Real tenants receive NO Battle Card readiness contribution today; the `battlecards` weight is fed only by demo seed (`LEADERSHIP_SEED`) in demo mode.
+- No Battle Card readiness contribution may be added until a trustworthy event source exists. The demo-only seeded values are deferred to the Leadership overhaul and must never be shown as real data.
+
+---
+
 ### Ralli Live
 
 Status: Beta Complete

@@ -106,6 +106,24 @@ Learners cannot author or govern tags. Tag management is unavailable to the lear
 
 ---
 
+## Battle Cards
+
+Battle Cards use tags only. Categories are retired from the application UI and service; there is no category authoring, selection, or "Uncategorized" state. (The legacy `tenant_bc_categories` table is left intact but unused by the app; migration 069 folded category labels into tags data-only, preserving provenance.)
+
+`tenant_battle_cards.tags[]` is the beta source of truth for organization. Tags are free-text on the card (normalized: trimmed, no blanks, case-insensitive de-dupe), not the governed Quiz taxonomy; Battle Cards are not connected to the Quiz taxonomy tables.
+
+Every card requires a Title, at least one meaningful tag, Their Strengths, Their Weaknesses, and Why We Win. Subtitle, Summary, Talk Track, and In-Depth sections are optional. "Meaningful" is enforced against the shared Lesson rich-text serializer output — whitespace, non-breaking spaces, empty formatting, and empty list markers do not satisfy a required field. Enforcement is server-authoritative for direct authenticated API writes (migration 070), mirroring the editor.
+
+Battle Cards archive and restore; they are never permanently deleted by an authenticated client. The DELETE policy and grant are removed for client roles; service_role and the database owner retain emergency access. Archive/restore only flips status — card id and content are preserved.
+
+Learners see active cards only. Archived cards are excluded from learner reads, search, and counts; managers/orgAdmins see active + archived within their tenant; ralli_admin spans tenants.
+
+Battle Card activity does not contribute to readiness. No learner viewed/opened/completed event is tracked, and there is no event source; real tenants receive no Battle Card readiness contribution. No readiness contribution may be added until a trustworthy activity-event source exists — the demo-only seeded values are never shown as real data.
+
+Required content is enforced without regression for legacy rows: a card whose required field was already valid can never be edited to an invalid state, and the last meaningful tag cannot be removed; incomplete legacy cards may still be archived, restored, retagged, metadata-edited, or completed. Content is never fabricated or auto-filled.
+
+---
+
 ## Knowledge Heatmap
 
 Immutable attempt-time taxonomy snapshots are historical truth. Topic attribution comes only from the snapshot captured at submission — never re-derived.

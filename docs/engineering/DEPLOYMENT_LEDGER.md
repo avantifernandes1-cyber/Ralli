@@ -570,3 +570,156 @@ production migrations 063–067 remain applied exactly once each (versions `2026
 committed migration files (SHA-256 parity re-verified at closeout; migration history unchanged, nothing
 rewritten/squashed/reordered). No new migration was applied during closeout; the only branch changes at
 closeout are frontend (sign-out navigation-state clearing) plus this ledger commit.
+
+## 2026-07-28 — Battle Card lifecycle + provenance + RLS/DELETE hardening (068) — **APPLIED TO PRODUCTION**
+
+Branch `feature/battle-cards-audit` @ `0244cd2`. Applied via ONE controlled `apply_migration` (Strategy A)
+after a passing immediate pre-apply gate; byte-identity re-confirmed against the committed blob. Additive —
+does NOT edit applied migrations 023/030; touches only `tenant_battle_cards` + `tenant_bc_categories`.
+
+| Order | Prod version (ledger) | Prod name | Git file | Commit | SQL SHA-256 | Applied (UTC) | Verification |
+|---|---|---|---|---|---|---|---|
+| 32 | `20260728175949` | 068_battle_card_lifecycle | supabase/migrations/068_battle_card_lifecycle.sql | 0244cd2 | a62c2c5c40d9b8c9b6da762a94c2707096d3600c344e20b152900ee785e1da81 | 2026-07-28 (version 20260728175949) | PASS — see below |
+
+Approved SHA-256: `a62c2c5c40d9b8c9b6da762a94c2707096d3600c344e20b152900ee785e1da81`. Apply result: `{"success":true}`.
+
+**What 068 adds:** `tenant_battle_cards.status` ('active'|'archived', default 'active', CHECK) + `archived_at`
++ `updated_by`; `tenant_bc_categories.updated_by`; index `idx_bc_cards_tenant_status`; server-authoritative
+provenance triggers (`tenant_battle_cards_touch`/`tenant_bc_categories_touch`) making created_by/created_at
+immutable on edit and updated_by/updated_at/archived_at server-owned; SELECT RLS learner-active-only; UPDATE
+RLS `WITH CHECK` on both tables; DROP `bc_cards_admin_delete` + REVOKE DELETE on cards from authenticated/anon.
+
+**Pre-apply gate (all PASS):** committed + working-tree SHA-256 both `a62c2c5c…da81`; 068 absent from ledger
+(max `20260728131451`); new objects absent; production had exactly 0 cards / 1 valid category; DELETE policy
+`bc_cards_admin_delete` + authenticated/anon DELETE grants present as preflighted; schema/deps intact.
+
+**Post-apply verification (read-only):**
+- Recorded version `20260728175949` / name `068_battle_card_lifecycle`; **exactly one** row; no migration
+  applied beyond 068.
+- New columns present as committed (status NOT NULL default 'active'; archived_at, updated_by nullable);
+  constraint + index + both functions + both triggers exist.
+- Card count still **0**. The single category unchanged except `updated_by = NULL` (label/tenant/created_by/
+  created_at/updated_at all unchanged; ADD COLUMN did not fire the trigger).
+- Final policy set: SELECT `bc_cards_tenant_read` (ralli_admin all; else own-tenant AND (active OR
+  orgAdmin/manager)); UPDATE `bc_cards_admin_update`/`bc_categories_admin_update` now carry `WITH CHECK`;
+  `bc_cards_admin_delete` **absent**; INSERT/category SELECT/category DELETE unchanged.
+- Cards DELETE grants now only `postgres`, `service_role` (authenticated + anon revoked) → no client hard
+  delete; emergency owner/service-role delete retained. `bc_categories_admin_delete` unchanged.
+- Behavioral proof (068 SQL harness, transactional/rolled back, against a local DB built from the applied
+  migration): 22/22 PASS incl. learner active-only + tenant-scoped SELECT, learner writes fail, cross-tenant
+  read/write/move fail, WITH CHECK blocks tenant movement, created_by/created_at immutable on edit,
+  server-controlled updated_by/updated_at/archived_at, and manager/orgAdmin/learner/anon/cross-tenant direct
+  DELETE all fail with the row surviving.
+- Regressions 057/063/065/066/067 SQL, JS suite (incl. 34 bc guards), esbuild parse, and Vite build all PASS.
+
+Operator: applied by Claude Code via the controlled Supabase `apply_migration` tool under explicit user
+production approval. Ledger row 32. **Frontend NOT merged or deployed** — next step is live Battle Cards QA
+on the preview. This ledger update is intentionally left uncommitted.
+
+## 2026-07-28 — Battle Cards taxonomy → tags only: category→tag conversion (069) — **APPLIED TO PRODUCTION**
+
+Branch `feature/battle-cards-audit` @ `9ac7202` (migration authored at `394a6e3`; the
+`9ac7202` commit is a test-only idempotency assertion — migration bytes unchanged).
+Applied via ONE controlled `apply_migration` (Strategy A) after a passing immediate
+pre-apply gate; byte-identity re-confirmed. Data-only; does NOT edit migrations 023/030
+or 068; touches only `tenant_battle_cards` rows (reads `tenant_bc_categories`).
+
+| Order | Prod version (ledger) | Prod name | Git file | Commit | SQL SHA-256 | Applied (UTC) | Verification |
+|---|---|---|---|---|---|---|---|
+| 33 | `20260728232125` | 069_battle_card_category_to_tag | supabase/migrations/069_battle_card_category_to_tag.sql | 394a6e3 | d88b7135fdc1a854e54c88ac24cb47eff1e0665ab17f593e2500ffe682acbdd3 | 2026-07-28 (version 20260728232125) | PASS — see below |
+| 34 | `20260729151513` | 070_battle_card_required_content | supabase/migrations/070_battle_card_required_content.sql | 776a947 | eff95a4c1ffef85adff39ff41d02d631ccd3c10c722cf7fcb2645fec6e02d698 | 2026-07-29 (version 20260729151513) | PASS — see below |
+
+Approved SHA-256: `d88b7135fdc1a854e54c88ac24cb47eff1e0665ab17f593e2500ffe682acbdd3`. Apply result: `{"success":true}`.
+
+**What 069 does:** for every card with a VALID category association, fold the category
+label into tags (normalized + case-insensitive de-dupe; existing tags never overwritten;
+blank labels skipped), then clear `category_id`. Cards without a category are untouched
+(no invented tag). The 068 provenance trigger is briefly DISABLEd (ACCESS EXCLUSIVE lock,
+same-transaction ENABLE) so only tags + category_id change — created_by/created_at/
+updated_by/updated_at preserved. Legacy `tenant_bc_categories` table kept intact.
+
+**Pre-apply gate (all PASS):** committed + working-tree SHA-256 both `d88b7135…bdd3`; 069
+absent from ledger (max `20260728175949`); 068 present once + trigger enabled; production
+had exactly 2 cards (`528e1a06` cat=`33ef0261` tags=[personality]; `ff7b4997` cat=null
+tags=[]) and 1 category (`33ef0261` "tag 1"); no partial conversion / schema drift.
+
+**Post-apply verification (read-only):**
+- Recorded version `20260728232125` / name `069_battle_card_category_to_tag`; exactly one
+  row; **no migration beyond 069** (33 total).
+- `528e1a06` tags = **`["personality","tag 1"]`**, `category_id` = null; id/title/content/
+  status/tenant/created_by(45a62442)/updated_by(45a62442)/created_at(18:43:41.635689)/
+  updated_at(**22:37:08.770177 unchanged**) all preserved.
+- `ff7b4997` remains **tagless** (`[]`), `category_id` = null, all provenance/timestamps
+  unchanged — no tag invented for the tagless card.
+- **Every** Battle Card `category_id` is null. Category `33ef0261` "tag 1" **unchanged**
+  (label/tenant/creator/updater/timestamps identical); category table + 4 RLS policies intact.
+- 068 protections unchanged: provenance trigger finishes **enabled** (`tgenabled='O'`);
+  status column present; `bc_cards_admin_delete` absent; cards DELETE grants = `postgres`,
+  `service_role` only; learner active-only SELECT policy present. No unrelated policies/
+  grants/functions/triggers/data changed.
+- Re-running the conversion is a **no-op** (production match set = 0 rows; committed 069
+  test T9 proves idempotency; second pass updates 0 rows, tags/category_id/provenance stable).
+- Tests: committed 069 harness 9/9, 068 harness 22/22, 057/065/066/067 regressions, JS
+  suite (46 bc guards), esbuild parse, Vite build — all PASS.
+
+Operator: applied by Claude Code via the controlled Supabase `apply_migration` tool under
+explicit user production approval. Ledger row 33. **Frontend NOT merged or deployed** —
+next step is live tags-only Battle Cards QA on the preview. This ledger update is
+intentionally left uncommitted.
+
+---
+
+## Migration 070 — Battle Card required-content enforcement (row 34)
+
+Approved artifact: commit `776a947799a8fa6fccfc13a4c9443805deb8b366`, file
+`supabase/migrations/070_battle_card_required_content.sql`, SHA-256
+`eff95a4c1ffef85adff39ff41d02d631ccd3c10c722cf7fcb2645fec6e02d698`.
+Apply result: `{"success":true}`. Production version **`20260729151513`**.
+
+**What 070 does:** adds one IMMUTABLE helper `battle_card_has_meaningful_text(text)`
+(mirrors the frontend `bcPlainText`; based on the real `htmlToMd` markdown-subset —
+false for null/blank/whitespace/U+00A0/line-breaks/empty formatting `****`,`__ __`/empty
+lists `- `,`1. `; true for real text) and one `BEFORE INSERT/UPDATE` trigger
+`trg_battle_cards_require_content` on `tenant_battle_cards`. Enforcement runs ONLY for the
+untrusted client roles (`authenticated`,`anon`); `postgres`/`service_role` are exempt.
+INSERT requires all five (Title, ≥1 tag, Their Strengths, Their Weaknesses, Why We Win);
+UPDATE is non-regression (a field valid on OLD must stay valid on NEW). Subtitle, Summary,
+Talk Track, In-Depth remain optional. Purely additive — no column/policy/grant/data change.
+
+**Pre-apply gate (all PASS):** committed + working-tree SHA-256 both `eff95a4c…e02d698`;
+070 absent from ledger (max `20260728232125`); 068 + 069 present once; no conflicting
+helper/trigger/CHECK; production had exactly 5 cards (3 valid: `528e1a06`,`ec5e7e27`,
+`3c6cd1a1`; 2 legacy-incomplete: `302e519c`,`ff7b4997` — strength/weakness/our_win len 0);
+068 provenance trigger enabled; no DELETE grant for authenticated/anon; single tenant
+`0abdfcb1`; no SECURITY DEFINER writer, no edge functions (no service-role write proxy).
+
+**Post-apply verification (read-only + one BEGIN…ROLLBACK behavioral pass):**
+- Recorded version `20260729151513` / name `070_battle_card_required_content`; exactly one
+  row; **no migration beyond 070**.
+- Both functions exist as committed (SECURITY INVOKER; helper IMMUTABLE + PARALLEL SAFE;
+  `search_path=""` on both). Trigger `trg_battle_cards_require_content` **enabled** (`O`),
+  ROW BEFORE INSERT/UPDATE (tgtype 23), sorts before `trg_touch_tenant_battle_cards`.
+- 068 provenance trigger remains **enabled** (`O`).
+- All 5 existing cards **byte-for-byte unchanged** — id/title/status/tags/content_md5/
+  created_by/updated_by/created_at/**updated_at** identical to the pre-apply snapshot (the
+  DDL rewrote no rows; the touch trigger did not fire). 3 valid / 2 legacy-incomplete
+  unchanged; both legacy bodies still len 0.
+- Behavioral matrix against production (ephemeral fixtures, rolled back → nothing persisted;
+  5 cards, 0 test rows, 2 legacy still empty afterwards): valid authenticated INSERT
+  succeeds w/ server-set created_by; invalid INSERT (formatting-only body / blank·null tags
+  / blank title) rejected; archived+invalid INSERT rejected; valid→invalid UPDATE (blank a
+  good field / remove last tag) rejected; incomplete-legacy archive/restore/retag/metadata
+  succeed; removing the legacy last tag rejected; legacy full correction succeeds and cannot
+  then regress; service_role/owner exemption holds (owner blank-body insert succeeds);
+  learner + anon INSERT rejected; cross-tenant UPDATE affects 0 rows; orgAdmin valid INSERT
+  succeeds; manager hard-delete rejected.
+- No unrelated change: exactly 2 triggers + 3 policies on the table; grants/functions/
+  migrations otherwise unchanged.
+- Tests: committed 070 harness 12/12, 068 harness 22/22, 069 harness 9/9 (local, 070
+  applied); JS suite 155/155 incl. Leadership declaration guard; esbuild parse; Vite build —
+  all PASS.
+
+Operator: applied by Claude Code via exactly one controlled Supabase `apply_migration`
+call under explicit user production approval (no db push / repair / manual ledger SQL /
+fallback). Ledger row 34. **Frontend NOT merged or deployed** — next step is final Battle
+Cards live QA and merge readiness. This ledger update is intentionally left uncommitted.

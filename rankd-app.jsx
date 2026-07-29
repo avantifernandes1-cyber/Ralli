@@ -71,12 +71,9 @@ import {
   getMyQuizAttemptsSafe,
   getAttemptSolutions,
   getTenantQuizAttempts,
-  getTenantBcCategories,
   getTenantBattleCards,
-  saveBcCategory   as dbSaveBcCategory,
-  deleteBcCategory as dbDeleteBcCategory,
   saveBattleCard   as dbSaveBattleCard,
-  deleteBattleCard as dbDeleteBattleCard,
+  setBattleCardArchived as dbSetBattleCardArchived,
   updateUserProfile as dbUpdateUserProfile,
   updateLastSeenAssignmentsAt,
   subscribeToTenantAssignments,
@@ -11237,47 +11234,11 @@ function LessonBlock({ block, cardStyle }) {
 
   if (block.type === "text") {
     if (!c.body) return null;
-    // Minimal markdown renderer: **bold**, *italic*, __underline__, - bullets, 1. numbered
-    const parseInline = (text) => {
-      const parts = [];
-      let rest = text, k = 0;
-      while (rest) {
-        const m = rest.match(/(\*\*(.+?)\*\*)|(__(.+?)__)|(\*(.+?)\*)/);
-        if (!m) { parts.push(rest); break; }
-        if (m.index > 0) parts.push(rest.slice(0, m.index));
-        if (m[1]) parts.push(<strong key={k++}>{m[2]}</strong>);
-        else if (m[3]) parts.push(<u key={k++}>{m[4]}</u>);
-        else parts.push(<em key={k++}>{m[6]}</em>);
-        rest = rest.slice(m.index + m[0].length);
-      }
-      return parts;
-    };
-    const renderBody = (text) => {
-      const lines = text.split("\n");
-      const out = [];
-      let i = 0;
-      while (i < lines.length) {
-        if (lines[i].startsWith("- ")) {
-          const items = [];
-          while (i < lines.length && lines[i].startsWith("- ")) { items.push(lines[i].slice(2)); i++; }
-          out.push(<ul key={i} style={{ margin: "4px 0 8px", paddingLeft: 22 }}>{items.map((t, j) => <li key={j} style={{ fontSize: 14, lineHeight: 1.8, color: C.text }}>{parseInline(t)}</li>)}</ul>);
-        } else if (/^\d+\.\s/.test(lines[i])) {
-          const items = [];
-          while (i < lines.length && /^\d+\.\s/.test(lines[i])) { items.push(lines[i].replace(/^\d+\.\s/, "")); i++; }
-          out.push(<ol key={i} style={{ margin: "4px 0 8px", paddingLeft: 22 }}>{items.map((t, j) => <li key={j} style={{ fontSize: 14, lineHeight: 1.8, color: C.text }}>{parseInline(t)}</li>)}</ol>);
-        } else if (lines[i] === "") {
-          out.push(<br key={i} />);
-          i++;
-        } else {
-          out.push(<p key={i} style={{ margin: "0 0 6px", fontSize: 14, lineHeight: 1.8, color: C.text }}>{parseInline(lines[i])}</p>);
-          i++;
-        }
-      }
-      return out;
-    };
+    // Shared safe markdown-subset renderer (see renderMarkdown): **bold**, *italic*,
+    // __underline__, - bullets, 1. numbered — emitted as escaped React elements.
     return withHeader(
       <div style={style}>
-        <div style={{ wordBreak: "break-word" }}>{renderBody(c.body)}</div>
+        <div style={{ wordBreak: "break-word" }}>{renderMarkdown(c.body)}</div>
       </div>
     );
   }
@@ -11781,6 +11742,116 @@ function htmlToMd(el) {
   return raw.replace(/\n{3,}/g, "\n\n").replace(/^\n+|\n+$/g, "");
 }
 
+// ── Shared markdown-subset renderer (extracted from LessonBlock so Lessons AND
+// Battle Cards render the SAME safe React-element output — never raw HTML, so
+// script/event-handler injection is impossible by construction). ────────────────
+function parseInlineMarkdown(text) {
+  const parts = [];
+  let rest = text, k = 0;
+  while (rest) {
+    const m = rest.match(/(\*\*(.+?)\*\*)|(__(.+?)__)|(\*(.+?)\*)/);
+    if (!m) { parts.push(rest); break; }
+    if (m.index > 0) parts.push(rest.slice(0, m.index));
+    if (m[1]) parts.push(<strong key={k++}>{m[2]}</strong>);
+    else if (m[3]) parts.push(<u key={k++}>{m[4]}</u>);
+    else parts.push(<em key={k++}>{m[6]}</em>);
+    rest = rest.slice(m.index + m[0].length);
+  }
+  return parts;
+}
+function renderMarkdown(text) {
+  const lines = String(text ?? "").split("\n");
+  const out = [];
+  let i = 0;
+  while (i < lines.length) {
+    if (lines[i].startsWith("- ")) {
+      const items = [];
+      while (i < lines.length && lines[i].startsWith("- ")) { items.push(lines[i].slice(2)); i++; }
+      out.push(<ul key={i} style={{ margin: "4px 0 8px", paddingLeft: 22 }}>{items.map((t, j) => <li key={j} style={{ fontSize: 14, lineHeight: 1.8, color: C.text }}>{parseInlineMarkdown(t)}</li>)}</ul>);
+    } else if (/^\d+\.\s/.test(lines[i])) {
+      const items = [];
+      while (i < lines.length && /^\d+\.\s/.test(lines[i])) { items.push(lines[i].replace(/^\d+\.\s/, "")); i++; }
+      out.push(<ol key={i} style={{ margin: "4px 0 8px", paddingLeft: 22 }}>{items.map((t, j) => <li key={j} style={{ fontSize: 14, lineHeight: 1.8, color: C.text }}>{parseInlineMarkdown(t)}</li>)}</ol>);
+    } else if (lines[i] === "") {
+      out.push(<br key={i} />);
+      i++;
+    } else {
+      out.push(<p key={i} style={{ margin: "0 0 6px", fontSize: 14, lineHeight: 1.8, color: C.text }}>{parseInlineMarkdown(lines[i])}</p>);
+      i++;
+    }
+  }
+  return out;
+}
+// Plain visible text from the markdown subset — for search + meaningful-empty
+// validation (strips list markers and *,_,` bold/italic/underline markup).
+function bcPlainText(md) {
+  return String(md ?? "")
+    .split("\n")
+    .map(l => l.replace(/^\s*(?:-\s+|\d+\.\s+)/, ""))
+    .join(" ")
+    .replace(/\*\*(.+?)\*\*/g, "$1").replace(/__(.+?)__/g, "$1").replace(/\*(.+?)\*/g, "$1")
+    .replace(/[*_]/g, "")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+// Shared rich-text EDITOR (extracted from BlockEditor's text branch) — one
+// implementation for Lessons and Battle Cards: contentEditable + the same five
+// execCommand formats, seeding from mdToHtml and syncing back via htmlToMd.
+// `seedKey` reseeds the editor from `value` on mount and whenever it changes
+// (e.g. Lesson block-type switch, or a Battle Card open/resume).
+function MarkdownEditor({ value = "", onChange, placeholder = "", minHeight = 120, seedKey, invalid = false }) {
+  const editRef = React.useRef(null);
+  const [empty, setEmpty] = React.useState(!String(value ?? "").trim());
+  React.useEffect(() => {
+    if (!editRef.current) return;
+    editRef.current.innerHTML = mdToHtml(value ?? "");
+    setEmpty(!String(value ?? "").trim());
+  }, [seedKey]); // eslint-disable-line react-hooks/exhaustive-deps
+  const sync = () => {
+    if (!editRef.current) return;
+    const md = htmlToMd(editRef.current);
+    setEmpty(!md.trim());
+    onChange?.(md);
+  };
+  const execFmt = (cmd) => { editRef.current?.focus(); document.execCommand(cmd, false, null); setTimeout(sync, 0); };
+  const fmtBtn = (label, title, action) => (
+    <button key={title} type="button" onMouseDown={e => e.preventDefault()} onClick={action} title={title} style={{
+      padding: "3px 8px", borderRadius: 5, border: `1px solid ${C.border}`,
+      background: C.white, fontSize: 12, cursor: "pointer", color: C.textSub, lineHeight: 1.4,
+    }}>{label}</button>
+  );
+  return (
+    <div>
+      <div style={{ display: "flex", gap: 5, marginBottom: 6, flexWrap: "wrap" }}>
+        {fmtBtn(<b>B</b>, "Bold", () => execFmt("bold"))}
+        {fmtBtn(<i>I</i>, "Italic", () => execFmt("italic"))}
+        {fmtBtn(<u>U</u>, "Underline", () => execFmt("underline"))}
+        {fmtBtn("•—", "Bullet list", () => execFmt("insertUnorderedList"))}
+        {fmtBtn("1.", "Numbered list", () => execFmt("insertOrderedList"))}
+      </div>
+      <div style={{ position: "relative" }}>
+        {placeholder && empty && (
+          <div style={{ position: "absolute", top: 10, left: 14, fontSize: 14, color: C.textMuted, pointerEvents: "none" }}>{placeholder}</div>
+        )}
+        <div
+          ref={editRef}
+          contentEditable
+          suppressContentEditableWarning
+          onInput={sync}
+          onBlur={sync}
+          style={{
+            width: "100%", boxSizing: "border-box", padding: "10px 14px", borderRadius: 10,
+            border: `1.5px solid ${invalid ? C.red : C.border}`, background: C.cardBg, fontSize: 14, color: C.text,
+            minHeight, outline: "none", overflowY: "auto", whiteSpace: "pre-wrap", wordBreak: "break-word",
+            lineHeight: 1.7, cursor: "text", fontFamily: "inherit",
+          }}
+        />
+      </div>
+    </div>
+  );
+}
+
 // Used inside LessonBuilderModal.
 function BlockEditor({ block, onChange, onRemove, onMoveUp, onMoveDown, isFirst, isLast }) {
   const BLOCK_TYPES   = ["text", "image", "video", "flipcard", "quiz", "recording"];
@@ -11789,30 +11860,6 @@ function BlockEditor({ block, onChange, onRemove, onMoveUp, onMoveDown, isFirst,
   const setC          = (key, val) => onChange({ ...block, content: { ...c, [key]: val } });
   const setHeader     = (val)      => onChange({ ...block, header: val });
   const setType       = (t)        => onChange({ ...block, type: t, content: {} });
-
-  // WYSIWYG rich-text for text blocks — contenteditable + execCommand
-  const editRef   = React.useRef(null);
-  // Initialize (or re-initialize when block type switches to "text")
-  React.useEffect(() => {
-    if (block.type !== "text" || !editRef.current) return;
-    editRef.current.innerHTML = mdToHtml(c.body ?? "");
-  }, [block.type]); // eslint-disable-line react-hooks/exhaustive-deps
-  // Sync contenteditable DOM → markdown state
-  const syncToMd = () => {
-    if (!editRef.current) return;
-    setC("body", htmlToMd(editRef.current));
-  };
-  const execFmt = (cmd) => {
-    editRef.current?.focus();
-    document.execCommand(cmd, false, null);
-    setTimeout(syncToMd, 0);
-  };
-  const fmtBtn = (label, title, action) => (
-    <button key={title} type="button" onClick={action} title={title} style={{
-      padding: "3px 8px", borderRadius: 5, border: `1px solid ${C.border}`,
-      background: C.white, fontSize: 12, cursor: "pointer", color: C.textSub, lineHeight: 1.4,
-    }}>{label}</button>
-  );
 
   const inputStyle = { width: "100%", padding: "9px 12px", borderRadius: 8, border: `1px solid ${C.border}`, fontSize: 13, color: C.text, background: C.pageBg, boxSizing: "border-box" };
   const taStyle    = { ...inputStyle, resize: "vertical", lineHeight: 1.5 };
@@ -11861,32 +11908,7 @@ function BlockEditor({ block, onChange, onRemove, onMoveUp, onMoveDown, isFirst,
 
       {/* Type-specific fields */}
       {block.type === "text" && (
-        <>
-          <div style={{ display: "flex", gap: 5, marginBottom: 6, flexWrap: "wrap" }}>
-            {fmtBtn(<b>B</b>,  "Bold",          () => execFmt("bold"))}
-            {fmtBtn(<i>I</i>,  "Italic",        () => execFmt("italic"))}
-            {fmtBtn(<u>U</u>,  "Underline",     () => execFmt("underline"))}
-            {fmtBtn("•—",      "Bullet list",   () => execFmt("insertUnorderedList"))}
-            {fmtBtn("1.",      "Numbered list", () => execFmt("insertOrderedList"))}
-          </div>
-          <div
-            ref={editRef}
-            contentEditable
-            suppressContentEditableWarning
-            onInput={syncToMd}
-            onBlur={syncToMd}
-            style={{
-              ...inputStyle,
-              minHeight: 120,
-              outline: "none",
-              overflowY: "auto",
-              whiteSpace: "pre-wrap",
-              wordBreak: "break-word",
-              lineHeight: 1.7,
-              cursor: "text",
-            }}
-          />
-        </>
+        <MarkdownEditor value={c.body ?? ""} onChange={v => setC("body", v)} seedKey={block.type} minHeight={120} />
       )}
       {block.type === "image" && (
         <>
@@ -15524,29 +15546,18 @@ function QuizzesScreen({ role, onNav, quizzes, onEditQuiz, onDeleteQuiz, onArchi
 
 // ── BATTLE CARDS SCREEN ─────────────────────────────────────
 //
-// Data model (production-ready):
-//   BC_CATEGORIES — { id, label, description }
-//   BATTLE_CARDS  — { id, categoryId, title, subtitle, summary,
-//                     strength, weakness, ourWin, talkTrack,
-//                     content: [{ heading, body }], tags, updatedAt }
+// Data model (tags-only; categories removed from the product):
+//   BATTLE_CARDS — { id, title, subtitle, summary, strength, weakness,
+//                    ourWin, talkTrack, content: [{ heading, body }], tags,
+//                    status, updatedAt }
 //
-// Admin/Manager creation tools can be added later without restructuring
-// this data shape. Replace module-level consts with API fetches when
-// the backend is ready.
+// Replace module-level consts with API fetches when the backend is ready.
 // ──────────────────────────────────────────────────────────────────────
-
-const INITIAL_BC_CATEGORIES = [
-  { id: "competitor", label: "Competitor Knowledge", description: "Head-to-head comparisons and positioning against competing products." },
-  { id: "product",    label: "Product Knowledge",    description: "Deep dives into ralli features, use cases, and value props." },
-  { id: "industry",   label: "Industry Knowledge",   description: "Market context, buyer trends, and vertical-specific insights." },
-  { id: "misc",       label: "Misc.",                description: "Objection handling, pricing talk tracks, and one-offs." },
-];
 
 // Production hook: replace with API response from /api/battle-cards
 const INITIAL_BATTLE_CARDS = [
   {
     id: "salesforce",
-    categoryId: "competitor",
     title: "Salesforce",
     subtitle: "CRM",
     summary: "Legacy enterprise CRM with strong brand recognition but high complexity and cost.",
@@ -15573,7 +15584,6 @@ const INITIAL_BATTLE_CARDS = [
   },
   {
     id: "hubspot",
-    categoryId: "competitor",
     title: "HubSpot",
     subtitle: "CRM + Marketing",
     summary: "Popular with marketing-led teams, but sales analytics and enterprise workflow are its weak points.",
@@ -15596,7 +15606,6 @@ const INITIAL_BATTLE_CARDS = [
   },
   {
     id: "outreach",
-    categoryId: "competitor",
     title: "Outreach",
     subtitle: "Sales Engagement",
     summary: "Strong sequencing and dialer, but operates in isolation from CRM and is expensive per seat.",
@@ -15619,7 +15628,6 @@ const INITIAL_BATTLE_CARDS = [
   },
   {
     id: "gong",
-    categoryId: "competitor",
     title: "Gong",
     subtitle: "Revenue Intelligence",
     summary: "Leading call intelligence platform, but passive by nature — it records and reports, it doesn't coach or train.",
@@ -15646,7 +15654,6 @@ const INITIAL_BATTLE_CARDS = [
   },
   {
     id: "ralli-product",
-    categoryId: "product",
     title: "ralli Platform Overview",
     subtitle: "Product Knowledge",
     summary: "Core platform capabilities: LMS, gamification, coaching, and readiness insights in one place.",
@@ -15673,7 +15680,6 @@ const INITIAL_BATTLE_CARDS = [
   },
   {
     id: "sales-cycle",
-    categoryId: "industry",
     title: "Modern B2B Sales Cycles",
     subtitle: "Industry Knowledge",
     summary: "How enterprise B2B buying has changed and what modern reps need to know.",
@@ -15696,7 +15702,6 @@ const INITIAL_BATTLE_CARDS = [
   },
   {
     id: "price-objection",
-    categoryId: "misc",
     title: "Handling the Price Objection",
     subtitle: "Objection Handling",
     summary: "Tactical talk tracks and reframes for when a prospect says your price is too high.",
@@ -15725,517 +15730,285 @@ const INITIAL_BATTLE_CARDS = [
 
 
 // ── BATTLE CARDS ADMIN SCREEN ────────────────────────────────────────────────
-// Admin/Manager: create, edit, delete categories and battle cards.
-// Production hook: replace onSave*/onDelete* callbacks with API calls.
+// Manager/admin: create, edit, tag, archive, and restore battle cards (tags-only
+// taxonomy — no categories; no permanent delete).
 // ─────────────────────────────────────────────────────────────────────────────
 
-function BattleCardsAdminScreen({ categories, cards, onSaveCategory, onDeleteCategory, onSaveCard, onDeleteCard }) {
-  // view: "home" | "category" | "detail" | "editCard"
-  const mobile         = useMobile();
-  const [view,         setView]         = useState("home");
-  const [activeCatId,  setActiveCatId]  = useState(null);
-  const [activeCardId, setActiveCardId] = useState(null);
-  const [search,       setSearch]       = useState("");
-  const [editingCard,  setEditingCard]  = useState(null);
-  const [editingCat,   setEditingCat]   = useState(null);
-  const [showCatForm,  setShowCatForm]  = useState(false);
-  const [confirmDel,   setConfirmDel]   = useState(null); // { type, id }
+// ── Battle Cards: tags-only taxonomy (categories removed from the product) ─────
+// Shared helpers so the manager and learner surfaces filter identically.
+function bcIsArchived(c) { return (c.status ?? "active") === "archived"; }
+function bcCardTags(c) { return Array.isArray(c.tags) ? c.tags : []; }
+// Distinct tags across the given cards (case-insensitive, first casing kept, sorted).
+function bcDistinctTags(cards) {
+  const seen = new Map();
+  for (const c of cards) for (const t of bcCardTags(c)) {
+    const k = String(t).toLowerCase();
+    if (!seen.has(k)) seen.set(k, t);
+  }
+  return [...seen.values()].sort((a, b) => a.localeCompare(b));
+}
+function bcMatchesSearch(c, q) {
+  if (!q) return true;
+  const s = q.toLowerCase();
+  // Summary is rich text (markdown subset) — search its READABLE text, not markup.
+  return (c.title ?? "").toLowerCase().includes(s)
+    || (c.subtitle ?? "").toLowerCase().includes(s)
+    || bcPlainText(c.summary).toLowerCase().includes(s)
+    || bcCardTags(c).some(t => String(t).toLowerCase().includes(s));
+}
+// selectedLower: lowercased Set. Empty = All. Otherwise a card matches if it
+// carries ANY selected tag.
+function bcMatchesTags(c, selectedLower) {
+  if (!selectedLower || selectedLower.size === 0) return true;
+  return bcCardTags(c).some(t => selectedLower.has(String(t).toLowerCase()));
+}
+function bcChipStyle(on) {
+  // Selected FILTER chips are a SOLID filled gold with dark text so they stay
+  // visually distinct from the informational yellow tag pills (TagChip), which
+  // use the pale orangeLight fill. Unselected filter chips are plain white.
+  return { padding: "6px 12px", borderRadius: 999, fontSize: 12, fontWeight: 700, cursor: "pointer",
+    border: `1px solid ${on ? C.orangeDeep : C.border}`, background: on ? C.orange : C.white, color: on ? C.text : C.textSub };
+}
+// Required Battle Card fields — one source of truth for the red-* markers + validation.
+const BC_REQUIRED_TEXT_FIELDS = [
+  { key: "title",    label: "Title" },
+  { key: "strength", label: "Their Strengths" },
+  { key: "weakness", label: "Their Weaknesses" },
+  { key: "ourWin",   label: "Why We Win" },
+];
+// Returns the invalid required-field keys (blank/whitespace-only), in editor order:
+// title, then tags (>=1), then the required competitive-detail text fields.
+function bcInvalidFields(draft, tags) {
+  const invalid = [];
+  if (!String(draft?.title ?? "").trim()) invalid.push("title");  // title is plain text
+  if (!(Array.isArray(tags) ? tags : []).length) invalid.push("tags");
+  for (const f of BC_REQUIRED_TEXT_FIELDS) {
+    if (f.key === "title") continue;
+    // Rich-text bodies: require MEANINGFUL visible text — empty HTML, whitespace,
+    // <p><br></p>/empty lists all serialize to "" and formatting-only markup
+    // strips to "" via bcPlainText, so none of them satisfy a required field.
+    if (!bcPlainText(draft?.[f.key])) invalid.push(f.key);
+  }
+  return invalid;
+}
 
-  // ── Navigation ──────────────────────────────────────────────────────────────
-  const openCategory = (catId) => { setActiveCatId(catId); setView("category"); };
-  const openCard     = (cardId) => { setActiveCardId(cardId); setView("detail"); };
-  const goHome       = () => { setView("home"); setActiveCatId(null); setActiveCardId(null); setSearch(""); };
-  const goCategory   = () => { setView("category"); setActiveCardId(null); };
-
-  const selectedCard   = cards.find(c => c.id === activeCardId);
-  const selectedCat    = categories.find(c => c.id === activeCatId);
-  const cardsInCat     = cards.filter(c => c.categoryId === activeCatId).sort((a, b) => a.title.localeCompare(b.title));
-  const allCardsSorted = [...cards].sort((a, b) => a.title.localeCompare(b.title));
-  const filtered = search.trim()
-    ? allCardsSorted.filter(c =>
-        c.title.toLowerCase().includes(search.toLowerCase()) ||
-        c.subtitle.toLowerCase().includes(search.toLowerCase()) ||
-        c.summary.toLowerCase().includes(search.toLowerCase()) ||
-        c.tags?.some(t => t.includes(search.toLowerCase()))
-      )
-    : allCardsSorted;
-
-  // ── Card editor state ───────────────────────────────────────────────────────
-  const blankCard = () => ({
-    id: `card-${Date.now()}`,
-    categoryId: activeCatId ?? categories[0]?.id ?? "",
-    title: "", subtitle: "", summary: "",
-    strength: "", weakness: "", ourWin: "", talkTrack: "",
-    tags: [], updatedAt: new Date().toISOString().slice(0,10), content: [],
-  });
-  const [draft, setDraft] = useState(blankCard);
-  const [cardSaving, setCardSaving] = useState(false);
-  const setF = (field) => (e) => setDraft(d => ({ ...d, [field]: e.target.value }));
-
-  const openNewCard  = () => { setDraft(blankCard()); setEditingCard("new"); setView("editCard"); };
-  const openEditCard = (card) => { setDraft({ ...card }); setEditingCard(card.id); setView("editCard"); };
-  const saveCard = async () => {
-    if (!draft.title.trim() || cardSaving) return;
-    setCardSaving(true);
-    const ok = await onSaveCard({ ...draft, title: draft.title.trim(), updatedAt: new Date().toISOString().slice(0,10) });
-    setCardSaving(false);
-    if (ok) setView(activeCatId ? "category" : "home");
-  };
-  const cancelEditCard = () => setView(activeCardId ? "detail" : activeCatId ? "category" : "home");
-
-  // content sections
-  const addSection    = () => setDraft(d => ({ ...d, content: [...d.content, { heading: "", body: "" }] }));
-  const removeSection = (i) => setDraft(d => ({ ...d, content: d.content.filter((_,j) => j !== i) }));
-  const setSection    = (i, field, val) => setDraft(d => ({
-    ...d, content: d.content.map((s, j) => j === i ? { ...s, [field]: val } : s),
-  }));
-  const moveSection   = (i, dir) => setDraft(d => {
-    const c = [...d.content];
-    const target = i + dir;
-    if (target < 0 || target >= c.length) return d;
-    [c[i], c[target]] = [c[target], c[i]];
-    return { ...d, content: c };
-  });
-
-  // ── Category editor state ───────────────────────────────────────────────────
-  const blankCat = () => ({ id: `cat-${Date.now()}`, label: "", description: "" });
-  const [catDraft, setCatDraft] = useState(blankCat);
-  const openNewCat  = () => { setCatDraft(blankCat()); setEditingCat("new"); setShowCatForm(true); };
-  const openEditCat = (cat) => { setCatDraft({ ...cat }); setEditingCat(cat.id); setShowCatForm(true); };
-  const saveCat     = async () => {
-    if (!catDraft.label.trim()) return;
-    const saved = await onSaveCategory({ ...catDraft, label: catDraft.label.trim() });
-    setShowCatForm(false);
-    if (editingCat === "new") setActiveCatId(saved?.id ?? catDraft.id);
-  };
-
-  // ── Confirm delete ──────────────────────────────────────────────────────────
-  const doDelete = () => {
-    if (!confirmDel) return;
-    if (confirmDel.type === "card") {
-      onDeleteCard(confirmDel.id);
-      if (activeCardId === confirmDel.id) goCategory();
+// ── Durable unsaved-draft persistence (Battle Card editor) ───────────────────
+// Draft state is scoped by tenant + authenticated user + editor target (a new
+// card vs a specific card id) so one account's/tenant's draft can NEVER surface
+// in another account, and an unsaved create draft never collides with an unsaved
+// edit of an existing card. Stored in localStorage (the app's scoped-key
+// convention, ralli_bc_*) so an interrupted session — reload, crash, accidental
+// nav — can be resumed. Cleared on sign-out (see clearBattleCardDrafts).
+const BC_DRAFT_PREFIX = "ralli_bc_draft_";
+function bcDraftKey(tenant, user, target) {
+  return `${BC_DRAFT_PREFIX}${tenant || "demo"}_${user || "guest"}_${target === "new" ? "new" : target}`;
+}
+// Human-readable "when the draft was saved" for the Resume banner.
+function bcRelativeTime(ms) {
+  if (!ms) return "just now";
+  const diff = Date.now() - ms;
+  if (diff < 60_000) return "just now";
+  const mins = Math.floor(diff / 60_000);
+  if (mins < 60) return `${mins} minute${mins === 1 ? "" : "s"} ago`;
+  const hrs = Math.floor(mins / 60);
+  if (hrs < 24) return `${hrs} hour${hrs === 1 ? "" : "s"} ago`;
+  const days = Math.floor(hrs / 24);
+  if (days < 7) return `${days} day${days === 1 ? "" : "s"} ago`;
+  try { return `on ${new Date(ms).toLocaleDateString()}`; } catch { return "earlier"; }
+}
+// Clears EVERY Battle Card draft on this device — used only on sign-out so a
+// signed-out session leaves no unsaved draft behind for the next account.
+function clearBattleCardDrafts() {
+  try {
+    const del = [];
+    for (let i = 0; i < localStorage.length; i++) {
+      const k = localStorage.key(i);
+      if (k && k.startsWith(BC_DRAFT_PREFIX)) del.push(k);
     }
-    if (confirmDel.type === "category") {
-      onDeleteCategory(confirmDel.id);
-      if (activeCatId === confirmDel.id) goHome();
-    }
-    setConfirmDel(null);
+    for (const k of del) localStorage.removeItem(k);
+  } catch {}
+}
+
+// Quiz-style Battle Card tag picker. Reuses the actual Quiz builder tag surface:
+// the same TagChip component for selected tags, the same ClassificationBadge
+// (tagged / tag_required) and the same "+ Add a tag…" <select> for adding an
+// existing tag. Battle Card tags are free text stored in tenant_battle_cards.tags[]
+// (NOT the governed Quiz taxonomy), so the one addition Quiz doesn't need is an
+// inline create input (no blanks, no case-insensitive duplicates). `suggestions`
+// already excludes archived-only tags (unless the edited card already uses one).
+function BcTagPicker({ selected, suggestions, onAdd, onRemove, error }) {
+  const [input, setInput] = useState("");
+  const selLower = new Set((selected ?? []).map(t => String(t).toLowerCase()));
+  const typed = input.trim();
+  const available = (suggestions ?? []).filter(s => !selLower.has(s.toLowerCase()));
+  const exactMatch = available.find(s => s.toLowerCase() === typed.toLowerCase());
+  const alreadySelected = selLower.has(typed.toLowerCase());
+  const canCreate = typed && !alreadySelected && !exactMatch;
+  const commit = () => {
+    const t = input.trim();
+    if (!t) return;                 // no blank tags
+    if (!selLower.has(t.toLowerCase())) onAdd(t);  // onAdd normalizes + dedupes
+    setInput("");
   };
-
-  const inputStyle = { width:"100%", boxSizing:"border-box", padding:"10px 14px", borderRadius:10, border:`1.5px solid ${C.border}`, background:C.cardBg, fontSize:14, color:C.text, outline:"none", fontFamily:"inherit" };
-  const taStyle    = { ...inputStyle, resize:"vertical", minHeight:90, lineHeight:1.6 };
-  const lbl        = (txt, req) => (
-    <label style={{ display:"block", fontSize:11, fontWeight:700, color:C.textMuted, letterSpacing:"0.08em", textTransform:"uppercase", marginBottom:8 }}>
-      {txt}{req && <span style={{ color:C.red }}> *</span>}
-    </label>
-  );
-
-  // Shared modals (appended to every view)
-  const modals = (
-    <>
-      {showCatForm && (
-        <div style={{ position:"fixed", inset:0, background:"rgba(0,0,0,0.45)", display:"flex", alignItems:"center", justifyContent:"center", zIndex:9999 }}
-          onClick={e => { if (e.target === e.currentTarget) setShowCatForm(false); }}>
-          <div style={{ background:C.cardBg, borderRadius:20, padding:"32px 36px", width:420, maxWidth:"90vw", border:`1px solid ${C.creamBorder}` }}>
-            <h3 style={{ margin:"0 0 20px", fontSize:18, fontWeight:900, color:C.text }}>{editingCat === "new" ? "New Category" : "Edit Category"}</h3>
-            <div style={{ marginBottom:14 }}>
-              <label style={{ display:"block", fontSize:11, fontWeight:700, color:C.textMuted, letterSpacing:"0.08em", textTransform:"uppercase", marginBottom:8 }}>Name <span style={{ color:C.red }}>*</span></label>
-              <input style={{ width:"100%", boxSizing:"border-box", padding:"10px 14px", borderRadius:10, border:`1.5px solid ${C.border}`, background:C.white, fontSize:14, color:C.text, outline:"none", fontFamily:"inherit" }}
-                value={catDraft.label} onChange={e => setCatDraft(d => ({ ...d, label: e.target.value }))} placeholder="e.g. Competitor Knowledge"
-                autoFocus />
-            </div>
-            <div style={{ marginBottom:24 }}>
-              <label style={{ display:"block", fontSize:11, fontWeight:700, color:C.textMuted, letterSpacing:"0.08em", textTransform:"uppercase", marginBottom:8 }}>Description</label>
-              <textarea style={{ width:"100%", boxSizing:"border-box", padding:"10px 14px", borderRadius:10, border:`1.5px solid ${C.border}`, background:C.white, fontSize:13, color:C.text, outline:"none", fontFamily:"inherit", resize:"vertical", minHeight:72, lineHeight:1.6 }}
-                value={catDraft.description} onChange={e => setCatDraft(d => ({ ...d, description: e.target.value }))} placeholder="Short description shown to reps" />
-            </div>
-            <div style={{ display:"flex", gap:10 }}>
-              <button onClick={() => setShowCatForm(false)} style={{ flex:1, padding:"11px 0", borderRadius:10, border:`1px solid ${C.border}`, background:C.cardBg, fontSize:13, fontWeight:700, cursor:"pointer", color:C.text }}>Cancel</button>
-              <button onClick={saveCat} disabled={!catDraft.label.trim()} style={{ flex:2, padding:"11px 0", borderRadius:10, border:"none", background:catDraft.label.trim()?C.orange:C.muted, color:catDraft.label.trim()?"#fff":C.textMuted, fontSize:13, fontWeight:700, cursor:catDraft.label.trim()?"pointer":"not-allowed" }}>
-                {editingCat === "new" ? "Create Category" : "Save Changes"}
-              </button>
-            </div>
-          </div>
-        </div>
-      )}
-      {confirmDel && (
-        <div style={{ position:"fixed", inset:0, background:"rgba(0,0,0,0.45)", display:"flex", alignItems:"center", justifyContent:"center", zIndex:9999 }}>
-          <div style={{ background:C.cardBg, borderRadius:20, padding:"32px 36px", width:360, maxWidth:"90vw", textAlign:"center", border:`1px solid ${C.creamBorder}` }}>
-            <h3 style={{ margin:"0 0 8px", fontSize:18, fontWeight:900, color:C.text }}>Delete {confirmDel.type === "card" ? "card" : "category"}?</h3>
-            <p style={{ margin:"0 0 24px", fontSize:13, color:C.textSub }}>
-              {confirmDel.type === "category"
-                ? "This will delete the category. Cards inside it will lose their category assignment."
-                : "This card will be permanently removed."}
-            </p>
-            <div style={{ display:"flex", gap:10 }}>
-              <button onClick={() => setConfirmDel(null)} style={{ flex:1, padding:"11px 0", borderRadius:10, border:`1px solid ${C.border}`, background:C.cardBg, fontSize:13, fontWeight:700, cursor:"pointer", color:C.text }}>Cancel</button>
-              <button onClick={doDelete} style={{ flex:1, padding:"11px 0", borderRadius:10, border:"none", background:"#ef4444", color:"#fff", fontSize:13, fontWeight:700, cursor:"pointer" }}>Delete</button>
-            </div>
-          </div>
-        </div>
-      )}
-    </>
-  );
-
-  // ── CARD EDITOR VIEW ────────────────────────────────────────────────────────
-  if (view === "editCard") {
-    const isNew = editingCard === "new";
-    return (
-      <div style={{ maxWidth: 740, display:"flex", flexDirection:"column", gap:0 }}>
-        <div style={{ display:"flex", alignItems:"center", justifyContent:"space-between", flexWrap:"wrap", gap:12, marginBottom:24 }}>
-          <div>
-            <button onClick={cancelEditCard} style={{ background:"none", border:"none", cursor:"pointer", fontSize:13, fontWeight:600, color:C.textSub, padding:0, display:"flex", alignItems:"center", gap:6, marginBottom:8 }}>← Battle Cards</button>
-            <h2 style={{ margin:0, fontSize:20, fontWeight:900, color:C.text }}>{isNew ? "New Battle Card" : `Edit: ${cards.find(c => c.id === editingCard)?.title ?? ""}`}</h2>
-          </div>
-          <div style={{ display:"flex", gap:10 }}>
-            <button onClick={cancelEditCard} style={{ padding:"10px 18px", borderRadius:10, border:`1px solid ${C.border}`, background:C.cardBg, fontSize:13, fontWeight:700, cursor:"pointer", color:C.text }}>Cancel</button>
-            <button onClick={saveCard} disabled={!draft.title.trim() || cardSaving} style={{ padding:"10px 20px", borderRadius:10, border:"none", background:draft.title.trim()&&!cardSaving?C.orange:C.muted, color:draft.title.trim()&&!cardSaving?"#fff":C.textMuted, fontSize:13, fontWeight:700, cursor:draft.title.trim()&&!cardSaving?"pointer":"not-allowed" }}>
-              {cardSaving ? "Saving…" : isNew ? "Create Card" : "Save Changes"}
-            </button>
-          </div>
-        </div>
-
-        <div style={{ display:"flex", flexDirection:"column", gap:16 }}>
-          <Card>
-            <div style={{ fontSize:13, fontWeight:800, color:C.text, marginBottom:16 }}>Basic Info</div>
-            <div style={{ display:"grid", gridTemplateColumns: mobile ? "1fr" : "1fr 1fr", gap:14, marginBottom:14 }}>
-              <div>{lbl("Title", true)}<input style={inputStyle} value={draft.title} onChange={setF("title")} placeholder="e.g. Salesforce" /></div>
-              <div>{lbl("Subtitle / Type")}<input style={inputStyle} value={draft.subtitle} onChange={setF("subtitle")} placeholder="e.g. CRM" /></div>
-            </div>
-            <div style={{ marginBottom:14 }}>
-              {lbl("Category", true)}
-              <select value={draft.categoryId} onChange={setF("categoryId")} style={{ ...inputStyle }}>
-                {categories.map(c => <option key={c.id} value={c.id}>{c.label}</option>)}
-              </select>
-            </div>
-            <div>{lbl("Summary")}<input style={inputStyle} value={draft.summary} onChange={setF("summary")} placeholder="One-line description shown in lists" /></div>
-          </Card>
-
-          <Card>
-            <div style={{ fontSize:13, fontWeight:800, color:C.text, marginBottom:16 }}>Competitive Detail</div>
-            <div style={{ display:"flex", flexDirection:"column", gap:14 }}>
-              <div>{lbl("Their Strengths", true)}<textarea style={taStyle} value={draft.strength} onChange={setF("strength")} placeholder="What they do well..." /></div>
-              <div>{lbl("Their Weaknesses", true)}<textarea style={taStyle} value={draft.weakness} onChange={setF("weakness")} placeholder="Where they fall short..." /></div>
-              <div>{lbl("Why We Win", true)}<textarea style={taStyle} value={draft.ourWin} onChange={setF("ourWin")} placeholder="Our differentiated value..." /></div>
-              <div>{lbl("Talk Track")}<textarea style={{ ...taStyle, minHeight:110 }} value={draft.talkTrack} onChange={setF("talkTrack")} placeholder="The rep's suggested script..." /></div>
-            </div>
-          </Card>
-
-          <Card>
-            <div style={{ display:"flex", alignItems:"center", justifyContent:"space-between", marginBottom:16 }}>
-              <div style={{ fontSize:13, fontWeight:800, color:C.text }}>In-Depth Content</div>
-              <button onClick={addSection} style={{ padding:"7px 14px", borderRadius:9, border:`1px solid ${C.orange}`, background:C.orangeLight, color:C.orange, fontSize:12, fontWeight:700, cursor:"pointer" }}>+ Add Section</button>
-            </div>
-            {draft.content.length === 0 ? (
-              <div style={{ padding:"28px 0", textAlign:"center", borderRadius:10, border:`2px dashed ${C.creamBorder}`, background:C.pageBg }}>
-                <p style={{ margin:0, fontSize:13, color:C.textSub }}>No sections yet. Add sections to give reps deeper context.</p>
-              </div>
-            ) : (
-              <div style={{ display:"flex", flexDirection:"column", gap:12 }}>
-                {draft.content.map((sec, i) => (
-                  <div key={i} style={{ borderRadius:12, border:`1px solid ${C.creamBorder}`, padding:16, background:C.pageBg }}>
-                    <div style={{ display:"flex", alignItems:"center", justifyContent:"space-between", marginBottom:10 }}>
-                      <span style={{ fontSize:11, fontWeight:700, color:C.textMuted }}>SECTION {i+1}</span>
-                      <div style={{ display:"flex", gap:6 }}>
-                        {i > 0                      && <button onClick={() => moveSection(i,-1)} style={{ background:"none", border:`1px solid ${C.border}`, borderRadius:6, width:26, height:26, cursor:"pointer", fontSize:12, color:C.textSub }}>↑</button>}
-                        {i < draft.content.length-1 && <button onClick={() => moveSection(i, 1)} style={{ background:"none", border:`1px solid ${C.border}`, borderRadius:6, width:26, height:26, cursor:"pointer", fontSize:12, color:C.textSub }}>↓</button>}
-                        <button onClick={() => removeSection(i)} style={{ background:"none", border:`1px solid rgba(239,68,68,0.3)`, borderRadius:6, width:26, height:26, cursor:"pointer", fontSize:12, color:"#ef4444" }}>✕</button>
-                      </div>
-                    </div>
-                    <input style={{ ...inputStyle, marginBottom:8 }} value={sec.heading} onChange={e => setSection(i,"heading",e.target.value)} placeholder="Section heading" />
-                    <textarea style={{ ...taStyle, minHeight:80 }} value={sec.body} onChange={e => setSection(i,"body",e.target.value)} placeholder="Section body..." />
-                  </div>
-                ))}
-              </div>
-            )}
-          </Card>
-        </div>
-        {modals}
-      </div>
-    );
-  }
-
-  // ── DETAIL VIEW ─────────────────────────────────────────────────────────────
-  if (view === "detail" && selectedCard) {
-    return (
-      <>
-        <BattleCardDetail
-          card={selectedCard}
-          onBack={activeCatId ? goCategory : goHome}
-          actions={
-            <>
-              <button onClick={() => openEditCard(selectedCard)} style={{ padding:"7px 16px", borderRadius:8, border:`1px solid ${C.border}`, background:C.white, fontSize:12, fontWeight:700, cursor:"pointer", color:C.text }}>Edit</button>
-              <button onClick={() => setConfirmDel({ type:"card", id:selectedCard.id })} style={{ padding:"7px 16px", borderRadius:8, border:"1px solid rgba(239,68,68,0.3)", background:"rgba(239,68,68,0.05)", fontSize:12, fontWeight:700, cursor:"pointer", color:"#ef4444" }}>Delete</button>
-            </>
-          }
-        />
-        {modals}
-      </>
-    );
-  }
-
-  // ── CATEGORY VIEW ───────────────────────────────────────────────────────────
-  if (view === "category" && selectedCat) {
-    return (
-      <div style={{ display:"flex", flexDirection:"column", gap:20 }}>
-        <div>
-          <button onClick={goHome} style={{ background:"none", border:"none", cursor:"pointer", padding:0, fontSize:13, fontWeight:600, color:C.textSub, display:"flex", alignItems:"center", gap:6, marginBottom:16 }}>← Battle Cards</button>
-          <div style={{ display:"flex", alignItems:"flex-start", justifyContent:"space-between", flexWrap:"wrap", gap:12 }}>
-            <div>
-              <h2 style={{ margin:0, fontSize:22, fontWeight:900, color:C.text }}>{selectedCat.label}</h2>
-              <p style={{ margin:"4px 0 0", fontSize:13, color:C.textSub }}>{selectedCat.description}</p>
-            </div>
-            <div style={{ display:"flex", gap:8, flexShrink:0 }}>
-              <button onClick={() => openEditCat(selectedCat)} style={{ padding:"9px 16px", borderRadius:10, border:`1px solid ${C.border}`, background:C.white, fontSize:12, fontWeight:700, cursor:"pointer", color:C.text }}>Edit Category</button>
-              <button onClick={openNewCard} style={{ padding:"9px 16px", borderRadius:10, border:"none", background:C.orange, color:"#fff", fontSize:12, fontWeight:700, cursor:"pointer" }}>+ New Card</button>
-            </div>
-          </div>
-        </div>
-
-        {cardsInCat.length === 0 ? (
-          <div style={{ padding:"48px 32px", textAlign:"center", borderRadius:16, border:`2px dashed ${C.creamBorder}`, background:C.cardBg }}>
-            <p style={{ margin:"0 0 6px", fontSize:14, fontWeight:700, color:C.text }}>No cards in this category yet</p>
-            <p style={{ margin:"0 0 20px", fontSize:13, color:C.textSub }}>Create the first card for {selectedCat.label}.</p>
-            <button onClick={openNewCard} style={{ padding:"10px 22px", borderRadius:10, border:"none", background:C.orange, color:"#fff", fontSize:13, fontWeight:700, cursor:"pointer" }}>+ New Card</button>
-          </div>
-        ) : (
-          <div style={{ display:"flex", flexDirection:"column", gap:8 }}>
-            {cardsInCat.map(card => (
-              <div key={card.id} style={{ display:"flex", alignItems:"center", gap:8 }}>
-                <button onClick={() => openCard(card.id)} style={{
-                  flex:1, display:"flex", alignItems:"center", justifyContent:"space-between",
-                  padding:"16px 20px", borderRadius:14,
-                  border:`1px solid ${C.creamBorder}`, background:C.cardBg,
-                  cursor:"pointer", textAlign:"left",
-                  transition:"border-color 0.12s, background 0.12s",
-                }}
-                onMouseEnter={e => { e.currentTarget.style.borderColor = C.orange; e.currentTarget.style.background = C.orangeLight; }}
-                onMouseLeave={e => { e.currentTarget.style.borderColor = C.creamBorder; e.currentTarget.style.background = C.cardBg; }}
-                >
-                  <div>
-                    <div style={{ fontSize:14, fontWeight:700, color:C.text }}>{card.title}</div>
-                    <div style={{ fontSize:12, color:C.textSub, marginTop:2 }}>{card.subtitle}</div>
-                    {card.summary && <div style={{ fontSize:12, color:C.textMuted, marginTop:4, maxWidth:520 }}>{card.summary}</div>}
-                  </div>
-                  <span style={{ fontSize:16, color:C.textMuted, flexShrink:0, marginLeft:16 }}>→</span>
-                </button>
-                <button onClick={() => openEditCard(card)} title="Edit" style={{ width:34, height:34, borderRadius:8, border:`1px solid ${C.border}`, background:C.white, fontSize:12, cursor:"pointer", color:C.textSub, flexShrink:0 }}>✎</button>
-                <button onClick={() => setConfirmDel({ type:"card", id:card.id })} title="Delete" style={{ width:34, height:34, borderRadius:8, border:"1px solid rgba(239,68,68,0.3)", background:"rgba(239,68,68,0.05)", fontSize:12, cursor:"pointer", color:"#ef4444", flexShrink:0 }}>✕</button>
-              </div>
-            ))}
-          </div>
-        )}
-        {modals}
-      </div>
-    );
-  }
-
-  // ── HOME VIEW ───────────────────────────────────────────────────────────────
+  const hasTags = (selected ?? []).length > 0;
+  // Same bordered-card shell + header + badge as the Quiz builder's tag section.
   return (
-    <div style={{ display:"flex", flexDirection:"column", gap:24 }}>
-      {/* Header */}
-      <div style={{ display:"flex", alignItems:"flex-start", justifyContent:"space-between", flexWrap:"wrap", gap:12 }}>
-        <div>
-          <h2 style={{ margin:0, fontSize:22, fontWeight:800, color:C.text }}>Battle Cards</h2>
-          <p style={{ margin:"4px 0 0", fontSize:13, color:C.textSub }}>Manage competitive intelligence for your team</p>
-        </div>
-        <div style={{ display:"flex", gap:8, flexShrink:0 }}>
-          <button onClick={openNewCat} style={{ padding:"10px 18px", borderRadius:12, border:`1px solid ${C.border}`, background:C.white, color:C.text, fontSize:13, fontWeight:700, cursor:"pointer" }}>+ New Category</button>
-          <button onClick={openNewCard} style={{ padding:"10px 20px", borderRadius:12, border:"none", background:C.orange, color:"#fff", fontSize:13, fontWeight:700, cursor:"pointer" }}>+ New Card</button>
-        </div>
+    <div style={{ border: `1px solid ${error ? C.red : C.border}`, borderRadius: 12, padding: 16, background: C.white }}>
+      <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
+        <span style={{ fontSize: 13, fontWeight: 800, color: C.text }}>Tags</span>
+        <ClassificationBadge state={hasTags ? "tagged" : "tag_required"} />
       </div>
 
-      {/* Search */}
-      <div style={{ display:"flex", alignItems:"center", gap:10, padding:"10px 14px", borderRadius:10, background:C.cardBg, border:`1px solid ${C.creamBorder}`, maxWidth:420 }}>
-        <span style={{ fontSize:13, color:C.textMuted }}>Search</span>
-        <input
-          type="text" value={search} placeholder="Cards, topics, competitors…"
-          onChange={e => setSearch(e.target.value)}
-          style={{ flex:1, border:"none", background:"transparent", fontSize:13, color:C.text, outline:"none", fontFamily:"inherit" }}
-        />
-        {search && <button onClick={() => setSearch("")} style={{ background:"none", border:"none", cursor:"pointer", fontSize:13, color:C.textMuted, padding:0, lineHeight:1 }}>✕</button>}
-      </div>
-
-      {/* Search results */}
-      {search.trim() ? (
-        <div>
-          <p style={{ margin:"0 0 12px", fontSize:12, fontWeight:700, color:C.textMuted, letterSpacing:"0.06em", textTransform:"uppercase" }}>
-            {filtered.length} result{filtered.length !== 1 ? "s" : ""}
-          </p>
-          {filtered.length === 0 ? (
-            <div style={{ padding:"40px 32px", textAlign:"center", borderRadius:16, border:`2px dashed ${C.creamBorder}`, background:C.cardBg }}>
-              <p style={{ margin:0, fontSize:14, fontWeight:700, color:C.text }}>No results for "{search}"</p>
-            </div>
-          ) : (
-            <div style={{ display:"flex", flexDirection:"column", gap:8 }}>
-              {filtered.map(card => (
-                <div key={card.id} style={{ display:"flex", alignItems:"center", gap:8 }}>
-                  <button onClick={() => { setActiveCatId(card.categoryId); openCard(card.id); }} style={{
-                    flex:1, display:"flex", alignItems:"center", justifyContent:"space-between",
-                    padding:"14px 18px", borderRadius:12, border:`1px solid ${C.creamBorder}`,
-                    background:C.cardBg, cursor:"pointer", textAlign:"left",
-                    transition:"border-color 0.12s",
-                  }}
-                  onMouseEnter={e => { e.currentTarget.style.borderColor = C.orange; e.currentTarget.style.background = C.orangeLight; }}
-                  onMouseLeave={e => { e.currentTarget.style.borderColor = C.creamBorder; e.currentTarget.style.background = C.cardBg; }}
-                  >
-                    <div>
-                      <div style={{ fontSize:14, fontWeight:700, color:C.text }}>{card.title}</div>
-                      <div style={{ fontSize:12, color:C.textSub, marginTop:2 }}>{card.subtitle} · {categories.find(c => c.id === card.categoryId)?.label}</div>
-                    </div>
-                    <span style={{ fontSize:16, color:C.textMuted, flexShrink:0, marginLeft:16 }}>→</span>
-                  </button>
-                  <button onClick={() => { setActiveCatId(card.categoryId); openEditCard(card); }} title="Edit" style={{ width:34, height:34, borderRadius:8, border:`1px solid ${C.border}`, background:C.white, fontSize:12, cursor:"pointer", color:C.textSub, flexShrink:0 }}>✎</button>
-                  <button onClick={() => setConfirmDel({ type:"card", id:card.id })} title="Delete" style={{ width:34, height:34, borderRadius:8, border:"1px solid rgba(239,68,68,0.3)", background:"rgba(239,68,68,0.05)", fontSize:12, cursor:"pointer", color:"#ef4444", flexShrink:0 }}>✕</button>
-                </div>
-              ))}
-            </div>
-          )}
+      {/* Selected tags — the exact Quiz TagChip component (filled pill + × remove) */}
+      {hasTags && (
+        <div style={{ display: "flex", flexWrap: "wrap", gap: 8, marginTop: 12 }}>
+          {(selected ?? []).map(t => <TagChip key={t} label={t} onRemove={() => onRemove(t)} />)}
         </div>
-      ) : (
-        <>
-          {/* Category grid */}
-          <div>
-            <p style={{ margin:"0 0 12px", fontSize:12, fontWeight:700, color:C.textMuted, letterSpacing:"0.06em", textTransform:"uppercase" }}>Categories</p>
-            {categories.length === 0 ? (
-              <div style={{ padding:"48px 32px", textAlign:"center", borderRadius:16, border:`2px dashed ${C.creamBorder}`, background:C.cardBg }}>
-                <p style={{ margin:"0 0 6px", fontSize:14, fontWeight:700, color:C.text }}>No categories yet</p>
-                <p style={{ margin:"0 0 20px", fontSize:13, color:C.textSub }}>Create a category to organize your battle cards.</p>
-                <button onClick={openNewCat} style={{ padding:"10px 22px", borderRadius:10, border:"none", background:C.orange, color:"#fff", fontSize:13, fontWeight:700, cursor:"pointer" }}>+ New Category</button>
-              </div>
-            ) : (
-              <div style={{ display:"grid", gridTemplateColumns: mobile ? "1fr" : "repeat(2, 1fr)", gap:12 }}>
-                {categories.map(cat => {
-                  const count = cards.filter(c => c.categoryId === cat.id).length;
-                  return (
-                    <div key={cat.id} style={{ position:"relative" }}>
-                      <button onClick={() => openCategory(cat.id)} style={{
-                        display:"block", width:"100%", padding:"18px 20px", borderRadius:14, textAlign:"left", cursor:"pointer",
-                        border:`1.5px solid ${C.creamBorder}`, background:C.cardBg,
-                        transition:"border-color 0.12s, background 0.12s",
-                      }}
-                      onMouseEnter={e => { e.currentTarget.style.borderColor = C.orange; e.currentTarget.style.background = C.orangeLight; }}
-                      onMouseLeave={e => { e.currentTarget.style.borderColor = C.creamBorder; e.currentTarget.style.background = C.cardBg; }}
-                      >
-                        <div style={{ fontSize:14, fontWeight:800, color:C.text, marginBottom:4, paddingRight:56 }}>{cat.label}</div>
-                        <div style={{ fontSize:12, color:C.textSub, lineHeight:1.4, marginBottom:10 }}>{cat.description}</div>
-                        <div style={{ fontSize:11, fontWeight:700, color:C.orange }}>{count} card{count !== 1 ? "s" : ""} →</div>
-                      </button>
-                      {/* Manager edit/delete overlay */}
-                      <div style={{ position:"absolute", top:10, right:10, display:"flex", gap:4, zIndex:1 }}>
-                        <button onClick={e => { e.stopPropagation(); openEditCat(cat); }} title="Edit category" style={{ width:26, height:26, borderRadius:6, border:`1px solid ${C.border}`, background:"rgba(255,255,255,0.92)", fontSize:11, cursor:"pointer", color:C.textSub }}>✎</button>
-                        <button onClick={e => { e.stopPropagation(); setConfirmDel({ type:"category", id:cat.id }); }} title="Delete category" style={{ width:26, height:26, borderRadius:6, border:"1px solid rgba(239,68,68,0.3)", background:"rgba(255,255,255,0.92)", fontSize:11, cursor:"pointer", color:"#ef4444" }}>✕</button>
-                      </div>
-                    </div>
-                  );
-                })}
-              </div>
-            )}
-          </div>
-
-          {/* All cards A–Z */}
-          {allCardsSorted.length > 0 && (
-            <div>
-              <p style={{ margin:"0 0 12px", fontSize:12, fontWeight:700, color:C.textMuted, letterSpacing:"0.06em", textTransform:"uppercase" }}>All Cards — A to Z</p>
-              <div style={{ display:"flex", flexDirection:"column", gap:6 }}>
-                {allCardsSorted.map(card => (
-                  <div key={card.id} style={{ display:"flex", alignItems:"center", gap:8 }}>
-                    <button onClick={() => { setActiveCatId(card.categoryId); openCard(card.id); }} style={{
-                      flex:1, display:"flex", alignItems:"center", justifyContent:"space-between",
-                      padding:"14px 18px", borderRadius:12, border:`1px solid ${C.creamBorder}`,
-                      background:C.cardBg, cursor:"pointer", textAlign:"left",
-                      transition:"border-color 0.12s, background 0.12s",
-                    }}
-                    onMouseEnter={e => { e.currentTarget.style.borderColor = C.orange; e.currentTarget.style.background = C.orangeLight; }}
-                    onMouseLeave={e => { e.currentTarget.style.borderColor = C.creamBorder; e.currentTarget.style.background = C.cardBg; }}
-                    >
-                      <div>
-                        <div style={{ fontSize:14, fontWeight:700, color:C.text }}>{card.title}</div>
-                        <div style={{ fontSize:12, color:C.textSub, marginTop:2 }}>{card.subtitle} · {categories.find(c => c.id === card.categoryId)?.label}</div>
-                      </div>
-                      <span style={{ fontSize:16, color:C.textMuted, flexShrink:0, marginLeft:16 }}>→</span>
-                    </button>
-                    <button onClick={() => { setActiveCatId(card.categoryId); openEditCard(card); }} title="Edit" style={{ width:34, height:34, borderRadius:8, border:`1px solid ${C.border}`, background:C.white, fontSize:12, cursor:"pointer", color:C.textSub, flexShrink:0 }}>✎</button>
-                    <button onClick={() => setConfirmDel({ type:"card", id:card.id })} title="Delete" style={{ width:34, height:34, borderRadius:8, border:"1px solid rgba(239,68,68,0.3)", background:"rgba(239,68,68,0.05)", fontSize:12, cursor:"pointer", color:"#ef4444", flexShrink:0 }}>✕</button>
-                  </div>
-                ))}
-              </div>
-            </div>
-          )}
-        </>
       )}
-      {modals}
+
+      {/* Add existing — the Quiz "+ Add a tag…" <select> — plus an inline create
+          input, since Battle Card tags are free text (not governed taxonomy). */}
+      <div style={{ display: "flex", alignItems: "center", gap: 10, marginTop: 12, flexWrap: "wrap" }}>
+        <select value="" onChange={e => { if (e.target.value) onAdd(e.target.value); }}
+          disabled={available.length === 0}
+          style={{ padding: "8px 10px", borderRadius: 8, border: `1px solid ${C.border}`, background: C.inputBg, fontSize: 13, color: C.text, minWidth: 180, cursor: available.length === 0 ? "default" : "pointer" }}>
+          <option value="">{available.length === 0 ? "No existing tags" : "+ Add a tag…"}</option>
+          {available.map(s => <option key={s} value={s}>{s}</option>)}
+        </select>
+        <input
+          style={{ flex: 1, minWidth: 160, boxSizing: "border-box", padding: "8px 10px", borderRadius: 8, border: `1px solid ${C.border}`, background: C.inputBg, fontSize: 13, color: C.text, outline: "none", fontFamily: "inherit" }}
+          value={input}
+          onChange={e => setInput(e.target.value)}
+          onKeyDown={e => {
+            if (e.key === "Enter" || e.key === ",") { e.preventDefault(); commit(); }
+            else if (e.key === "Backspace" && !input && (selected?.length)) { onRemove(selected[selected.length - 1]); }
+          }}
+          placeholder="Create a tag…"
+        />
+        {canCreate && (
+          <button onClick={commit} style={{ padding: "8px 12px", borderRadius: 8, border: `1px solid ${C.orange}`, background: C.orangeLight, color: C.orange, fontSize: 12, fontWeight: 700, cursor: "pointer" }}>+ Create “{typed}”</button>
+        )}
+      </div>
+
+      {/* One guidance line (mirrors Quiz): validation error when nothing selected. */}
+      {!hasTags && (
+        <div style={{ fontSize: 12, marginTop: 10, fontWeight: error ? 700 : 400, color: error ? C.red : C.textMuted }}>
+          {error ? "Add at least one tag before saving — Battle Cards are organized by tags." : "Select at least one tag to classify this card."}
+        </div>
+      )}
+    </div>
+  );
+}
+// Tag-filter chips — visual behavior matches the Quiz tag filters (pill chips, All
+// first, orange when selected). Multi-select; All resets. No category language.
+function BcTagFilters({ tags, selected, onToggle, onAll, allCount, usage }) {
+  if (tags.length === 0) return null;
+  const none = !selected || selected.size === 0;
+  return (
+    <div style={{ display: "flex", flexWrap: "wrap", alignItems: "center", gap: 6 }}>
+      <button onClick={onAll} style={bcChipStyle(none)}>All ({allCount})</button>
+      {tags.map(t => (
+        <button key={t} onClick={() => onToggle(t)} style={bcChipStyle(selected.has(t.toLowerCase()))}>
+          {t}{usage ? ` · ${usage.get(t.toLowerCase()) || 0}` : ""}
+        </button>
+      ))}
+      {!none && <button onClick={onAll} style={{ background: "none", border: "none", cursor: "pointer", fontSize: 12, fontWeight: 700, color: C.textMuted, padding: "6px 4px" }}>Clear</button>}
+    </div>
+  );
+}
+// Compact list row (used by both surfaces). Optional trailing actions node.
+function BcCardRow({ card, onOpen, archived = false, actions = null }) {
+  return (
+    <div style={{ display: "flex", alignItems: "center", gap: 8, opacity: archived ? 0.72 : 1 }}>
+      <button onClick={onOpen} style={{
+        flex: 1, display: "flex", alignItems: "center", justifyContent: "space-between",
+        padding: "14px 18px", borderRadius: 12,
+        border: `1px ${archived ? "dashed" : "solid"} ${C.border}`, background: C.white,
+        cursor: "pointer", textAlign: "left",
+      }}
+      onMouseEnter={e => { if (!archived) { e.currentTarget.style.borderColor = C.orange; e.currentTarget.style.background = C.orangeLight; } }}
+      onMouseLeave={e => { e.currentTarget.style.borderColor = C.border; e.currentTarget.style.background = C.white; }}
+      >
+        <div style={{ minWidth: 0 }}>
+          <div style={{ fontSize: 14, fontWeight: 700, color: C.text }}>{card.title}</div>
+          {card.subtitle && <div style={{ fontSize: 12, color: C.textSub, marginTop: 2 }}>{card.subtitle}</div>}
+          {bcCardTags(card).length > 0 && (
+            <div style={{ display: "flex", flexWrap: "wrap", gap: 4, marginTop: 6 }}>
+              {/* Quiz-style yellow tag pill (TagChip) — same as detail + Quiz cards */}
+              {bcCardTags(card).map(t => <TagChip key={t} label={t} />)}
+            </div>
+          )}
+        </div>
+        {archived
+          ? <span style={{ fontSize: 11, fontWeight: 700, color: C.textMuted, flexShrink: 0, marginLeft: 16 }}>ARCHIVED</span>
+          : <span style={{ fontSize: 16, color: C.textMuted, flexShrink: 0, marginLeft: 16 }}>→</span>}
+      </button>
+      {actions}
     </div>
   );
 }
 
-// ── BattleCardsScreen ─────────────────────────────────────────────────────────
-// Navigation: home → category view → card detail
-// All navigation is internal state (no router needed for this screen)
-
+// ── BattleCardDetail — distinct card-detail view (no filter controls here) ──────
 function BattleCardDetail({ card, onBack, actions }) {
   return (
     <div style={{ display: "flex", flexDirection: "column", gap: 20 }}>
-      {/* Back + header */}
       <div>
-        <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", marginBottom: 16 }}>
-          <button onClick={onBack} style={{
-            background: "none", border: "none", cursor: "pointer", padding: 0,
-            fontSize: 13, fontWeight: 600, color: C.textSub, display: "flex", alignItems: "center", gap: 6,
-          }}>← Back</button>
-          {actions && <div style={{ display: "flex", gap: 8 }}>{actions}</div>}
-        </div>
-        <div style={{ display: "flex", alignItems: "flex-start", justifyContent: "space-between", flexWrap: "wrap", gap: 10 }}>
-          <div>
-            <h2 style={{ margin: 0, fontSize: 22, fontWeight: 900, color: C.text }}>{card.title}</h2>
-            <p style={{ margin: "4px 0 0", fontSize: 13, color: C.textSub }}>{card.subtitle}</p>
+        <button onClick={onBack} style={{
+          background: "none", border: "none", cursor: "pointer", padding: 0,
+          fontSize: 13, fontWeight: 600, color: C.textSub, display: "flex", alignItems: "center", gap: 6, marginBottom: 16,
+        }}>← Back to Battle Cards</button>
+        {/* Distinct detail header (title + subtitle + tags) — white surface, matching Quiz content cards */}
+        <div style={{ borderRadius: 16, border: `1px solid ${C.border}`, background: C.white, padding: "20px 24px" }}>
+          <div style={{ display: "flex", alignItems: "flex-start", justifyContent: "space-between", flexWrap: "wrap", gap: 12 }}>
+            <div style={{ minWidth: 0 }}>
+              <h2 style={{ margin: 0, fontSize: 24, fontWeight: 900, color: C.text }}>{card.title}</h2>
+              {card.subtitle && <p style={{ margin: "4px 0 0", fontSize: 14, color: C.textSub }}>{card.subtitle}</p>}
+            </div>
+            {actions && <div style={{ display: "flex", gap: 8, flexShrink: 0 }}>{actions}</div>}
           </div>
-          {card.updatedAt && (
-            <span style={{ fontSize: 11, color: C.textMuted, padding: "4px 10px", borderRadius: 99, background: C.cardBg, border: `1px solid ${C.creamBorder}` }}>
-              Updated {card.updatedAt}
-            </span>
+          {bcCardTags(card).length > 0 && (
+            <div style={{ display: "flex", flexWrap: "wrap", gap: 6, marginTop: 12 }}>
+              {/* Same Quiz yellow tag pill (TagChip) used on the list rows */}
+              {bcCardTags(card).map(t => <TagChip key={t} label={t} />)}
+            </div>
           )}
+          {card.updatedAt && <div style={{ fontSize: 11, color: C.textMuted, marginTop: 10 }}>Updated {card.updatedAt}</div>}
         </div>
-        {card.summary && (
-          <p style={{ margin: "10px 0 0", fontSize: 14, color: C.text, lineHeight: 1.6, maxWidth: 640 }}>{card.summary}</p>
-        )}
+        {card.summary && <div style={{ margin: "14px 4px 0", maxWidth: 640 }}>{renderMarkdown(card.summary)}</div>}
       </div>
 
-      {/* ── PRESERVED DETAIL UI ── */}
-      <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr 1fr", gap: 14 }}>
-        <Card style={{ borderTop: `3px solid ${C.red}` }}>
+      {/* Content panels — accent borders + auto-fit so they read as detail, not list rows.
+          Bodies render via the shared safe markdown renderer (identical for learners). */}
+      <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(240px, 1fr))", gap: 14 }}>
+        <Card style={{ borderTop: `3px solid ${C.red}`, background: C.white }}>
           <div style={{ fontSize: 12, fontWeight: 700, color: C.red, letterSpacing: "0.06em", marginBottom: 12 }}>THEIR STRENGTHS</div>
-          <p style={{ margin: 0, fontSize: 14, color: C.text, lineHeight: 1.6 }}>{card.strength}</p>
+          <div>{renderMarkdown(card.strength)}</div>
         </Card>
-        <Card style={{ borderTop: `3px solid ${C.yellow}` }}>
+        <Card style={{ borderTop: `3px solid ${C.yellow}`, background: C.white }}>
           <div style={{ fontSize: 12, fontWeight: 700, color: C.yellow, letterSpacing: "0.06em", marginBottom: 12 }}>THEIR WEAKNESSES</div>
-          <p style={{ margin: 0, fontSize: 14, color: C.text, lineHeight: 1.6 }}>{card.weakness}</p>
+          <div>{renderMarkdown(card.weakness)}</div>
         </Card>
-        <Card style={{ borderTop: `3px solid ${C.green}` }}>
+        <Card style={{ borderTop: `3px solid ${C.green}`, background: C.white }}>
           <div style={{ fontSize: 12, fontWeight: 700, color: C.green, letterSpacing: "0.06em", marginBottom: 12 }}>WHY WE WIN</div>
-          <p style={{ margin: 0, fontSize: 14, color: C.text, lineHeight: 1.6 }}>{card.ourWin}</p>
+          <div>{renderMarkdown(card.ourWin)}</div>
         </Card>
       </div>
 
-      <Card style={{ background: C.pageBg }}>
-        <div style={{ fontSize: 12, fontWeight: 700, color: C.textSub, letterSpacing: "0.06em", marginBottom: 12 }}>TALK TRACK</div>
-        <p style={{ margin: 0, fontSize: 14, color: C.text, lineHeight: 1.7, fontStyle: "italic" }}>
-          "{card.talkTrack}"
-        </p>
-      </Card>
+      {card.talkTrack && (
+        <Card style={{ background: C.pageBg }}>
+          <div style={{ fontSize: 12, fontWeight: 700, color: C.textSub, letterSpacing: "0.06em", marginBottom: 12 }}>TALK TRACK</div>
+          <div style={{ fontStyle: "italic" }}>{renderMarkdown(card.talkTrack)}</div>
+        </Card>
+      )}
 
-      {/* ── IN-DEPTH CONTENT ── */}
       {card.content?.length > 0 && (
         <div>
-          <div style={{ fontSize: 11, fontWeight: 700, color: C.textMuted, letterSpacing: "0.1em", textTransform: "uppercase", marginBottom: 14 }}>
-            In-Depth
-          </div>
+          <div style={{ fontSize: 11, fontWeight: 700, color: C.textMuted, letterSpacing: "0.1em", textTransform: "uppercase", marginBottom: 14 }}>In-Depth</div>
           <div style={{ display: "flex", flexDirection: "column", gap: 14 }}>
             {card.content.map((section, i) => (
-              <Card key={i}>
-                <h3 style={{ margin: "0 0 10px", fontSize: 15, fontWeight: 800, color: C.text }}>{section.heading}</h3>
-                <p style={{ margin: 0, fontSize: 14, color: C.text, lineHeight: 1.7 }}>{section.body}</p>
+              <Card key={i} style={{ background: C.white }}>
+                {section.heading && <h3 style={{ margin: "0 0 10px", fontSize: 15, fontWeight: 800, color: C.text }}>{section.heading}</h3>}
+                <div>{renderMarkdown(section.body)}</div>
               </Card>
             ))}
           </div>
@@ -16245,242 +16018,522 @@ function BattleCardDetail({ card, onBack, actions }) {
   );
 }
 
-function BattleCardsScreen({ categories = INITIAL_BC_CATEGORIES, cards = INITIAL_BATTLE_CARDS, isLoading = false, isReal = false }) {
-  // view: "home" | "category" | "detail"
-  const mobile       = useMobile();
-  const [view,       setView]       = useState("home");
-  const [activeCat,  setActiveCat]  = useState(null); // BC_CATEGORIES id
-  const [activeCard, setActiveCard] = useState(null); // BATTLE_CARDS id
-  const [search,     setSearch]     = useState("");
+// ── BattleCardsAdminScreen — manager: one list (active + archived), tags only ───
+function BattleCardsAdminScreen({ cards, onSaveCard, onSetArchived, isReal = false, isLoading = false, loadError = null, onRetry, tenantId = null, userId = null }) {
+  const mobile = useMobile();
+  const [view,         setView]         = useState("list"); // list | detail | editCard
+  const [activeCardId, setActiveCardId] = useState(null);
+  const [search,       setSearch]       = useState("");
+  const [selected,     setSelected]     = useState(() => new Set()); // lowercased tags
+  const [editingCard,  setEditingCard]  = useState(null);
+  const [confirmArchive, setConfirmArchive] = useState(null);
+  const [cardSaving,   setCardSaving]   = useState(false);
+  const [errors,       setErrors]       = useState({});   // { title, tags, strength, weakness, ourWin }
+  const [saveError,    setSaveError]    = useState(false); // top-level "fix required fields" banner
+  const fieldRefs = React.useRef({});
 
-  const openCategory = (catId) => { setActiveCat(catId); setView("category"); };
-  const openCard     = (cardId) => { setActiveCard(cardId); setView("detail"); };
-  const goHome       = ()       => { setView("home"); setActiveCat(null); setActiveCard(null); setSearch(""); };
-  const goCategory   = ()       => { setView("category"); setActiveCard(null); };
+  // ── Durable unsaved-draft persistence (scoped by tenant + user + target) ──
+  const draftTenant = tenantId ?? "demo";
+  const draftUser   = userId ?? "guest";
+  const [resumeInfo, setResumeInfo]   = useState(null);  // {savedAt, serverNewer} | null (banner for open editor)
+  const [confirmExit, setConfirmExit] = useState(null);  // null | "leave" (keep draft) | "discard" (destroy draft)
+  const [editorSeed, setEditorSeed]   = useState(0);     // bumped on open/resume to reseed rich editors
+  const editorBaselineRef = React.useRef(null);          // server content (JSON) at editor-open time
+  const pendingResumeRef  = React.useRef(null);          // the stored draft snapshot offered for Resume
 
-  const selectedCard = cards.find(c => c.id === activeCard);
-  const selectedCat  = categories.find(c => c.id === activeCat);
-  const cardsInCat   = cards.filter(c => c.categoryId === activeCat).sort((a, b) => a.title.localeCompare(b.title));
-  const allCardsSorted = [...cards].sort((a, b) => a.title.localeCompare(b.title));
+  const blankCard = () => ({ id: `card-${Date.now()}`, title: "", subtitle: "", summary: "", strength: "", weakness: "", ourWin: "", talkTrack: "", tags: [], content: [] });
+  const [draft, setDraft] = useState(blankCard);
+  // Setting a plain-text field clears its own inline error as soon as it becomes non-blank.
+  const setF = (field) => (e) => {
+    const val = e.target.value;
+    setDraft(d => ({ ...d, [field]: val }));
+    if (errors[field] && String(val).trim()) setErrors(er => ({ ...er, [field]: false }));
+  };
+  // Setting a RICH-text field (markdown). Error clears once meaningful visible text exists.
+  const setRich = (field) => (val) => {
+    setDraft(d => ({ ...d, [field]: val }));
+    if (errors[field] && bcPlainText(val)) setErrors(er => ({ ...er, [field]: false }));
+  };
 
-  const filtered = search.trim()
-    ? (() => {
-        const q = search.toLowerCase();
-        return allCardsSorted.filter(c => {
-          const catLabel = categories.find(cat => cat.id === c.categoryId)?.label ?? "";
-          return (
-            c.title?.toLowerCase().includes(q) ||
-            c.subtitle?.toLowerCase().includes(q) ||
-            c.summary?.toLowerCase().includes(q) ||
-            catLabel.toLowerCase().includes(q) ||
-            c.talkTrack?.toLowerCase().includes(q) ||
-            c.strength?.toLowerCase().includes(q) ||
-            c.weakness?.toLowerCase().includes(q) ||
-            c.ourWin?.toLowerCase().includes(q) ||
-            c.tags?.some(t => t.toLowerCase().includes(q)) ||
-            c.content?.some(s => s.heading?.toLowerCase().includes(q) || s.body?.toLowerCase().includes(q))
-          );
-        });
-      })()
-    : allCardsSorted;
+  const activeCards   = cards.filter(c => !bcIsArchived(c));
+  const archivedCards = [...cards.filter(bcIsArchived)].sort((a, b) => a.title.localeCompare(b.title));
+  const tagUniverse   = bcDistinctTags(activeCards);
+  const usage = new Map();
+  for (const c of activeCards) for (const t of bcCardTags(c)) { const k = t.toLowerCase(); usage.set(k, (usage.get(k) || 0) + 1); }
+  // One canonical predicate for BOTH lists (no leaking): active shows active cards
+  // matching search AND tag filters; archived shows archived cards matching the same.
+  const matchesFilters = (c) => bcMatchesSearch(c, search.trim()) && bcMatchesTags(c, selected);
+  const filteredActive   = [...activeCards].filter(matchesFilters).sort((a, b) => a.title.localeCompare(b.title));
+  const filteredArchived = archivedCards.filter(matchesFilters);
 
-  // ── DETAIL VIEW ──
+  const selectedCard = cards.find(c => c.id === activeCardId);
+  const openCard = (id) => { setActiveCardId(id); setView("detail"); };
+  const goList   = () => { setView("list"); setActiveCardId(null); };
+  const toggleTag = (t) => setSelected(prev => { const n = new Set(prev); const k = t.toLowerCase(); n.has(k) ? n.delete(k) : n.add(k); return n; });
+  // Clear/All resets the search AND every selected tag (one reset).
+  const resetFilters = () => { setSearch(""); setSelected(new Set()); };
+
+  // Tag authoring for the editor (mirrors normalizeCardTags: trim, no blanks,
+  // case-insensitive dedupe). Adding a valid tag clears the tag validation error.
+  const addTag = (raw) => {
+    const t = String(raw ?? "").trim();
+    if (!t) return;
+    setDraft(d => (d.tags ?? []).some(x => x.toLowerCase() === t.toLowerCase()) ? d : { ...d, tags: [...(d.tags ?? []), t] });
+    setErrors(er => ({ ...er, tags: false }));
+  };
+  const removeTag = (t) => setDraft(d => ({ ...d, tags: (d.tags ?? []).filter(x => x !== t) }));
+
+  // Existing tags to suggest in the picker: the tenant's ACTIVE-card tags, plus any
+  // tag the currently-edited card already carries (so an archived-only tag it uses
+  // is still shown) — archived-only tags are otherwise excluded from suggestions.
+  const tagSuggestions = (() => {
+    const seen = new Map();
+    for (const t of bcDistinctTags(activeCards)) seen.set(t.toLowerCase(), t);
+    for (const t of (draft.tags ?? [])) if (!seen.has(t.toLowerCase())) seen.set(t.toLowerCase(), t);
+    return [...seen.values()].sort((a, b) => a.localeCompare(b));
+  })();
+
+  // Sections carry a UI-only stable _id so rich-text editors keep their content on
+  // reorder; it is stripped before save (never persisted to the DB content JSON).
+  const withSecIds = (content) => (content ?? []).map((s, i) => ({ _id: s._id ?? `sec-${Date.now()}-${i}`, ...s }));
+
+  // Opening the editor: set the server baseline, then look for a durable draft for
+  // THIS exact target (new vs this card id, this tenant+user). If one exists and
+  // differs from the server content, offer Resume/Discard — we never silently
+  // replace the (possibly newer) server content with an older local draft.
+  const openEditor = (target, baseCard) => {
+    const base = { ...baseCard, tags: baseCard.tags ?? [], content: withSecIds(baseCard.content) };
+    editorBaselineRef.current = JSON.stringify(base);
+    pendingResumeRef.current = null;
+    let resume = null;
+    try {
+      const raw = localStorage.getItem(bcDraftKey(draftTenant, draftUser, target));
+      if (raw) {
+        const parsed = JSON.parse(raw);
+        const stored = parsed?.draft;
+        if (stored && JSON.stringify({ ...stored, content: withSecIds(stored.content) }) !== editorBaselineRef.current) {
+          pendingResumeRef.current = { ...stored, content: withSecIds(stored.content) };
+          // Newer-server-content guard: the card's authoritative Last Updated date is
+          // after the day this draft was saved → resuming would drop newer changes.
+          const savedDay = new Date(parsed.savedAt).toISOString().slice(0, 10);
+          const serverNewer = target !== "new" && !!baseCard.updatedAt && savedDay < baseCard.updatedAt;
+          resume = { savedAt: parsed.savedAt, serverNewer };
+        } else {
+          localStorage.removeItem(bcDraftKey(draftTenant, draftUser, target)); // stale/no-op draft
+        }
+      }
+    } catch {}
+    setDraft(base);
+    setErrors({}); setSaveError(false);
+    setResumeInfo(resume);
+    setEditingCard(target);
+    setEditorSeed(s => s + 1);
+    setView("editCard");
+  };
+  const openNewCard  = () => openEditor("new", blankCard());
+  const openEditCard = (card) => openEditor(card.id, card);
+  const cancelEditCard = () => { setConfirmExit(null); setView(activeCardId ? "detail" : "list"); };
+  // True when the editor holds unsaved changes (draft differs from the server
+  // baseline) — i.e. there is a live draft that autosave has stored.
+  const editorDirty = () => editorBaselineRef.current != null && JSON.stringify(draft) !== editorBaselineRef.current;
+  // Ordinary Back / Cancel: warn when there are unsaved changes rather than
+  // silently leaving. Confirming a leave KEEPS the draft (resumable next time).
+  const attemptLeave = () => { if (editorDirty()) setConfirmExit("leave"); else cancelEditCard(); };
+  // Explicit in-editor discard: destroy ONLY this scoped draft (no DB write, no
+  // toast, saved card untouched) and return to the prior detail/list view.
+  const discardAndExit = () => {
+    try { localStorage.removeItem(bcDraftKey(draftTenant, draftUser, editingCard)); } catch {}
+    pendingResumeRef.current = null;
+    setResumeInfo(null);
+    setConfirmExit(null);
+    cancelEditCard();
+  };
+
+  // Autosave: while editing, persist the draft to localStorage whenever it differs
+  // from the server baseline. A clean (unchanged) editor stores nothing.
+  React.useEffect(() => {
+    if (view !== "editCard" || !editingCard) return;
+    const key = bcDraftKey(draftTenant, draftUser, editingCard);
+    try {
+      const dirty = editorBaselineRef.current == null || JSON.stringify(draft) !== editorBaselineRef.current;
+      if (dirty) localStorage.setItem(key, JSON.stringify({ draft, savedAt: Date.now() }));
+      else localStorage.removeItem(key);
+    } catch {}
+  }, [draft, view, editingCard, draftTenant, draftUser]);
+
+  // If the manager starts editing (draft diverges from baseline) while a Resume
+  // offer is still showing, they've chosen to start fresh — dismiss the offer.
+  React.useEffect(() => {
+    if (resumeInfo && editorBaselineRef.current != null && JSON.stringify(draft) !== editorBaselineRef.current) setResumeInfo(null);
+  }, [draft]); // eslint-disable-line react-hooks/exhaustive-deps
+
+  const resumeDraft = () => {
+    const d = pendingResumeRef.current;
+    if (d) { setDraft(d); setEditorSeed(s => s + 1); }
+    setResumeInfo(null); setErrors({}); setSaveError(false);
+  };
+  const discardDraft = () => {
+    // Clears ONLY this targeted draft; unrelated drafts are untouched.
+    try { localStorage.removeItem(bcDraftKey(draftTenant, draftUser, editingCard)); } catch {}
+    pendingResumeRef.current = null;
+    setResumeInfo(null);
+  };
+
+  const saveCard = async () => {
+    if (cardSaving) return;
+    const tags = draft.tags ?? [];
+    const invalid = bcInvalidFields(draft, tags);
+    if (invalid.length > 0) {
+      // Honest failure: mark every invalid field, show a top message, keep the
+      // manager in the editor with all content, and focus/scroll the first invalid.
+      // The draft is preserved (autosave already stored it) — nothing is discarded.
+      setErrors(Object.fromEntries(invalid.map(k => [k, true])));
+      setSaveError(true);
+      const first = fieldRefs.current[invalid[0]];
+      if (first) { try { first.scrollIntoView({ behavior: "smooth", block: "center" }); first.focus({ preventScroll: true }); } catch { first.focus?.(); } }
+      return;  // no save, no toast, no navigation
+    }
+    setErrors({}); setSaveError(false);
+    setCardSaving(true);
+    // Strip UI-only section _id before persisting (keep DB content JSON clean).
+    const content = (draft.content ?? []).map(({ heading, body }) => ({ heading, body }));
+    const ok = await onSaveCard({ ...draft, title: draft.title.trim(), tags, content });
+    setCardSaving(false);
+    if (ok) {
+      // Successful save clears this card's draft (nothing left to resume).
+      try { localStorage.removeItem(bcDraftKey(draftTenant, draftUser, editingCard)); } catch {}
+      pendingResumeRef.current = null; setResumeInfo(null);
+      goList();
+    }
+    // A failed save keeps the draft (autosave retains it) so nothing is lost.
+  };
+
+  // content sections
+  const addSection    = () => setDraft(d => ({ ...d, content: [...d.content, { _id: `sec-${Date.now()}-${d.content.length}`, heading: "", body: "" }] }));
+  const removeSection = (i) => setDraft(d => ({ ...d, content: d.content.filter((_, j) => j !== i) }));
+  const setSection    = (i, field, val) => setDraft(d => ({ ...d, content: d.content.map((s, j) => j === i ? { ...s, [field]: val } : s) }));
+  const moveSection   = (i, dir) => setDraft(d => { const c = [...d.content]; const t = i + dir; if (t < 0 || t >= c.length) return d; [c[i], c[t]] = [c[t], c[i]]; return { ...d, content: c }; });
+
+  const inputStyle = { width: "100%", boxSizing: "border-box", padding: "10px 14px", borderRadius: 10, border: `1.5px solid ${C.border}`, background: C.cardBg, fontSize: 14, color: C.text, outline: "none", fontFamily: "inherit" };
+  const taStyle    = { ...inputStyle, resize: "vertical", minHeight: 90, lineHeight: 1.6 };
+  const lbl = (txt, req) => (<label style={{ display: "block", fontSize: 11, fontWeight: 700, color: C.textMuted, letterSpacing: "0.08em", textTransform: "uppercase", marginBottom: 8 }}>{txt}{req && <span style={{ color: C.red }}> *</span>}</label>);
+
+  const archiveModal = confirmArchive && (
+    <div style={{ position: "fixed", inset: 0, background: "rgba(0,0,0,0.45)", display: "flex", alignItems: "center", justifyContent: "center", zIndex: 9999 }}>
+      <div style={{ background: C.cardBg, borderRadius: 20, padding: "32px 36px", width: 380, maxWidth: "90vw", textAlign: "center", border: `1px solid ${C.creamBorder}` }}>
+        <h3 style={{ margin: "0 0 8px", fontSize: 18, fontWeight: 900, color: C.text }}>Archive this card?</h3>
+        <p style={{ margin: "0 0 24px", fontSize: 13, color: C.textSub }}>It will be hidden from reps and removed from search and counts. Nothing is deleted — you can restore it anytime from the Archived section.</p>
+        <div style={{ display: "flex", gap: 10 }}>
+          <button onClick={() => setConfirmArchive(null)} style={{ flex: 1, padding: "11px 0", borderRadius: 10, border: `1px solid ${C.border}`, background: C.cardBg, fontSize: 13, fontWeight: 700, cursor: "pointer", color: C.text }}>Cancel</button>
+          <button onClick={() => { onSetArchived(confirmArchive, true); if (activeCardId === confirmArchive) goList(); setConfirmArchive(null); }} style={{ flex: 1, padding: "11px 0", borderRadius: 10, border: "none", background: C.orange, color: "#fff", fontSize: 13, fontWeight: 700, cursor: "pointer" }}>Archive</button>
+        </div>
+      </div>
+    </div>
+  );
+
+  const rowActions = (card) => (
+    <>
+      <button onClick={() => openEditCard(card)} title="Edit" style={{ width: 34, height: 34, borderRadius: 8, border: `1px solid ${C.border}`, background: C.white, fontSize: 12, cursor: "pointer", color: C.textSub, flexShrink: 0 }}>✎</button>
+      {bcIsArchived(card)
+        ? <button onClick={() => onSetArchived(card.id, false)} title="Restore" style={{ height: 34, padding: "0 12px", borderRadius: 8, border: `1px solid ${C.border}`, background: C.white, fontSize: 12, fontWeight: 700, cursor: "pointer", color: C.text, flexShrink: 0 }}>Restore</button>
+        : <button onClick={() => setConfirmArchive(card.id)} title="Archive" style={{ height: 34, padding: "0 12px", borderRadius: 8, border: `1px solid ${C.border}`, background: C.white, fontSize: 12, fontWeight: 700, cursor: "pointer", color: C.textSub, flexShrink: 0 }}>Archive</button>}
+    </>
+  );
+
+  // ── Honest load states ──
+  if (loadError) {
+    return (
+      <div style={{ padding: "48px 32px", textAlign: "center", borderRadius: 16, border: `1px solid ${C.creamBorder}`, background: C.cardBg, maxWidth: 520, margin: "0 auto" }}>
+        <p style={{ margin: "0 0 6px", fontSize: 15, fontWeight: 800, color: C.text }}>Couldn't load battle cards</p>
+        <p style={{ margin: "0 0 20px", fontSize: 13, color: C.textSub }}>Something went wrong reaching the server. This is not the same as an empty library.</p>
+        <button onClick={() => onRetry?.()} style={{ padding: "10px 22px", borderRadius: 10, border: "none", background: C.orange, color: "#fff", fontSize: 13, fontWeight: 700, cursor: "pointer" }}>Retry</button>
+      </div>
+    );
+  }
+  if (isReal && isLoading) return <LoadingState rows={4} message="Loading battle cards…" />;
+
+  // ── CARD EDITOR (tags only; ≥1 tag required) ──
+  if (view === "editCard") {
+    const isNew = editingCard === "new";
+    const dirty = editorDirty();
+    const errText = (field) => errors[field]
+      ? <div style={{ fontSize: 12, color: C.red, fontWeight: 700, marginTop: 6 }}>This field is required.</div> : null;
+    return (
+      <div style={{ maxWidth: 740, display: "flex", flexDirection: "column", gap: 0 }}>
+        <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", flexWrap: "wrap", gap: 12, marginBottom: 16 }}>
+          <div>
+            <button onClick={attemptLeave} style={{ background: "none", border: "none", cursor: "pointer", fontSize: 13, fontWeight: 600, color: C.textSub, padding: 0, display: "flex", alignItems: "center", gap: 6, marginBottom: 8 }}>← Battle Cards</button>
+            <h2 style={{ margin: 0, fontSize: 20, fontWeight: 900, color: C.text }}>{isNew ? "New Battle Card" : `Edit: ${cards.find(c => c.id === editingCard)?.title ?? ""}`}</h2>
+          </div>
+          <div style={{ display: "flex", gap: 10 }}>
+            {/* Destructive, secondary — clears only this draft; shown only when there are unsaved changes. Distinct from Archive (which lives on the list/detail, not here). */}
+            {dirty && (
+              <button onClick={() => setConfirmExit("discard")} style={{ padding: "10px 18px", borderRadius: 10, border: `1px solid ${C.red}`, background: C.white, fontSize: 13, fontWeight: 700, cursor: "pointer", color: C.red }}>{isNew ? "Discard Draft" : "Discard Changes"}</button>
+            )}
+            <button onClick={attemptLeave} style={{ padding: "10px 18px", borderRadius: 10, border: `1px solid ${C.border}`, background: C.white, fontSize: 13, fontWeight: 700, cursor: "pointer", color: C.text }}>Cancel</button>
+            <button onClick={saveCard} disabled={cardSaving} style={{ padding: "10px 20px", borderRadius: 10, border: "none", background: cardSaving ? C.muted : C.orange, color: cardSaving ? C.textMuted : "#fff", fontSize: 13, fontWeight: 700, cursor: cardSaving ? "not-allowed" : "pointer" }}>{cardSaving ? "Saving…" : isNew ? "Create Card" : "Save Changes"}</button>
+          </div>
+        </div>
+
+        {/* Exit guard — "leave" keeps the draft (resumable); "discard" destroys it. */}
+        {confirmExit && (
+          <div style={{ position: "fixed", inset: 0, background: "rgba(0,0,0,0.45)", display: "flex", alignItems: "center", justifyContent: "center", zIndex: 9999 }} onClick={() => setConfirmExit(null)}>
+            <div onClick={e => e.stopPropagation()} style={{ background: C.white, borderRadius: 20, padding: "28px 32px", width: 420, maxWidth: "90vw", border: `1px solid ${C.border}` }}>
+              <h3 style={{ margin: "0 0 8px", fontSize: 18, fontWeight: 900, color: C.text }}>
+                {confirmExit === "discard" ? (isNew ? "Discard this draft?" : "Discard your changes?") : "Leave without saving?"}
+              </h3>
+              <p style={{ margin: "0 0 24px", fontSize: 13, color: C.textSub, lineHeight: 1.6 }}>
+                {confirmExit === "discard"
+                  ? (isNew
+                      ? "This permanently removes the unsaved draft. Nothing is saved to your battle cards."
+                      : "This removes your unsaved edits and keeps the saved battle card exactly as it is. The card is not archived or deleted.")
+                  : "Your unsaved changes will be kept as a draft, so you can resume where you left off next time."}
+              </p>
+              <div style={{ display: "flex", gap: 10, justifyContent: "flex-end" }}>
+                <button onClick={() => setConfirmExit(null)} style={{ padding: "10px 18px", borderRadius: 10, border: `1px solid ${C.border}`, background: C.white, fontSize: 13, fontWeight: 700, cursor: "pointer", color: C.text }}>Keep editing</button>
+                {confirmExit === "discard"
+                  ? <button onClick={discardAndExit} style={{ padding: "10px 18px", borderRadius: 10, border: "none", background: C.red, color: "#fff", fontSize: 13, fontWeight: 700, cursor: "pointer" }}>{isNew ? "Discard draft" : "Discard changes"}</button>
+                  : <button onClick={cancelEditCard} style={{ padding: "10px 18px", borderRadius: 10, border: `1px solid ${C.border}`, background: C.white, fontSize: 13, fontWeight: 700, cursor: "pointer", color: C.text }}>Leave</button>}
+              </div>
+            </div>
+          </div>
+        )}
+
+        {saveError && (
+          <div style={{ marginBottom: 16, padding: "12px 16px", borderRadius: 10, background: C.redBg ?? "rgba(239,68,68,0.08)", border: "1px solid rgba(239,68,68,0.3)", color: "#b91c1c", fontSize: 13, fontWeight: 700 }}>
+            Please fill in every required field (marked *) before saving.
+          </div>
+        )}
+
+        {resumeInfo && (
+          <div style={{ marginBottom: 16, padding: "12px 16px", borderRadius: 10, background: C.orangeLight, border: `1px solid ${C.orangeBorder}`, display: "flex", alignItems: "center", justifyContent: "space-between", flexWrap: "wrap", gap: 10 }}>
+            <div style={{ fontSize: 13, color: C.text }}>
+              <b>Unsaved draft found</b> — saved {bcRelativeTime(resumeInfo.savedAt)}.
+              {resumeInfo.serverNewer && <span style={{ display: "block", marginTop: 4, color: "#b45309", fontWeight: 700 }}>⚠ This card was updated on the server after your draft was saved — resuming will replace those newer changes.</span>}
+            </div>
+            <div style={{ display: "flex", gap: 8, flexShrink: 0 }}>
+              <button onClick={resumeDraft} style={{ padding: "7px 14px", borderRadius: 8, border: "none", background: C.orange, color: "#fff", fontSize: 12, fontWeight: 700, cursor: "pointer" }}>Resume draft</button>
+              <button onClick={discardDraft} style={{ padding: "7px 14px", borderRadius: 8, border: `1px solid ${C.border}`, background: C.white, color: C.text, fontSize: 12, fontWeight: 700, cursor: "pointer" }}>Discard</button>
+            </div>
+          </div>
+        )}
+
+        <div style={{ display: "flex", flexDirection: "column", gap: 16 }}>
+          <Card>
+            <div style={{ fontSize: 13, fontWeight: 800, color: C.text, marginBottom: 16 }}>Basic Info</div>
+            <div style={{ display: "grid", gridTemplateColumns: mobile ? "1fr" : "1fr 1fr", gap: 14, marginBottom: 14 }}>
+              <div>{lbl("Title", true)}<input ref={el => (fieldRefs.current.title = el)} style={{ ...inputStyle, borderColor: errors.title ? C.red : C.border }} value={draft.title} onChange={setF("title")} placeholder="e.g. Salesforce" />{errText("title")}</div>
+              <div>{lbl("Subtitle / Type")}<input style={inputStyle} value={draft.subtitle} onChange={setF("subtitle")} placeholder="e.g. CRM" /></div>
+            </div>
+            <div style={{ marginBottom: 14 }}>{lbl("Summary")}<MarkdownEditor value={draft.summary ?? ""} onChange={setRich("summary")} seedKey={editorSeed} minHeight={80} placeholder="Short description shown at the top of the card" /></div>
+            <div ref={el => (fieldRefs.current.tags = el)}>
+              <BcTagPicker selected={draft.tags ?? []} suggestions={tagSuggestions} onAdd={addTag} onRemove={removeTag} error={errors.tags} />
+            </div>
+          </Card>
+
+          <Card>
+            <div style={{ fontSize: 13, fontWeight: 800, color: C.text, marginBottom: 16 }}>Competitive Detail</div>
+            <div style={{ display: "flex", flexDirection: "column", gap: 14 }}>
+              <div ref={el => (fieldRefs.current.strength = el)}>{lbl("Their Strengths", true)}<MarkdownEditor value={draft.strength ?? ""} onChange={setRich("strength")} seedKey={editorSeed} minHeight={90} invalid={!!errors.strength} placeholder="What they do well..." />{errText("strength")}</div>
+              <div ref={el => (fieldRefs.current.weakness = el)}>{lbl("Their Weaknesses", true)}<MarkdownEditor value={draft.weakness ?? ""} onChange={setRich("weakness")} seedKey={editorSeed} minHeight={90} invalid={!!errors.weakness} placeholder="Where they fall short..." />{errText("weakness")}</div>
+              <div ref={el => (fieldRefs.current.ourWin = el)}>{lbl("Why We Win", true)}<MarkdownEditor value={draft.ourWin ?? ""} onChange={setRich("ourWin")} seedKey={editorSeed} minHeight={90} invalid={!!errors.ourWin} placeholder="Our differentiated value..." />{errText("ourWin")}</div>
+              <div>{lbl("Talk Track")}<MarkdownEditor value={draft.talkTrack ?? ""} onChange={setRich("talkTrack")} seedKey={editorSeed} minHeight={110} placeholder="The rep's suggested script..." /></div>
+            </div>
+          </Card>
+
+          <Card>
+            <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", marginBottom: 16 }}>
+              <div style={{ fontSize: 13, fontWeight: 800, color: C.text }}>In-Depth Content</div>
+              <button onClick={addSection} style={{ padding: "7px 14px", borderRadius: 9, border: `1px solid ${C.orange}`, background: C.orangeLight, color: C.orange, fontSize: 12, fontWeight: 700, cursor: "pointer" }}>+ Add Section</button>
+            </div>
+            {draft.content.length === 0 ? (
+              <div style={{ padding: "28px 0", textAlign: "center", borderRadius: 10, border: `2px dashed ${C.creamBorder}`, background: C.pageBg }}>
+                <p style={{ margin: 0, fontSize: 13, color: C.textSub }}>No sections yet. Add sections to give reps deeper context.</p>
+              </div>
+            ) : (
+              <div style={{ display: "flex", flexDirection: "column", gap: 12 }}>
+                {draft.content.map((sec, i) => (
+                  <div key={sec._id ?? i} style={{ borderRadius: 12, border: `1px solid ${C.creamBorder}`, padding: 16, background: C.pageBg }}>
+                    <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", marginBottom: 10 }}>
+                      <span style={{ fontSize: 11, fontWeight: 700, color: C.textMuted }}>SECTION {i + 1}</span>
+                      <div style={{ display: "flex", gap: 6 }}>
+                        {i > 0                      && <button onClick={() => moveSection(i, -1)} style={{ background: "none", border: `1px solid ${C.border}`, borderRadius: 6, width: 26, height: 26, cursor: "pointer", fontSize: 12, color: C.textSub }}>↑</button>}
+                        {i < draft.content.length-1 && <button onClick={() => moveSection(i, 1)} style={{ background: "none", border: `1px solid ${C.border}`, borderRadius: 6, width: 26, height: 26, cursor: "pointer", fontSize: 12, color: C.textSub }}>↓</button>}
+                        <button onClick={() => removeSection(i)} style={{ background: "none", border: `1px solid rgba(239,68,68,0.3)`, borderRadius: 6, width: 26, height: 26, cursor: "pointer", fontSize: 12, color: "#ef4444" }}>✕</button>
+                      </div>
+                    </div>
+                    {/* Heading stays plain text; body reuses the shared Lesson rich-text editor. */}
+                    <input style={{ ...inputStyle, marginBottom: 8 }} value={sec.heading} onChange={e => setSection(i, "heading", e.target.value)} placeholder="Section heading" />
+                    <MarkdownEditor value={sec.body ?? ""} onChange={v => setSection(i, "body", v)} seedKey={`${editorSeed}:${sec._id ?? i}`} minHeight={80} placeholder="Section body..." />
+                  </div>
+                ))}
+              </div>
+            )}
+          </Card>
+        </div>
+      </div>
+    );
+  }
+
+  // ── DETAIL (preview) with manager actions: Edit + Archive/Restore ──
   if (view === "detail" && selectedCard) {
     return (
-      <BattleCardDetail
-        card={selectedCard}
-        onBack={activeCat ? goCategory : goHome}
-      />
-    );
-  }
-
-  // ── CATEGORY VIEW ──
-  if (view === "category" && selectedCat) {
-    return (
-      <div style={{ display: "flex", flexDirection: "column", gap: 20 }}>
-        <div>
-          <button onClick={goHome} style={{
-            background: "none", border: "none", cursor: "pointer", padding: 0,
-            fontSize: 13, fontWeight: 600, color: C.textSub, display: "flex", alignItems: "center", gap: 6, marginBottom: 16,
-          }}>← Battle Cards</button>
-          <h2 style={{ margin: 0, fontSize: 22, fontWeight: 900, color: C.text }}>{selectedCat.label}</h2>
-          <p style={{ margin: "4px 0 0", fontSize: 13, color: C.textSub }}>{selectedCat.description}</p>
-        </div>
-
-        {cardsInCat.length === 0 ? (
-          <div style={{ padding: "48px 32px", textAlign: "center", borderRadius: 16, border: `2px dashed ${C.creamBorder}`, background: C.cardBg }}>
-            <p style={{ margin: 0, fontSize: 14, fontWeight: 700, color: C.text }}>No cards in this category yet</p>
-            <p style={{ margin: "6px 0 0", fontSize: 13, color: C.textSub }}>Check back when more content is added.</p>
-          </div>
-        ) : (
-          <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
-            {cardsInCat.map(card => (
-              <button key={card.id} onClick={() => openCard(card.id)} style={{
-                display: "flex", alignItems: "center", justifyContent: "space-between",
-                padding: "16px 20px", borderRadius: 14,
-                border: `1px solid ${C.creamBorder}`, background: C.cardBg,
-                cursor: "pointer", textAlign: "left", width: "100%",
-                transition: "border-color 0.12s, background 0.12s",
-              }}
-              onMouseEnter={e => { e.currentTarget.style.borderColor = C.orange; e.currentTarget.style.background = C.orangeLight; }}
-              onMouseLeave={e => { e.currentTarget.style.borderColor = C.creamBorder; e.currentTarget.style.background = C.cardBg; }}
-              >
-                <div>
-                  <div style={{ fontSize: 14, fontWeight: 700, color: C.text }}>{card.title}</div>
-                  <div style={{ fontSize: 12, color: C.textSub, marginTop: 2 }}>{card.subtitle}</div>
-                  {card.summary && <div style={{ fontSize: 12, color: C.textMuted, marginTop: 4, maxWidth: 520 }}>{card.summary}</div>}
-                </div>
-                <span style={{ fontSize: 16, color: C.textMuted, flexShrink: 0, marginLeft: 16 }}>→</span>
-              </button>
-            ))}
-          </div>
-        )}
-      </div>
-    );
-  }
-
-  // ── LOADING / EMPTY GUARDS (real users only) ──
-  if (isLoading) {
-    return (
-      <div style={{ display: "flex", flexDirection: "column", gap: 20 }}>
-        <div>
-          <h2 style={{ margin: 0, fontSize: 22, fontWeight: 800, color: C.text }}>Battle Cards</h2>
-          <p style={{ margin: "4px 0 0", fontSize: 13, color: C.textSub }}>Competitive intelligence at your fingertips</p>
-        </div>
-        <LoadingState rows={4} message="Loading battle cards…" />
-      </div>
-    );
-  }
-
-  if (isReal && categories.length === 0 && cards.length === 0) {
-    return (
-      <div style={{ display: "flex", flexDirection: "column", gap: 20 }}>
-        <div>
-          <h2 style={{ margin: 0, fontSize: 22, fontWeight: 800, color: C.text }}>Battle Cards</h2>
-          <p style={{ margin: "4px 0 0", fontSize: 13, color: C.textSub }}>Competitive intelligence at your fingertips</p>
-        </div>
-        <EmptyState
-          icon="🃏"
-          title="No battle cards yet"
-          message="Your admin hasn't added any battle cards. Check back after your team configures your content library."
+      <>
+        <BattleCardDetail
+          card={selectedCard}
+          onBack={goList}
+          actions={
+            <>
+              <button onClick={() => openEditCard(selectedCard)} style={{ padding: "7px 16px", borderRadius: 8, border: `1px solid ${C.border}`, background: C.white, fontSize: 12, fontWeight: 700, cursor: "pointer", color: C.text }}>Edit</button>
+              {bcIsArchived(selectedCard)
+                ? <button onClick={() => onSetArchived(selectedCard.id, false)} style={{ padding: "7px 16px", borderRadius: 8, border: `1px solid ${C.border}`, background: C.white, fontSize: 12, fontWeight: 700, cursor: "pointer", color: C.text }}>Restore</button>
+                : <button onClick={() => setConfirmArchive(selectedCard.id)} style={{ padding: "7px 16px", borderRadius: 8, border: `1px solid ${C.border}`, background: C.white, fontSize: 12, fontWeight: 700, cursor: "pointer", color: C.textSub }}>Archive</button>}
+            </>
+          }
         />
-      </div>
+        {archiveModal}
+      </>
     );
   }
 
-  // ── HOME VIEW ──
+  // ── LIST (single list: active first, archived below) ──
   return (
-    <div style={{ display: "flex", flexDirection: "column", gap: 24 }}>
-      {/* Header */}
-      <div>
-        <h2 style={{ margin: 0, fontSize: 22, fontWeight: 800, color: C.text }}>Battle Cards</h2>
-        <p style={{ margin: "4px 0 0", fontSize: 13, color: C.textSub }}>Competitive intelligence at your fingertips</p>
-      </div>
-
-      {/* Search */}
-      <div style={{ display: "flex", alignItems: "center", gap: 10, padding: "10px 14px", borderRadius: 10, background: C.cardBg, border: `1px solid ${C.creamBorder}`, maxWidth: 420 }}>
-        <span style={{ fontSize: 13, color: C.textMuted }}>Search</span>
-        <input
-          type="text" value={search} placeholder="Search battle cards…"
-          onChange={e => setSearch(e.target.value)}
-          style={{ flex: 1, border: "none", background: "transparent", fontSize: 13, color: C.text, outline: "none", fontFamily: "inherit" }}
-        />
-        {search && (
-          <button onClick={() => setSearch("")} style={{ background: "none", border: "none", cursor: "pointer", fontSize: 13, color: C.textMuted, padding: 0, lineHeight: 1 }}>✕</button>
-        )}
-      </div>
-
-      {/* Search results */}
-      {search.trim() ? (
+    <div style={{ display: "flex", flexDirection: "column", gap: 20 }}>
+      <div style={{ display: "flex", alignItems: "flex-start", justifyContent: "space-between", flexWrap: "wrap", gap: 12 }}>
         <div>
-          <p style={{ margin: "0 0 12px", fontSize: 12, fontWeight: 700, color: C.textMuted, letterSpacing: "0.06em", textTransform: "uppercase" }}>
-            {filtered.length} result{filtered.length !== 1 ? "s" : ""}
-          </p>
-          {filtered.length === 0 ? (
-            <EmptyState
-              icon="🔍"
-              title={`No results for "${search}"`}
-              message="Try a competitor name, category, or keyword from the card content."
-            />
-          ) : (
-            <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
-              {filtered.map(card => (
-                <button key={card.id} onClick={() => { setActiveCat(card.categoryId); openCard(card.id); }} style={{
-                  display: "flex", alignItems: "center", justifyContent: "space-between",
-                  padding: "14px 18px", borderRadius: 12, border: `1px solid ${C.creamBorder}`,
-                  background: C.cardBg, cursor: "pointer", textAlign: "left", width: "100%",
-                  transition: "border-color 0.12s",
-                }}
-                onMouseEnter={e => { e.currentTarget.style.borderColor = C.orange; e.currentTarget.style.background = C.orangeLight; }}
-                onMouseLeave={e => { e.currentTarget.style.borderColor = C.creamBorder; e.currentTarget.style.background = C.cardBg; }}
-                >
-                  <div>
-                    <div style={{ fontSize: 14, fontWeight: 700, color: C.text }}>{card.title}</div>
-                    <div style={{ fontSize: 12, color: C.textSub, marginTop: 2 }}>{card.subtitle} · {categories.find(c => c.id === card.categoryId)?.label}</div>
-                  </div>
-                  <span style={{ fontSize: 16, color: C.textMuted, flexShrink: 0, marginLeft: 16 }}>→</span>
-                </button>
-              ))}
-            </div>
-          )}
+          <h2 style={{ margin: 0, fontSize: 22, fontWeight: 800, color: C.text }}>Battle Cards</h2>
+          <p style={{ margin: "4px 0 0", fontSize: 13, color: C.textSub }}>Competitive intelligence for your team</p>
+        </div>
+        <button onClick={openNewCard} style={{ padding: "10px 20px", borderRadius: 12, border: "none", background: C.orange, color: "#fff", fontSize: 13, fontWeight: 700, cursor: "pointer", flexShrink: 0 }}>+ New Card</button>
+      </div>
+
+      <div>
+        <div style={{ display: "flex", alignItems: "center", gap: 10, padding: "10px 14px", borderRadius: 10, background: C.cardBg, border: `1px solid ${C.creamBorder}`, maxWidth: 420 }}>
+          <span style={{ fontSize: 13, color: C.textMuted }}>Search</span>
+          <input type="text" value={search} placeholder="Title, subtitle, summary, tags…" onChange={e => setSearch(e.target.value)} style={{ flex: 1, border: "none", background: "transparent", fontSize: 13, color: C.text, outline: "none", fontFamily: "inherit" }} />
+          {search && <button onClick={() => setSearch("")} style={{ background: "none", border: "none", cursor: "pointer", fontSize: 13, color: C.textMuted, padding: 0, lineHeight: 1 }}>✕</button>}
+        </div>
+        {/* Explain the scope so a title match on the word "tag" isn't mistaken for a tag filter. */}
+        <p style={{ margin: "6px 2px 0", fontSize: 11, color: C.textMuted }}>Search matches titles, subtitles, summaries, and tags. Use the tag chips below to filter by an exact tag.</p>
+      </div>
+
+      <BcTagFilters tags={tagUniverse} selected={selected} onToggle={toggleTag} onAll={resetFilters} allCount={activeCards.length} usage={usage} />
+
+      {/* Active cards */}
+      {filteredActive.length === 0 ? (
+        <div style={{ padding: "48px 32px", textAlign: "center", borderRadius: 16, border: `2px dashed ${C.creamBorder}`, background: C.cardBg }}>
+          <p style={{ margin: "0 0 6px", fontSize: 14, fontWeight: 700, color: C.text }}>{activeCards.length === 0 ? "No battle cards yet" : "No cards match this filter"}</p>
+          <p style={{ margin: "0 0 20px", fontSize: 13, color: C.textSub }}>{activeCards.length === 0 ? "Create the first card for your team." : "Try a different search or clear the tag filters."}</p>
+          {activeCards.length === 0 && <button onClick={openNewCard} style={{ padding: "10px 22px", borderRadius: 10, border: "none", background: C.orange, color: "#fff", fontSize: 13, fontWeight: 700, cursor: "pointer" }}>+ New Card</button>}
         </div>
       ) : (
-        <>
-          {/* Categories */}
-          <div>
-            <p style={{ margin: "0 0 12px", fontSize: 12, fontWeight: 700, color: C.textMuted, letterSpacing: "0.06em", textTransform: "uppercase" }}>Categories</p>
-            <div style={{ display: "grid", gridTemplateColumns: mobile ? "1fr" : "repeat(2, 1fr)", gap: 12 }}>
-              {categories.map(cat => {
-                const count = cards.filter(c => c.categoryId === cat.id).length;
-                return (
-                  <button key={cat.id} onClick={() => openCategory(cat.id)} style={{
-                    padding: "18px 20px", borderRadius: 14, textAlign: "left", cursor: "pointer",
-                    border: `1.5px solid ${C.creamBorder}`, background: C.cardBg, width: "100%",
-                    transition: "border-color 0.12s, background 0.12s",
-                  }}
-                  onMouseEnter={e => { e.currentTarget.style.borderColor = C.orange; e.currentTarget.style.background = C.orangeLight; }}
-                  onMouseLeave={e => { e.currentTarget.style.borderColor = C.creamBorder; e.currentTarget.style.background = C.cardBg; }}
-                  >
-                    <div style={{ fontSize: 14, fontWeight: 800, color: C.text, marginBottom: 4 }}>{cat.label}</div>
-                    <div style={{ fontSize: 12, color: C.textSub, lineHeight: 1.4, marginBottom: 10 }}>{cat.description}</div>
-                    <div style={{ fontSize: 11, fontWeight: 700, color: C.orange }}>{count} card{count !== 1 ? "s" : ""} →</div>
-                  </button>
-                );
-              })}
-            </div>
+        <div>
+          <p style={{ margin: "0 0 12px", fontSize: 12, fontWeight: 700, color: C.textMuted, letterSpacing: "0.06em", textTransform: "uppercase" }}>Active · {filteredActive.length}</p>
+          <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
+            {filteredActive.map(card => <BcCardRow key={card.id} card={card} onOpen={() => openCard(card.id)} actions={rowActions(card)} />)}
           </div>
-
-          {/* All cards A–Z */}
-          <div>
-            <p style={{ margin: "0 0 12px", fontSize: 12, fontWeight: 700, color: C.textMuted, letterSpacing: "0.06em", textTransform: "uppercase" }}>All Cards — A to Z</p>
-            <div style={{ display: "flex", flexDirection: "column", gap: 6 }}>
-              {allCardsSorted.map(card => (
-                <button key={card.id} onClick={() => { setActiveCat(card.categoryId); openCard(card.id); }} style={{
-                  display: "flex", alignItems: "center", justifyContent: "space-between",
-                  padding: "14px 18px", borderRadius: 12, border: `1px solid ${C.creamBorder}`,
-                  background: C.cardBg, cursor: "pointer", textAlign: "left", width: "100%",
-                  transition: "border-color 0.12s, background 0.12s",
-                }}
-                onMouseEnter={e => { e.currentTarget.style.borderColor = C.orange; e.currentTarget.style.background = C.orangeLight; }}
-                onMouseLeave={e => { e.currentTarget.style.borderColor = C.creamBorder; e.currentTarget.style.background = C.cardBg; }}
-                >
-                  <div>
-                    <div style={{ fontSize: 14, fontWeight: 700, color: C.text }}>{card.title}</div>
-                    <div style={{ fontSize: 12, color: C.textSub, marginTop: 2 }}>
-                      {card.subtitle} · {categories.find(c => c.id === card.categoryId)?.label}
-                    </div>
-                  </div>
-                  <span style={{ fontSize: 16, color: C.textMuted, flexShrink: 0, marginLeft: 16 }}>→</span>
-                </button>
-              ))}
-            </div>
-          </div>
-        </>
+        </div>
       )}
+
+      {/* Archived cards below (managers only) — same canonical search/tag predicate */}
+      {filteredArchived.length > 0 && (
+        <div>
+          <p style={{ margin: "0 0 12px", fontSize: 12, fontWeight: 700, color: C.textMuted, letterSpacing: "0.06em", textTransform: "uppercase" }}>Archived · {filteredArchived.length}</p>
+          <div style={{ display: "flex", flexDirection: "column", gap: 6 }}>
+            {filteredArchived.map(card => <BcCardRow key={card.id} card={card} onOpen={() => openCard(card.id)} archived actions={rowActions(card)} />)}
+          </div>
+        </div>
+      )}
+      {archiveModal}
     </div>
   );
 }
 
+// ── BattleCardsScreen — learner: one active-card list, tags only, read-only ─────
+function BattleCardsScreen({ cards = INITIAL_BATTLE_CARDS, isLoading = false, loadError = null, onRetry, isReal = false }) {
+  const mobile = useMobile();
+  const [view,         setView]         = useState("list"); // list | detail
+  const [activeCardId, setActiveCardId] = useState(null);
+  // Persist search + tag filters so returning to Battle Cards restores the list state.
+  const [search, setSearch] = useState(() => { try { return sessionStorage.getItem("ralli_bc_search") || ""; } catch { return ""; } });
+  const [selected, setSelected] = useState(() => { try { const s = sessionStorage.getItem("ralli_bc_tags"); return new Set(s ? JSON.parse(s) : []); } catch { return new Set(); } });
+  React.useEffect(() => { try { sessionStorage.setItem("ralli_bc_search", search); } catch {} }, [search]);
+  React.useEffect(() => { try { sessionStorage.setItem("ralli_bc_tags", JSON.stringify([...selected])); } catch {} }, [selected]);
+
+  const visibleCards = cards.filter(c => !bcIsArchived(c)); // learners: active only (RLS also enforces)
+  const tagUniverse  = bcDistinctTags(visibleCards);
+  const usage = new Map();
+  for (const c of visibleCards) for (const t of bcCardTags(c)) { const k = t.toLowerCase(); usage.set(k, (usage.get(k) || 0) + 1); }
+  const filtered = [...visibleCards].filter(c => bcMatchesSearch(c, search.trim()) && bcMatchesTags(c, selected)).sort((a, b) => a.title.localeCompare(b.title));
+
+  const selectedCard = visibleCards.find(c => c.id === activeCardId);
+  const openCard = (id) => { setActiveCardId(id); setView("detail"); };
+  const goList   = () => { setView("list"); setActiveCardId(null); };
+  const toggleTag = (t) => setSelected(prev => { const n = new Set(prev); const k = t.toLowerCase(); n.has(k) ? n.delete(k) : n.add(k); return n; });
+  const resetFilters = () => { setSearch(""); setSelected(new Set()); }; // Clear/All resets search + tags
+
+  const header = (
+    <div>
+      <h2 style={{ margin: 0, fontSize: 22, fontWeight: 800, color: C.text }}>Battle Cards</h2>
+      <p style={{ margin: "4px 0 0", fontSize: 13, color: C.textSub }}>Competitive intelligence at your fingertips</p>
+    </div>
+  );
+
+  if (loadError) {
+    return (
+      <div style={{ display: "flex", flexDirection: "column", gap: 20 }}>
+        {header}
+        <div style={{ padding: "48px 32px", textAlign: "center", borderRadius: 16, border: `1px solid ${C.creamBorder}`, background: C.cardBg }}>
+          <p style={{ margin: "0 0 6px", fontSize: 15, fontWeight: 800, color: C.text }}>Couldn't load battle cards</p>
+          <p style={{ margin: "0 0 20px", fontSize: 13, color: C.textSub }}>Something went wrong reaching the server. Please try again.</p>
+          <button onClick={() => onRetry?.()} style={{ padding: "10px 22px", borderRadius: 10, border: "none", background: C.orange, color: "#fff", fontSize: 13, fontWeight: 700, cursor: "pointer" }}>Retry</button>
+        </div>
+      </div>
+    );
+  }
+  if (isLoading) {
+    return <div style={{ display: "flex", flexDirection: "column", gap: 20 }}>{header}<LoadingState rows={4} message="Loading battle cards…" /></div>;
+  }
+  if (isReal && visibleCards.length === 0) {
+    return (
+      <div style={{ display: "flex", flexDirection: "column", gap: 20 }}>
+        {header}
+        <EmptyState icon="🃏" title="No battle cards yet" message="Your admin hasn't added any battle cards. Check back after your team configures your content library." />
+      </div>
+    );
+  }
+
+  // ── DETAIL (read-only) ──
+  if (view === "detail" && selectedCard) {
+    return <BattleCardDetail card={selectedCard} onBack={goList} />;
+  }
+
+  // ── LIST ──
+  return (
+    <div style={{ display: "flex", flexDirection: "column", gap: 20 }}>
+      {header}
+      <div>
+        <div style={{ display: "flex", alignItems: "center", gap: 10, padding: "10px 14px", borderRadius: 10, background: C.cardBg, border: `1px solid ${C.creamBorder}`, maxWidth: 420 }}>
+          <span style={{ fontSize: 13, color: C.textMuted }}>Search</span>
+          <input type="text" value={search} placeholder="Title, subtitle, summary, tags…" onChange={e => setSearch(e.target.value)} style={{ flex: 1, border: "none", background: "transparent", fontSize: 13, color: C.text, outline: "none", fontFamily: "inherit" }} />
+          {search && <button onClick={() => setSearch("")} style={{ background: "none", border: "none", cursor: "pointer", fontSize: 13, color: C.textMuted, padding: 0, lineHeight: 1 }}>✕</button>}
+        </div>
+        <p style={{ margin: "6px 2px 0", fontSize: 11, color: C.textMuted }}>Search matches titles, subtitles, summaries, and tags. Use the tag chips below to filter by an exact tag.</p>
+      </div>
+      <BcTagFilters tags={tagUniverse} selected={selected} onToggle={toggleTag} onAll={resetFilters} allCount={visibleCards.length} usage={usage} />
+      {filtered.length === 0 ? (
+        <div style={{ padding: "40px 32px", textAlign: "center", borderRadius: 16, border: `2px dashed ${C.creamBorder}`, background: C.cardBg }}>
+          <p style={{ margin: 0, fontSize: 14, fontWeight: 700, color: C.text }}>No cards match this filter</p>
+          <p style={{ margin: "6px 0 0", fontSize: 13, color: C.textSub }}>Try a different search or clear the tag filters.</p>
+        </div>
+      ) : (
+        <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
+          {filtered.map(card => <BcCardRow key={card.id} card={card} onOpen={() => openCard(card.id)} />)}
+        </div>
+      )}
+    </div>
+  );
+}
 // ── LEADERSHIP DASHBOARD ─────────────────────────────────────
 //
 // SALES READINESS SCORE MODEL
@@ -17023,6 +17076,7 @@ function _sortDesc(list, getDateStr) {
     return (isNaN(db) ? 0 : db) - (isNaN(da) ? 0 : da);
   });
 }
+
 
 // Rep Drill-Down Final Polish — one small reusable expand/collapse control,
 // reused by every "show 3, then View all (N)" list in RepDrillDownModal
@@ -24014,14 +24068,9 @@ export default function App() {
   // Reuses the ONE canonical manager loader; not a second assignment-state path.
   const [learnAssignRefreshKey, setLearnAssignRefreshKey] = useState(0);
 
-  // Battle card categories — demo: localStorage; real users: Supabase tenant_bc_categories
-  const [bcCategories, setBcCategories] = useState(() => {
-    if (/* real user check deferred to useEffect */ false) return [];
-    try {
-      const saved = localStorage.getItem("ralli_bc_categories");
-      return saved ? JSON.parse(saved) : INITIAL_BC_CATEGORIES;
-    } catch { return INITIAL_BC_CATEGORIES; }
-  });
+  // Battle cards use a TAGS-ONLY taxonomy — categories were removed from the product.
+  // (The legacy tenant_bc_categories table is kept for migration safety, but the
+  // frontend no longer reads or writes it.)
 
   // Battle cards — demo: localStorage; real users: Supabase tenant_battle_cards
   const [battleCards, setBattleCards] = useState(() => {
@@ -24032,6 +24081,12 @@ export default function App() {
   });
   // Loading flag for BattleCardsScreen — true while Supabase BC fetch is in flight.
   const [bcLoading, setBcLoading] = useState(false);
+  // Load lifecycle for honest states: bcError distinguishes a failed load from a
+  // genuinely empty library; bcLoaded gates rendering so a real tenant never flashes
+  // demo seed content before the first successful fetch; bcReloadKey drives Retry.
+  const [bcError,     setBcError]     = useState(null);
+  const [bcLoaded,    setBcLoaded]    = useState(false);
+  const [bcReloadKey, setBcReloadKey] = useState(0);
 
   // BC data loaded after const user/currentOrg are declared (see useEffect below line 13866)
 
@@ -24073,21 +24128,31 @@ export default function App() {
   // Ralli Admin can toggle these per-tenant; they override the plan-based defaults.
   const [tenantFeatureAccess, setTenantFeatureAccess] = useState(null); // null = not yet loaded
 
-  // ── Load BC data from Supabase for real users ─────────────────────────────
+  // ── Load Battle Cards from Supabase for real users (tags-only; no categories) ──
   // Placed here so user + currentOrg are already declared above.
-  // Clear demo/localStorage data immediately so real users never see seed categories,
-  // even if the DB call fails — empty state is safer than misleading demo content.
+  // Clear demo/localStorage data immediately so real users never see seed content,
+  // even if the DB call fails — an honest error is safer than misleading demo cards.
   useEffect(() => {
     const tid = currentOrg?.id ?? user?.orgId ?? null;
     if (!user?._isReal || !tid) return;
-    setBcCategories([]);  // clear seed immediately; DB result fills in below
+    let cancelled = false;
     setBattleCards([]);
+    setBcError(null);
+    setBcLoaded(false);   // gate rendering until this load resolves — no demo flash
     setBcLoading(true);
-    Promise.allSettled([
-      getTenantBcCategories(tid).then(({ data }) => { if (data) setBcCategories(data); }),
-      getTenantBattleCards(tid).then(({ data }) => { if (data) setBattleCards(data); }),
-    ]).finally(() => setBcLoading(false));
-  }, [user?._isReal, currentOrg?.id, user?.orgId]); // eslint-disable-line react-hooks/exhaustive-deps
+    getTenantBattleCards(tid)
+      .then(({ data, error }) => {
+        if (cancelled) return;
+        // A load FAILURE must never masquerade as an empty library — surface an
+        // error (learner/admin screens render Retry) instead of silently showing "none".
+        if (error) { setBcError(error); return; }
+        setBattleCards(data ?? []);
+        setBcLoaded(true);
+      })
+      .catch((e) => { if (!cancelled) setBcError(e); })
+      .finally(() => { if (!cancelled) setBcLoading(false); });
+    return () => { cancelled = true; };
+  }, [user?._isReal, currentOrg?.id, user?.orgId, bcReloadKey]); // eslint-disable-line react-hooks/exhaustive-deps
 
   // Map NAV featureKey → tenant_settings.feature_access key
   const FEATURE_KEY_MAP = { games: "games", learn: "learn", leaderboard: "learn", progress: "analytics", battlecards: "battle_cards", quizzes: "learn", dashboard: null };
@@ -24270,8 +24335,8 @@ export default function App() {
         setSessions(INITIAL_SESSIONS);           // prevent real sessions leaking to next demo user
         setPastSessions([]);                     // prevent real past sessions leaking to next demo user
         setBattleCards(INITIAL_BATTLE_CARDS);    // prevent real BC data leaking to next demo user
-        setBcCategories(INITIAL_BC_CATEGORIES);  // prevent real BC categories leaking to next demo user
         clearLearnNavSessionState();              // don't leak screen / Learn subtab / pending quiz review into the next login
+        clearBattleCardDrafts();                  // don't leak an unsaved Battle Card draft into the next login
         window.location.replace("/login");        // hard-navigate so URL matches the login screen
       }
     });
@@ -24755,56 +24820,13 @@ export default function App() {
     }
   };
 
-  // ── Battle card category CRUD ──
-  const bcCatKey   = currentOrg?.id ? `ralli_bc_categories_${currentOrg.id}` : "ralli_bc_categories";
+  // ── Battle card CRUD (tags-only taxonomy; no categories) ──
   const bcCardsKey = currentOrg?.id ? `ralli_bc_cards_${currentOrg.id}`      : "ralli_battle_cards";
 
-  const handleSaveBcCategory = async (cat) => {
-    const tid = currentOrg?.id ?? user?.orgId ?? null;
-    if (user?._isReal && tid) {
-      const { data, error } = await dbSaveBcCategory(tid, cat, user.id);
-      if (error) { console.error("[ralli] saveBcCategory failed:", error); toast.error("Failed to save category. Please try again."); return null; }
-      // data may be null if RLS blocks SELECT after INSERT; treat as success and use local cat shape
-      const canonical = data ?? { ...cat, id: cat.id };
-      setBcCategories(prev => {
-        const byRealId = data ? prev.find(c => c.id === data.id) : null;
-        const byTempId = prev.find(c => c.id === cat.id);
-        if (byRealId) return prev.map(c => c.id === canonical.id ? canonical : c);
-        if (byTempId) return prev.map(c => c.id === cat.id ? canonical : c);
-        return [...prev, canonical];
-      });
-      toast.success("Category saved.");
-      return canonical;
-    }
-    // Demo fallback
-    const canonical = cat;
-    setBcCategories(prev => {
-      const next = prev.find(c => c.id === cat.id) ? prev.map(c => c.id === cat.id ? canonical : c) : [...prev, canonical];
-      try { localStorage.setItem(bcCatKey, JSON.stringify(next)); } catch {}
-      return next;
-    });
-    toast.success("Category saved.");
-    return canonical;
-  };
-  const handleDeleteBcCategory = async (id) => {
-    const tid = currentOrg?.id ?? user?.orgId ?? null;
-    if (user?._isReal && tid) {
-      const { error } = await dbDeleteBcCategory(tid, id);
-      if (error) { console.error("[ralli] deleteBcCategory failed:", error); toast.error("Failed to delete category. Please try again."); return; }
-    }
-    setBcCategories(prev => {
-      const next = prev.filter(c => c.id !== id);
-      if (!user?._isReal) { try { localStorage.setItem(bcCatKey, JSON.stringify(next)); } catch {} }
-      return next;
-    });
-    toast.success("Category deleted.");
-  };
-
-  // ── Battle card CRUD ──
   const handleSaveBattleCard = async (card) => {
     const tid = currentOrg?.id ?? user?.orgId ?? null;
     if (user?._isReal && tid) {
-      const { data, error } = await dbSaveBattleCard(tid, card, user.id);
+      const { data, error } = await dbSaveBattleCard(tid, card);
       if (error) { console.error("[ralli] saveBattleCard failed:", error); toast.error("Failed to save battle card. Please try again."); return false; }
       if (data) {
         setBattleCards(prev => prev.find(c => c.id === data.id) ? prev.map(c => c.id === data.id ? data : c) : [...prev, data]);
@@ -24816,27 +24838,34 @@ export default function App() {
       toast.error("Failed to save battle card. Please try again.");
       return false;
     }
-    // Demo fallback
+    // Demo fallback (new cards default to active)
+    const localCard = { status: "active", ...card };
     setBattleCards(prev => {
-      const next = prev.find(c => c.id === card.id) ? prev.map(c => c.id === card.id ? card : c) : [...prev, card];
+      const next = prev.find(c => c.id === card.id) ? prev.map(c => c.id === card.id ? { ...c, ...card } : c) : [...prev, localCard];
       try { localStorage.setItem(bcCardsKey, JSON.stringify(next)); } catch {}
       return next;
     });
     toast.success("Battle card saved.");
     return true;
   };
-  const handleDeleteBattleCard = async (id) => {
+  // Archive/restore — the ONE UI path to the canonical service. No permanent delete.
+  const handleSetBattleCardArchived = async (id, archived) => {
     const tid = currentOrg?.id ?? user?.orgId ?? null;
     if (user?._isReal && tid) {
-      const { error } = await dbDeleteBattleCard(tid, id);
-      if (error) { console.error("[ralli] deleteBattleCard failed:", error); toast.error("Failed to delete battle card. Please try again."); return; }
+      const { data, error } = await dbSetBattleCardArchived(tid, id, archived);
+      if (error) { console.error("[ralli] setBattleCardArchived failed:", error); toast.error(`Failed to ${archived ? "archive" : "restore"} battle card. Please try again.`); return false; }
+      if (data) setBattleCards(prev => prev.map(c => c.id === data.id ? data : c));
+      toast.success(archived ? "Battle card archived." : "Battle card restored.");
+      return true;
     }
+    // Demo fallback — flip local status so the active/archived split refreshes immediately
     setBattleCards(prev => {
-      const next = prev.filter(c => c.id !== id);
-      if (!user?._isReal) { try { localStorage.setItem(bcCardsKey, JSON.stringify(next)); } catch {} }
+      const next = prev.map(c => c.id === id ? { ...c, status: archived ? "archived" : "active" } : c);
+      try { localStorage.setItem(bcCardsKey, JSON.stringify(next)); } catch {}
       return next;
     });
-    toast.success("Battle card deleted.");
+    toast.success(archived ? "Battle card archived." : "Battle card restored.");
+    return true;
   };
 
   // ── Quiz CRUD ──
@@ -25508,8 +25537,8 @@ export default function App() {
         ) : null} />;
       case "quizzes":           return <QuizzesScreen role={gameRole} onNav={navigate} quizzes={quizzes} onEditQuiz={handleEditQuiz} onDeleteQuiz={handleDeleteQuiz} onArchiveQuiz={handleArchiveQuiz} onRestoreQuiz={handleRestoreQuiz} onToggleFavorite={handleToggleFavorite} onToggleActive={handleToggleActive} pendingQuizId={pendingQuizId} onClearPendingQuiz={() => setPendingQuizId(null)} canCreate={perm("actions","create")} canEdit={perm("actions","edit")} canDelete={perm("actions","delete")} canLaunch={perm("actions","launch")} canAssign={perm("actions","assign")} onAssignQuiz={handleAssignQuiz} onLaunchQuiz={handleCreateSession} orgUsers={orgUsers} orgs={orgs} currentUser={currentUser} tenantId={currentOrg?.id ?? null} isReal={!!user?._isReal} quizzesReady={quizzesReady} sharedAssignmentData={sharedAssignmentData} onRefreshQuizzes={refreshQuizzes} pendingQuizReview={pendingQuizReview} onExitQuiz={() => { setPendingQuizId(null); setPendingQuizReview(null); navigate("learn"); }} />;
       case "battlecards":       return (isAdminType && perm("actions","edit"))
-        ? <BattleCardsAdminScreen categories={bcCategories} cards={battleCards} onSaveCategory={handleSaveBcCategory} onDeleteCategory={handleDeleteBcCategory} onSaveCard={handleSaveBattleCard} onDeleteCard={handleDeleteBattleCard} />
-        : <BattleCardsScreen categories={bcCategories} cards={battleCards} isLoading={bcLoading} isReal={!!user?._isReal} />;
+        ? <BattleCardsAdminScreen cards={battleCards} onSaveCard={handleSaveBattleCard} onSetArchived={handleSetBattleCardArchived} isReal={!!user?._isReal} isLoading={bcLoading || (!!user?._isReal && !bcLoaded && !bcError)} loadError={bcError} onRetry={() => setBcReloadKey(k => k + 1)} tenantId={currentOrg?.id ?? user?.orgId ?? null} userId={user?.id ?? null} />
+        : <BattleCardsScreen cards={battleCards} isLoading={bcLoading || (!!user?._isReal && !bcLoaded && !bcError)} loadError={bcError} onRetry={() => setBcReloadKey(k => k + 1)} isReal={!!user?._isReal} />;
       case "insights":           return <InsightsScreen user={user} isReal={!!user?._isReal} tenantId={currentOrg?.id ?? null} orgUsers={orgUsers} isAdmin={isAdminType} readinessThreshold={readinessThreshold} />;
       case "progress":          return isAdminType
         ? <LeadershipDashboardScreen currentOrg={currentOrg} orgUsers={orgUsers} isReal={!!user?._isReal} readinessThreshold={readinessThreshold} />
@@ -25522,7 +25551,7 @@ export default function App() {
       case "settings":
         if (isSuperAdmin)  return <RoleAccessScreen rolePermissions={rolePermissions} onSave={handleSaveRolePermissions} currentOrg={currentOrg} />;
         if (isOrgAdmin)    return <OrgAdminSettingsScreen rolePermissions={rolePermissions} onSaveRolePermissions={handleSaveRolePermissions} currentOrg={currentOrg} orgId={user.orgId} orgName={currentOrg?.name ?? "Your Team"} orgUsers={orgUsers} onAddUser={handleAddUser} readinessThreshold={readinessThreshold} onSaveReadinessThreshold={handleSaveReadinessThreshold} />;
-        return <UserSettingsScreen user={user} profile={userProfile} notifPrefs={notifPrefs} onSaveProfile={handleSaveProfile} onSaveNotifs={handleSaveNotifs} currentOrg={currentOrg} onSignOut={async () => { if (user?._isReal) { await supabase.auth.signOut(); /* SIGNED_OUT handler redirects */ } else { setCurrentUser(null); setLastSeenAt(null); setNewAssignmentCount(0); setPendingLessonId(null); setPendingCourseId(null); setPendingQuizId(null); setOrgs(INITIAL_ORGS); setOrgUsers(INITIAL_ORG_USERS); setQuizzesReady(false); setSessions(INITIAL_SESSIONS); setBattleCards(INITIAL_BATTLE_CARDS); setBcCategories(INITIAL_BC_CATEGORIES); clearLearnNavSessionState(); window.location.replace("/login"); } }} />;
+        return <UserSettingsScreen user={user} profile={userProfile} notifPrefs={notifPrefs} onSaveProfile={handleSaveProfile} onSaveNotifs={handleSaveNotifs} currentOrg={currentOrg} onSignOut={async () => { if (user?._isReal) { await supabase.auth.signOut(); /* SIGNED_OUT handler redirects */ } else { setCurrentUser(null); setLastSeenAt(null); setNewAssignmentCount(0); setPendingLessonId(null); setPendingCourseId(null); setPendingQuizId(null); setOrgs(INITIAL_ORGS); setOrgUsers(INITIAL_ORG_USERS); setQuizzesReady(false); setSessions(INITIAL_SESSIONS); setBattleCards(INITIAL_BATTLE_CARDS); clearLearnNavSessionState(); clearBattleCardDrafts(); window.location.replace("/login"); } }} />;
       default:                  return <HomeScreen user={user} />;
     }
   };
@@ -25667,8 +25696,9 @@ export default function App() {
                     setQuizzesReady(false);
                     setSessions(INITIAL_SESSIONS);
                     setBattleCards(INITIAL_BATTLE_CARDS);
-                    setBcCategories(INITIAL_BC_CATEGORIES);
+
                     clearLearnNavSessionState();
+                    clearBattleCardDrafts();
                     window.location.replace("/login");
                   }
                   // Real users: SIGNED_OUT event fires window.location.replace("/login")
