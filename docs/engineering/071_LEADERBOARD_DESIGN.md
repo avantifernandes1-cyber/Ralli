@@ -69,8 +69,17 @@ snapshot-backfill policy + tests. **This is the gate before any ranking ships.**
 
 ## 3. Team-at-game-time snapshot (SHIPPED in 071)
 
+**Snapshot timing (exact, honest definition):** `game_players` is inserted **at game
+COMPLETION** (`endGameSession`), so 071 captures the player's team **at completion time — NOT
+at join/start**. This is the intended beta definition. If a player's team changes *during* a
+game, the **completion-time** team is what is captured. It is deliberately not join-time
+identity, and no second table is given duplicate snapshot ownership. On UPDATE the trigger
+freezes **only** `team_id`/`team_name` (it is not a whole-row freeze — `final_score`,
+`final_rank`, `accuracy`, `name`, `emoji`, `color`, and any future column pass through), so
+later score/display edits are preserved while the completion-time team snapshot stays immutable.
+
 - Canonical owner: **`game_players`** (per-player, one-row-per-completed-session, written once
-  at game end). `game_session_participants` is mutable lobby presence and is NOT the owner.
+  at game completion). `game_session_participants` is mutable lobby presence and is NOT the owner.
 - Additive `team_id uuid` + `team_name text`; stamped by a **SECURITY DEFINER BEFORE
   INSERT/UPDATE trigger** from the player_id's **same-tenant** profile; client value ignored;
   **immutable** on UPDATE; **NULL** for guests/no-team/cross-tenant/no-tenant; **no backfill**

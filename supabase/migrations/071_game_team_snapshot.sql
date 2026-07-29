@@ -59,8 +59,12 @@ DECLARE
   v_team_name text;
 BEGIN
   IF (TG_OP = 'UPDATE') THEN
-    -- Immutable after first capture — an edit can never change the snapshot,
-    -- so team transfers / renames after the game leave history intact.
+    -- Freeze ONLY the team snapshot (team_id, team_name). This is NOT a whole-row
+    -- freeze: we never do `NEW := OLD`. Every other column in NEW — final_score,
+    -- final_rank, accuracy, name, emoji, color, and any future game_players field
+    -- — passes through UNCHANGED, so legitimate result/display updates are never
+    -- discarded. Team transfers / renames after the game therefore cannot rewrite
+    -- the captured snapshot, while all other edits proceed normally.
     NEW.team_id   := OLD.team_id;
     NEW.team_name := OLD.team_name;
     RETURN NEW;
