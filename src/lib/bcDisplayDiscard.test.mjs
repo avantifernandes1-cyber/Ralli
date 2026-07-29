@@ -14,15 +14,16 @@ const admin  = app.slice(app.indexOf("function BattleCardsAdminScreen("), app.in
 let pass = 0, fail = 0;
 const ok = (n, cond, extra = "") => { if (cond) { pass++; console.log("PASS  " + n); } else { fail++; console.log("FAIL  " + n + (extra ? "  → " + extra : "")); } };
 
-// ── (3) PROS / CONS — fully uppercase, in manager + preview/learner surfaces ──
-ok("detail shows uppercase PROS and CONS panel labels",
-   />PROS</.test(detail) && />CONS</.test(detail));
-ok("detail no longer shows THEIR STRENGTHS / THEIR WEAKNESSES",
-   !/THEIR STRENGTHS/.test(detail) && !/THEIR WEAKNESSES/.test(detail));
-ok("no lowercase/mixed pros|cons label leaked (>pros<, >Pros<, >Cons<, >CONs<)",
-   !/>(pros|Pros|Cons|CONs|cons)</.test(app));
-ok("editor labels are Pros / Cons (rendered uppercase by lbl textTransform)",
-   /lbl\("Pros", true\)/.test(admin) && /lbl\("Cons", true\)/.test(admin));
+// ── (3) THEIR STRENGTHS / THEIR WEAKNESSES — restored labels in manager +
+//        preview/learner surfaces; PROS/CONS (any casing) must NOT appear ──────
+ok("detail shows THEIR STRENGTHS and THEIR WEAKNESSES panel labels",
+   />THEIR STRENGTHS</.test(detail) && />THEIR WEAKNESSES</.test(detail));
+ok("editor labels are Their Strengths / Their Weaknesses",
+   /lbl\("Their Strengths", true\)/.test(admin) && /lbl\("Their Weaknesses", true\)/.test(admin));
+ok("no PROS/CONS label anywhere in the Battle Card UI (detail)",
+   !/\bPROS\b|\bCONS\b/i.test(detail));
+ok("no PROS/CONS (any casing) label in the Battle Card editor/admin",
+   !/lbl\("Pros"|lbl\("Cons"|>PROS<|>CONS<|>Pros<|>Cons</i.test(admin));
 ok("WHY WE WIN panel is unchanged (not relabelled)", />WHY WE WIN</.test(detail));
 ok("db field keys unchanged (strength/weakness/our_win, ourWin) — display-only change",
    /renderMarkdown\(card\.strength\)/.test(detail) && /renderMarkdown\(card\.weakness\)/.test(detail)

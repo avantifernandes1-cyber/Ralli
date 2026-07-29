@@ -15981,11 +15981,11 @@ function BattleCardDetail({ card, onBack, actions }) {
           Bodies render via the shared safe markdown renderer (identical for learners). */}
       <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(240px, 1fr))", gap: 14 }}>
         <Card style={{ borderTop: `3px solid ${C.red}`, background: C.white }}>
-          <div style={{ fontSize: 12, fontWeight: 700, color: C.red, letterSpacing: "0.06em", marginBottom: 12 }}>PROS</div>
+          <div style={{ fontSize: 12, fontWeight: 700, color: C.red, letterSpacing: "0.06em", marginBottom: 12 }}>THEIR STRENGTHS</div>
           <div>{renderMarkdown(card.strength)}</div>
         </Card>
         <Card style={{ borderTop: `3px solid ${C.yellow}`, background: C.white }}>
-          <div style={{ fontSize: 12, fontWeight: 700, color: C.yellow, letterSpacing: "0.06em", marginBottom: 12 }}>CONS</div>
+          <div style={{ fontSize: 12, fontWeight: 700, color: C.yellow, letterSpacing: "0.06em", marginBottom: 12 }}>THEIR WEAKNESSES</div>
           <div>{renderMarkdown(card.weakness)}</div>
         </Card>
         <Card style={{ borderTop: `3px solid ${C.green}`, background: C.white }}>
@@ -16334,8 +16334,8 @@ function BattleCardsAdminScreen({ cards, onSaveCard, onSetArchived, isReal = fal
           <Card>
             <div style={{ fontSize: 13, fontWeight: 800, color: C.text, marginBottom: 16 }}>Competitive Detail</div>
             <div style={{ display: "flex", flexDirection: "column", gap: 14 }}>
-              <div ref={el => (fieldRefs.current.strength = el)}>{lbl("Pros", true)}<MarkdownEditor value={draft.strength ?? ""} onChange={setRich("strength")} seedKey={editorSeed} minHeight={90} invalid={!!errors.strength} placeholder="What they do well..." />{errText("strength")}</div>
-              <div ref={el => (fieldRefs.current.weakness = el)}>{lbl("Cons", true)}<MarkdownEditor value={draft.weakness ?? ""} onChange={setRich("weakness")} seedKey={editorSeed} minHeight={90} invalid={!!errors.weakness} placeholder="Where they fall short..." />{errText("weakness")}</div>
+              <div ref={el => (fieldRefs.current.strength = el)}>{lbl("Their Strengths", true)}<MarkdownEditor value={draft.strength ?? ""} onChange={setRich("strength")} seedKey={editorSeed} minHeight={90} invalid={!!errors.strength} placeholder="What they do well..." />{errText("strength")}</div>
+              <div ref={el => (fieldRefs.current.weakness = el)}>{lbl("Their Weaknesses", true)}<MarkdownEditor value={draft.weakness ?? ""} onChange={setRich("weakness")} seedKey={editorSeed} minHeight={90} invalid={!!errors.weakness} placeholder="Where they fall short..." />{errText("weakness")}</div>
               <div ref={el => (fieldRefs.current.ourWin = el)}>{lbl("Why We Win", true)}<MarkdownEditor value={draft.ourWin ?? ""} onChange={setRich("ourWin")} seedKey={editorSeed} minHeight={90} invalid={!!errors.ourWin} placeholder="Our differentiated value..." />{errText("ourWin")}</div>
               <div>{lbl("Talk Track")}<MarkdownEditor value={draft.talkTrack ?? ""} onChange={setRich("talkTrack")} seedKey={editorSeed} minHeight={110} placeholder="The rep's suggested script..." /></div>
             </div>
