@@ -15763,8 +15763,11 @@ function bcMatchesTags(c, selectedLower) {
   return bcCardTags(c).some(t => selectedLower.has(String(t).toLowerCase()));
 }
 function bcChipStyle(on) {
+  // Selected FILTER chips are a SOLID filled gold with dark text so they stay
+  // visually distinct from the informational yellow tag pills (TagChip), which
+  // use the pale orangeLight fill. Unselected filter chips are plain white.
   return { padding: "6px 12px", borderRadius: 999, fontSize: 12, fontWeight: 700, cursor: "pointer",
-    border: `1px solid ${on ? C.orange : C.border}`, background: on ? C.orangeLight : C.white, color: on ? C.orange : C.textSub };
+    border: `1px solid ${on ? C.orangeDeep : C.border}`, background: on ? C.orange : C.white, color: on ? C.text : C.textSub };
 }
 // Required Battle Card fields — one source of truth for the red-* markers + validation.
 const BC_REQUIRED_TEXT_FIELDS = [
@@ -15920,18 +15923,19 @@ function BcCardRow({ card, onOpen, archived = false, actions = null }) {
       <button onClick={onOpen} style={{
         flex: 1, display: "flex", alignItems: "center", justifyContent: "space-between",
         padding: "14px 18px", borderRadius: 12,
-        border: `1px ${archived ? "dashed" : "solid"} ${C.creamBorder}`, background: C.cardBg,
+        border: `1px ${archived ? "dashed" : "solid"} ${C.border}`, background: C.white,
         cursor: "pointer", textAlign: "left",
       }}
       onMouseEnter={e => { if (!archived) { e.currentTarget.style.borderColor = C.orange; e.currentTarget.style.background = C.orangeLight; } }}
-      onMouseLeave={e => { e.currentTarget.style.borderColor = C.creamBorder; e.currentTarget.style.background = C.cardBg; }}
+      onMouseLeave={e => { e.currentTarget.style.borderColor = C.border; e.currentTarget.style.background = C.white; }}
       >
         <div style={{ minWidth: 0 }}>
           <div style={{ fontSize: 14, fontWeight: 700, color: C.text }}>{card.title}</div>
           {card.subtitle && <div style={{ fontSize: 12, color: C.textSub, marginTop: 2 }}>{card.subtitle}</div>}
           {bcCardTags(card).length > 0 && (
             <div style={{ display: "flex", flexWrap: "wrap", gap: 4, marginTop: 6 }}>
-              {bcCardTags(card).map(t => <span key={t} style={{ padding: "2px 8px", borderRadius: 999, background: C.muted, color: C.textSub, fontSize: 11, fontWeight: 700 }}>{t}</span>)}
+              {/* Quiz-style yellow tag pill (TagChip) — same as detail + Quiz cards */}
+              {bcCardTags(card).map(t => <TagChip key={t} label={t} />)}
             </div>
           )}
         </div>
@@ -15953,8 +15957,8 @@ function BattleCardDetail({ card, onBack, actions }) {
           background: "none", border: "none", cursor: "pointer", padding: 0,
           fontSize: 13, fontWeight: 600, color: C.textSub, display: "flex", alignItems: "center", gap: 6, marginBottom: 16,
         }}>← Back to Battle Cards</button>
-        {/* Distinct detail header (title + subtitle + tags), visually separated from list rows */}
-        <div style={{ borderRadius: 16, border: `1px solid ${C.creamBorder}`, background: C.cardBg, padding: "20px 24px" }}>
+        {/* Distinct detail header (title + subtitle + tags) — white surface, matching Quiz content cards */}
+        <div style={{ borderRadius: 16, border: `1px solid ${C.border}`, background: C.white, padding: "20px 24px" }}>
           <div style={{ display: "flex", alignItems: "flex-start", justifyContent: "space-between", flexWrap: "wrap", gap: 12 }}>
             <div style={{ minWidth: 0 }}>
               <h2 style={{ margin: 0, fontSize: 24, fontWeight: 900, color: C.text }}>{card.title}</h2>
@@ -15964,7 +15968,8 @@ function BattleCardDetail({ card, onBack, actions }) {
           </div>
           {bcCardTags(card).length > 0 && (
             <div style={{ display: "flex", flexWrap: "wrap", gap: 6, marginTop: 12 }}>
-              {bcCardTags(card).map(t => <span key={t} style={{ padding: "3px 10px", borderRadius: 999, background: C.orangeLight, color: C.orange, fontSize: 12, fontWeight: 700 }}>{t}</span>)}
+              {/* Same Quiz yellow tag pill (TagChip) used on the list rows */}
+              {bcCardTags(card).map(t => <TagChip key={t} label={t} />)}
             </div>
           )}
           {card.updatedAt && <div style={{ fontSize: 11, color: C.textMuted, marginTop: 10 }}>Updated {card.updatedAt}</div>}
@@ -15975,15 +15980,15 @@ function BattleCardDetail({ card, onBack, actions }) {
       {/* Content panels — accent borders + auto-fit so they read as detail, not list rows.
           Bodies render via the shared safe markdown renderer (identical for learners). */}
       <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(240px, 1fr))", gap: 14 }}>
-        <Card style={{ borderTop: `3px solid ${C.red}` }}>
-          <div style={{ fontSize: 12, fontWeight: 700, color: C.red, letterSpacing: "0.06em", marginBottom: 12 }}>THEIR STRENGTHS</div>
+        <Card style={{ borderTop: `3px solid ${C.red}`, background: C.white }}>
+          <div style={{ fontSize: 12, fontWeight: 700, color: C.red, letterSpacing: "0.06em", marginBottom: 12 }}>PROS</div>
           <div>{renderMarkdown(card.strength)}</div>
         </Card>
-        <Card style={{ borderTop: `3px solid ${C.yellow}` }}>
-          <div style={{ fontSize: 12, fontWeight: 700, color: C.yellow, letterSpacing: "0.06em", marginBottom: 12 }}>THEIR WEAKNESSES</div>
+        <Card style={{ borderTop: `3px solid ${C.yellow}`, background: C.white }}>
+          <div style={{ fontSize: 12, fontWeight: 700, color: C.yellow, letterSpacing: "0.06em", marginBottom: 12 }}>CONS</div>
           <div>{renderMarkdown(card.weakness)}</div>
         </Card>
-        <Card style={{ borderTop: `3px solid ${C.green}` }}>
+        <Card style={{ borderTop: `3px solid ${C.green}`, background: C.white }}>
           <div style={{ fontSize: 12, fontWeight: 700, color: C.green, letterSpacing: "0.06em", marginBottom: 12 }}>WHY WE WIN</div>
           <div>{renderMarkdown(card.ourWin)}</div>
         </Card>
@@ -16001,7 +16006,7 @@ function BattleCardDetail({ card, onBack, actions }) {
           <div style={{ fontSize: 11, fontWeight: 700, color: C.textMuted, letterSpacing: "0.1em", textTransform: "uppercase", marginBottom: 14 }}>In-Depth</div>
           <div style={{ display: "flex", flexDirection: "column", gap: 14 }}>
             {card.content.map((section, i) => (
-              <Card key={i}>
+              <Card key={i} style={{ background: C.white }}>
                 {section.heading && <h3 style={{ margin: "0 0 10px", fontSize: 15, fontWeight: 800, color: C.text }}>{section.heading}</h3>}
                 <div>{renderMarkdown(section.body)}</div>
               </Card>
@@ -16031,6 +16036,7 @@ function BattleCardsAdminScreen({ cards, onSaveCard, onSetArchived, isReal = fal
   const draftTenant = tenantId ?? "demo";
   const draftUser   = userId ?? "guest";
   const [resumeInfo, setResumeInfo]   = useState(null);  // {savedAt, serverNewer} | null (banner for open editor)
+  const [confirmExit, setConfirmExit] = useState(null);  // null | "leave" (keep draft) | "discard" (destroy draft)
   const [editorSeed, setEditorSeed]   = useState(0);     // bumped on open/resume to reseed rich editors
   const editorBaselineRef = React.useRef(null);          // server content (JSON) at editor-open time
   const pendingResumeRef  = React.useRef(null);          // the stored draft snapshot offered for Resume
@@ -16126,7 +16132,22 @@ function BattleCardsAdminScreen({ cards, onSaveCard, onSetArchived, isReal = fal
   };
   const openNewCard  = () => openEditor("new", blankCard());
   const openEditCard = (card) => openEditor(card.id, card);
-  const cancelEditCard = () => setView(activeCardId ? "detail" : "list");
+  const cancelEditCard = () => { setConfirmExit(null); setView(activeCardId ? "detail" : "list"); };
+  // True when the editor holds unsaved changes (draft differs from the server
+  // baseline) — i.e. there is a live draft that autosave has stored.
+  const editorDirty = () => editorBaselineRef.current != null && JSON.stringify(draft) !== editorBaselineRef.current;
+  // Ordinary Back / Cancel: warn when there are unsaved changes rather than
+  // silently leaving. Confirming a leave KEEPS the draft (resumable next time).
+  const attemptLeave = () => { if (editorDirty()) setConfirmExit("leave"); else cancelEditCard(); };
+  // Explicit in-editor discard: destroy ONLY this scoped draft (no DB write, no
+  // toast, saved card untouched) and return to the prior detail/list view.
+  const discardAndExit = () => {
+    try { localStorage.removeItem(bcDraftKey(draftTenant, draftUser, editingCard)); } catch {}
+    pendingResumeRef.current = null;
+    setResumeInfo(null);
+    setConfirmExit(null);
+    cancelEditCard();
+  };
 
   // Autosave: while editing, persist the draft to localStorage whenever it differs
   // from the server baseline. A clean (unchanged) editor stores nothing.
@@ -16234,20 +16255,49 @@ function BattleCardsAdminScreen({ cards, onSaveCard, onSetArchived, isReal = fal
   // ── CARD EDITOR (tags only; ≥1 tag required) ──
   if (view === "editCard") {
     const isNew = editingCard === "new";
+    const dirty = editorDirty();
     const errText = (field) => errors[field]
       ? <div style={{ fontSize: 12, color: C.red, fontWeight: 700, marginTop: 6 }}>This field is required.</div> : null;
     return (
       <div style={{ maxWidth: 740, display: "flex", flexDirection: "column", gap: 0 }}>
         <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", flexWrap: "wrap", gap: 12, marginBottom: 16 }}>
           <div>
-            <button onClick={cancelEditCard} style={{ background: "none", border: "none", cursor: "pointer", fontSize: 13, fontWeight: 600, color: C.textSub, padding: 0, display: "flex", alignItems: "center", gap: 6, marginBottom: 8 }}>← Battle Cards</button>
+            <button onClick={attemptLeave} style={{ background: "none", border: "none", cursor: "pointer", fontSize: 13, fontWeight: 600, color: C.textSub, padding: 0, display: "flex", alignItems: "center", gap: 6, marginBottom: 8 }}>← Battle Cards</button>
             <h2 style={{ margin: 0, fontSize: 20, fontWeight: 900, color: C.text }}>{isNew ? "New Battle Card" : `Edit: ${cards.find(c => c.id === editingCard)?.title ?? ""}`}</h2>
           </div>
           <div style={{ display: "flex", gap: 10 }}>
-            <button onClick={cancelEditCard} style={{ padding: "10px 18px", borderRadius: 10, border: `1px solid ${C.border}`, background: C.cardBg, fontSize: 13, fontWeight: 700, cursor: "pointer", color: C.text }}>Cancel</button>
+            {/* Destructive, secondary — clears only this draft; shown only when there are unsaved changes. Distinct from Archive (which lives on the list/detail, not here). */}
+            {dirty && (
+              <button onClick={() => setConfirmExit("discard")} style={{ padding: "10px 18px", borderRadius: 10, border: `1px solid ${C.red}`, background: C.white, fontSize: 13, fontWeight: 700, cursor: "pointer", color: C.red }}>{isNew ? "Discard Draft" : "Discard Changes"}</button>
+            )}
+            <button onClick={attemptLeave} style={{ padding: "10px 18px", borderRadius: 10, border: `1px solid ${C.border}`, background: C.white, fontSize: 13, fontWeight: 700, cursor: "pointer", color: C.text }}>Cancel</button>
             <button onClick={saveCard} disabled={cardSaving} style={{ padding: "10px 20px", borderRadius: 10, border: "none", background: cardSaving ? C.muted : C.orange, color: cardSaving ? C.textMuted : "#fff", fontSize: 13, fontWeight: 700, cursor: cardSaving ? "not-allowed" : "pointer" }}>{cardSaving ? "Saving…" : isNew ? "Create Card" : "Save Changes"}</button>
           </div>
         </div>
+
+        {/* Exit guard — "leave" keeps the draft (resumable); "discard" destroys it. */}
+        {confirmExit && (
+          <div style={{ position: "fixed", inset: 0, background: "rgba(0,0,0,0.45)", display: "flex", alignItems: "center", justifyContent: "center", zIndex: 9999 }} onClick={() => setConfirmExit(null)}>
+            <div onClick={e => e.stopPropagation()} style={{ background: C.white, borderRadius: 20, padding: "28px 32px", width: 420, maxWidth: "90vw", border: `1px solid ${C.border}` }}>
+              <h3 style={{ margin: "0 0 8px", fontSize: 18, fontWeight: 900, color: C.text }}>
+                {confirmExit === "discard" ? (isNew ? "Discard this draft?" : "Discard your changes?") : "Leave without saving?"}
+              </h3>
+              <p style={{ margin: "0 0 24px", fontSize: 13, color: C.textSub, lineHeight: 1.6 }}>
+                {confirmExit === "discard"
+                  ? (isNew
+                      ? "This permanently removes the unsaved draft. Nothing is saved to your battle cards."
+                      : "This removes your unsaved edits and keeps the saved battle card exactly as it is. The card is not archived or deleted.")
+                  : "Your unsaved changes will be kept as a draft, so you can resume where you left off next time."}
+              </p>
+              <div style={{ display: "flex", gap: 10, justifyContent: "flex-end" }}>
+                <button onClick={() => setConfirmExit(null)} style={{ padding: "10px 18px", borderRadius: 10, border: `1px solid ${C.border}`, background: C.white, fontSize: 13, fontWeight: 700, cursor: "pointer", color: C.text }}>Keep editing</button>
+                {confirmExit === "discard"
+                  ? <button onClick={discardAndExit} style={{ padding: "10px 18px", borderRadius: 10, border: "none", background: C.red, color: "#fff", fontSize: 13, fontWeight: 700, cursor: "pointer" }}>{isNew ? "Discard draft" : "Discard changes"}</button>
+                  : <button onClick={cancelEditCard} style={{ padding: "10px 18px", borderRadius: 10, border: `1px solid ${C.border}`, background: C.white, fontSize: 13, fontWeight: 700, cursor: "pointer", color: C.text }}>Leave</button>}
+              </div>
+            </div>
+          </div>
+        )}
 
         {saveError && (
           <div style={{ marginBottom: 16, padding: "12px 16px", borderRadius: 10, background: C.redBg ?? "rgba(239,68,68,0.08)", border: "1px solid rgba(239,68,68,0.3)", color: "#b91c1c", fontSize: 13, fontWeight: 700 }}>
@@ -16284,8 +16334,8 @@ function BattleCardsAdminScreen({ cards, onSaveCard, onSetArchived, isReal = fal
           <Card>
             <div style={{ fontSize: 13, fontWeight: 800, color: C.text, marginBottom: 16 }}>Competitive Detail</div>
             <div style={{ display: "flex", flexDirection: "column", gap: 14 }}>
-              <div ref={el => (fieldRefs.current.strength = el)}>{lbl("Their Strengths", true)}<MarkdownEditor value={draft.strength ?? ""} onChange={setRich("strength")} seedKey={editorSeed} minHeight={90} invalid={!!errors.strength} placeholder="What they do well..." />{errText("strength")}</div>
-              <div ref={el => (fieldRefs.current.weakness = el)}>{lbl("Their Weaknesses", true)}<MarkdownEditor value={draft.weakness ?? ""} onChange={setRich("weakness")} seedKey={editorSeed} minHeight={90} invalid={!!errors.weakness} placeholder="Where they fall short..." />{errText("weakness")}</div>
+              <div ref={el => (fieldRefs.current.strength = el)}>{lbl("Pros", true)}<MarkdownEditor value={draft.strength ?? ""} onChange={setRich("strength")} seedKey={editorSeed} minHeight={90} invalid={!!errors.strength} placeholder="What they do well..." />{errText("strength")}</div>
+              <div ref={el => (fieldRefs.current.weakness = el)}>{lbl("Cons", true)}<MarkdownEditor value={draft.weakness ?? ""} onChange={setRich("weakness")} seedKey={editorSeed} minHeight={90} invalid={!!errors.weakness} placeholder="Where they fall short..." />{errText("weakness")}</div>
               <div ref={el => (fieldRefs.current.ourWin = el)}>{lbl("Why We Win", true)}<MarkdownEditor value={draft.ourWin ?? ""} onChange={setRich("ourWin")} seedKey={editorSeed} minHeight={90} invalid={!!errors.ourWin} placeholder="Our differentiated value..." />{errText("ourWin")}</div>
               <div>{lbl("Talk Track")}<MarkdownEditor value={draft.talkTrack ?? ""} onChange={setRich("talkTrack")} seedKey={editorSeed} minHeight={110} placeholder="The rep's suggested script..." /></div>
             </div>
