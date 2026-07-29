@@ -65,15 +65,24 @@ Completed:
 
 ### Battle Cards
 
-Status: Beta candidate (lifecycle slice — pending live QA + migration 068 apply)
+Status: Beta Complete (ready to merge — awaiting merge approval)
 
-Completed (this slice):
+Migrations 068, 069, 070 applied and verified in production (versions `20260728175949`, `20260728232125`, `20260729151513`). Live QA passed; frontend on `feature/battle-cards-audit`, not yet merged.
 
+Completed (full beta scope):
+
+- Create / edit cards (Title, Subtitle, Summary, Their Strengths, Their Weaknesses, Why We Win, Talk Track, In-Depth sections)
+- Tags-only organization: categories retired from the UI/service; `tenant_battle_cards.tags[]` is the source of truth (data-only category→tag conversion, migration 069, provenance preserved)
+- Search + exact tag filters (free-text scope title/subtitle/summary/tags; tag chips are exact normalized matches; archived-only tags excluded from suggestions)
+- Rich-text authoring reusing the Lesson editor/renderer (bold/italic/underline/lists) for the body fields; injection-safe markdown-subset rendering shared with Lessons; plain text for Title/Subtitle/Tags/section headings
+- Durable unsaved drafts scoped by tenant + user + create-vs-edit + card id, with Resume/Discard, in-editor Discard, and Back-with-unsaved-changes warning; cleared on save/discard and on sign-out
 - Archive / restore (status active|archived, archived_at) instead of hard delete; permanent delete not exposed
-- Learners read active cards only (RLS-enforced); managers see active + archived; archived excluded from learner search, categories, and counts
-- Tag authoring/editing with whitespace normalization + case-insensitive de-dupe; learner search matches tags
-- Manager preview; Uncategorized honesty on category delete; honest loading / error+Retry / empty states; no demo-content flash for real tenants
-- Server-authoritative provenance: created_by immutable on edit, updated_by + updated_at set by DB trigger; UPDATE RLS `WITH CHECK` blocks cross-tenant moves
+- Learners read active cards only (RLS-enforced); managers/orgAdmins see active + archived; archived excluded from learner search and counts
+- Tenant isolation (SELECT/INSERT/UPDATE RLS + `WITH CHECK` block cross-tenant moves)
+- Server-authoritative provenance: created_by / created_at immutable on edit; updated_by / updated_at / archived_at set by DB trigger (068)
+- Hard-delete prevention: no client-role DELETE (policy dropped + grant revoked; service_role/owner retain emergency access) (068)
+- Required-content enforcement server-side (070): Title, ≥1 meaningful tag, Their Strengths, Their Weaknesses, Why We Win — validated for direct authenticated API writes; INSERT full-validity, UPDATE non-regression (legacy incomplete rows can still be archived/corrected but valid content cannot regress)
+- Responsive list + detail experience; Quiz-consistent white card surfaces and yellow tag pills
 
 Readiness / analytics boundary (for the later Leadership Dashboard overhaul — do NOT treat as production evidence):
 

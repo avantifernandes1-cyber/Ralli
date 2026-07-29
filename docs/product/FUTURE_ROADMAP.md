@@ -41,3 +41,17 @@ Roleplay.
 Conversation practice.
 
 Call scoring.
+
+---
+
+## Battle Cards (deferred — not part of the beta)
+
+These are intentionally out of the Battle Cards beta scope and not committed:
+
+- Shared cross-content taxonomy evaluation (whether Battle Cards, Quizzes, and Lessons should share one governed tag taxonomy)
+- Battle Card assignments / distribution to reps
+- Viewed / activity tracking (opened / read events)
+- Trustworthy Battle Card readiness contribution (blocked until a real activity-event source exists)
+- Version history
+- Duplicate / copy a card
+- Direct per-card links
