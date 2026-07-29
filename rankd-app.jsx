@@ -15740,6 +15740,86 @@ function bcChipStyle(on) {
   return { padding: "6px 12px", borderRadius: 999, fontSize: 12, fontWeight: 700, cursor: "pointer",
     border: `1px solid ${on ? C.orange : C.border}`, background: on ? C.orangeLight : C.white, color: on ? C.orange : C.textSub };
 }
+// Required Battle Card fields — one source of truth for the red-* markers + validation.
+const BC_REQUIRED_TEXT_FIELDS = [
+  { key: "title",    label: "Title" },
+  { key: "strength", label: "Their Strengths" },
+  { key: "weakness", label: "Their Weaknesses" },
+  { key: "ourWin",   label: "Why We Win" },
+];
+// Returns the invalid required-field keys (blank/whitespace-only), in editor order:
+// title, then tags (>=1), then the required competitive-detail text fields.
+function bcInvalidFields(draft, tags) {
+  const invalid = [];
+  if (!String(draft?.title ?? "").trim()) invalid.push("title");
+  if (!(Array.isArray(tags) ? tags : []).length) invalid.push("tags");
+  for (const f of BC_REQUIRED_TEXT_FIELDS) {
+    if (f.key === "title") continue;
+    if (!String(draft?.[f.key] ?? "").trim()) invalid.push(f.key);
+  }
+  return invalid;
+}
+
+// Quiz-style Battle Card tag picker: shows the tenant's existing active tags as
+// selectable pills, lets the manager create a new normalized tag (no blanks, no
+// case-insensitive duplicates), and clearly separates SELECTED from AVAILABLE.
+// Keyboard (Enter creates/selects, Backspace removes last) + mouse. Source of truth
+// is tenant_battle_cards.tags[] — derived, not a second taxonomy. `suggestions`
+// already excludes archived-only tags (unless the edited card already uses one).
+function BcTagPicker({ selected, suggestions, onAdd, onRemove, error }) {
+  const [input, setInput] = useState("");
+  const selLower = new Set((selected ?? []).map(t => String(t).toLowerCase()));
+  const typed = input.trim();
+  const available = (suggestions ?? []).filter(s => !selLower.has(s.toLowerCase()));
+  const exactMatch = available.find(s => s.toLowerCase() === typed.toLowerCase());
+  const alreadySelected = selLower.has(typed.toLowerCase());
+  const canCreate = typed && !alreadySelected && !exactMatch;
+  const commit = () => {
+    const t = input.trim();
+    if (!t) return;                 // no blank tags
+    if (!selLower.has(t.toLowerCase())) onAdd(t);  // onAdd normalizes + dedupes
+    setInput("");
+  };
+  return (
+    <div>
+      <div style={{ fontSize: 11, fontWeight: 700, color: C.textMuted, marginBottom: 6 }}>Selected {selected?.length ? `· ${selected.length}` : ""}</div>
+      <div style={{ display: "flex", flexWrap: "wrap", gap: 6, marginBottom: 10, minHeight: 28 }}>
+        {(selected ?? []).length === 0
+          ? <span style={{ fontSize: 12, color: C.textMuted }}>No tags selected yet</span>
+          : (selected ?? []).map(t => (
+              <span key={t} style={{ display: "inline-flex", alignItems: "center", gap: 6, padding: "4px 10px", borderRadius: 999, background: C.orange, color: "#fff", fontSize: 12, fontWeight: 700 }}>
+                {t}
+                <button onClick={() => onRemove(t)} title="Remove tag" style={{ background: "none", border: "none", cursor: "pointer", color: "#fff", fontSize: 13, lineHeight: 1, padding: 0 }}>✕</button>
+              </span>
+            ))}
+      </div>
+      <input
+        style={{ width: "100%", boxSizing: "border-box", padding: "10px 14px", borderRadius: 10, border: `1.5px solid ${error ? C.red : C.border}`, background: C.cardBg, fontSize: 14, color: C.text, outline: "none", fontFamily: "inherit" }}
+        value={input}
+        onChange={e => setInput(e.target.value)}
+        onKeyDown={e => {
+          if (e.key === "Enter" || e.key === ",") { e.preventDefault(); commit(); }
+          else if (e.key === "Backspace" && !input && (selected?.length)) { onRemove(selected[selected.length - 1]); }
+        }}
+        placeholder="Type a tag and press Enter to add or create"
+      />
+      {canCreate && (
+        <button onClick={commit} style={{ marginTop: 8, padding: "6px 12px", borderRadius: 999, border: `1px dashed ${C.orange}`, background: C.orangeLight, color: C.orange, fontSize: 12, fontWeight: 700, cursor: "pointer" }}>+ Create “{typed}”</button>
+      )}
+      {available.length > 0 && (
+        <>
+          <div style={{ fontSize: 11, fontWeight: 700, color: C.textMuted, margin: "12px 0 6px" }}>Add existing</div>
+          <div style={{ display: "flex", flexWrap: "wrap", gap: 6 }}>
+            {available.map(s => (
+              <button key={s} onClick={() => onAdd(s)} style={{ ...bcChipStyle(false), cursor: "pointer" }}>+ {s}</button>
+            ))}
+          </div>
+        </>
+      )}
+      {error && <div style={{ fontSize: 12, color: C.red, fontWeight: 700, marginTop: 8 }}>Add at least one tag before saving — Battle Cards are organized by tags.</div>}
+    </div>
+  );
+}
 // Tag-filter chips — visual behavior matches the Quiz tag filters (pill chips, All
 // first, orange when selected). Multi-select; All resets. No category language.
 function BcTagFilters({ tags, selected, onToggle, onAll, allCount, usage }) {
@@ -15863,49 +15943,79 @@ function BattleCardsAdminScreen({ cards, onSaveCard, onSetArchived, isReal = fal
   const [selected,     setSelected]     = useState(() => new Set()); // lowercased tags
   const [editingCard,  setEditingCard]  = useState(null);
   const [confirmArchive, setConfirmArchive] = useState(null);
-  const [tagInput,     setTagInput]     = useState("");
-  const [showTagError, setShowTagError] = useState(false);
   const [cardSaving,   setCardSaving]   = useState(false);
+  const [errors,       setErrors]       = useState({});   // { title, tags, strength, weakness, ourWin }
+  const [saveError,    setSaveError]    = useState(false); // top-level "fix required fields" banner
+  const fieldRefs = React.useRef({});
 
   const blankCard = () => ({ id: `card-${Date.now()}`, title: "", subtitle: "", summary: "", strength: "", weakness: "", ourWin: "", talkTrack: "", tags: [], content: [] });
   const [draft, setDraft] = useState(blankCard);
-  const setF = (field) => (e) => setDraft(d => ({ ...d, [field]: e.target.value }));
+  // Setting a field clears its own inline error as soon as it becomes non-blank.
+  const setF = (field) => (e) => {
+    const val = e.target.value;
+    setDraft(d => ({ ...d, [field]: val }));
+    if (errors[field] && String(val).trim()) setErrors(er => ({ ...er, [field]: false }));
+  };
 
   const activeCards   = cards.filter(c => !bcIsArchived(c));
   const archivedCards = [...cards.filter(bcIsArchived)].sort((a, b) => a.title.localeCompare(b.title));
   const tagUniverse   = bcDistinctTags(activeCards);
   const usage = new Map();
   for (const c of activeCards) for (const t of bcCardTags(c)) { const k = t.toLowerCase(); usage.set(k, (usage.get(k) || 0) + 1); }
-  const filteredActive = [...activeCards].filter(c => bcMatchesSearch(c, search.trim()) && bcMatchesTags(c, selected)).sort((a, b) => a.title.localeCompare(b.title));
+  // One canonical predicate for BOTH lists (no leaking): active shows active cards
+  // matching search AND tag filters; archived shows archived cards matching the same.
+  const matchesFilters = (c) => bcMatchesSearch(c, search.trim()) && bcMatchesTags(c, selected);
+  const filteredActive   = [...activeCards].filter(matchesFilters).sort((a, b) => a.title.localeCompare(b.title));
+  const filteredArchived = archivedCards.filter(matchesFilters);
 
   const selectedCard = cards.find(c => c.id === activeCardId);
   const openCard = (id) => { setActiveCardId(id); setView("detail"); };
   const goList   = () => { setView("list"); setActiveCardId(null); };
   const toggleTag = (t) => setSelected(prev => { const n = new Set(prev); const k = t.toLowerCase(); n.has(k) ? n.delete(k) : n.add(k); return n; });
-  const clearTags = () => setSelected(new Set());
+  // Clear/All resets the search AND every selected tag (one reset).
+  const resetFilters = () => { setSearch(""); setSelected(new Set()); };
 
-  // Tags editor (mirrors normalizeCardTags: trim, no blanks, case-insensitive dedupe).
+  // Tag authoring for the editor (mirrors normalizeCardTags: trim, no blanks,
+  // case-insensitive dedupe). Adding a valid tag clears the tag validation error.
   const addTag = (raw) => {
     const t = String(raw ?? "").trim();
     if (!t) return;
     setDraft(d => (d.tags ?? []).some(x => x.toLowerCase() === t.toLowerCase()) ? d : { ...d, tags: [...(d.tags ?? []), t] });
-    setTagInput(""); setShowTagError(false);
+    setErrors(er => ({ ...er, tags: false }));
   };
   const removeTag = (t) => setDraft(d => ({ ...d, tags: (d.tags ?? []).filter(x => x !== t) }));
 
-  const openNewCard  = () => { setDraft(blankCard()); setTagInput(""); setShowTagError(false); setEditingCard("new"); setView("editCard"); };
-  const openEditCard = (card) => { setDraft({ ...card, tags: card.tags ?? [] }); setTagInput(""); setShowTagError(false); setEditingCard(card.id); setView("editCard"); };
+  // Existing tags to suggest in the picker: the tenant's ACTIVE-card tags, plus any
+  // tag the currently-edited card already carries (so an archived-only tag it uses
+  // is still shown) — archived-only tags are otherwise excluded from suggestions.
+  const tagSuggestions = (() => {
+    const seen = new Map();
+    for (const t of bcDistinctTags(activeCards)) seen.set(t.toLowerCase(), t);
+    for (const t of (draft.tags ?? [])) if (!seen.has(t.toLowerCase())) seen.set(t.toLowerCase(), t);
+    return [...seen.values()].sort((a, b) => a.localeCompare(b));
+  })();
+
+  const openNewCard  = () => { setDraft(blankCard()); setErrors({}); setSaveError(false); setEditingCard("new"); setView("editCard"); };
+  const openEditCard = (card) => { setDraft({ ...card, tags: card.tags ?? [] }); setErrors({}); setSaveError(false); setEditingCard(card.id); setView("editCard"); };
   const cancelEditCard = () => setView(activeCardId ? "detail" : "list");
   const saveCard = async () => {
-    if (!draft.title.trim() || cardSaving) return;
-    const pending = tagInput.trim();
-    const tags = pending && !(draft.tags ?? []).some(x => x.toLowerCase() === pending.toLowerCase())
-      ? [...(draft.tags ?? []), pending] : (draft.tags ?? []);
-    if (tags.length === 0) { setShowTagError(true); return; }  // require ≥1 tag — honest block
+    if (cardSaving) return;
+    const tags = draft.tags ?? [];
+    const invalid = bcInvalidFields(draft, tags);
+    if (invalid.length > 0) {
+      // Honest failure: mark every invalid field, show a top message, keep the
+      // manager in the editor with all content, and focus/scroll the first invalid.
+      setErrors(Object.fromEntries(invalid.map(k => [k, true])));
+      setSaveError(true);
+      const first = fieldRefs.current[invalid[0]];
+      if (first) { try { first.scrollIntoView({ behavior: "smooth", block: "center" }); first.focus({ preventScroll: true }); } catch { first.focus?.(); } }
+      return;  // no save, no toast, no navigation
+    }
+    setErrors({}); setSaveError(false);
     setCardSaving(true);
     const ok = await onSaveCard({ ...draft, title: draft.title.trim(), tags });
     setCardSaving(false);
-    if (ok) { setTagInput(""); goList(); }
+    if (ok) goList();
   };
 
   // content sections
@@ -15955,59 +16065,47 @@ function BattleCardsAdminScreen({ cards, onSaveCard, onSetArchived, isReal = fal
   // ── CARD EDITOR (tags only; ≥1 tag required) ──
   if (view === "editCard") {
     const isNew = editingCard === "new";
-    const canSave = draft.title.trim() && !cardSaving;
+    const errText = (field) => errors[field]
+      ? <div style={{ fontSize: 12, color: C.red, fontWeight: 700, marginTop: 6 }}>This field is required.</div> : null;
     return (
       <div style={{ maxWidth: 740, display: "flex", flexDirection: "column", gap: 0 }}>
-        <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", flexWrap: "wrap", gap: 12, marginBottom: 24 }}>
+        <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", flexWrap: "wrap", gap: 12, marginBottom: 16 }}>
           <div>
             <button onClick={cancelEditCard} style={{ background: "none", border: "none", cursor: "pointer", fontSize: 13, fontWeight: 600, color: C.textSub, padding: 0, display: "flex", alignItems: "center", gap: 6, marginBottom: 8 }}>← Battle Cards</button>
             <h2 style={{ margin: 0, fontSize: 20, fontWeight: 900, color: C.text }}>{isNew ? "New Battle Card" : `Edit: ${cards.find(c => c.id === editingCard)?.title ?? ""}`}</h2>
           </div>
           <div style={{ display: "flex", gap: 10 }}>
             <button onClick={cancelEditCard} style={{ padding: "10px 18px", borderRadius: 10, border: `1px solid ${C.border}`, background: C.cardBg, fontSize: 13, fontWeight: 700, cursor: "pointer", color: C.text }}>Cancel</button>
-            <button onClick={saveCard} disabled={!canSave} style={{ padding: "10px 20px", borderRadius: 10, border: "none", background: canSave ? C.orange : C.muted, color: canSave ? "#fff" : C.textMuted, fontSize: 13, fontWeight: 700, cursor: canSave ? "pointer" : "not-allowed" }}>{cardSaving ? "Saving…" : isNew ? "Create Card" : "Save Changes"}</button>
+            <button onClick={saveCard} disabled={cardSaving} style={{ padding: "10px 20px", borderRadius: 10, border: "none", background: cardSaving ? C.muted : C.orange, color: cardSaving ? C.textMuted : "#fff", fontSize: 13, fontWeight: 700, cursor: cardSaving ? "not-allowed" : "pointer" }}>{cardSaving ? "Saving…" : isNew ? "Create Card" : "Save Changes"}</button>
           </div>
         </div>
+
+        {saveError && (
+          <div style={{ marginBottom: 16, padding: "12px 16px", borderRadius: 10, background: C.redBg ?? "rgba(239,68,68,0.08)", border: "1px solid rgba(239,68,68,0.3)", color: "#b91c1c", fontSize: 13, fontWeight: 700 }}>
+            Please fill in every required field (marked *) before saving.
+          </div>
+        )}
 
         <div style={{ display: "flex", flexDirection: "column", gap: 16 }}>
           <Card>
             <div style={{ fontSize: 13, fontWeight: 800, color: C.text, marginBottom: 16 }}>Basic Info</div>
             <div style={{ display: "grid", gridTemplateColumns: mobile ? "1fr" : "1fr 1fr", gap: 14, marginBottom: 14 }}>
-              <div>{lbl("Title", true)}<input style={inputStyle} value={draft.title} onChange={setF("title")} placeholder="e.g. Salesforce" /></div>
+              <div>{lbl("Title", true)}<input ref={el => (fieldRefs.current.title = el)} style={{ ...inputStyle, borderColor: errors.title ? C.red : C.border }} value={draft.title} onChange={setF("title")} placeholder="e.g. Salesforce" />{errText("title")}</div>
               <div>{lbl("Subtitle / Type")}<input style={inputStyle} value={draft.subtitle} onChange={setF("subtitle")} placeholder="e.g. CRM" /></div>
             </div>
             <div style={{ marginBottom: 14 }}>{lbl("Summary")}<input style={inputStyle} value={draft.summary} onChange={setF("summary")} placeholder="One-line description shown in lists" /></div>
-            <div>
+            <div ref={el => (fieldRefs.current.tags = el)}>
               {lbl("Tags", true)}
-              <div style={{ display: "flex", flexWrap: "wrap", gap: 6, marginBottom: (draft.tags?.length ? 8 : 0) }}>
-                {(draft.tags ?? []).map(t => (
-                  <span key={t} style={{ display: "inline-flex", alignItems: "center", gap: 6, padding: "4px 10px", borderRadius: 999, background: C.orangeLight, color: C.orange, fontSize: 12, fontWeight: 700 }}>
-                    {t}
-                    <button onClick={() => removeTag(t)} title="Remove tag" style={{ background: "none", border: "none", cursor: "pointer", color: C.orange, fontSize: 13, lineHeight: 1, padding: 0 }}>✕</button>
-                  </span>
-                ))}
-              </div>
-              <input
-                style={{ ...inputStyle, borderColor: showTagError ? C.red : C.border }}
-                value={tagInput}
-                onChange={e => setTagInput(e.target.value)}
-                onKeyDown={e => {
-                  if (e.key === "Enter" || e.key === ",") { e.preventDefault(); addTag(tagInput); }
-                  else if (e.key === "Backspace" && !tagInput && (draft.tags?.length)) { removeTag(draft.tags[draft.tags.length - 1]); }
-                }}
-                onBlur={() => addTag(tagInput)}
-                placeholder="Add a tag and press Enter (reps search and filter by these)"
-              />
-              {showTagError && <div style={{ fontSize: 12, color: C.red, fontWeight: 700, marginTop: 6 }}>Add at least one tag before saving — Battle Cards are organized by tags.</div>}
+              <BcTagPicker selected={draft.tags ?? []} suggestions={tagSuggestions} onAdd={addTag} onRemove={removeTag} error={errors.tags} />
             </div>
           </Card>
 
           <Card>
             <div style={{ fontSize: 13, fontWeight: 800, color: C.text, marginBottom: 16 }}>Competitive Detail</div>
             <div style={{ display: "flex", flexDirection: "column", gap: 14 }}>
-              <div>{lbl("Their Strengths", true)}<textarea style={taStyle} value={draft.strength} onChange={setF("strength")} placeholder="What they do well..." /></div>
-              <div>{lbl("Their Weaknesses", true)}<textarea style={taStyle} value={draft.weakness} onChange={setF("weakness")} placeholder="Where they fall short..." /></div>
-              <div>{lbl("Why We Win", true)}<textarea style={taStyle} value={draft.ourWin} onChange={setF("ourWin")} placeholder="Our differentiated value..." /></div>
+              <div>{lbl("Their Strengths", true)}<textarea ref={el => (fieldRefs.current.strength = el)} style={{ ...taStyle, borderColor: errors.strength ? C.red : C.border }} value={draft.strength} onChange={setF("strength")} placeholder="What they do well..." />{errText("strength")}</div>
+              <div>{lbl("Their Weaknesses", true)}<textarea ref={el => (fieldRefs.current.weakness = el)} style={{ ...taStyle, borderColor: errors.weakness ? C.red : C.border }} value={draft.weakness} onChange={setF("weakness")} placeholder="Where they fall short..." />{errText("weakness")}</div>
+              <div>{lbl("Why We Win", true)}<textarea ref={el => (fieldRefs.current.ourWin = el)} style={{ ...taStyle, borderColor: errors.ourWin ? C.red : C.border }} value={draft.ourWin} onChange={setF("ourWin")} placeholder="Our differentiated value..." />{errText("ourWin")}</div>
               <div>{lbl("Talk Track")}<textarea style={{ ...taStyle, minHeight: 110 }} value={draft.talkTrack} onChange={setF("talkTrack")} placeholder="The rep's suggested script..." /></div>
             </div>
           </Card>
@@ -16077,13 +16175,17 @@ function BattleCardsAdminScreen({ cards, onSaveCard, onSetArchived, isReal = fal
         <button onClick={openNewCard} style={{ padding: "10px 20px", borderRadius: 12, border: "none", background: C.orange, color: "#fff", fontSize: 13, fontWeight: 700, cursor: "pointer", flexShrink: 0 }}>+ New Card</button>
       </div>
 
-      <div style={{ display: "flex", alignItems: "center", gap: 10, padding: "10px 14px", borderRadius: 10, background: C.cardBg, border: `1px solid ${C.creamBorder}`, maxWidth: 420 }}>
-        <span style={{ fontSize: 13, color: C.textMuted }}>Search</span>
-        <input type="text" value={search} placeholder="Title, subtitle, summary, tags…" onChange={e => setSearch(e.target.value)} style={{ flex: 1, border: "none", background: "transparent", fontSize: 13, color: C.text, outline: "none", fontFamily: "inherit" }} />
-        {search && <button onClick={() => setSearch("")} style={{ background: "none", border: "none", cursor: "pointer", fontSize: 13, color: C.textMuted, padding: 0, lineHeight: 1 }}>✕</button>}
+      <div>
+        <div style={{ display: "flex", alignItems: "center", gap: 10, padding: "10px 14px", borderRadius: 10, background: C.cardBg, border: `1px solid ${C.creamBorder}`, maxWidth: 420 }}>
+          <span style={{ fontSize: 13, color: C.textMuted }}>Search</span>
+          <input type="text" value={search} placeholder="Title, subtitle, summary, tags…" onChange={e => setSearch(e.target.value)} style={{ flex: 1, border: "none", background: "transparent", fontSize: 13, color: C.text, outline: "none", fontFamily: "inherit" }} />
+          {search && <button onClick={() => setSearch("")} style={{ background: "none", border: "none", cursor: "pointer", fontSize: 13, color: C.textMuted, padding: 0, lineHeight: 1 }}>✕</button>}
+        </div>
+        {/* Explain the scope so a title match on the word "tag" isn't mistaken for a tag filter. */}
+        <p style={{ margin: "6px 2px 0", fontSize: 11, color: C.textMuted }}>Search matches titles, subtitles, summaries, and tags. Use the tag chips below to filter by an exact tag.</p>
       </div>
 
-      <BcTagFilters tags={tagUniverse} selected={selected} onToggle={toggleTag} onAll={clearTags} allCount={activeCards.length} usage={usage} />
+      <BcTagFilters tags={tagUniverse} selected={selected} onToggle={toggleTag} onAll={resetFilters} allCount={activeCards.length} usage={usage} />
 
       {/* Active cards */}
       {filteredActive.length === 0 ? (
@@ -16101,12 +16203,12 @@ function BattleCardsAdminScreen({ cards, onSaveCard, onSetArchived, isReal = fal
         </div>
       )}
 
-      {/* Archived cards below (managers only) */}
-      {archivedCards.length > 0 && (
+      {/* Archived cards below (managers only) — same canonical search/tag predicate */}
+      {filteredArchived.length > 0 && (
         <div>
-          <p style={{ margin: "0 0 12px", fontSize: 12, fontWeight: 700, color: C.textMuted, letterSpacing: "0.06em", textTransform: "uppercase" }}>Archived · {archivedCards.length}</p>
+          <p style={{ margin: "0 0 12px", fontSize: 12, fontWeight: 700, color: C.textMuted, letterSpacing: "0.06em", textTransform: "uppercase" }}>Archived · {filteredArchived.length}</p>
           <div style={{ display: "flex", flexDirection: "column", gap: 6 }}>
-            {archivedCards.map(card => <BcCardRow key={card.id} card={card} onOpen={() => openCard(card.id)} archived actions={rowActions(card)} />)}
+            {filteredArchived.map(card => <BcCardRow key={card.id} card={card} onOpen={() => openCard(card.id)} archived actions={rowActions(card)} />)}
           </div>
         </div>
       )}
@@ -16136,7 +16238,7 @@ function BattleCardsScreen({ cards = INITIAL_BATTLE_CARDS, isLoading = false, lo
   const openCard = (id) => { setActiveCardId(id); setView("detail"); };
   const goList   = () => { setView("list"); setActiveCardId(null); };
   const toggleTag = (t) => setSelected(prev => { const n = new Set(prev); const k = t.toLowerCase(); n.has(k) ? n.delete(k) : n.add(k); return n; });
-  const clearTags = () => setSelected(new Set());
+  const resetFilters = () => { setSearch(""); setSelected(new Set()); }; // Clear/All resets search + tags
 
   const header = (
     <div>
@@ -16178,12 +16280,15 @@ function BattleCardsScreen({ cards = INITIAL_BATTLE_CARDS, isLoading = false, lo
   return (
     <div style={{ display: "flex", flexDirection: "column", gap: 20 }}>
       {header}
-      <div style={{ display: "flex", alignItems: "center", gap: 10, padding: "10px 14px", borderRadius: 10, background: C.cardBg, border: `1px solid ${C.creamBorder}`, maxWidth: 420 }}>
-        <span style={{ fontSize: 13, color: C.textMuted }}>Search</span>
-        <input type="text" value={search} placeholder="Title, subtitle, summary, tags…" onChange={e => setSearch(e.target.value)} style={{ flex: 1, border: "none", background: "transparent", fontSize: 13, color: C.text, outline: "none", fontFamily: "inherit" }} />
-        {search && <button onClick={() => setSearch("")} style={{ background: "none", border: "none", cursor: "pointer", fontSize: 13, color: C.textMuted, padding: 0, lineHeight: 1 }}>✕</button>}
+      <div>
+        <div style={{ display: "flex", alignItems: "center", gap: 10, padding: "10px 14px", borderRadius: 10, background: C.cardBg, border: `1px solid ${C.creamBorder}`, maxWidth: 420 }}>
+          <span style={{ fontSize: 13, color: C.textMuted }}>Search</span>
+          <input type="text" value={search} placeholder="Title, subtitle, summary, tags…" onChange={e => setSearch(e.target.value)} style={{ flex: 1, border: "none", background: "transparent", fontSize: 13, color: C.text, outline: "none", fontFamily: "inherit" }} />
+          {search && <button onClick={() => setSearch("")} style={{ background: "none", border: "none", cursor: "pointer", fontSize: 13, color: C.textMuted, padding: 0, lineHeight: 1 }}>✕</button>}
+        </div>
+        <p style={{ margin: "6px 2px 0", fontSize: 11, color: C.textMuted }}>Search matches titles, subtitles, summaries, and tags. Use the tag chips below to filter by an exact tag.</p>
       </div>
-      <BcTagFilters tags={tagUniverse} selected={selected} onToggle={toggleTag} onAll={clearTags} allCount={visibleCards.length} usage={usage} />
+      <BcTagFilters tags={tagUniverse} selected={selected} onToggle={toggleTag} onAll={resetFilters} allCount={visibleCards.length} usage={usage} />
       {filtered.length === 0 ? (
         <div style={{ padding: "40px 32px", textAlign: "center", borderRadius: 16, border: `2px dashed ${C.creamBorder}`, background: C.cardBg }}>
           <p style={{ margin: 0, fontSize: 14, fontWeight: 700, color: C.text }}>No cards match this filter</p>

@@ -79,7 +79,8 @@ ok("manager splits active vs archived", /const activeCards\s+=/.test(admin) && /
 ok("manager archive/restore via canonical onSetArchived", /onSetArchived\(/.test(admin));
 ok("manager exposes NO permanent Delete", !/title="Delete"/.test(admin) && !/permanently removed/.test(admin));
 ok("manager has NO category UI/selectors/Uncategorized", !/Uncategorized/.test(admin) && !/categor/i.test(admin));
-ok("editor requires >=1 tag (honest block + message)", /if \(tags\.length === 0\) \{ setShowTagError\(true\); return; \}/.test(admin) && /Add at least one tag before saving/.test(admin));
+ok("editor requires >=1 tag + all required fields via bcInvalidFields (honest block)",
+   /bcInvalidFields\(draft, tags\)/.test(admin) && /Add at least one tag before saving/.test(app));
 ok("editor has a tag authoring control", /const addTag = /.test(admin) && /const removeTag = /.test(admin));
 ok("manager renders tag filter chips", /<BcTagFilters/.test(admin));
 ok("manager active count uses filtered active source", /Active · \{filteredActive\.length\}/.test(admin));
