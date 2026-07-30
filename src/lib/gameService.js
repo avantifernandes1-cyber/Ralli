@@ -598,6 +598,24 @@ export async function getManagerSessionAnalytics(sessionId) {
  *
  * @returns {Promise<{ data: Object[]|null, error: Object|null }>}
  */
+/**
+ * Atomic safe rejoin (migration 078) — a prior same-tenant participant re-entering a
+ * STARTED/paused session by PIN. The server verifies eligibility (authenticated,
+ * same-tenant real session, status='started', caller already a participant by
+ * auth.uid()) and reactivates their existing participant row in one op — never a
+ * duplicate, never a resume, never admitting a non-participant. Returns the session
+ * (id/pin/name/status/phase/paused/…) + the caller's stored participant identity, or
+ * an error the caller maps to a user message.
+ *
+ * @param {string} pin
+ * @returns {Promise<{ data: { session: Object, participant: Object }|null, error: Object|null }>}
+ */
+export async function rejoinSession(pin) {
+  const { data, error } = await supabase.rpc("rpc_rejoin_session", { p_pin: pin });
+  if (error) return { data: null, error };
+  return { data: { session: data?.session ?? null, participant: data?.participant ?? null }, error: null };
+}
+
 export async function getLearnerJoinableSessions() {
   const { data, error } = await supabase.rpc("rpc_learner_joinable_sessions");
   if (error) return { data: null, error };

@@ -22,6 +22,7 @@ import {
   endGameSession,
   getActiveSessions,
   getLearnerJoinableSessions,
+  rejoinSession,
   joinGameSession,
   getLobbyParticipants,
   subscribeToLobbyParticipants,
@@ -3276,9 +3277,23 @@ function KahootHostView({ onNav, sessionName, pin, sessionDbId, demoMode, tenant
                 </button>
               </>
             ) : (
-              <button onClick={doTogglePause} style={{ padding: "14px 36px", borderRadius: 14, border: "none", background: C.orange, color: "#fff", fontSize: 17, fontWeight: 900, cursor: "pointer", display: "flex", alignItems: "center", gap: 10 }}>
-                ▶ Resume
-              </button>
+              // Normal paused overlay (incl. the resting state after "Stay Paused"):
+              // End Game (authoritative force-end via the confirm modal → doForceEnd)
+              // AND Resume. Resume stays disabled until at least one active player is
+              // back (connectedNow ≥ 1); a rejoining player never auto-resumes.
+              <>
+                <button onClick={() => setShowEndConfirm(true)} style={{ padding: "14px 28px", borderRadius: 14, border: `1px solid rgba(255,255,255,0.35)`, background: "transparent", color: "#fff", fontSize: 16, fontWeight: 900, cursor: "pointer" }}>
+                  End Game
+                </button>
+                {(() => {
+                  const canResume = connectedNow() >= 1;
+                  return (
+                    <button onClick={doTogglePause} disabled={!canResume} style={{ padding: "14px 36px", borderRadius: 14, border: "none", background: canResume ? C.orange : "rgba(255,255,255,0.25)", color: "#fff", fontSize: 17, fontWeight: 900, cursor: canResume ? "pointer" : "not-allowed", opacity: canResume ? 1 : 0.6, display: "flex", alignItems: "center", gap: 10 }}>
+                      ▶ Resume
+                    </button>
+                  );
+                })()}
+              </>
             )}
           </div>
         </div>
@@ -6622,8 +6637,8 @@ function RankdScreen({ onNav, onJoin, sessions, pastSessions = [], onLaunch, onV
     // centers the max-width column with comfortable side padding, so the hub is no
     // longer stranded at the far left of a wide canvas. Only the CONTAINER is
     // centered — inner text/tabs/controls stay left-aligned; full-width on small screens.
-    <div style={{ width: "100%", display: "flex", justifyContent: "center", padding: "0 24px", boxSizing: "border-box" }}>
-    <div style={{ width: "100%", maxWidth: 920, display: "flex", flexDirection: "column" }}>
+    <div style={{ width: "100%", display: "flex", justifyContent: "center", padding: "0 32px", boxSizing: "border-box" }}>
+    <div style={{ width: "100%", maxWidth: 1480, display: "flex", flexDirection: "column" }}>
       {/* Hero */}
       <div style={{
         background: C.cream,
@@ -25484,12 +25499,36 @@ export default function App() {
       const tenantId = currentUser?.orgId ?? null;
       const { data: remote, error: pinErr } = await findJoinableSession(tenantId, pin);
       if (remote) {
-        // Only allow joining sessions that are actively waiting for players
+        // Only brand-new joins go to a 'waiting' session. A non-waiting session is
+        // either terminal (closed) or started/paused — the latter is a REJOIN, not a
+        // new join.
         if (remote.status && remote.status !== "waiting") {
-          console.warn("[ralli:game] handleEnterPin: session not accepting players, status:", remote.status);
-          return ["completed", "ended", "canceled"].includes(remote.status)
-            ? "This game has already ended."
-            : "This game has already started.";
+          if (["completed", "ended", "canceled"].includes(remote.status)) {
+            return "This game has already ended.";
+          }
+          // Started/paused → attempt a safe, server-authorized rejoin (migration 078):
+          // the RPC verifies the caller already participated in this exact same-tenant
+          // session (by auth.uid()) and atomically reactivates their existing row — no
+          // duplicate, no resume. A brand-new user (never a participant) is rejected and
+          // sees the closed-game message; a returning participant is restored into the
+          // game via the existing safe player reconcile, with the host still paused.
+          const { data: rj, error: rjErr } = await rejoinSession(pin);
+          if (rjErr || !rj?.session) {
+            console.warn("[ralli:game] rejoin denied:", rjErr?.message ?? rjErr);
+            return "This game has already started.";
+          }
+          const rs = rj.session;
+          setActiveGameSessionDbId(rs.id);
+          setActiveGameIsDemo(false);                 // rejoin only applies to real sessions
+          setLobbyPin(rs.pin ?? pin);
+          setLobbySessionName(rs.name ?? sessionName);
+          setLobbyPlayerName(rj.participant?.name ?? currentUser?.name ?? null);
+          setLobbyPlayerEmoji(rj.participant?.emoji ?? null);
+          // started / past-waiting → game view; player reconcile (getPlayerSessionRestore)
+          // restores the exact phase/question/score. Host stays paused → Resume is manual.
+          const live = rs.status === "started" || (rs.phase && rs.phase !== "waiting");
+          setScreen(live ? "rankd-game" : "rankd-lobby");
+          return null;
         }
         const fetched = {
           code:          remote.pin,
