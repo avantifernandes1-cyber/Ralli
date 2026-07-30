@@ -167,6 +167,38 @@ export async function endGameSession(pin, { scores = [], tenantId = null } = {})
 }
 
 /**
+ * Request server-authoritative verification of a durably-completed session
+ * (migration 072 + the verify-game-session Edge Function). The function
+ * re-grades the session against its frozen snapshot with the shared canonical
+ * grader and writes immutable verification records; the underlying RPC is
+ * idempotent, so retries / reconnect / repeated completion never duplicate them.
+ *
+ * SAFE-BY-DEFAULT: the Edge Function is not deployed in every environment yet.
+ * When it is absent/unreachable, this resolves as `{ unavailable: true }`
+ * WITHOUT throwing — the caller treats the session as simply "unverified" (never
+ * leaderboard-eligible) and MUST NOT let this affect gameplay results or the end
+ * screen. Service errors are never surfaced to the player.
+ *
+ * @param {string} sessionId - game_sessions.id (UUID)
+ * @returns {Promise<{ data: Object|null, error: Object|null, unavailable: boolean }>}
+ */
+export async function requestSessionVerification(sessionId) {
+  if (!sessionId) return { data: null, error: null, unavailable: true };
+  try {
+    const { data, error } = await supabase.functions.invoke("verify-game-session", {
+      body: { session_id: sessionId },
+    });
+    // A not-deployed / unreachable function (FunctionsFetchError, 404) is an
+    // expected pre-deploy state, not a failure — report it as unavailable so the
+    // caller degrades to "unverified" rather than erroring.
+    if (error) return { data: null, error, unavailable: true };
+    return { data, error: null, unavailable: false };
+  } catch (e) {
+    return { data: null, error: e, unavailable: true };
+  }
+}
+
+/**
  * Cancel a session — a terminal status that is NOT joinable (findable joins
  * require status "waiting") and is NOT surfaced in Past Sessions (getGameHistory
  * only queries status "completed"). Used to roll back a session whose question

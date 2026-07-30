@@ -38,7 +38,12 @@ import {
   saveSessionQuestionSnapshot,
   getSessionQuestionSnapshot,
   cancelGameSession,
+  requestSessionVerification,
 } from "./src/lib/gameService.js";
+// Canonical, runtime-neutral answer grader — the SINGLE source of correctness
+// truth shared by the live host reveal (below) and the server verification path
+// (supabase/functions/verify-game-session). See src/lib/gameGrading.js.
+import { gradeAnswer } from "./src/lib/gameGrading.js";
 import {
   getTenantCourses,
   getTenantLessons,
@@ -2537,8 +2542,9 @@ function KahootHostView({ onNav, sessionName, pin, sessionDbId, demoMode, tenant
       return;
     }
     if (q.type === "type") {
-      // Auto-grade typed answers against acceptedAnswers (case-insensitive)
-      const accepted = (q.acceptedAnswers ?? []).map(a => a.toLowerCase().trim());
+      // Auto-grade typed answers via the canonical shared grader (case-insensitive
+      // acceptedAnswers match — identical rule, now single-sourced). See
+      // src/lib/gameGrading.js.
       const qDist = []; // no option distribution for type questions
       setQuestionHistory(h => [...h, { qIdx, q: q?.q, options: [], correct: null, distribution: qDist, correctCount: 0, totalAnswers: Object.values(chAnswers).length, avgTimeMs: 0 }]);
       let baseScores;
@@ -2548,7 +2554,7 @@ function KahootHostView({ onNav, sessionName, pin, sessionDbId, demoMode, tenant
       const newScores = baseScores.map(p => {
         const ans = chAnswers[p.id];
         if (!ans?.text) return { ...p, delta: 0, wasCorrect: false };
-        const correct = accepted.length > 0 && accepted.some(a => ans.text.toLowerCase().trim() === a);
+        const correct = gradeAnswer(q, ans.text).correct === true;
         const speedBonus = correct && ans.timeMs ? Math.max(0, Math.round((1 - ans.timeMs / (q.timeLimit * 1000)) * 50)) : 0;
         const delta = correct ? 100 + speedBonus : 0;
         return { ...p, score: p.score + delta, delta, wasCorrect: correct };
@@ -2568,7 +2574,7 @@ function KahootHostView({ onNav, sessionName, pin, sessionDbId, demoMode, tenant
         const answerRows = newScores.map(p => {
           const ans = chAnswers[p.id];
           if (!ans?.text) return { playerId: p.id, playerName: p.name, questionIdx: qIdx, optionIdx: null, text: null, timeMs: null, isCorrect: false, points: 0, tenantId };
-          const correct = (q.acceptedAnswers ?? []).some(a => (ans.text ?? "").toLowerCase().trim() === a.toLowerCase().trim());
+          const correct = gradeAnswer(q, ans.text ?? null).correct === true;
           return { playerId: p.id, playerName: ans.name ?? p.name, questionIdx: qIdx, optionIdx: null, text: ans.text ?? null, timeMs: ans.timeMs ?? null, isCorrect: correct, points: p.delta ?? 0, tenantId };
         });
         saveGameAnswers(sessionDbId, answerRows).then(({ error }) => { if (error) console.error("[ralli:host] saveGameAnswers (type) failed:", error); });
@@ -2592,8 +2598,10 @@ function KahootHostView({ onNav, sessionName, pin, sessionDbId, demoMode, tenant
       const newScores = baseScores.map(p => {
         const ans = chAnswers[p.id];
         if (ans?.sliderValue == null) return { ...p, delta: 0, wasCorrect: false };
-        const diff    = Math.abs(ans.sliderValue - target);
-        const correct = diff <= tol;
+        // Canonical grader applies the SAME tolerance rule (|value - target| <= tolerance,
+        // with target/tolerance defaults via ?? so 0 is preserved). target/tol below
+        // still drive the reveal broadcast + question history unchanged.
+        const correct = gradeAnswer(q, ans.sliderValue).correct === true;
         const speedBonus = correct && ans.timeMs ? Math.max(0, Math.round((1 - ans.timeMs / (q.timeLimit * 1000)) * 50)) : 0;
         const delta = correct ? 100 + speedBonus : 0;
         return { ...p, score: p.score + delta, delta, wasCorrect: correct };
@@ -2610,8 +2618,7 @@ function KahootHostView({ onNav, sessionName, pin, sessionDbId, demoMode, tenant
         const answerRows = newScores.map(p => {
           const ans = chAnswers[p.id];
           if (ans?.sliderValue == null) return { playerId: p.id, playerName: p.name, questionIdx: qIdx, optionIdx: null, text: null, timeMs: null, isCorrect: false, points: 0, tenantId, numericValue: null };
-          const diff = Math.abs(ans.sliderValue - target);
-          return { playerId: p.id, playerName: ans.name ?? p.name, questionIdx: qIdx, optionIdx: null, text: null, timeMs: ans.timeMs ?? null, isCorrect: diff <= tol, points: p.delta ?? 0, tenantId, numericValue: ans.sliderValue ?? null };
+          return { playerId: p.id, playerName: ans.name ?? p.name, questionIdx: qIdx, optionIdx: null, text: null, timeMs: ans.timeMs ?? null, isCorrect: gradeAnswer(q, ans.sliderValue).correct === true, points: p.delta ?? 0, tenantId, numericValue: ans.sliderValue ?? null };
         });
         saveGameAnswers(sessionDbId, answerRows).then(({ error }) => { if (error) console.error("[ralli:host] saveGameAnswers (slider) failed:", error); });
       }
@@ -2632,15 +2639,18 @@ function KahootHostView({ onNav, sessionName, pin, sessionDbId, demoMode, tenant
       if (scores.length > 0) { baseScores = scores; }
       else if (chPlayers.length > 0) { baseScores = chPlayers.map(p => ({ ...p, score: 0 })); }
       else { baseScores = Object.entries(chAnswers).map(([pid, ans]) => buildScoreRowFromAnswer(pid, ans)); }
-      const scoreMatch = (mps) => {
-        if (!Array.isArray(mps) || mps.length === 0) return 0;
-        return mps.filter(mp => shuffledRight[mp.rightIdx]?.right === pairs[mp.leftIdx]?.right).length;
-      };
+      // Resolve each submitted rightIdx to its right TEXT against this question's
+      // shuffle, producing the canonical [{leftIdx, rightText}] that the shared
+      // grader AND the persisted answer_json use — one Matching correctness rule
+      // (all pairs correct AND count == pairs.length). detail.matched gives the
+      // per-pair count for the reveal display (matchCorrectCount), single-sourced.
+      const resolveSubmitted = (mps) => (Array.isArray(mps) ? mps.map(mp => ({ leftIdx: mp.leftIdx, rightText: shuffledRight[mp.rightIdx]?.right ?? null })) : []);
       const newScores = baseScores.map(p => {
         const ans = chAnswers[p.id];
         if (!ans?.matchPairs?.length) return { ...p, delta: 0, wasCorrect: false };
-        const correctCount = scoreMatch(ans.matchPairs);
-        const correct = pairs.length > 0 && correctCount === pairs.length;
+        const g = gradeAnswer(q, resolveSubmitted(ans.matchPairs));
+        const correctCount = g.detail?.matched ?? 0;
+        const correct = g.correct === true;
         const speedBonus = correct && ans.timeMs ? Math.max(0, Math.round((1 - ans.timeMs / (q.timeLimit * 1000)) * 50)) : 0;
         const delta = correct ? 100 + speedBonus : 0;
         return { ...p, score: p.score + delta, delta, wasCorrect: correct, matchCorrectCount: correctCount };
@@ -2688,7 +2698,7 @@ function KahootHostView({ onNav, sessionName, pin, sessionDbId, demoMode, tenant
     const newScores = baseScores.map(p => {
       const ans = chAnswers[p.id];
       if (!ans) return { ...p, delta: 0, wasCorrect: false };
-      const correct = ans.optionIdx === q.correct;
+      const correct = gradeAnswer(q, ans.optionIdx).correct === true;
       const speedBonus = correct && ans.timeMs ? Math.max(0, Math.round((1 - ans.timeMs / (q.timeLimit * 1000)) * 50)) : 0;
       const delta = correct ? 100 + speedBonus : 0;
       return { ...p, score: p.score + delta, delta, wasCorrect: correct };
@@ -2711,7 +2721,7 @@ function KahootHostView({ onNav, sessionName, pin, sessionDbId, demoMode, tenant
           optionIdx:   ans.optionIdx ?? null,
           text:        ans.text ?? null,
           timeMs:      ans.timeMs ?? null,
-          isCorrect:   ans.optionIdx === q.correct,
+          isCorrect:   gradeAnswer(q, ans.optionIdx).correct === true,
           points:      p.delta ?? 0,
           tenantId,
         };
@@ -25432,6 +25442,19 @@ export default function App() {
           if (error) console.error("[ralli] getGameHistory refresh failed:", error);
           if (history) setPastSessions(history);
         });
+      }
+      // Post-completion, request server-authoritative verification (migration 072
+      // + verify-game-session). Fire-and-forget and retryable/idempotent: it runs
+      // ONLY after durable completion, must never delay or strand the end screen,
+      // and a failure/unavailable Edge Function must never erase gameplay results
+      // — the session simply stays UNVERIFIED (and thus never leaderboard-eligible).
+      // endedDbId is null for demo games, so this is real-session-only.
+      if (endedDbId) {
+        requestSessionVerification(endedDbId)
+          .then(({ unavailable }) => {
+            if (unavailable) console.info("[ralli] session verification unavailable — session stays unverified until the verify service is deployed");
+          })
+          .catch(() => { /* never affects gameplay results */ });
       }
     }).catch(e => console.error("[ralli] endGameSession failed:", e));
     // Award game points for all real participants, then trigger readiness for each.

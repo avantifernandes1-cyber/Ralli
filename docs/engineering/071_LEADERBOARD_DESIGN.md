@@ -1,9 +1,17 @@
-# Ralli Live Leaderboard — Design + Grading-Trust Blocker (071 slice)
+# Ralli Live Leaderboard — Design + Grading-Trust Blocker (071 + 072 slices)
 
-Status: **Trust-foundation slice only.** This branch ships migration 071 (team-at-game-time
-snapshot) + tests. The leaderboard **read RPC and UI are intentionally NOT built** —
-they are blocked on a server-authoritative grading decision (below). Nothing is applied
-to production; nothing merged.
+Status: **Trust-foundation slices.** Migration 071 (team-at-game-time snapshot, APPLIED
+to production) + migration 072 (server-authoritative VERIFICATION foundation: canonical
+grader + immutable verification storage + snapshot freeze + writer RPC + Edge Function,
+LOCALLY VALIDATED, **not applied / not deployed**). The leaderboard **read RPC and UI
+remain intentionally NOT built and NOT exposed.** The standalone Leaderboard navigation is
+retained. See **§11–§17** for the 072 verification foundation.
+
+> **Update (072 slice):** the server-authoritative grading path described as a "blocker" in
+> §1 below is now **implemented** as the verification foundation (§11–§17), pending a
+> separate migration + Edge-Function preflight/deploy approval. Until 072 is applied AND the
+> `verify-game-session` Edge Function is deployed AND a leaderboard read RPC + UI are built,
+> the leaderboard stays blocked. No leaderboard ranks are computed or exposed anywhere.
 
 Approved product decisions are recorded verbatim in the task; this doc records the
 engineering design and the honest blocker.
@@ -182,3 +190,119 @@ reaches parity + live QA**, then removed in the final parity commit.
 - This design doc.
 No frontend/nav/service change; no read RPC; standalone Leaderboard untouched. Migration applied
 to a clean **local** DB only. **Stop for grading approval before building the read RPC + UI.**
+
+---
+
+# 072 slice — Server-authoritative VERIFICATION foundation
+
+The §1 grading-trust blocker is now implemented as an honest, independent verification layer.
+Nothing is applied to production and the Edge Function is not deployed; the frontend keeps
+verification behind a safe "unavailable / unverified" state. **No ranking is built or exposed.**
+
+## 11. Canonical grader architecture (one source of truth)
+
+`src/lib/gameGrading.js` — a pure, runtime-neutral ES module (no imports; no browser/React/
+Supabase/DOM/clock/random/tenant deps; deterministic; versioned `GRADER_VERSION =
+"ralli-game-grader@1"`). It is imported **verbatim** by:
+- the live host reveal path (`rankd-app.jsx` `doReveal()` — the 5 auto-gradable types now call
+  `gradeAnswer()` for the correctness boolean; point/speed economy unchanged);
+- the server verification path (`supabase/functions/verify-game-session/index.ts`, via a
+  relative import — the eszip bundler follows it; `import_map.json` pins supabase-js);
+- Node parity/unit tests (`src/lib/gameGrading.test.mjs`).
+
+There is **no second grading implementation** (no SQL grader; the Edge Function does not
+re-implement correctness). `gradeAnswer(question, submitted)` returns
+`{ correct: boolean|null, eligibility, reason, detail? }`; `gradePersistedAnswer(question, row)`
+and `buildSessionVerdicts(snapshot, answerRows)` adapt persisted `game_answers` rows to the
+grader and are exactly what the Edge Function runs. Parity with the pre-072 shipped rules
+(self-paced `isAnswerCorrect` + live `doReveal`) is locked by tests (13/13).
+
+**Runtime-blocker decision:** RESOLVED — one dependency-free ESM module loads in Vite, Deno/
+Edge, and Node. No duplicate grader is needed.
+
+## 12. Supported vs ineligible question rules (exact)
+
+| Type | Rule (canonical) | Eligibility |
+|---|---|---|
+| mc / tf | `submitted === question.correct` (option index) | `scored` (or `unanswered` if no submission) |
+| type | trim+lowercase both sides; `acceptedAnswers.some(==)`; empty set ⇒ never correct | `scored` / `unanswered` |
+| slider | `abs(value − target) ≤ tolerance`; `target/tolerance` via `??` so **0 is preserved** | `scored` / `unanswered` |
+| match | every left slot paired to its own pair's right TEXT **and** count == pairs (order-independent) | `scored` / `unanswered` |
+| open | never machine-verifiable → `correct = null` | `open_manual` (excluded until a trusted manual record exists) |
+| skipped (host) | not a real (non-)answer | `skipped` (`correct = null`, not scored) |
+| unknown/removed type | never guessed correct | `unsupported` (`correct = null`) |
+| malformed question/answer | never throws; never accidentally correct | `malformed` |
+
+Only `scored` answers count toward verified accuracy. `open_manual` requires a defensible
+manual verification record (storage is future; excluded today).
+
+## 13. Immutable verification storage contract (migration 072)
+
+Two append-only, service-role-only tables (never overwrite client gameplay fields):
+- `game_session_verifications` — one durable row per verified session: `status`
+  (`complete`|`ineligible`), `reason`, `grader_version`, `snapshot_hash`, `question_count`,
+  `verified_scored_answers`, `eligible_participant_count`, `verification_source`, `verified_at`,
+  server-derived `tenant_id`. `UNIQUE(session_id)`. **No leaderboard rank is ever stored.**
+- `game_answer_verifications` — immutable per-answer verdict: `verified_correct` (bool|null),
+  `eligibility`, `reason`, `grader_version`, `snapshot_hash`, `question_idx`,
+  `question_stable_id`, `answer_id`, `player_id`, `verification_method` (`auto`|`manual`),
+  `manual_grader_id`, `tenant_id`. `UNIQUE(session_id, question_idx, player_id)`.
+
+Guarantees (all test-proven, 19/19): RLS on; authenticated same-tenant **read only**; anon/
+authenticated cannot INSERT/UPDATE/DELETE and cannot EXECUTE the writer; a BEFORE-UPDATE
+trigger makes records immutable; `record_game_verification(session, grader_version, source,
+verdicts)` is `SECURITY DEFINER`, `search_path=''`, EXECUTE = **service_role only**, atomic
+(session+answers in one tx → partial failure verifies nothing), idempotent (repeat = no-op),
+tenant-derived server-side, cross-session-safe (rejects verdicts referencing other sessions),
+and honest: missing snapshot → durable `ineligible`/`no_snapshot`; frozen-hash mismatch →
+integrity error; never backfills/guesses legacy sessions. Client `is_correct`/`points` are
+never read (proven: a lying `is_correct=true` on a wrong option still verifies `false`).
+
+## 14. Snapshot integrity (migration 072)
+
+`game_sessions.question_snapshot` is now **write-once**: settable only while `status='waiting'`
+(the existing create-time write), immutable thereafter — later rewrites/clears are rejected by
+`trg_game_sessions_freeze_snapshot`. On first set the trigger stamps server-owned
+`question_snapshot_hash` (md5 fingerprint) + `question_snapshot_frozen_at` (client values for
+these ignored). Existing snapshot-bearing sessions were hash-backfilled (hash/frozen_at only;
+snapshot bytes untouched). `live_question`, `phase`, `paused`, `status`, `ended_at`, analytics,
+and phase recovery are unaffected. Legacy null-snapshot sessions stay honestly unverifiable
+(cannot be retro-attached a snapshot once past `waiting`). Verification binds to the frozen hash.
+
+## 15. Response-time trust finding (Fast & Accurate BLOCKER)
+
+`game_answers.time_ms` is computed **entirely in the player's browser** (`Date.now() − qStartMs`
+in `RankdGameScreen`, broadcast over realtime) and stored verbatim. `game_answers.answered_at`
+is server-set but only at the **batch INSERT at reveal**, not at answer receipt — so there is
+**no trustworthy server-receipt timestamp**. Therefore: response speed is **unverified**; no
+verified-speed field is stored; **Fast & Accurate stays disabled** and normalized-speed ranking
+is unavailable. Smallest honest future architecture (out of scope; needs approval, is a
+gameplay-submission change): a server answer-submission path (RPC or Edge Function) that stamps
+receipt time server-side per answer against the frozen snapshot's time limit — replacing the
+realtime-broadcast answer with a server write. Not attempted here.
+
+## 16. Leaderboard eligibility contract (server-authoritative; enforced by the future read RPC)
+
+A session is leaderboard-eligible only when ALL hold: real (non-demo); durably `completed`;
+immutable snapshot present and hash-bound; `game_session_verifications.status='complete'` with
+no unresolved integrity error; **≥2 eligible authenticated same-tenant learner participants**
+(`eligible_participant_count ≥ 2`, computed by 072 as active `role='user'` profiles with ≥1
+`scored` verified answer); and ≥1 verified `scored` answer exists. A player counts only when:
+active learner/rep profile, authenticated same-tenant identity, not a guest, not a manager/admin,
+with ≥1 verified `scored` answer. **Accuracy uses only verified `scored` answers** (client
+`is_correct`/`final_score`/`final_rank` are never leaderboard truth). Speed and Fast & Accurate
+remain unavailable until server-receipt timing exists (§15). Production reality today: every
+completed real session has exactly 1 participant → **zero sessions are eligible** (honest
+insufficient-data state), and 33/41 completed sessions have no snapshot → unverifiable.
+
+## 17. What ships in the 072 slice (and what does NOT)
+
+Ships (locally validated only): `supabase/migrations/072_game_verification_foundation.sql`;
+`supabase/tests/072_game_verification_foundation.test.sql` (19 checks); `src/lib/gameGrading.js`
++ `src/lib/gameGrading.test.mjs` (13 checks); `supabase/functions/verify-game-session/`
+(index.ts + import_map.json, **not deployed**); host `doReveal` rewired onto the shared grader
+(behavior-preserving); `gameService.requestSessionVerification` + a safe post-completion hook
+(behind an unavailable/unverified state). **Does NOT:** apply 072, deploy the Edge Function,
+build/expose any leaderboard read RPC or UI, remove the standalone Leaderboard nav, compute or
+store ranks, or enable speed. **Remaining blocker before leaderboard UI:** apply 072 (preflight)
++ deploy `verify-game-session` + build the read RPC + UI under separate approval.
