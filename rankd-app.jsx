@@ -39,6 +39,9 @@ import {
   getSessionQuestionSnapshot,
   cancelGameSession,
   requestSessionVerification,
+  getPlayerSessionRestore,
+  getMyCompletedSessionReview,
+  listMyGameHistory,
 } from "./src/lib/gameService.js";
 // Canonical, runtime-neutral answer grader — the SINGLE source of correctness
 // truth shared by the live host reveal (below) and the server verification path.
@@ -46,6 +49,11 @@ import {
 // exact same file (deploy bundles within supabase/functions); the browser imports
 // it here. One canonical grader, no copy. See supabase/functions/_shared/gameGrading.js.
 import { gradeAnswer } from "./supabase/functions/_shared/gameGrading.js";
+// Canonical player-safe question serializer — the SINGLE place that strips
+// correct-answer/grading fields before a question is sent to or restored by a
+// player (SHOW_QUESTION broadcast + persisted live_question). The host keeps the
+// canonical question locally for its own reveal/scoring. See src/lib/playerSafeQuestion.js.
+import { toPlayerSafeQuestion, applyRevealToQuestion } from "./src/lib/playerSafeQuestion.js";
 import {
   getTenantCourses,
   getTenantLessons,
@@ -2408,6 +2416,26 @@ function KahootHostView({ onNav, sessionName, pin, sessionDbId, demoMode, tenant
   };
 
   // Persist phase transitions to DB so host can recover on refresh
+  // Holds the exact player-SAFE live_question payload built at startQuestion, so
+  // reveal recovery can be augmented with post-reveal answer info without ever
+  // re-broadcasting the canonical question.
+  const liveQuestionRef = useRef(null);
+
+  // At REVEAL (question durably closed), persist the SAFE live_question + a
+  // `reveal` block carrying the correct-answer info the REVEAL broadcast already
+  // sends. This is the ONLY durable source reveal RECOVERY uses for the correct
+  // answer — the pre-reveal payload never contained it. Post-reveal, so safe.
+  const persistReveal = useCallback((revealInfo) => {
+    if (!sessionDbId) return;
+    const base = liveQuestionRef.current ?? {};
+    updateSessionPhase(sessionDbId, {
+      phase: "reveal",
+      currentQuestionIndex: qIdx,
+      paused: false,
+      liveQuestion: { ...base, reveal: revealInfo },
+    }).catch(e => console.error("[ralli:host] persistReveal failed:", e));
+  }, [sessionDbId, qIdx]); // eslint-disable-line react-hooks/exhaustive-deps
+
   const persistPhase = useCallback((nextPhase, nextQIdx, nextPaused) => {
     if (!sessionDbId) return;
     const resolvedPhase = nextPhase ?? phase;
@@ -2475,7 +2503,13 @@ function KahootHostView({ onNav, sessionName, pin, sessionDbId, demoMode, tenant
     const shuffled = q.type === "match" && q.pairs?.length
       ? [...q.pairs].sort(() => Math.random() - 0.5)
       : [];
-    const liveQuestion = { qIdx, question: q, timeLimit: q.timeLimit, questionStartedAt: startedAt, shuffledRight: shuffled, pausedAt: null, remainingTimeMs: null, timingUpdatedAt: startedAt };
+    // PLAYER-SAFE payload: strip every correct-answer/grading field via the one
+    // canonical serializer. This exact object is BOTH persisted to live_question
+    // AND broadcast in SHOW_QUESTION — never the canonical question. The host
+    // keeps `q` (canonical) locally for its own reveal/scoring. shuffledRight is
+    // the player-visible shuffled Matching choices (safe; no left→right mapping).
+    const liveQuestion = { qIdx, question: toPlayerSafeQuestion(q), timeLimit: q.timeLimit, questionStartedAt: startedAt, shuffledRight: shuffled, pausedAt: null, remainingTimeMs: null, timingUpdatedAt: startedAt };
+    liveQuestionRef.current = liveQuestion;
 
     if (sessionDbId) {
       const { error } = await updateSessionPhase(sessionDbId, {
@@ -2564,7 +2598,7 @@ function KahootHostView({ onNav, sessionName, pin, sessionDbId, demoMode, tenant
       newScores.sort((a, b) => b.score - a.score);
       setScores(newScores);
       setPhase("reveal");
-      persistPhase("reveal", qIdx, false);
+      persistReveal({ acceptedAnswers: q.acceptedAnswers ?? [] });
       broadcast({ type: GM.REVEAL, correctIdx: null, scores: newScores, acceptedAnswers: q.acceptedAnswers ?? [] });
       if (sessionDbId) {
         // One row per known player, not just answerers — a player with no
@@ -2611,7 +2645,7 @@ function KahootHostView({ onNav, sessionName, pin, sessionDbId, demoMode, tenant
       newScores.sort((a, b) => b.score - a.score);
       setScores(newScores);
       setPhase("reveal");
-      persistPhase("reveal", qIdx, false);
+      persistReveal({ sliderTarget: target, sliderTolerance: tol });
       broadcast({ type: GM.REVEAL, correctIdx: null, scores: newScores, sliderTarget: target, sliderTolerance: tol });
       if (sessionDbId) {
         // See the "type" branch above for why this covers every known
@@ -2660,7 +2694,7 @@ function KahootHostView({ onNav, sessionName, pin, sessionDbId, demoMode, tenant
       newScores.sort((a, b) => b.score - a.score);
       setScores(newScores);
       setPhase("reveal");
-      persistPhase("reveal", qIdx, false);
+      persistReveal({ matchPairsCorrect: pairs, shuffledRight });
       broadcast({ type: GM.REVEAL, correctIdx: null, scores: newScores, matchPairsCorrect: pairs, shuffledRight });
       if (sessionDbId) {
         // See the "type" branch above for why this covers every known
@@ -2687,7 +2721,7 @@ function KahootHostView({ onNav, sessionName, pin, sessionDbId, demoMode, tenant
     const qAvgMs = qTotal > 0 ? Object.values(chAnswers).reduce((s,a) => s+(a.timeMs||0), 0) / qTotal : 0;
     setQuestionHistory(h => [...h, { qIdx, q: q?.q, options: q?.options, correct: q?.correct, distribution: qDist, correctCount: qDist[q?.correct]||0, totalAnswers: qTotal, avgTimeMs: qAvgMs }]);
     setPhase("reveal");
-    persistPhase("reveal", qIdx, false);
+    persistReveal({ correctIdx: q.correct });
     // Tri-level fallback: scores state → presence chPlayers → chAnswers keys (always populated at this point)
     let baseScores;
     if (scores.length > 0) {
@@ -2746,7 +2780,7 @@ function KahootHostView({ onNav, sessionName, pin, sessionDbId, demoMode, tenant
     setScores(newScores);
     broadcast({ type: GM.REVEAL, correctIdx: null, scores: newScores, isOpen: true });
     setPhase("reveal");
-    persistPhase("reveal", qIdx, false);
+    persistReveal({ isOpen: true });
     // Persist open-ended answers (fire-and-forget)
     if (sessionDbId) {
       const scoreMap = Object.fromEntries(newScores.map(p => [p.id, p]));
@@ -3475,7 +3509,9 @@ function KahootPlayerView({ onNav, playerName, playerEmoji, playerId, pin, sessi
   const reconcile = useCallback(async () => {
     if (!sessionDbId || !playerId) return;
     try {
-      const { session, answers } = await getSessionRestoreData(sessionDbId);
+      // Learner-safe restore RPC (073): own answers only + sanitized live_question.
+      // Never another player's answers, never question_snapshot.
+      const { session, answers } = await getPlayerSessionRestore(sessionDbId);
       if (session.error || !session.data) return;
       const s  = session.data;
       const lq = s.live_question;
@@ -3526,7 +3562,11 @@ function KahootPlayerView({ onNav, playerName, playerEmoji, playerId, pin, sessi
       // highlighted — honest, and never stranded.
       if (s.phase === "reveal" && idxMatch && lq.qIdx >= appliedQIdxRef.current) {
         const myRow = (answers.data ?? []).find(r => r.player_id === playerId && r.question_idx === lq.qIdx);
-        setQuestion(lq.question);
+        // Reveal recovery restores the correct-answer display from the POST-reveal
+        // `reveal` block the host persisted at reveal — never the pre-reveal payload
+        // (which is sanitized). If reveal info isn't present yet, the sanitized
+        // question renders without the answer (honest), never leaking early.
+        setQuestion(applyRevealToQuestion(lq.question, lq.reveal));
         appliedQIdxRef.current = lq.qIdx;
         if (myRow) { setIsCorrect(!!myRow.is_correct); setMyDelta(myRow.points ?? 0); }
         setPhase("reveal");
@@ -3633,6 +3673,10 @@ function KahootPlayerView({ onNav, playerName, playerEmoji, playerId, pin, sessi
         revealCorrect = selectedIdx === chMsg.correctIdx;
       }
       setIsCorrect(revealCorrect);
+      // Post-reveal ONLY: merge the correct-answer info the REVEAL broadcast carries
+      // back into the (sanitized) question so the reveal render can display it. The
+      // pre-reveal payload never contained it. Same helper as recovery below.
+      setQuestion(prev => (prev ? applyRevealToQuestion(prev, chMsg) : prev));
       const me = chMsg.scores?.find(p => p.id === playerId) ?? chMsg.scores?.find(p => p.name === playerName);
       if (me) { setMyScore(me.score); setMyDelta(me.delta); setMyRank(chMsg.scores.indexOf(me) + 1); }
     }
@@ -5869,18 +5913,17 @@ function PlayerSessionDetail({ session, playerId, onBack }) {
     setSnapStatus("loading"); setAnswersStatus("loading");
     setSnapshot(null); setAnswers([]); setTotalPlayers(null);
     (async () => {
-      const [snapRes, ansRes, cntRes] = await Promise.all([
-        getSessionQuestionSnapshot(dbId),
-        getPlayerAnswersForSession(dbId, playerId),
-        getSessionPlayerCounts([dbId]),
-      ]);
+      // Learner-safe completed-session review RPC (073): snapshot (post-completion,
+      // participant-only) + the caller's OWN answers + player count in one call.
+      // Never another player's raw answer. Explicit failure (retryable), never empty-as-ok.
+      const { data: review, error: reviewErr } = await getMyCompletedSessionReview(dbId);
       if (cancelled) return;             // a delayed response must not overwrite a newer session
-      if (snapRes.error)                       setSnapStatus("failed");
-      else if (!snapRes.data || snapRes.data.length === 0) setSnapStatus("empty"); // legacy: no snapshot
-      else { setSnapshot(snapRes.data);        setSnapStatus("ok"); }
-      if (ansRes.error) setAnswersStatus("failed");
-      else { setAnswers(ansRes.data ?? []); setAnswersStatus("ok"); }
-      if (!cntRes.error && cntRes.data) setTotalPlayers(cntRes.data[dbId] ?? null); // else hidden
+      if (reviewErr) { setSnapStatus("failed"); setAnswersStatus("failed"); return; }
+      const snap = review?.snapshot ?? null;
+      if (!snap || snap.length === 0) setSnapStatus("empty"); // legacy: no snapshot
+      else { setSnapshot(snap); setSnapStatus("ok"); }
+      setAnswers(review?.myAnswers ?? []); setAnswersStatus("ok");
+      setTotalPlayers(review?.playerCount ?? null);
     })();
     return () => { cancelled = true; };
   }, [session?.dbId, playerId, reloadKey]);
@@ -6029,9 +6072,9 @@ function RankdJoinPanel({ onJoin, sessions, currentUser }) {
     if (tab !== "scores" || !currentUser?._isReal || !currentUser?.id) return;
     let cancelled = false;
     setHistoryStatus("loading");
-    getPlayerGameHistory(currentUser.id).then(({ data, error }) => {
+    listMyGameHistory().then(({ data, error }) => {  // learner-safe own history RPC (073)
       if (cancelled) return;
-      if (error) { console.error("[ralli:player] getPlayerGameHistory failed:", error); setHistoryStatus("failed"); return; }
+      if (error) { console.error("[ralli:player] listMyGameHistory failed:", error); setHistoryStatus("failed"); return; }
       const rows = data ?? [];
       setDbHistory(rows);
       setHistoryStatus("ok");

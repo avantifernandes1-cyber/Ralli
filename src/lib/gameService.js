@@ -698,3 +698,51 @@ export async function getSessionRestoreData(sessionId) {
     answers: { data: answersResult.data ?? null, error: answersResult.error ?? null },
   };
 }
+
+// ── LEARNER-SAFE READ RPCs (migration 073) ──────────────────────────────────────
+
+/**
+ * Active-player reconnect via the learner-safe RPC (073). Returns the SAME shape
+ * as getSessionRestoreData ({ session:{data,error}, answers:{data,error} }) so the
+ * player reconcile is unchanged — but `answers` contains ONLY the caller's own
+ * per-question points/correctness, and the session's live_question is the
+ * already-sanitized payload (correct answers only inside its post-reveal block).
+ * Never returns question_snapshot or another player's answer. Errors are explicit
+ * and retryable (never coerced to empty gameplay state).
+ *
+ * @param {string} sessionId - game_sessions.id (UUID)
+ */
+export async function getPlayerSessionRestore(sessionId) {
+  const { data, error } = await supabase.rpc("rpc_player_session_restore", { p_session_id: sessionId });
+  if (error) return { session: { data: null, error }, answers: { data: null, error } };
+  return {
+    session: { data: data?.session ?? null, error: null },
+    answers: { data: data?.my_answers ?? [], error: null },
+  };
+}
+
+/**
+ * A participant's own review of a durably COMPLETED session via the learner-safe
+ * RPC (073). Correct answers (snapshot) are returned only post-completion to a
+ * participant; never another player's raw answer.
+ *
+ * @param {string} sessionId - game_sessions.id (UUID)
+ * @returns {Promise<{ data: { snapshot: Array|null, myAnswers: Array, playerCount: number|null }|null, error: Object|null }>}
+ */
+export async function getMyCompletedSessionReview(sessionId) {
+  const { data, error } = await supabase.rpc("rpc_my_completed_session_review", { p_session_id: sessionId });
+  if (error) return { data: null, error };
+  return { data: { snapshot: data?.snapshot ?? null, myAnswers: data?.my_answers ?? [], playerCount: data?.player_count ?? null }, error: null };
+}
+
+/**
+ * The caller's own game history via the learner-safe RPC (073) — same row shape
+ * as getPlayerGameHistory (game_players fields + a `game_sessions` metadata
+ * object), but server-enforced to the caller's own rows.
+ *
+ * @param {number} [limit=20]
+ */
+export async function listMyGameHistory(limit = 20) {
+  const { data, error } = await supabase.rpc("rpc_list_my_game_history", { p_limit: limit });
+  return { data: error ? null : (data ?? []), error };
+}
