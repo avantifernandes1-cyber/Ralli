@@ -25,7 +25,6 @@ import {
   rejoinSession,
   joinGameSession,
   getLobbyParticipants,
-  subscribeToLobbyParticipants,
   saveGameAnswers,
   updateSessionPhase,
   markParticipantLeft,
@@ -6860,87 +6859,74 @@ function RankdLobbyScreen({ onNav, pin, sessionDbId: propSessionDbId = null, pla
     status: p.status ?? "active",
   });
 
-  // ── Admin: load initial participants from DB ────────────────────────────────
-  useEffect(() => {
-    if (role !== "admin" || !sessionDbId || isDemoMode) return;
-    getLobbyParticipants(sessionDbId).then(({ data, error }) => {
-      if (error) console.error("[ralli:lobby] getLobbyParticipants FAILED:", error);
-      if (data) setDbPlayers(data.map(normParticipant));
-    });
-  }, [sessionDbId, isDemoMode]); // eslint-disable-line react-hooks/exhaustive-deps
+  // ── Durable lobby roster (single source: getLobbyParticipants → rpc_lobby_participants) ──
+  // The client's direct postgres_changes subscription on game_session_participants was
+  // removed (prerequisite for revoking table SELECT). Roster VISIBILITY/COUNT is driven by
+  // Realtime Presence (chPlayers, see combinedRealPlayers below); this durable RPC is the
+  // identity/status truth and the recovery path. A monotonic request counter drops stale
+  // responses so a slow earlier fetch can never overwrite newer lobby state.
+  const rosterReqRef = useRef(0);
 
-  // ── Admin: subscribe to realtime INSERTs on game_session_participants ───────
-  // Fires immediately when a player calls joinGameSession(), cross-device.
-  useEffect(() => {
-    if (role !== "admin" || !sessionDbId || isDemoMode) return;
-    const channel = subscribeToLobbyParticipants(sessionDbId, (row) => {
-      setDbPlayers(prev => {
-        if (prev.some(p => p.id === row.player_id)) return prev; // already present
-        return [...prev, normParticipant(row)];
-      });
-    });
-    return () => { supabase.removeChannel(channel); };
-  }, [sessionDbId, isDemoMode]); // eslint-disable-line react-hooks/exhaustive-deps
-
-  // ── Admin: poll every 4s as fallback when realtime isn't enabled ────────────
-  useEffect(() => {
-    if (role !== "admin" || !sessionDbId || isDemoMode) return;
-    const interval = setInterval(() => {
-      getLobbyParticipants(sessionDbId).then(({ data }) => {
-        if (data) setDbPlayers(data.map(normParticipant));
-      });
-    }, 4000);
-    return () => clearInterval(interval);
-  }, [sessionDbId, isDemoMode]); // eslint-disable-line react-hooks/exhaustive-deps
-
-  // ── Player: load participants from DB + subscribe to INSERTs ─────────────────
-  // Mirrors the admin side so the player sees the same live count.
-  useEffect(() => {
-    if (role === "admin" || isDemoMode || !sessionDbId) return;
-
-    // Optimistic self-entry: show player count ≥ 1 immediately without waiting
-    // for joinGameSession() (fire-and-forget) or presence subscription to complete.
+  // Player-side optimistic self-entry: show count ≥ 1 immediately without waiting for the
+  // fire-and-forget join or the first durable fetch. Emoji stays null for no-avatar players.
+  const selfEntry = useMemo(() => {
+    if (role === "admin" || isDemoMode || !playerId) return null;
     const pidx = Math.abs((playerId ?? "").charCodeAt(0) + ((playerId ?? "").charCodeAt(1) || 0)) % PLAYER_EMOJIS.length;
-    // No-avatar players stay null here too — this optimistic self-entry was the
-    // last remaining placeholder source (playerEmoji ?? PLAYER_EMOJIS[pidx]).
-    const selfEntry = normParticipant({
+    return normParticipant({
       player_id: currentUser?.id ?? playerId,
       name:      playerName,
       emoji:     playerEmoji ?? null,
       color:     PLAYER_COLORS[pidx % PLAYER_COLORS.length],
       status:    "active",
     });
-    setDbPlayers([selfEntry]);
+  }, [role, isDemoMode, playerId, currentUser?.id, playerName, playerEmoji]); // eslint-disable-line react-hooks/exhaustive-deps
 
-    // Helper: merge DB rows, keeping self if not yet persisted
-    const mergeWithSelf = (rows) => {
-      const selfId   = selfEntry.id;
-      const selfInDb = rows.some(p => p.id === selfId);
-      return selfInDb ? rows : [selfEntry, ...rows];
-    };
+  // Apply durable rows; on the player side keep the optimistic self until it persists.
+  const applyRoster = useCallback((rows) => {
+    if (role === "admin" || !selfEntry) { setDbPlayers(rows); return; }
+    setDbPlayers(rows.some(p => p.id === selfEntry.id) ? rows : [selfEntry, ...rows]);
+  }, [role, selfEntry]);
 
-    // Initial load
-    getLobbyParticipants(sessionDbId).then(({ data }) => {
-      if (data) setDbPlayers(mergeWithSelf(data.map(normParticipant)));
+  // Immediate durable refresh (stale-protected). Called by every trigger below.
+  const refreshRoster = useCallback(() => {
+    if (isDemoMode || !sessionDbId) return;
+    const seq = ++rosterReqRef.current;
+    getLobbyParticipants(sessionDbId).then(({ data, error }) => {
+      if (error) { console.error("[ralli:lobby] getLobbyParticipants FAILED:", error); return; }
+      if (!data) return;
+      if (seq !== rosterReqRef.current) return; // a newer request already applied — drop this one
+      applyRoster(data.map(normParticipant));
     });
-    // Realtime INSERT subscription
-    const channel = subscribeToLobbyParticipants(sessionDbId, (row) => {
-      setDbPlayers(prev => {
-        if (prev.some(p => p.id === (row.player_id ?? row.id))) return prev;
-        return [...prev, normParticipant(row)];
-      });
-    });
-    // Poll every 3s as fallback
-    const interval = setInterval(() => {
-      getLobbyParticipants(sessionDbId).then(({ data }) => {
-        if (data) setDbPlayers(mergeWithSelf(data.map(normParticipant)));
-      });
-    }, 3000);
+  }, [isDemoMode, sessionDbId, applyRoster]); // eslint-disable-line react-hooks/exhaustive-deps
+
+  // Mount: optimistic self (player) → immediate durable load (also the post-join refresh,
+  // since the lobby mounts right after join) → polling recovery. One path for both roles.
+  useEffect(() => {
+    if (isDemoMode || !sessionDbId) return;
+    if (role !== "admin" && selfEntry) setDbPlayers([selfEntry]);
+    refreshRoster();
+    const interval = setInterval(refreshRoster, role === "admin" ? 4000 : 3000);
+    return () => clearInterval(interval);
+  }, [sessionDbId, isDemoMode, role, selfEntry, refreshRoster]); // eslint-disable-line react-hooks/exhaustive-deps
+
+  // Presence is the "someone joined / reconnected" trigger the removed postgres_changes
+  // INSERT used to serve: when the connected set changes, pull the durable roster so the
+  // new/returning player's stored identity enriches promptly (not just at the next poll tick).
+  useEffect(() => {
+    refreshRoster();
+  }, [chPlayers.length, refreshRoster]); // eslint-disable-line react-hooks/exhaustive-deps
+
+  // Window focus / tab-visible return → immediate durable refresh (missed-event recovery).
+  useEffect(() => {
+    if (isDemoMode || !sessionDbId) return;
+    const onVisible = () => { if (document.visibilityState === "visible") refreshRoster(); };
+    document.addEventListener("visibilitychange", onVisible);
+    window.addEventListener("focus", refreshRoster);
     return () => {
-      supabase.removeChannel(channel);
-      clearInterval(interval);
+      document.removeEventListener("visibilitychange", onVisible);
+      window.removeEventListener("focus", refreshRoster);
     };
-  }, [sessionDbId, isDemoMode, role]); // eslint-disable-line react-hooks/exhaustive-deps
+  }, [isDemoMode, sessionDbId, refreshRoster]); // eslint-disable-line react-hooks/exhaustive-deps
 
   // ── Player: poll game_sessions.phase as countdown/start fallback ─────────────
   // Broadcast (GM.GAME_START / GM.SHOW_QUESTION) can be missed in race conditions.

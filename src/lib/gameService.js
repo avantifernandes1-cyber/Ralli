@@ -280,37 +280,13 @@ export async function getLobbyParticipants(sessionId) {
   return { data: rows, error: null };
 }
 
-/**
- * Subscribe to new participants joining this lobby (postgres_changes INSERT).
- * Returns the Supabase channel so the caller can unsubscribe on cleanup.
- *
- * Usage:
- *   const channel = subscribeToLobbyParticipants(sessionId, (row) => addPlayer(row));
- *   // cleanup:
- *   supabase.removeChannel(channel);
- *
- * @param {string} sessionId - game_sessions.id (UUID)
- * @param {(row: Object) => void} onInsert - called with the new participant row
- * @returns {RealtimeChannel}
- */
-export function subscribeToLobbyParticipants(sessionId, onInsert) {
-  const channel = supabase
-    .channel(`lobby_participants:${sessionId}`)
-    .on(
-      "postgres_changes",
-      {
-        event:  "INSERT",
-        schema: "public",
-        table:  "game_session_participants",
-        filter: `session_id=eq.${sessionId}`,
-      },
-      (payload) => {
-        if (payload.new) onInsert(payload.new);
-      }
-    )
-    .subscribe();
-  return channel;
-}
+// NOTE: subscribeToLobbyParticipants (postgres_changes INSERT on
+// game_session_participants) was removed as a prerequisite for revoking direct table
+// SELECT. Its only job was to notify the lobby that a new participant row appeared;
+// the roster's visibility/count is driven by Realtime Presence (chPlayers), and the
+// durable identity/status truth is getLobbyParticipants() → rpc_lobby_participants.
+// The lobby now refreshes that durable roster on presence change / focus / poll, so
+// no client needs a direct postgres_changes subscription on this table.
 
 // ── LIVE GAME PERSISTENCE ─────────────────────────────────────────────────────
 
