@@ -29,8 +29,10 @@
 // file with no third-party deps, so it bundles as-is with no copy.
 
 import { createClient } from "https://esm.sh/@supabase/supabase-js@2.45.0";
-// THE single source of grading truth — same file the live client imports.
-import { buildSessionVerdicts, GRADER_VERSION } from "../../../src/lib/gameGrading.js";
+// THE single source of grading truth — same file the live client imports. Lives
+// in supabase/functions/_shared so `supabase functions deploy` bundles it via the
+// standard in-functions-dir path (no import reaching outside supabase/functions).
+import { buildSessionVerdicts, GRADER_VERSION } from "../_shared/gameGrading.js";
 
 const SUPABASE_URL = Deno.env.get("SUPABASE_URL")!;
 const ANON_KEY = Deno.env.get("SUPABASE_ANON_KEY")!;
@@ -99,7 +101,7 @@ Deno.serve(async (req) => {
     if (snapshot) {
       const { data: answers, error: aErr } = await admin
         .from("game_answers")
-        .select("id, player_id, question_idx, option_idx, answer_text, numeric_value, answer_json, was_skipped")
+        .select("id, player_id, question_idx, option_idx, answer_text, numeric_value, answer_json, was_skipped, answered_at")
         .eq("session_id", sessionId);
       if (aErr) return json({ error: "answers load failed", retryable: true }, 500);
       // 8. Independently grade with the SHARED grader (client fields ignored).

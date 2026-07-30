@@ -41,9 +41,11 @@ import {
   requestSessionVerification,
 } from "./src/lib/gameService.js";
 // Canonical, runtime-neutral answer grader — the SINGLE source of correctness
-// truth shared by the live host reveal (below) and the server verification path
-// (supabase/functions/verify-game-session). See src/lib/gameGrading.js.
-import { gradeAnswer } from "./src/lib/gameGrading.js";
+// truth shared by the live host reveal (below) and the server verification path.
+// Lives in supabase/functions/_shared so the Deno Edge Function can bundle the
+// exact same file (deploy bundles within supabase/functions); the browser imports
+// it here. One canonical grader, no copy. See supabase/functions/_shared/gameGrading.js.
+import { gradeAnswer } from "./supabase/functions/_shared/gameGrading.js";
 import {
   getTenantCourses,
   getTenantLessons,

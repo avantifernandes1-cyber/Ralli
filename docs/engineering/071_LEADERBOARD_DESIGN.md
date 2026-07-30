@@ -47,7 +47,7 @@ until one of the grading paths below is approved.
 Smallest honest option, in preference order:
 
 1. **Extract-and-reuse (preferred).** Refactor the correctness functions out of `doReveal`
-   into a shared pure module (`src/lib/gameGrading.js`), used unchanged by the live client,
+   into a shared pure module (`supabase/functions/_shared/gameGrading.js`), used unchanged by the live client,
    then run that same module in a Supabase **edge function** `verify_game_session(session_id)`
    that: loads the immutable `question_snapshot` + raw `game_answers`, recomputes `is_correct`
    for MC/TF/Type/Slider/Matching, writes a verified result set (e.g. `game_answers.verified_correct`
@@ -201,14 +201,14 @@ verification behind a safe "unavailable / unverified" state. **No ranking is bui
 
 ## 11. Canonical grader architecture (one source of truth)
 
-`src/lib/gameGrading.js` — a pure, runtime-neutral ES module (no imports; no browser/React/
+`supabase/functions/_shared/gameGrading.js` — a pure, runtime-neutral ES module (no imports; no browser/React/
 Supabase/DOM/clock/random/tenant deps; deterministic; versioned `GRADER_VERSION =
 "ralli-game-grader@1"`). It is imported **verbatim** by:
 - the live host reveal path (`rankd-app.jsx` `doReveal()` — the 5 auto-gradable types now call
   `gradeAnswer()` for the correctness boolean; point/speed economy unchanged);
 - the server verification path (`supabase/functions/verify-game-session/index.ts`, via a
   relative import — the eszip bundler follows it; `import_map.json` pins supabase-js);
-- Node parity/unit tests (`src/lib/gameGrading.test.mjs`).
+- Node parity/unit tests (`supabase/functions/_shared/gameGrading.test.mjs`).
 
 There is **no second grading implementation** (no SQL grader; the Edge Function does not
 re-implement correctness). `gradeAnswer(question, submitted)` returns
@@ -298,8 +298,8 @@ insufficient-data state), and 33/41 completed sessions have no snapshot → unve
 ## 17. What ships in the 072 slice (and what does NOT)
 
 Ships (locally validated only): `supabase/migrations/072_game_verification_foundation.sql`;
-`supabase/tests/072_game_verification_foundation.test.sql` (19 checks); `src/lib/gameGrading.js`
-+ `src/lib/gameGrading.test.mjs` (13 checks); `supabase/functions/verify-game-session/`
+`supabase/tests/072_game_verification_foundation.test.sql` (19 checks); `supabase/functions/_shared/gameGrading.js`
++ `supabase/functions/_shared/gameGrading.test.mjs` (13 checks); `supabase/functions/verify-game-session/`
 (index.ts + import_map.json, **not deployed**); host `doReveal` rewired onto the shared grader
 (behavior-preserving); `gameService.requestSessionVerification` + a safe post-completion hook
 (behind an unavailable/unverified state). **Does NOT:** apply 072, deploy the Edge Function,

@@ -53,6 +53,9 @@ INSERT INTO public.game_sessions (id, tenant_id, quiz_id, host_id, pin, name, st
 -- S8: completed real WITH snapshot, ONE learner only (solo-session count test).
 INSERT INTO public.game_sessions (id, tenant_id, quiz_id, host_id, pin, name, status, question_count, demo_mode, ended_at, question_snapshot)
  VALUES ('00000000-0000-0000-0000-00000000f008','00000000-0000-0000-0000-0000000000a0','q1','00000000-0000-0000-0000-0000000000a1','700008','S8','completed',2,false, now(), :'snap'::jsonb);
+-- S9: completed real WITH snapshot (backfill-correctness test — simulated legacy null hash).
+INSERT INTO public.game_sessions (id, tenant_id, quiz_id, host_id, pin, name, status, question_count, demo_mode, ended_at, question_snapshot)
+ VALUES ('00000000-0000-0000-0000-00000000f009','00000000-0000-0000-0000-0000000000a0','q1','00000000-0000-0000-0000-0000000000a1','700009','S9','completed',2,false, now(), :'snap'::jsonb);
 
 -- game_answers for S1 (explicit ids). ans3 stores is_correct=TRUE on a WRONG option
 -- to prove the verifier ignores client correctness.
@@ -121,6 +124,44 @@ BEGIN
   IF (SELECT phase FROM public.game_sessions WHERE id='00000000-0000-0000-0000-00000000f001') <> 'reveal' THEN RAISE EXCEPTION 'A6 FAIL: phase update discarded'; END IF;
   RAISE NOTICE '6. non-snapshot updates (phase/live_question/…) succeed; hash/frozen_at server-owned + immutable: PASS';
 
+  -- Freeze compatibility: on a snapshot-frozen session (S3), the legitimate
+  -- lifecycle writes still work — status transitions + live_question set/clear +
+  -- pause/reconnect metadata — and the snapshot hash is preserved throughout.
+  SELECT question_snapshot_hash INTO v_hash FROM public.game_sessions WHERE id='00000000-0000-0000-0000-00000000f003';
+  UPDATE public.game_sessions SET status='started', started_at=now() WHERE id='00000000-0000-0000-0000-00000000f003';
+  UPDATE public.game_sessions SET phase='question', live_question='{"qIdx":0}'::jsonb, current_question_index=0 WHERE id='00000000-0000-0000-0000-00000000f003';
+  UPDATE public.game_sessions SET paused=true WHERE id='00000000-0000-0000-0000-00000000f003';         -- pause
+  UPDATE public.game_sessions SET paused=false, live_question=NULL WHERE id='00000000-0000-0000-0000-00000000f003'; -- resume + clear live_question
+  UPDATE public.game_sessions SET status='completed', ended_at=now() WHERE id='00000000-0000-0000-0000-00000000f003';
+  SELECT question_snapshot_hash INTO v_hash2 FROM public.game_sessions WHERE id='00000000-0000-0000-0000-00000000f003';
+  IF v_hash2 IS DISTINCT FROM v_hash THEN RAISE EXCEPTION 'A6b FAIL: lifecycle writes changed the snapshot hash (% -> %)', v_hash, v_hash2; END IF;
+  IF (SELECT status FROM public.game_sessions WHERE id='00000000-0000-0000-0000-00000000f003') <> 'completed' THEN RAISE EXCEPTION 'A6b FAIL: status transition blocked'; END IF;
+  RAISE NOTICE '6b. status transitions + live_question set/clear + pause/resume unaffected by freeze; hash preserved: PASS';
+
+  -- Backfill correctness (regression for the migration bug this audit found):
+  -- simulate a legacy snapshot row whose hash is NULL, then prove (i) an
+  -- unchanged-snapshot UPDATE with the trigger ENABLED cannot set the hash (the
+  -- trigger re-asserts OLD.hash=NULL) — which is exactly why the migration
+  -- backfill DISABLEs the trigger — and (ii) the disable-wrapped backfill sets it.
+  ALTER TABLE public.game_sessions DISABLE TRIGGER trg_game_sessions_freeze_snapshot;
+  UPDATE public.game_sessions SET question_snapshot_hash=NULL, question_snapshot_frozen_at=NULL WHERE id='00000000-0000-0000-0000-00000000f009';
+  ALTER TABLE public.game_sessions ENABLE TRIGGER trg_game_sessions_freeze_snapshot;
+  -- (i) trigger-enabled attempt to set hash is nullified:
+  UPDATE public.game_sessions SET question_snapshot_hash='attempt-with-trigger-on' WHERE id='00000000-0000-0000-0000-00000000f009';
+  IF (SELECT question_snapshot_hash FROM public.game_sessions WHERE id='00000000-0000-0000-0000-00000000f009') IS NOT NULL
+    THEN RAISE EXCEPTION 'A7 FAIL: trigger did not re-assert null hash (backfill-must-disable premise wrong)'; END IF;
+  -- (ii) the migration''s disable-wrapped backfill statement sets it:
+  ALTER TABLE public.game_sessions DISABLE TRIGGER trg_game_sessions_freeze_snapshot;
+  UPDATE public.game_sessions
+     SET question_snapshot_hash = md5(question_snapshot::text),
+         question_snapshot_frozen_at = COALESCE(question_snapshot_frozen_at, ended_at, created_at)
+   WHERE question_snapshot IS NOT NULL AND question_snapshot_hash IS NULL;
+  ALTER TABLE public.game_sessions ENABLE TRIGGER trg_game_sessions_freeze_snapshot;
+  SELECT question_snapshot_hash INTO v_hash FROM public.game_sessions WHERE id='00000000-0000-0000-0000-00000000f009';
+  IF v_hash IS NULL OR v_hash <> md5((SELECT question_snapshot FROM public.game_sessions WHERE id='00000000-0000-0000-0000-00000000f009')::text)
+    THEN RAISE EXCEPTION 'A7 FAIL: disable-wrapped backfill did not set the hash (%)', v_hash; END IF;
+  RAISE NOTICE '6c. legacy-snapshot hash backfill persists only with the trigger disabled (migration bug fixed): PASS';
+
   -- ══ B. VERIFICATION RPC — valid path ═════════════════════════════════════════
   v_res := public.record_game_verification(
     '00000000-0000-0000-0000-00000000f001','ralli-game-grader@1','test',
@@ -182,6 +223,19 @@ BEGIN
   IF v_b THEN RAISE EXCEPTION 'C13 FAIL: verdict referencing another session was accepted'; END IF;
   IF (SELECT count(*) FROM public.game_session_verifications WHERE session_id='00000000-0000-0000-0000-00000000f006') <> 0 THEN RAISE EXCEPTION 'C13 FAIL: partial write persisted after cross-session error'; END IF;
   RAISE NOTICE '13. verdict referencing another session rejected; nothing persisted (rollback): PASS';
+
+  -- Duplicate verdict identity guard: two verdicts for the same (question_idx,
+  -- player_id) are rejected deterministically (defense in depth; the grader
+  -- resolves duplicates to one canonical verdict before writing). Nothing persists.
+  BEGIN
+    v_res := public.record_game_verification('00000000-0000-0000-0000-00000000f006','ralli-game-grader@1','test',
+      '[{"answer_id":null,"player_id":"00000000-0000-0000-0000-0000000000a1","question_idx":0,"eligibility":"scored","verified_correct":true},
+        {"answer_id":null,"player_id":"00000000-0000-0000-0000-0000000000a1","question_idx":0,"eligibility":"scored","verified_correct":false}]'::jsonb);
+    v_b := true;
+  EXCEPTION WHEN OTHERS THEN v_b := false; END;
+  IF v_b THEN RAISE EXCEPTION 'C13b FAIL: duplicate (question_idx,player_id) verdict identity was accepted'; END IF;
+  IF (SELECT count(*) FROM public.game_session_verifications WHERE session_id='00000000-0000-0000-0000-00000000f006') <> 0 THEN RAISE EXCEPTION 'C13b FAIL: partial write after duplicate-key rejection'; END IF;
+  RAISE NOTICE '13b. duplicate (question_idx,player_id) verdict identity rejected; nothing persisted: PASS';
 
   -- Hash mismatch: corrupt S7''s stored hash (freeze trigger bypassed) → rejected.
   ALTER TABLE public.game_sessions DISABLE TRIGGER trg_game_sessions_freeze_snapshot;

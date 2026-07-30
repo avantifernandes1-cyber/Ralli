@@ -17,6 +17,7 @@ import {
   reconstructSubmitted,
   normalizeQuestion,
   buildSessionVerdicts,
+  resolveDuplicateAnswer,
   GRADER_VERSION,
   ELIGIBILITY,
   AUTO_GRADABLE_TYPES,
@@ -238,6 +239,44 @@ test("buildSessionVerdicts: edge grading core over a full session", () => {
   // on a wrong option must still verify false.
   const lying = buildSessionVerdicts([mc], [{ id: "x", player_id: "u", question_idx: 0, option_idx: 0, is_correct: true, points: 999, time_ms: 1 }]);
   assert.equal(lying[0].verified_correct, false);
+});
+
+test("resolveDuplicateAnswer: latest answered_at wins; ties/missing → ambiguous", () => {
+  const a = { id: "a", answered_at: "2026-07-30T01:00:00.000000+00:00", option_idx: 0 };
+  const b = { id: "b", answered_at: "2026-07-30T01:05:00.000000+00:00", option_idx: 1 };
+  assert.equal(resolveDuplicateAnswer([a]).canonical.id, "a");
+  assert.equal(resolveDuplicateAnswer([a]).ambiguous, false);
+  // latest wins regardless of input order
+  assert.equal(resolveDuplicateAnswer([a, b]).canonical.id, "b");
+  assert.equal(resolveDuplicateAnswer([b, a]).canonical.id, "b");
+  assert.equal(resolveDuplicateAnswer([a, b]).ambiguous, false);
+  // tie at max answered_at → ambiguous
+  const c = { id: "c", answered_at: b.answered_at, option_idx: 0 };
+  assert.equal(resolveDuplicateAnswer([b, c]).ambiguous, true);
+  // missing answered_at on a contested row → ambiguous
+  const d = { id: "d", answered_at: null, option_idx: 0 };
+  assert.equal(resolveDuplicateAnswer([a, d]).ambiguous, true);
+});
+
+test("buildSessionVerdicts: resolves duplicate rows to ONE verdict per (q,player)", () => {
+  const snapshot = [mc]; // correct index 2
+  const rows = [
+    { id: "old", player_id: "u1", question_idx: 0, option_idx: 0, answered_at: "2026-07-30T01:00:00.000000+00:00" }, // wrong, earlier
+    { id: "new", player_id: "u1", question_idx: 0, option_idx: 2, answered_at: "2026-07-30T01:09:00.000000+00:00" }, // correct, later (durable)
+  ];
+  const v = buildSessionVerdicts(snapshot, rows);
+  assert.equal(v.length, 1, "duplicates collapse to one verdict");
+  assert.equal(v[0].answer_id, "new", "latest durable answer chosen");
+  assert.equal(v[0].verified_correct, true);
+  assert.equal(v[0].eligibility, ELIGIBILITY.SCORED);
+  // ambiguous tie → single ineligible verdict, not two rows
+  const tie = buildSessionVerdicts(snapshot, [
+    { id: "t1", player_id: "u1", question_idx: 0, option_idx: 2, answered_at: "2026-07-30T01:00:00.000000+00:00" },
+    { id: "t2", player_id: "u1", question_idx: 0, option_idx: 0, answered_at: "2026-07-30T01:00:00.000000+00:00" },
+  ]);
+  assert.equal(tie.length, 1);
+  assert.equal(tie[0].eligibility, ELIGIBILITY.AMBIGUOUS);
+  assert.equal(tie[0].verified_correct, null);
 });
 
 test("buildSessionVerdicts: defensive on malformed inputs", () => {

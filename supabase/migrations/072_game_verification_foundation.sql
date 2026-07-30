@@ -116,12 +116,20 @@ CREATE TRIGGER trg_game_sessions_freeze_snapshot
 -- verifiable sessions bind to a stored hash too. This sets ONLY the two new
 -- (currently all-NULL) columns; it changes no gameplay data. It does not create
 -- snapshots for legacy null-snapshot sessions (those stay honestly unverifiable).
--- Runs BEFORE-trigger safe: it only writes the hash/frozen_at, snapshot unchanged.
+--
+-- The freeze trigger MUST be disabled for this UPDATE: on an unchanged-snapshot
+-- UPDATE the trigger deliberately re-asserts NEW.hash := OLD.hash (= NULL here),
+-- which would silently nullify this backfill. Disabling it for this one
+-- statement lets the hash/frozen_at persist; the snapshot column itself is never
+-- touched, so immutability is not weakened. (Same DISABLE/re-ENABLE-in-transaction
+-- pattern as migration 069.)
+ALTER TABLE public.game_sessions DISABLE TRIGGER trg_game_sessions_freeze_snapshot;
 UPDATE public.game_sessions
    SET question_snapshot_hash      = md5(question_snapshot::text),
        question_snapshot_frozen_at = COALESCE(question_snapshot_frozen_at, ended_at, created_at)
  WHERE question_snapshot IS NOT NULL
    AND question_snapshot_hash IS NULL;
+ALTER TABLE public.game_sessions ENABLE TRIGGER trg_game_sessions_freeze_snapshot;
 
 -- ══ PART 2 — IMMUTABLE VERIFICATION STORAGE ═════════════════════════════════════
 
@@ -249,6 +257,7 @@ DECLARE
   v_hash      text;
   v_verif_id  uuid;
   v_bad       integer;
+  v_dup       integer;
   v_scored    integer;
   v_participants integer;
   v_qcount    integer;
@@ -314,6 +323,20 @@ BEGIN
       WHERE ga.id = (e->>'answer_id')::uuid AND ga.session_id = p_session_id);
   IF v_bad > 0 THEN
     RAISE EXCEPTION 'record_game_verification: % verdict(s) reference answers outside session %', v_bad, p_session_id;
+  END IF;
+
+  -- Deterministic duplicate protection (defense in depth; the caller/grader must
+  -- have already resolved duplicate game_answers to ONE canonical verdict per
+  -- (question_idx, player_id) — see gameGrading.resolveDuplicateAnswer). If any
+  -- duplicate identity slips through, reject with a clear error rather than let
+  -- the UNIQUE(session_id,question_idx,player_id) index fail opaquely; nothing is
+  -- written (the whole function is one transaction).
+  SELECT count(*) INTO v_dup FROM (
+    SELECT 1 FROM jsonb_array_elements(COALESCE(p_verdicts, '[]'::jsonb)) e
+    GROUP BY (e->>'question_idx'), (e->>'player_id')
+    HAVING count(*) > 1) d;
+  IF v_dup > 0 THEN
+    RAISE EXCEPTION 'record_game_verification: % duplicate (question_idx, player_id) verdict identit(y/ies) for session % — resolve to one canonical answer before writing', v_dup, p_session_id;
   END IF;
 
   -- Counts (NOT ranks) computed from the verdicts BEFORE any insert, so the

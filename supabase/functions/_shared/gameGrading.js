@@ -44,6 +44,7 @@ export const ELIGIBILITY = Object.freeze({
   OPEN_MANUAL: "open_manual",   // open-ended → not auto-verifiable; needs a trusted manual record
   UNSUPPORTED: "unsupported",   // unknown/removed type → never scored (never guessed correct)
   MALFORMED: "malformed",       // question or answer shape unusable → not scored
+  AMBIGUOUS: "ambiguous_duplicate", // duplicate rows with no trustworthy latest → not scored, never guessed
 });
 
 /**
@@ -246,27 +247,72 @@ export function gradePersistedAnswer(question, row) {
 export function buildSessionVerdicts(snapshot, answerRows) {
   const questions = Array.isArray(snapshot) ? snapshot : [];
   const rows = Array.isArray(answerRows) ? answerRows : [];
-  return rows.map(row => {
+  // game_answers has NO unique constraint, so a session may hold duplicate rows
+  // for the same (question_idx, player_id) — e.g. a host refresh that re-reveals a
+  // question re-inserts a batch. We must resolve those to ONE canonical verdict per
+  // (question_idx, player_id) deterministically BEFORE writing (the verification
+  // tables enforce UNIQUE(session_id, question_idx, player_id)). Never rely on
+  // arbitrary DB row order.
+  const groups = new Map();
+  for (const row of rows) {
     const idx = Number.isInteger(row && row.question_idx) ? row.question_idx : -1;
+    const pid = row && row.player_id != null ? String(row.player_id) : "";
+    const key = idx + "|" + pid;
+    if (!groups.has(key)) groups.set(key, []);
+    groups.get(key).push(row);
+  }
+  const verdicts = [];
+  for (const group of groups.values()) {
+    const { canonical, ambiguous } = resolveDuplicateAnswer(group);
+    const idx = Number.isInteger(canonical && canonical.question_idx) ? canonical.question_idx : -1;
     const question = idx >= 0 && idx < questions.length ? questions[idx] : null;
+    const stableId = question ? normalizeQuestion(question).stableId : null;
     let verdict;
-    if (!question) {
+    if (ambiguous) {
+      // Duplicate identity with no trustworthy latest → do not guess correctness.
+      verdict = { correct: null, eligibility: ELIGIBILITY.AMBIGUOUS, reason: "duplicate answers with no trustworthy latest (missing/tied answered_at)" };
+    } else if (!question) {
       verdict = { correct: null, eligibility: ELIGIBILITY.MALFORMED, reason: `no snapshot question at index ${idx}` };
     } else {
-      verdict = gradePersistedAnswer(question, row);
+      verdict = gradePersistedAnswer(question, canonical);
     }
-    const stableId = question ? normalizeQuestion(question).stableId : null;
-    return {
-      answer_id: (row && row.id) || null,
-      player_id: (row && row.player_id) || null,
+    verdicts.push({
+      answer_id: (canonical && canonical.id) || null,
+      player_id: (canonical && canonical.player_id) || null,
       question_idx: idx,
       question_stable_id: stableId,
       verified_correct: verdict.correct, // boolean | null (null = not auto-verifiable)
       eligibility: verdict.eligibility,
       reason: verdict.reason,
       verification_method: "auto",
-    };
-  });
+    });
+  }
+  return verdicts;
+}
+
+/**
+ * Deterministic duplicate resolution for one (question_idx, player_id) group.
+ * Honest precedence: prefer the LATEST DURABLE answer by the server-set
+ * `answered_at` (the only trustworthy ordering field on game_answers; it is set
+ * by the DB default at each reveal-batch insert). If `answered_at` is missing on
+ * any contested row, or the maximum is not unique (a tie), the identity is
+ * AMBIGUOUS — we do not pick arbitrarily. Single-row groups are unambiguous.
+ *
+ * `answered_at` values come uniformly from PostgREST as ISO-8601 UTC strings with
+ * fixed fractional precision, so lexicographic comparison is a correct ordering.
+ *
+ * @returns {{canonical: object, ambiguous: boolean}}
+ */
+export function resolveDuplicateAnswer(group) {
+  if (!Array.isArray(group) || group.length === 0) return { canonical: null, ambiguous: false };
+  if (group.length === 1) return { canonical: group[0], ambiguous: false };
+  const timed = group.map(r => ({ r, t: r && r.answered_at != null ? String(r.answered_at) : null }));
+  if (timed.some(x => x.t === null)) return { canonical: group[0], ambiguous: true };
+  let maxT = null;
+  for (const x of timed) if (maxT === null || x.t > maxT) maxT = x.t;
+  const top = timed.filter(x => x.t === maxT);
+  if (top.length !== 1) return { canonical: group[0], ambiguous: true };
+  return { canonical: top[0].r, ambiguous: false };
 }
 
 // Grouped export for ergonomic importing in the Edge Function / tests.
@@ -279,6 +325,7 @@ export const gameGrading = {
   reconstructSubmitted,
   gradePersistedAnswer,
   buildSessionVerdicts,
+  resolveDuplicateAnswer,
 };
 
 export default gameGrading;
