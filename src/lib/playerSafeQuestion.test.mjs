@@ -62,6 +62,61 @@ test("applyRevealToQuestion restores correct-answer display fields post-reveal",
   assert.equal(mr.pairs[0].right, "1");
 });
 
+test("DEEP sanitization: nested/object options can never carry solution metadata", () => {
+  // A malicious/rich builder shape: option objects carrying correctness + ids.
+  const evil = {
+    id: "e", type: "mc", q: "?", timeLimit: 20, correct: 1,
+    options: [
+      { text: "A", correct: false, isCorrect: false, id: "opt-a", explanation: "nope", score: 0 },
+      { text: "B", correct: true,  isCorrect: true,  id: "opt-b", explanation: "the answer", score: 100 },
+      "C",
+      { label: "D", answerId: "x", meta: { winner: true } },
+    ],
+    // even a nested pairs array on a non-match type must not leak
+    pairs: [{ left: { text: "L", correct: true }, right: "R", correct: true }],
+  };
+  const safe = toPlayerSafeQuestion(evil);
+  // options reduced to display text ONLY — no objects, no correctness survive
+  assert.deepEqual(safe.options, ["A", "B", "C", "D"]);
+  for (const o of safe.options) assert.equal(typeof o, "string");
+  assert.ok(isPlayerSafeQuestion(safe));
+  // The whole serialized blob must contain none of the solution tokens.
+  const blob = JSON.stringify(safe);
+  for (const tok of ["correct", "isCorrect", "explanation", "opt-b", "answerId", "winner", "score"]) {
+    assert.ok(!blob.includes(tok), `solution token "${tok}" survived serialization: ${blob}`);
+  }
+});
+
+test("DEEP sanitization: Matching left objects reduced to text; right never sent", () => {
+  const evil = { id: "m", type: "match", q: "?", timeLimit: 30,
+    pairs: [{ left: { text: "Left1", correct: 2, mapTo: "R2" }, right: "R1" }, { left: "Left2", right: "R2" }] };
+  const safe = toPlayerSafeQuestion(evil);
+  assert.deepEqual(safe.pairs, [{ left: "Left1" }, { left: "Left2" }]);
+  const blob = JSON.stringify(safe);
+  for (const tok of ["right", "R1", "R2", "correct", "mapTo"]) {
+    assert.ok(!blob.includes(tok), `matching token "${tok}" survived: ${blob}`);
+  }
+});
+
+test("unknown question type fails safe (never returns the original object)", () => {
+  const legacy = { id: "z", type: "mystery", q: "?", correct: 3, acceptedAnswers: ["a"], secretAnswer: "42", options: [{ text: "x", correct: true }] };
+  const safe = toPlayerSafeQuestion(legacy);
+  assert.notStrictEqual(safe, legacy);          // new object, not the original
+  assert.ok(isPlayerSafeQuestion(safe));
+  const blob = JSON.stringify(safe);
+  for (const tok of ["correct", "acceptedAnswers", "secretAnswer", "42"]) {
+    assert.ok(!blob.includes(tok), `unknown-type leak of "${tok}": ${blob}`);
+  }
+  assert.deepEqual(safe.options, ["x"]);          // normalized, no metadata
+});
+
+test("scalar fields arriving as objects are reduced to text, never copied", () => {
+  const q = { id: "s", type: "type", q: { text: "prompt", correct: "answer" }, timeLimit: 30, acceptedAnswers: ["answer"] };
+  const safe = toPlayerSafeQuestion(q);
+  assert.equal(safe.q, "prompt");
+  assert.ok(!JSON.stringify(safe).includes("answer"));
+});
+
 test("malformed inputs never throw", () => {
   for (const bad of [null, undefined, 1, "x", []]) {
     assert.doesNotThrow(() => toPlayerSafeQuestion(bad));

@@ -8,12 +8,14 @@ BEGIN;
 INSERT INTO auth.users (id, aud, role, email, created_at, updated_at) VALUES
  ('00000000-0000-0000-0000-0000000073a1','authenticated','authenticated','r73_host@t.test',now(),now()),
  ('00000000-0000-0000-0000-0000000073a2','authenticated','authenticated','r73_other@t.test',now(),now()),
+ ('00000000-0000-0000-0000-0000000073a3','authenticated','authenticated','r73_nonpart@t.test',now(),now()),
  ('00000000-0000-0000-0000-0000000073b1','authenticated','authenticated','r73_btenant@t.test',now(),now());
 INSERT INTO public.tenants (id, slug, name) VALUES
  ('00000000-0000-0000-0000-0000000073a0','r73_ta','R73_TA'),
  ('00000000-0000-0000-0000-0000000073b0','r73_tb','R73_TB');
 UPDATE public.profiles SET role='user', tenant_id='00000000-0000-0000-0000-0000000073a0', status='active' WHERE id='00000000-0000-0000-0000-0000000073a1';
 UPDATE public.profiles SET role='user', tenant_id='00000000-0000-0000-0000-0000000073a0', status='active' WHERE id='00000000-0000-0000-0000-0000000073a2';
+UPDATE public.profiles SET role='user', tenant_id='00000000-0000-0000-0000-0000000073a0', status='active' WHERE id='00000000-0000-0000-0000-0000000073a3';  -- same tenant, NOT a participant
 UPDATE public.profiles SET role='user', tenant_id='00000000-0000-0000-0000-0000000073b0', status='active' WHERE id='00000000-0000-0000-0000-0000000073b1';
 -- Completed session in tenant A, host a1 played it; a2 did NOT participate.
 INSERT INTO public.game_sessions (id, tenant_id, quiz_id, host_id, pin, name, status, question_count, demo_mode, ended_at, question_snapshot)
@@ -46,6 +48,15 @@ BEGIN
   -- a2's own answer is the wrong one (is_correct false); must never see a1's row
   IF (v->'my_answers'->0->>'is_correct') <> 'false' THEN RAISE EXCEPTION 'T2 FAIL: a2 got someone else''s answer'; END IF;
   RAISE NOTICE '2. player_restore: a learner sees only their OWN answer (no cross-player): PASS';
+  RESET ROLE;
+
+  -- ── player_restore: same-tenant NON-participant (a3) denied ──
+  PERFORM set_config('request.jwt.claims','{"sub":"00000000-0000-0000-0000-0000000073a3","role":"authenticated"}', true);
+  SET LOCAL ROLE authenticated;
+  BEGIN v := public.rpc_player_session_restore('00000000-0000-0000-0000-000000073f01'); v_b := true;
+  EXCEPTION WHEN OTHERS THEN v_b := false; END;
+  IF v_b THEN RAISE EXCEPTION 'T2b FAIL: same-tenant non-participant was allowed to restore'; END IF;
+  RAISE NOTICE '2b. player_restore: same-tenant NON-participant denied: PASS';
   RESET ROLE;
 
   -- ── player_restore: cross-tenant (b1) denied ──

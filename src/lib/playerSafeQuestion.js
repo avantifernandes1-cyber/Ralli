@@ -45,10 +45,33 @@ export const SOLUTION_QUESTION_KEYS = Object.freeze([
   // `pairs` is handled specially below: left prompts kept, right solution dropped.
 ]);
 
+// Reduce any option to its player-visible DISPLAY TEXT ONLY. An option is
+// normally a plain string; if a builder ever stores an object, we copy NONE of
+// its structure (which could carry `correct`/`isCorrect`/answer ids/explanation/
+// scoring metadata) — only its visible label. Never returns the original object.
+function toDisplayText(v) {
+  if (v === null || v === undefined) return "";
+  const t = typeof v;
+  if (t === "string") return v;
+  if (t === "number" || t === "boolean") return String(v);
+  if (t === "object") {
+    // Object option/prompt: extract a visible label, dropping everything else.
+    const cand = v.text ?? v.label ?? v.value ?? v.title ?? v.name;
+    return typeof cand === "string" ? cand
+         : (typeof cand === "number" || typeof cand === "boolean") ? String(cand)
+         : ""; // unknown object shape → empty label, never the object itself
+  }
+  return "";
+}
+
 /**
  * Build the player-safe view of a question. Returns a NEW object containing only
- * allowlisted fields; for Matching, `pairs` is reduced to left prompts only
- * (the canonical left→right mapping is the solution and is never sent).
+ * allowlisted fields, with `options` and Matching left-prompts NORMALIZED to plain
+ * display text so no nested solution-bearing key (correct/isCorrect/answer id/
+ * explanation/scoring metadata) can survive through objects, arrays, spreads,
+ * Matching pairs, or unknown future shapes. For Matching, the canonical left→right
+ * mapping is never sent. Unknown question types fail safe — they get the same
+ * normalized allowlist subset, never the original object.
  *
  * @param {object} q - a canonical question object
  * @returns {object} player-safe question
@@ -57,13 +80,28 @@ export function toPlayerSafeQuestion(q) {
   if (!q || typeof q !== "object") return {};
   const safe = {};
   for (const k of PLAYER_SAFE_QUESTION_KEYS) {
-    if (Object.prototype.hasOwnProperty.call(q, k)) safe[k] = q[k];
+    if (!Object.prototype.hasOwnProperty.call(q, k)) continue;
+    if (k === "options") continue;   // normalized below, never copied verbatim
+    const v = q[k];
+    // Scalar presentational fields only. If a supposedly-scalar field arrives as
+    // an object/array (malformed/malicious), reduce it to display text — never
+    // copy an object structure into the safe payload.
+    if (k === "q" || k === "text" || k === "minLabel" || k === "maxLabel") {
+      safe[k] = (v !== null && typeof v === "object") ? toDisplayText(v) : v;
+    } else if (v !== null && typeof v === "object") {
+      // id/type/timeLimit/min/max/step/imageUrl should be scalars; drop any object.
+      continue;
+    } else {
+      safe[k] = v;
+    }
   }
-  // Matching: keep ONLY the left prompts so the player can render the left
-  // column; the shuffled right choices travel separately in the live payload
-  // (liveQuestion.shuffledRight). Never include p.right (the canonical mapping).
+  // Options → array of display-text strings only (strips any nested correctness).
+  if (Array.isArray(q.options)) {
+    safe.options = q.options.map(toDisplayText);
+  }
+  // Matching: keep ONLY the left prompt display text; never p.right (the mapping).
   if (q.type === "match" && Array.isArray(q.pairs)) {
-    safe.pairs = q.pairs.map(p => ({ left: p && typeof p === "object" ? p.left : undefined }));
+    safe.pairs = q.pairs.map(p => ({ left: p && typeof p === "object" ? toDisplayText(p.left) : toDisplayText(p) }));
   }
   return safe;
 }
@@ -80,8 +118,13 @@ export function isPlayerSafeQuestion(q) {
   for (const k of SOLUTION_QUESTION_KEYS) {
     if (Object.prototype.hasOwnProperty.call(q, k)) return false;
   }
-  // Matching pairs must not carry `right`.
-  if (Array.isArray(q.pairs) && q.pairs.some(p => p && typeof p === "object" && "right" in p)) return false;
+  // options must be plain scalars (no nested objects/arrays that could hide
+  // correctness metadata).
+  if (Array.isArray(q.options) && q.options.some(o => o !== null && typeof o === "object")) return false;
+  // Matching pairs must be { left: scalar } only — never `right`, never a nested object.
+  if (Array.isArray(q.pairs) && q.pairs.some(p =>
+    !p || typeof p !== "object" || "right" in p || (p.left !== null && p.left !== undefined && typeof p.left === "object")
+  )) return false;
   return true;
 }
 

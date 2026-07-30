@@ -44,16 +44,22 @@ DECLARE
   v_my_tenant text := (public.get_my_tenant_id())::text;  -- null for anon
 BEGIN
   IF p_session_id IS NULL THEN RAISE EXCEPTION 'rpc_player_session_restore: session id required'; END IF;
+  IF v_uid IS NULL THEN RAISE EXCEPTION 'authentication required'; END IF;
   SELECT * INTO v_session FROM public.game_sessions WHERE id = p_session_id;
   IF NOT FOUND THEN RAISE EXCEPTION 'session not found'; END IF;
 
-  -- Same access scope as today's RLS (no widening): authenticated same-tenant, or
-  -- anon for a demo (tenant_id IS NULL) session. Tenant derived server-side.
+  -- Tighter than today's RLS: the caller must be a PARTICIPANT of THIS exact
+  -- session (a lobby participant row or an own answer row), AND same-tenant (a
+  -- participant row can only exist same-tenant; the tenant check is defensive).
+  -- A same-tenant non-participant is denied. Tenant derived server-side.
   IF NOT (
-    (v_session.tenant_id IS NULL)
-    OR (v_uid IS NOT NULL AND v_my_tenant IS NOT NULL AND v_session.tenant_id = v_my_tenant)
+    (v_session.tenant_id IS NULL OR (v_my_tenant IS NOT NULL AND v_session.tenant_id = v_my_tenant))
+    AND (
+      EXISTS (SELECT 1 FROM public.game_session_participants gsp WHERE gsp.session_id = p_session_id AND gsp.player_id = v_uid)
+      OR EXISTS (SELECT 1 FROM public.game_answers ga WHERE ga.session_id = p_session_id AND ga.player_id = v_uid)
+    )
   ) THEN
-    RAISE EXCEPTION 'not authorized for this session';
+    RAISE EXCEPTION 'not a participant of this session';
   END IF;
 
   RETURN jsonb_build_object(
@@ -73,8 +79,12 @@ END;
 $$;
 COMMENT ON FUNCTION public.rpc_player_session_restore(uuid) IS
   'Learner-safe active-player reconnect (073): durable phase/state + safe live_question + the caller''s OWN per-question points/correctness. Never question_snapshot; never another player''s answer. Same-tenant or anon-demo only.';
-REVOKE ALL ON FUNCTION public.rpc_player_session_restore(uuid) FROM PUBLIC;
-GRANT EXECUTE ON FUNCTION public.rpc_player_session_restore(uuid) TO anon, authenticated, service_role;
+-- EXECUTE to authenticated only (NOT anon): demo/anonymous games run entirely
+-- in-memory (sessionDbId is null), so an anon player never calls DB restore.
+-- Granting anon here would be unused access, so it is deliberately omitted. The
+-- tenant_id IS NULL branch above remains as defensive-only handling.
+REVOKE ALL ON FUNCTION public.rpc_player_session_restore(uuid) FROM PUBLIC, anon;
+GRANT EXECUTE ON FUNCTION public.rpc_player_session_restore(uuid) TO authenticated, service_role;
 
 -- ── 2. Completed learner review (participant-only, post-completion) ──────────────
 -- Ralli Live intentionally reveals correct answers AFTER a game for review. That
