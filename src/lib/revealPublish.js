@@ -20,8 +20,13 @@
  *                    newer/older qIdx, terminal status) — reject, never overwrite.
  */
 
-// Exact game_sessions.status spellings (audited): active vs terminal.
-export const ACTIVE_SESSION_STATUSES = Object.freeze(["waiting", "started", "live", "active", "paused"]);
+// The ONLY game_sessions.status a reveal may run under. Audited from the code:
+// game_sessions.status is written exactly as 'started' (startGameSession, at game
+// launch), 'completed' (endGameSession) and 'canceled' (cancelGameSession). No
+// 'live'/'active'/'paused' status is ever written — pausing sets the separate
+// `paused` boolean, not the status. So a running, unpaused game is EXACTLY
+// status='started' AND paused=false; 'waiting'/terminal are rejected.
+export const REVEAL_ALLOWED_STATUSES = Object.freeze(["started"]);
 // Phases a reveal may legitimately transition FROM: a live auto-question, or the
 // open-ended grading phase (open-review is the open-ended analog of 'question').
 export const REVEAL_PRE_PHASES = Object.freeze(["question", "open-review"]);
@@ -68,4 +73,4 @@ export function classifyRevealPublish(currentRow, expectedQIdx, frozenLiveQuesti
   return "stale";
 }
 
-export default { ACTIVE_SESSION_STATUSES, REVEAL_PRE_PHASES, deepEqualJson, classifyRevealPublish };
+export default { REVEAL_ALLOWED_STATUSES, REVEAL_PRE_PHASES, deepEqualJson, classifyRevealPublish };

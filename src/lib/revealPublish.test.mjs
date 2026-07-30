@@ -3,14 +3,14 @@ import assert from "node:assert/strict";
 import {
   deepEqualJson,
   classifyRevealPublish,
-  ACTIVE_SESSION_STATUSES,
+  REVEAL_ALLOWED_STATUSES,
   REVEAL_PRE_PHASES,
 } from "./revealPublish.js";
 
 const payload = { qIdx: 2, question: { id: "q", type: "mc", options: ["a", "b"] }, shuffledRight: [{ right: "x" }], reveal: { correctIdx: 1 } };
 
-test("constants: audited spellings", () => {
-  assert.deepEqual(ACTIVE_SESSION_STATUSES, ["waiting", "started", "live", "active", "paused"]);
+test("constants: audited reveal status/phase set (running game only)", () => {
+  assert.deepEqual(REVEAL_ALLOWED_STATUSES, ["started"]); // only a running game; never waiting/paused/terminal
   assert.deepEqual(REVEAL_PRE_PHASES, ["question", "open-review"]);
 });
 

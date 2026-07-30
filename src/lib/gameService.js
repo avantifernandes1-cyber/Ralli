@@ -17,7 +17,7 @@
  */
 
 import { supabase } from "./supabase.js";
-import { ACTIVE_SESSION_STATUSES, REVEAL_PRE_PHASES, classifyRevealPublish } from "./revealPublish.js";
+import { REVEAL_ALLOWED_STATUSES, REVEAL_PRE_PHASES, classifyRevealPublish } from "./revealPublish.js";
 
 // ── SESSION ────────────────────────────────────────────────────────────────────
 
@@ -347,10 +347,11 @@ export async function updateSessionPhase(sessionId, { phase, currentQuestionInde
  *
  * FIRST PUBLICATION (atomic, strict): flips phase→'reveal' + persists the reveal
  * ONLY when the session is on the exact question, in a pre-reveal phase
- * (`question`, or `open-review` for open-ended), and an ACTIVE status. This
- * requirement — not merely "not terminal" — is what stops a delayed reveal from
- * overwriting a same-index `countdown` (which cleared live_question) or any other
- * non-question phase.
+ * (`question`, or `open-review` for open-ended), the status is exactly a RUNNING
+ * game (`started`), AND it is not paused (`paused=false`). Requiring the running
+ * status + unpaused — not merely "not terminal" — is what stops a delayed reveal
+ * from overwriting a same-index `countdown`/`scoreboard`, a `waiting` lobby, or a
+ * paused game.
  *
  * 0-ROW OUTCOME is classified (read-only) from the current row:
  *   - `idempotent`: phase already 'reveal' for this exact qIdx with the SAME
@@ -374,7 +375,8 @@ export async function publishRevealDurable(sessionId, expectedQIdx, liveQuestion
     .eq("id", sessionId)
     .eq("current_question_index", expectedQIdx)
     .in("phase", REVEAL_PRE_PHASES)
-    .in("status", ACTIVE_SESSION_STATUSES)
+    .in("status", REVEAL_ALLOWED_STATUSES)   // only a running game (status='started')
+    .eq("paused", false)                      // a paused game must be resumed first
     .select("id");
   if (error) return { ok: false, outcome: "error", error };
   if (data && data.length === 1) return { ok: true, outcome: "applied", error: null };
