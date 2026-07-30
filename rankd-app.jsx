@@ -196,6 +196,52 @@ const liveQuestionRemainingSecs = (lq, paused, now = Date.now()) =>
 // Monotonic timing version of a live_question (start/pause/resume moment).
 const liveQuestionTimingSeq = (lq) => (lq?.timingUpdatedAt ?? lq?.questionStartedAt ?? 0);
 
+// ═══════════════════ [RALLI_START_REGRESSION_TRACE] — TEMPORARY DIAGNOSTIC ═══════════════════
+// Pure observation for the game-start regression. NO behavior change: it only reads
+// state and appends to a store + console + an on-screen panel. NEVER logs correct-answer
+// fields. REMOVE this whole block (and every ralliTrace(...) call + <RalliTracePanel/>)
+// once the first failing boundary is captured.
+const RALLI_TRACE = { host: {}, player: {}, _seq: 0, _subs: new Set() };
+function ralliTrace(role, patch) {
+  const bucket = role === "admin" ? "host" : "player";
+  const now = Date.now();
+  let hhmmss = String(now);
+  try { hhmmss = new Date(now).toISOString().slice(11, 23); } catch { /* keep epoch */ }
+  RALLI_TRACE._seq += 1;
+  Object.assign(RALLI_TRACE[bucket], patch, { _lastEvent: `${hhmmss} #${RALLI_TRACE._seq}` });
+  try { console.log("[RALLI_START_REGRESSION_TRACE]", bucket, hhmmss, JSON.stringify(patch)); }
+  catch { console.log("[RALLI_START_REGRESSION_TRACE]", bucket, hhmmss, patch); }
+  RALLI_TRACE._subs.forEach((fn) => { try { fn(); } catch { /* ignore */ } });
+}
+// A tiny wall-clock stamp for panel fields (HH:MM:SS.mmm). Never used for logic.
+function ralliStamp(t = Date.now()) { try { return new Date(t).toISOString().slice(11, 23); } catch { return String(t); } }
+function RalliTracePanel({ role }) {
+  const which = role === "admin" ? "host" : "player";
+  const [, force] = useState(0);
+  useEffect(() => {
+    const fn = () => force((n) => (n + 1) % 1000000);
+    RALLI_TRACE._subs.add(fn);
+    return () => { RALLI_TRACE._subs.delete(fn); };
+  }, []);
+  const data = RALLI_TRACE[which];
+  const keys = Object.keys(data).sort();
+  return (
+    <div style={{ position: "fixed", left: 0, right: 0, bottom: 0, zIndex: 2147483647, maxHeight: "44vh", overflowY: "auto", background: "rgba(6,10,16,0.95)", color: "#7CFC00", font: "11px/1.45 ui-monospace,Menlo,Consolas,monospace", padding: "6px 9px 12px", borderTop: "2px solid #7CFC00", boxShadow: "0 -4px 18px rgba(0,0,0,0.55)" }}>
+      <div style={{ color: "#FFD400", fontWeight: 800, marginBottom: 4, letterSpacing: "0.02em" }}>
+        [RALLI_START_REGRESSION_TRACE] {which.toUpperCase()} — screenshot this whole panel
+      </div>
+      {keys.length === 0
+        ? <div style={{ color: "#888" }}>waiting for events…</div>
+        : keys.map((k) => (
+            <div key={k} style={{ whiteSpace: "pre-wrap", wordBreak: "break-word" }}>
+              <span style={{ color: "#66CCFF" }}>{k}</span>: <span>{typeof data[k] === "object" ? JSON.stringify(data[k]) : String(data[k])}</span>
+            </div>
+          ))}
+    </div>
+  );
+}
+// ═══════════════════ end [RALLI_START_REGRESSION_TRACE] module ═══════════════════
+
 function useGameChannel(pin, role) {
   const channelRef       = useRef(null);
   // The player's Presence identity for THIS channel connection. Persistent (not
@@ -228,6 +274,7 @@ function useGameChannel(pin, role) {
         presence:  { key: presenceKey },
       },
     });
+    ralliTrace(role, { channelKey: `game:${pin}`, channelCreatedAt: ralliStamp(), presenceKey }); // [RALLI_START_REGRESSION_TRACE]
 
     // ── Presence sync → player roster ─────────────────────────────────────────
     // Fires on every join/leave. Flatten all presence entries and filter to
@@ -252,6 +299,7 @@ function useGameChannel(pin, role) {
         color: p.color ?? null,
         score: 0,
       }));
+      ralliTrace(role, { presenceSyncAt: ralliStamp(), presenceIds: players.map((p) => p.id), presenceCount: players.length, presenceRawEntries: Object.values(state).flat().length }); // [RALLI_START_REGRESSION_TRACE]
       setChPlayers(players);
     });
 
@@ -274,6 +322,7 @@ function useGameChannel(pin, role) {
         }
       } else {
         // Players receive all host broadcasts as chMsg (same shape as before)
+        ralliTrace(role, { lastBroadcastRecvAt: ralliStamp(), lastBroadcastEvent: event, lastBroadcastQIdx: payload?.qIdx ?? null, lastBroadcastPayloadType: payload?.question?.type ?? null }); // [RALLI_START_REGRESSION_TRACE] (no answer fields)
         setChMsg({ type: event, ...payload });
       }
     });
@@ -282,6 +331,7 @@ function useGameChannel(pin, role) {
     setChStatus("init");
     channel.subscribe((status) => {
       setChStatus(status);
+      ralliTrace(role, { subscribeStatus: status, subscribeStatusAt: ralliStamp(), ...(status === "SUBSCRIBED" ? { subscribedAt: ralliStamp(), reTrackedOnSubscribe: !!presenceRef.current } : {}) }); // [RALLI_START_REGRESSION_TRACE]
       // (Re)track the player's Presence on EVERY SUBSCRIBED — initial subscribe
       // and every reconnect — so presence survives a dropped websocket. Not
       // cleared here, so the identity persists across reconnects.
@@ -291,6 +341,7 @@ function useGameChannel(pin, role) {
     });
 
     return () => {
+      ralliTrace(role, { channelTornDownAt: ralliStamp(), channelTornDownKey: `game:${pin}` }); // [RALLI_START_REGRESSION_TRACE] — identity change / unmount
       supabase.removeChannel(channel);
       channelRef.current = null;
       presenceRef.current = null; // channel torn down (pin/role change) → next game starts fresh
@@ -317,8 +368,10 @@ function useGameChannel(pin, role) {
     };
     presenceRef.current = trackData;
     const ch = channelRef.current;
-    if (ch) ch.track(trackData); // no-op until SUBSCRIBED; the callback re-tracks then
-  }, []);
+    let trackResult = "no-channel";
+    if (ch) { try { ch.track(trackData); trackResult = "tracked"; } catch (e) { trackResult = `error:${e?.message ?? e}`; } } // no-op until SUBSCRIBED; the callback re-tracks then
+    ralliTrace(role, { presenceTrackAt: ralliStamp(), presenceTrackResult: trackResult, presenceTrackId: trackData.playerId }); // [RALLI_START_REGRESSION_TRACE]
+  }, [role]);
 
   // ── broadcast ─────────────────────────────────────────────────────────────
   // Intercepts PLAYER_JOIN → tracks player in Presence instead of sending a message.
@@ -2237,6 +2290,26 @@ function KahootHostView({ onNav, sessionName, pin, sessionDbId, demoMode, tenant
   const dbActiveForHaltRef = useRef(dbActiveForHalt);
   dbActiveForHaltRef.current = dbActiveForHalt;
 
+  // [RALLI_START_REGRESSION_TRACE] host state snapshot — pure observation, no behavior change.
+  useEffect(() => {
+    const durIds = (dbParticipants ?? [])
+      .filter((p) => !p.status || p.status === "joined" || p.status === "active")
+      .map((p) => p.player_id ?? p.id);
+    const lastBeat = (dbParticipants ?? [])
+      .map((p) => (p.last_seen_at ? new Date(p.last_seen_at).getTime() : 0))
+      .reduce((a, b) => Math.max(a, b), 0);
+    ralliTrace("admin", {
+      sessionDbId: sessionDbId ?? null,
+      channelKey: `game:${pin}`,
+      chStatus,
+      phase, paused, qIdx,
+      presenceIds: chPlayers.map((p) => p.id), presenceCount: chPlayers.length,
+      durableActiveIds: durIds, durableActiveCount: durIds.length, dbActiveForHalt,
+      lastHeartbeatSeenAt: lastBeat ? ralliStamp(lastBeat) : "none",
+      halted, restoreState,
+    });
+  }, [sessionDbId, pin, chStatus, phase, paused, qIdx, chPlayers, dbActiveForHalt, dbParticipants, halted, restoreState]); // eslint-disable-line react-hooks/exhaustive-deps
+
   // Connected-now count: Presence when subscribed, fresh DB heartbeats otherwise.
   const connectedNow = () => (chStatus === "SUBSCRIBED" ? chPlayers.length : dbActiveForHalt);
 
@@ -2253,9 +2326,14 @@ function KahootHostView({ onNav, sessionName, pin, sessionDbId, demoMode, tenant
       }
       // active === 0
       if (!haltArmedRef.current) return;       // already handled this empty episode (host chose Stay Paused / End)
-      if (zeroSinceRef.current == null) { zeroSinceRef.current = Date.now(); return; }
+      if (zeroSinceRef.current == null) {
+        zeroSinceRef.current = Date.now();
+        ralliTrace("admin", { haltZeroStreakStartedAt: ralliStamp(), haltCountSource: subscribed ? "presence(SUBSCRIBED)" : "dbHeartbeat(not-subscribed)", haltActiveCountObserved: active }); // [RALLI_START_REGRESSION_TRACE]
+        return;
+      }
       if (Date.now() - zeroSinceRef.current >= HALT_GRACE_MS) {
         haltArmedRef.current = false;          // disarm — exactly one halt per empty episode
+        ralliTrace("admin", { haltTriggeredAt: ralliStamp(), haltReason: `active=0 for >=${HALT_GRACE_MS}ms; countSource=${subscribed ? "presence(SUBSCRIBED)" : "dbHeartbeat(not-subscribed)"}; presenceLen=${chPlayersLenRef.current}; dbActiveForHalt=${dbActiveForHaltRef.current}; chStatus=${chStatusRef.current}` }); // [RALLI_START_REGRESSION_TRACE]
         setHalted(true);
       }
     }, 1000);
@@ -2540,6 +2618,7 @@ function KahootHostView({ onNav, sessionName, pin, sessionDbId, demoMode, tenant
   // surface a retryable error to the host.
   const startQuestion = async () => {
     if (!q) return;
+    ralliTrace("admin", { startQuestionInvokedAt: ralliStamp(), startQuestionQIdx: qIdx, startQuestionType: q?.type ?? null }); // [RALLI_START_REGRESSION_TRACE]
     clearPauseEpisode(); // a new question ends any prior pause episode
     const startedAt = Date.now();
     // Matching: one shuffle for this question, shared with every client via the
@@ -2561,22 +2640,27 @@ function KahootHostView({ onNav, sessionName, pin, sessionDbId, demoMode, tenant
       });
       if (error) {
         console.error("[ralli:host] startQuestion: durable persist failed, not broadcasting:", error);
+        ralliTrace("admin", { safeQuestionPersistAt: ralliStamp(), safeQuestionPersistResult: `ERROR: ${error?.message ?? JSON.stringify(error)}`, showQuestionSendResult: "SKIPPED (persist failed)" }); // [RALLI_START_REGRESSION_TRACE]
         setQuestionStartError(true); // game state untouched; host can retry
         return;
       }
     }
+    ralliTrace("admin", { safeQuestionPersistAt: ralliStamp(), safeQuestionPersistResult: sessionDbId ? "OK" : "skipped(no sessionDbId/demo)" }); // [RALLI_START_REGRESSION_TRACE]
     setQuestionStartError(false);
     hasRevealedRef.current = false; // fresh question — arm the reveal guard
     setShuffledRight(shuffled);
     setTimeLeft(q.timeLimit);
     setPhase("question");
-    broadcast({ type: GM.SHOW_QUESTION, ...liveQuestion });
+    let sendResult = "sent";
+    try { broadcast({ type: GM.SHOW_QUESTION, ...liveQuestion }); } catch (e) { sendResult = `error:${e?.message ?? e}`; }
+    ralliTrace("admin", { showQuestionSendAt: ralliStamp(), showQuestionSendResult: sendResult, showQuestionQIdx: qIdx }); // [RALLI_START_REGRESSION_TRACE]
   };
 
   useEffect(() => {
     if (restoreState !== "done") return; // block until restoration finishes
     if (halted || paused) return; // no automatic progression while paused/halted
     if (phase !== "countdown") return;
+    if (cdNum === 3) ralliTrace("admin", { countdownStartAt: ralliStamp(), countdownForQIdx: qIdx }); // [RALLI_START_REGRESSION_TRACE]
     if (cdNum <= 0) {
       // Guard: startQuestion() is async, so cdNum stays 0 / phase stays
       // "countdown" until the persist resolves and setPhase("question") runs.
@@ -3544,7 +3628,11 @@ function KahootPlayerView({ onNav, playerName, playerEmoji, playerId, pin, sessi
   // (paused wall-clock is never consumed), else limit − elapsed from the
   // effective start, clamped to zero — never a fresh full clock on recovery.
   const applyShowQuestion = useCallback((payload, paused = false) => {
-    if (!payload?.question) return;
+    if (!payload?.question) {
+      ralliTrace("user", { applyShowQuestionAt: ralliStamp(), applyShowQuestionResult: "REJECTED (no payload.question)", applyShowQuestionQIdx: payload?.qIdx ?? null }); // [RALLI_START_REGRESSION_TRACE]
+      return;
+    }
+    ralliTrace("user", { applyShowQuestionAt: ralliStamp(), applyShowQuestionResult: "APPLIED", applyShowQuestionQIdx: payload?.qIdx ?? null, appliedQuestionType: payload?.question?.type ?? null, appliedHasOptions: Array.isArray(payload?.question?.options) ? payload.question.options.length : 0 }); // [RALLI_START_REGRESSION_TRACE] (no answer fields)
     const remaining = liveQuestionRemainingSecs(payload, paused);
     setQuestion(payload.question);
     setTimeLeft(remaining);
@@ -3557,6 +3645,17 @@ function KahootPlayerView({ onNav, playerName, playerEmoji, playerId, pin, sessi
     timingSeqRef.current = liveQuestionTimingSeq(payload);
     setPhase("question");
   }, []);
+
+  // [RALLI_START_REGRESSION_TRACE] player identity + mount/unmount. Pure observation.
+  useEffect(() => {
+    try { supabase.auth.getUser().then(({ data }) => ralliTrace("user", { authUserId: data?.user?.id ?? "anon/none" })).catch(() => {}); } catch { /* ignore */ }
+    ralliTrace("user", { componentMountedAt: ralliStamp(), gamePlayerId: playerId ?? null, sessionDbId: sessionDbId ?? null, channelKey: `game:${pin}` });
+    return () => { ralliTrace("user", { componentUnmountedAt: ralliStamp() }); };
+  }, []); // eslint-disable-line react-hooks/exhaustive-deps
+  // [RALLI_START_REGRESSION_TRACE] live render snapshot (subscription/phase/applied qIdx).
+  useEffect(() => {
+    ralliTrace("user", { chStatus, ...(chStatus === "SUBSCRIBED" ? { chSubscribedSeenAt: ralliStamp() } : {}), renderPhase: phase, renderQuestionType: question?.type ?? null, appliedQIdx: appliedQIdxRef.current, channelKey: `game:${pin}` }); // eslint-disable-line
+  }, [chStatus, phase, question]); // eslint-disable-line react-hooks/exhaustive-deps
 
   // ── Durable reconcile: recover current state from game_sessions ─────────────
   // The recovery path for a missed/late SHOW_QUESTION (or REVEAL) broadcast.
@@ -3573,20 +3672,34 @@ function KahootPlayerView({ onNav, playerName, playerEmoji, playerId, pin, sessi
   //   • all state comes from the session row the reconcile actually read
   const reconcile = useCallback(async () => {
     if (!sessionDbId || !playerId) return;
+    // [RALLI_START_REGRESSION_TRACE] instrumentation-only version guard: snapshot the
+    // applied qIdx at dispatch so we can tell (below) whether a delayed restore response
+    // would have rolled the player back over a newer realtime question. Pure observation.
+    const dispatchedAppliedQIdx = appliedQIdxRef.current;
+    ralliTrace("user", { restoreRpcStartAt: ralliStamp(), restoreRpcAtAppliedQIdx: dispatchedAppliedQIdx }); // [RALLI_START_REGRESSION_TRACE]
     try {
       // Learner-safe restore RPC (073): own answers only + sanitized live_question.
       // Never another player's answers, never question_snapshot.
       const { session, answers } = await getPlayerSessionRestore(sessionDbId);
-      if (session.error || !session.data) return;
+      if (session.error || !session.data) {
+        ralliTrace("user", { restoreRpcResultAt: ralliStamp(), restoreRpcResult: session.error ? `ERROR: ${session.error?.message ?? JSON.stringify(session.error)}` : "no session.data" }); // [RALLI_START_REGRESSION_TRACE]
+        return;
+      }
       const s  = session.data;
       const lq = s.live_question;
       const idxMatch = lq && lq.qIdx === s.current_question_index;
+      // [RALLI_START_REGRESSION_TRACE] did the applied qIdx advance (via a realtime
+      // SHOW_QUESTION) while this restore was in flight? If so, a question-phase apply
+      // below is correctly skipped by the existing `lq.qIdx > appliedQIdxRef.current` guard.
+      const staleVsNewer = (s.phase === "question" && idxMatch && lq && lq.qIdx <= appliedQIdxRef.current && appliedQIdxRef.current > dispatchedAppliedQIdx);
+      ralliTrace("user", { restoreRpcResultAt: ralliStamp(), restoreRpcResult: "OK", restorePhase: s.phase, restoreQIdx: lq?.qIdx ?? null, restoreCurrentQIdx: s.current_question_index, restoreIdxMatch: !!idxMatch, restorePaused: !!s.paused, restoreDiscardedAsStale: !!staleVsNewer, appliedQIdxNow: appliedQIdxRef.current }); // [RALLI_START_REGRESSION_TRACE]
 
-      // Cumulative score — idempotent, always safe to recompute.
+      // Cumulative score — idempotent, always safe to recompute. The learner-safe
+      // restore RPC already returns ONLY this caller's own answers (my_answers), and
+      // those rows carry no player_id, so we must NOT filter by player_id here (that
+      // filter matched nothing and zeroed the score — regression fix).
       if (answers.data?.length) {
-        const sc = answers.data
-          .filter(r => r.player_id === playerId)
-          .reduce((sum, r) => sum + (r.points ?? 0), 0);
+        const sc = answers.data.reduce((sum, r) => sum + (r.points ?? 0), 0);
         setMyScore(sc);
       }
       // Adopt the read's paused flag only if its timing version is NOT older
@@ -3626,7 +3739,9 @@ function KahootPlayerView({ onNav, playerName, playerEmoji, playerId, pin, sessi
       // reveal sees the correct answer + their score without their own pick
       // highlighted — honest, and never stranded.
       if (s.phase === "reveal" && idxMatch && lq.qIdx >= appliedQIdxRef.current) {
-        const myRow = (answers.data ?? []).find(r => r.player_id === playerId && r.question_idx === lq.qIdx);
+        // my_answers is already own-only (learner-safe RPC) and carries no player_id,
+        // so match on question_idx alone (filtering by player_id lost the row — fix).
+        const myRow = (answers.data ?? []).find(r => r.question_idx === lq.qIdx);
         // Reveal recovery restores the correct-answer display from the POST-reveal
         // `reveal` block the host persisted at reveal — never the pre-reveal payload
         // (which is sanitized). If reveal info isn't present yet, the sanitized
@@ -3696,7 +3811,8 @@ function KahootPlayerView({ onNav, playerName, playerEmoji, playerId, pin, sessi
   useEffect(() => {
     if (!sessionDbId || !playerId) return;
     const beat = () => updateParticipantHeartbeat(sessionDbId, playerId)
-      .catch(e => console.error("[ralli:player] heartbeat failed:", e));
+      .then((r) => ralliTrace("user", { heartbeatAt: ralliStamp(), heartbeatResult: r?.error ? `ERROR: ${r.error?.message ?? JSON.stringify(r.error)}` : "OK" })) // [RALLI_START_REGRESSION_TRACE]
+      .catch(e => { console.error("[ralli:player] heartbeat failed:", e); ralliTrace("user", { heartbeatAt: ralliStamp(), heartbeatResult: `THREW: ${e?.message ?? e}` }); }); // [RALLI_START_REGRESSION_TRACE]
     beat();
     const interval = setInterval(beat, 15_000);
     return () => clearInterval(interval);
@@ -3705,12 +3821,14 @@ function KahootPlayerView({ onNav, playerName, playerEmoji, playerId, pin, sessi
   useEffect(() => {
     if (!chMsg) return;
     // Game start: host broadcast — show countdown before first question
-    if (chMsg.type === GM.GAME_START) { setCdNum(3); setPhase("countdown"); }
+    if (chMsg.type === GM.GAME_START) { ralliTrace("user", { countdownReceivedAt: ralliStamp() }); setCdNum(3); setPhase("countdown"); } // [RALLI_START_REGRESSION_TRACE]
     if (chMsg.type === GM.SHOW_QUESTION) {
       // Fast realtime path — same helper as durable recovery so setup/shuffle/
       // timer never diverge. Guarded so a stray older/duplicate frame can't roll
       // the player back onto a question they've already moved past.
-      if ((chMsg.qIdx ?? 0) >= appliedQIdxRef.current) applyShowQuestion(chMsg);
+      const pass = (chMsg.qIdx ?? 0) >= appliedQIdxRef.current;
+      ralliTrace("user", { showQuestionRecvAt: ralliStamp(), showQuestionRecvQIdx: chMsg.qIdx ?? null, showQuestionGuardPassed: pass, appliedQIdxBefore: appliedQIdxRef.current }); // [RALLI_START_REGRESSION_TRACE]
+      if (pass) applyShowQuestion(chMsg);
     }
     if (chMsg.type === GM.OPEN_REVIEW) { setPhase("open-waiting"); }
     if (chMsg.type === GM.REVEAL) {
@@ -4385,10 +4503,19 @@ function KahootPlayerView({ onNav, playerName, playerEmoji, playerId, pin, sessi
 function RankdGameScreen({ onNav, sessionName, role, playerName, playerEmoji, questions = GAME_QUESTIONS, demoMode = true, pin, sessionDbId, tenantId, broadcast, trackPlayerPresence, chMsg, chStatus, chAnswers, chPlayers, playerId, onGameEnd, setChAnswers }) {
   // Real multiplayer mode — route to Kahoot views
   if (!demoMode && role === "admin") {
-    return <KahootHostView onNav={onNav} sessionName={sessionName} pin={pin} sessionDbId={sessionDbId} demoMode={demoMode} tenantId={tenantId} questions={questions} broadcast={broadcast} chAnswers={chAnswers} chPlayers={chPlayers} chStatus={chStatus} onGameEnd={onGameEnd} setChAnswers={setChAnswers} />;
+    // [RALLI_START_REGRESSION_TRACE] host diagnostic panel rendered as a sibling so it
+    // survives every host sub-state (loading/error/questionStartError/halt/main). Remove with the block above.
+    return (<>
+      <KahootHostView onNav={onNav} sessionName={sessionName} pin={pin} sessionDbId={sessionDbId} demoMode={demoMode} tenantId={tenantId} questions={questions} broadcast={broadcast} chAnswers={chAnswers} chPlayers={chPlayers} chStatus={chStatus} onGameEnd={onGameEnd} setChAnswers={setChAnswers} />
+      <RalliTracePanel role="admin" />
+    </>);
   }
   if (!demoMode && role !== "admin") {
-    return <KahootPlayerView onNav={onNav} playerName={playerName} playerEmoji={playerEmoji} playerId={playerId} pin={pin} sessionDbId={sessionDbId} tenantId={tenantId} broadcast={broadcast} trackPlayerPresence={trackPlayerPresence} chMsg={chMsg} chStatus={chStatus} />;
+    // [RALLI_START_REGRESSION_TRACE] player diagnostic panel (sibling, survives every player sub-state).
+    return (<>
+      <KahootPlayerView onNav={onNav} playerName={playerName} playerEmoji={playerEmoji} playerId={playerId} pin={pin} sessionDbId={sessionDbId} tenantId={tenantId} broadcast={broadcast} trackPlayerPresence={trackPlayerPresence} chMsg={chMsg} chStatus={chStatus} />
+      <RalliTracePanel role="user" />
+    </>);
   }
 
   const mobile = useMobile();
