@@ -28,15 +28,11 @@ import {
   updateSessionPhase,
   markParticipantLeft,
   updateParticipantHeartbeat,
-  getPlayerGameHistory,
-  getPlayerAnswersForSession,
   getSessionPlayerCounts,
   getGameHistory,
-  getSessionPlayers,
   getSessionRestoreData,
-  getGameAnswersForSession,
+  getManagerSessionAnalytics,
   saveSessionQuestionSnapshot,
-  getSessionQuestionSnapshot,
   cancelGameSession,
   requestSessionVerification,
   getPlayerSessionRestore,
@@ -2018,8 +2014,9 @@ function KahootHostView({ onNav, sessionName, pin, sessionDbId, demoMode, tenant
 
     (async () => {
       try {
-        // 1. Parallel fetch: session state + per-question answer history
-        const { session, answers } = await getSessionRestoreData(sessionDbId);
+        // 1. Server-authorized host restore (migration 075): session state +
+        // per-question answer history + participant identity, in ONE RPC call.
+        const { session, answers, participants: participantsResult } = await getSessionRestoreData(sessionDbId);
         if (cancelled) return;
 
         if (session.error) throw new Error(session.error.message ?? "Failed to load session");
@@ -2077,13 +2074,9 @@ function KahootHostView({ onNav, sessionName, pin, sessionDbId, demoMode, tenant
             else totals.set(row.player_id, { name: row.player_name, score: row.points ?? 0 });
           }
 
-          // Fetch all participants (no status filter) for emoji/color
-          const { data: participants } = await supabase
-            .from("game_session_participants")
-            .select("player_id, name, emoji, color")
-            .eq("session_id", sessionDbId)
-            .order("joined_at", { ascending: true });
-          if (cancelled) return;
+          // All participants (no status filter) for emoji/color — from the host
+          // restore RPC above (migration 075), not a direct participants read.
+          const participants = participantsResult?.data ?? [];
 
           // Build merged score rows, starting from full participant list (preserves 0-score players)
           const seen = new Set();
@@ -6895,20 +6888,18 @@ function RankdLobbyScreen({ onNav, pin, playerName, playerEmoji, sessionName, ro
   useEffect(() => {
     if (role === "admin" || isDemoMode || !sessionDbId) return;
     const check = () => {
-      supabase
-        .from("game_sessions")
-        .select("phase, status")
-        .eq("id", sessionDbId)
-        .single()
-        .then(({ data }) => {
-          if (!data) return;
-          // Durable recovery: if the host terminated the session (from the
-          // lobby or otherwise) and the realtime event was missed, resolve to
-          // the ended message rather than sitting in the lobby / "Hang tight".
-          if (["canceled", "ended", "completed"].includes(data.status)) { setHostEnded(true); return; }
-          const started = data.status === "started" || (data.phase && data.phase !== "waiting");
-          if (started) onNav("rankd-game");
-        });
+      // Learner-safe read (073 restore RPC — participant-authorized): read the
+      // session's phase/status via the server RPC, never a direct game_sessions read.
+      getPlayerSessionRestore(sessionDbId).then(({ session }) => {
+        const data = session?.data;
+        if (!data) return;
+        // Durable recovery: if the host terminated the session (from the
+        // lobby or otherwise) and the realtime event was missed, resolve to
+        // the ended message rather than sitting in the lobby / "Hang tight".
+        if (["canceled", "ended", "completed"].includes(data.status)) { setHostEnded(true); return; }
+        const started = data.status === "started" || (data.phase && data.phase !== "waiting");
+        if (started) onNav("rankd-game");
+      }).catch(() => {});
     };
     check(); // immediate on mount so a refresh after cancellation resolves at once
     const interval = setInterval(check, 2000);
@@ -7221,18 +7212,35 @@ function RankdResultsScreen({ onNav, sessionDbId, sessionCode, sessions, gameDat
   const [reloadKey,      setReloadKey]      = useState(0);
   const retryLoad = () => setReloadKey(k => k + 1);
 
-  // Load player scores from DB when not in memory (host refreshed after end, or
-  // opening from history). A failed query must never look like "no players".
+  // Manager exact-session analytics (migration 075): ONE server-authorized call
+  // (rpc_manager_session_analytics — host / same-tenant orgAdmin / ralli_admin only)
+  // provides player scores + per-answer rows + the immutable question snapshot for
+  // this EXACT session, replacing the three former direct table reads. A failed call
+  // surfaces as retryable "error" on each pane — never silently "no players" / "no
+  // responses" / "legacy session". In-memory scores still take DISPLAY precedence
+  // (realScores below); the durable snapshot remains the ONLY historical question source.
   useEffect(() => {
-    if (inMemoryForThisSession && gameData?.scores) { setPlayersStatus("ok"); return; } // matched in-memory scores
-    if (!session?.dbId)   { setPlayersStatus("ok"); return; } // demo / non-persisted
+    const haveMemScores = inMemoryForThisSession && !!gameData?.scores;
+    if (!session?.dbId) {
+      // Demo / non-persisted: no durable sources to load.
+      setPlayersStatus("ok"); setDbScores(null);
+      setDetailLoaded(true); setAnswerStatus("ok"); setSnapshotStatus("ok");
+      setAnswerRows([]); setDetailQuestions(null);
+      return;
+    }
     let cancelled = false;
-    setPlayersStatus("loading"); setDbScores(null); // clear prior session's data
-    getSessionPlayers(session.dbId).then(({ data, error }) => {
+    setPlayersStatus(haveMemScores ? "ok" : "loading"); setDbScores(null);
+    setDetailLoaded(false); setAnswerStatus("loading"); setSnapshotStatus("loading");
+    setAnswerRows(null); setDetailQuestions(null);
+    getManagerSessionAnalytics(session.dbId).then(({ data, error }) => {
       if (cancelled) return;
-      if (error) { setPlayersStatus("error"); setDbScores(null); return; }
-      setPlayersStatus("ok");
-      setDbScores((data ?? []).map((p) => ({
+      if (error) {
+        setPlayersStatus(haveMemScores ? "ok" : "error"); setDbScores(null);
+        setAnswerStatus("error"); setSnapshotStatus("error");
+        setAnswerRows(null); setDetailQuestions(null); setDetailLoaded(true);
+        return;
+      }
+      setDbScores((data?.players ?? []).map((p) => ({
         id:    p.player_id,
         name:  p.name,
         emoji: p.emoji ?? null,   // no-avatar players stay null — name only, no placeholder
@@ -7240,7 +7248,16 @@ function RankdResultsScreen({ onNav, sessionDbId, sessionCode, sessions, gameDat
         score: p.final_score ?? 0,
         delta: 0,
       })));
-    }).catch(() => { if (!cancelled) { setPlayersStatus("error"); setDbScores(null); } });
+      setPlayersStatus("ok");
+      setAnswerStatus("ok");   setAnswerRows(data?.answers ?? []);
+      setSnapshotStatus("ok"); setDetailQuestions(data?.snapshot ?? null);
+      setDetailLoaded(true);
+    }).catch(() => {
+      if (cancelled) return;
+      setPlayersStatus(haveMemScores ? "ok" : "error"); setDbScores(null);
+      setAnswerStatus("error"); setSnapshotStatus("error");
+      setAnswerRows(null); setDetailQuestions(null); setDetailLoaded(true);
+    });
     return () => { cancelled = true; };
   }, [session?.dbId, reloadKey]); // eslint-disable-line react-hooks/exhaustive-deps
 
@@ -7258,43 +7275,10 @@ function RankdResultsScreen({ onNav, sessionDbId, sessionCode, sessions, gameDat
   const [selectedPlayerId, setSelectedPlayerId] = useState(null);
   const [selectedQIdx,     setSelectedQIdx]     = useState(null);
 
-  // One retryable loader for the answer/snapshot pair. A failed query is
-  // surfaced as "error" (retryable) — NOT silently coerced to []/null, which
-  // would falsely read as "no responses" / "legacy session". `cancelled` +
-  // `reloadKey` in the deps prevent a stale/prior-session response from
-  // overwriting a newer retry or a newly selected session; state is cleared up
-  // front so another session's results can never flash or persist.
-  useEffect(() => {
-    if (!session?.dbId) {
-      // Demo / non-persisted: no durable sources to load.
-      setDetailLoaded(true); setAnswerStatus("ok"); setSnapshotStatus("ok");
-      setAnswerRows([]); setDetailQuestions(null);
-      return;
-    }
-    let cancelled = false;
-    setDetailLoaded(false);
-    setAnswerStatus("loading"); setSnapshotStatus("loading");
-    setAnswerRows(null); setDetailQuestions(null);
-    Promise.all([
-      getGameAnswersForSession(session.dbId),
-      getSessionQuestionSnapshot(session.dbId),
-    ]).then(([answersRes, snapRes]) => {
-      if (cancelled) return;
-      if (answersRes.error) { setAnswerStatus("error"); setAnswerRows(null); }
-      else                  { setAnswerStatus("ok");    setAnswerRows(answersRes.data ?? []); }
-      // Persisted session: the immutable snapshot is the ONLY canonical source.
-      // A query error is retryable ("error"); a successful null is legacy. No
-      // fallback to gameData or the mutable quiz.
-      if (snapRes.error)    { setSnapshotStatus("error"); setDetailQuestions(null); }
-      else                  { setSnapshotStatus("ok");    setDetailQuestions(snapRes.data ?? null); }
-      setDetailLoaded(true);
-    }).catch(() => {
-      if (cancelled) return;
-      setAnswerStatus("error"); setSnapshotStatus("error");
-      setAnswerRows(null); setDetailQuestions(null); setDetailLoaded(true);
-    });
-    return () => { cancelled = true; };
-  }, [session?.dbId, reloadKey]); // eslint-disable-line react-hooks/exhaustive-deps
+  // (Answer rows + question snapshot are loaded together with player scores by the
+  // single rpc_manager_session_analytics effect above — migration 075 — so there is
+  // no longer a separate direct-read loader here. The immutable snapshot remains the
+  // ONLY canonical historical question source; a query error stays retryable.)
 
   // Scores: identity-matched in-memory results (immediate) → durable game_players.
   const realScores = (inMemoryForThisSession ? gameData?.scores : null) ?? dbScores ?? null;
