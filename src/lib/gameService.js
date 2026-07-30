@@ -99,8 +99,10 @@ export async function startGameSession(pin, tenantId = null) {
     })
     .eq("pin", pin);
   if (tenantId) query = query.eq("tenant_id", tenantId);
-  const { data, error } = await query.select().single();
-  return { data, error };
+  // Write only — the caller does not consume the returned row (fire-and-forget), so no
+  // `.select()`/RETURNING is needed (safe-read cutover: revoking table SELECT won't break start).
+  const { error } = await query;
+  return { data: null, error };
 }
 
 /**
@@ -112,39 +114,40 @@ export async function startGameSession(pin, tenantId = null) {
  *   scores: [{ id?, name, score, emoji?, color? }]
  * @returns {Promise<{ data: Object|null, error: Object|null }>}
  */
-export async function endGameSession(pin, { scores = [], tenantId = null } = {}) {
-  // 1. Update session status. Scoped by tenant_id whenever the caller has
-  // one, not just pin — pins are only unique WITHIN a tenant (migration
-  // 046), so a code-only match here could otherwise end a different
-  // tenant's session that happens to share the same visible pin.
+export async function endGameSession(pin, { scores = [], tenantId = null, sessionId = null } = {}) {
+  // 1. Update session status. Scoped by tenant_id whenever the caller has one, not
+  // just pin — pins are only unique WITHIN a tenant (migration 046). Write only: the
+  // authoritative session id is passed in (activeGameSessionDbId), so no `.select()`/
+  // RETURNING is needed and revoking table SELECT won't break end (safe-read cutover).
   let query = supabase
     .from("game_sessions")
-    .update({
-      status:   "completed",
-      ended_at: new Date().toISOString(),
-    })
+    .update({ status: "completed", ended_at: new Date().toISOString() })
     .eq("pin", pin);
   if (tenantId) query = query.eq("tenant_id", tenantId);
-  const { data: session, error: sessionError } = await query.select().single();
+  const { error: sessionError } = await query;
 
   if (sessionError) {
     console.error("[gameService] endGameSession: failed to update session", sessionError);
     return { data: null, error: sessionError };
   }
 
-  if (!session?.id) return { data: null, error: new Error("session not found") };
+  // The caller passes the exact session id it already holds — no read of the
+  // just-updated row. Without it the session is still marked completed above; the
+  // per-session participant/player writes are simply skipped (legacy fallback).
+  const sid = sessionId ?? null;
+  if (!sid) return { data: null, error: null };
 
   // 2. Mark all active participants as completed (so lobby no longer shows them)
   await supabase
     .from("game_session_participants")
     .update({ status: "completed", last_seen_at: new Date().toISOString() })
-    .eq("session_id", session.id)
+    .eq("session_id", sid)
     .in("status", ["active", "joined"]);
 
   // 3. Save final player scores (ranked by position in scores array)
   if (scores.length > 0) {
     const playerRows = scores.map((p, idx) => ({
-      session_id:  session.id,
+      session_id:  sid,
       tenant_id:   tenantId,
       player_id:   p.id ?? p.playerId ?? p.name ?? `player-${idx}`,
       name:        p.name,
@@ -164,7 +167,7 @@ export async function endGameSession(pin, { scores = [], tenantId = null } = {})
     }
   }
 
-  return { data: session, error: null };
+  return { data: { id: sid }, error: null };
 }
 
 /**
@@ -238,7 +241,10 @@ export async function joinGameSession(sessionId, { playerId, name, emoji = null,
   const finalEmoji = emoji;   // caller-authoritative — null clears any prior avatar
   const finalColor = color;
 
-  const { data, error } = await supabase
+  // Write only — the caller consumes only `error` (join succeeded / failed), never the
+  // upserted row, so no `.select()`/RETURNING is needed. This keeps join working after
+  // table SELECT is revoked (a `.select().single()` would otherwise fail on no returned row).
+  const { error } = await supabase
     .from("game_session_participants")
     .upsert(
       {
@@ -251,10 +257,8 @@ export async function joinGameSession(sessionId, { playerId, name, emoji = null,
         joined_at:  new Date().toISOString(),
       },
       { onConflict: "session_id,player_id" }
-    )
-    .select()
-    .single();
-  return { data, error };
+    );
+  return { data: null, error };
 }
 
 /**
@@ -361,27 +365,18 @@ export async function updateSessionPhase(sessionId, { phase, currentQuestionInde
  * @returns {Promise<{ ok: boolean, outcome: 'applied'|'idempotent'|'conflict'|'stale'|'error', error: Object|null }>}
  */
 export async function publishRevealDurable(sessionId, expectedQIdx, liveQuestion) {
-  const { data, error } = await supabase
-    .from("game_sessions")
-    .update({ phase: "reveal", live_question: liveQuestion })
-    .eq("id", sessionId)
-    .eq("current_question_index", expectedQIdx)
-    .in("phase", REVEAL_PRE_PHASES)
-    .in("status", REVEAL_ALLOWED_STATUSES)   // only a running game (status='started')
-    .eq("paused", false)                      // a paused game must be resumed first
-    .select("id");
+  // Safe-read cutover (migration 079): the strict conditional first-publication UPDATE
+  // and the 0-row current-row read now run server-side, host/manager-authorized, via
+  // rpc_host_publish_reveal — so no direct game_sessions read/write here. The 0-row
+  // outcome is still classified with the SAME shared JS (classifyRevealPublish); the
+  // reveal state machine's semantics are unchanged.
+  const { data, error } = await supabase.rpc("rpc_host_publish_reveal", {
+    p_session_id: sessionId, p_expected_qidx: expectedQIdx, p_live_question: liveQuestion,
+  });
   if (error) return { ok: false, outcome: "error", error };
-  if (data && data.length === 1) return { ok: true, outcome: "applied", error: null };
-
-  // 0 rows: classify (read-only). No write occurred, so this only decides the
-  // return reason (idempotent lost-response / integrity conflict / stale).
-  const { data: cur, error: selErr } = await supabase
-    .from("game_sessions")
-    .select("phase, current_question_index, live_question")
-    .eq("id", sessionId)
-    .maybeSingle();
-  if (selErr) return { ok: false, outcome: "error", error: selErr };
-  const cls = classifyRevealPublish(cur, expectedQIdx, liveQuestion);
+  if (data?.outcome === "applied") return { ok: true, outcome: "applied", error: null };
+  // 0 rows → classify the returned current row (idempotent lost-response / conflict / stale).
+  const cls = classifyRevealPublish(data?.current ?? null, expectedQIdx, liveQuestion);
   if (cls === "idempotent") return { ok: true, outcome: "idempotent", error: null };
   return { ok: false, outcome: cls, error: null }; // 'conflict' | 'stale'
 }

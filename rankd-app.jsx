@@ -25756,10 +25756,13 @@ export default function App() {
         ? { ...s, status: "completed" } : s
     ));
     const gameTenantId = currentOrg?.id ?? user?.orgId ?? null;
-    // Persist results + mark participants completed in Supabase (fire-and-forget)
+    // Persist results + mark participants completed in Supabase (fire-and-forget).
+    // Pass the authoritative session id so endGameSession needs no read of the row it
+    // just updated (safe-read cutover — works after table SELECT is revoked).
     endGameSession(lobbyPin, {
       scores:   data?.scores ?? [],
       tenantId: gameTenantId,
+      sessionId: endedDbId,
     }).then(() => {
       // Refresh Past Sessions from the DB now that this session's status/
       // ended_at/game_players are actually persisted — without this, Past

@@ -174,26 +174,17 @@ export async function awardQuizPoints(tenantId, userId, quizId, attempt, { isRet
 export async function awardGamePointsForSession(tenantId, sessionPin, scores) {
   if (!tenantId || !sessionPin || !scores?.length) return;
 
-  // 1. Find the session DB record by pin
-  const { data: session, error: sessionError } = await supabase
-    .from("game_sessions")
-    .select("id")
-    .eq("pin", String(sessionPin))
-    .maybeSingle();
-
-  if (sessionError || !session) {
-    console.error("[ralli] awardGamePointsForSession: session not found for pin", sessionPin, sessionError);
+  // 1-2. Resolve the session id + participant (player_id,name) map via the
+  // host/manager-authorized RPC (migration 079) — no direct game_sessions /
+  // game_session_participants read here. Scoring math below is unchanged.
+  const { data: ctx, error: ctxError } = await supabase.rpc("rpc_host_award_context", { p_pin: String(sessionPin) });
+  if (ctxError || !ctx?.session_id) {
+    console.error("[ralli] awardGamePointsForSession: award context unavailable for pin", sessionPin, ctxError);
     return;
   }
-
-  // 2. Load participants (includes player_id = auth user id)
-  const { data: participants, error: participantsError } = await supabase
-    .from("game_session_participants")
-    .select("player_id, name")
-    .eq("session_id", session.id);
-
-  if (participantsError || !participants?.length) {
-    console.error("[ralli] awardGamePointsForSession: no participants found", participantsError);
+  const participants = ctx.participants ?? [];
+  if (!participants.length) {
+    console.error("[ralli] awardGamePointsForSession: no participants found for pin", sessionPin);
     return;
   }
 
