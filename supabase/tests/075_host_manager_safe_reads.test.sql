@@ -14,7 +14,7 @@ RETURNS boolean LANGUAGE sql STABLE SECURITY DEFINER SET search_path = '' AS $$
   SELECT auth.uid() IS NOT NULL AND (
     p_host_id = auth.uid()::text
     OR EXISTS (SELECT 1 FROM public.profiles p WHERE p.id = auth.uid()
-      AND ((p.role = 'orgAdmin' AND p.tenant_id IS NOT NULL AND p.tenant_id::text = p_tenant) OR p.role = 'ralli_admin')));
+      AND ((p.role IN ('orgAdmin','manager') AND p.tenant_id IS NOT NULL AND p.tenant_id::text = p_tenant) OR p.role = 'ralli_admin')));
 $$;
 
 CREATE OR REPLACE FUNCTION public.rpc_host_session_restore(p_session_id uuid)
@@ -37,7 +37,7 @@ DECLARE v_role text; v_tenant uuid; v_target text;
 BEGIN
   IF auth.uid() IS NULL THEN RETURN '[]'::jsonb; END IF;
   SELECT role, tenant_id INTO v_role, v_tenant FROM public.profiles WHERE id = auth.uid();
-  IF v_role = 'orgAdmin' AND v_tenant IS NOT NULL THEN v_target := v_tenant::text;
+  IF v_role IN ('orgAdmin','manager') AND v_tenant IS NOT NULL THEN v_target := v_tenant::text;
   ELSIF v_role = 'ralli_admin' THEN v_target := p_tenant_id::text;
   ELSE RETURN '[]'::jsonb; END IF;
   IF v_target IS NULL THEN RETURN '[]'::jsonb; END IF;
@@ -51,7 +51,7 @@ DECLARE v_role text; v_tenant uuid; v_target text;
 BEGIN
   IF auth.uid() IS NULL THEN RETURN '[]'::jsonb; END IF;
   SELECT role, tenant_id INTO v_role, v_tenant FROM public.profiles WHERE id = auth.uid();
-  IF v_role = 'orgAdmin' AND v_tenant IS NOT NULL THEN v_target := v_tenant::text;
+  IF v_role IN ('orgAdmin','manager') AND v_tenant IS NOT NULL THEN v_target := v_tenant::text;
   ELSIF v_role = 'ralli_admin' THEN v_target := p_tenant_id::text;
   ELSE RETURN '[]'::jsonb; END IF;
   IF v_target IS NULL THEN RETURN '[]'::jsonb; END IF;
@@ -111,19 +111,26 @@ INSERT INTO auth.users (id, aud, role, email, created_at, updated_at) VALUES
  ('00000000-0000-0000-0000-000000075003','authenticated','authenticated','r75_mgrB@t.test',now(),now()),  -- MB other-tenant manager
  ('00000000-0000-0000-0000-000000075004','authenticated','authenticated','r75_ra@t.test',now(),now()),    -- RA ralli_admin
  ('00000000-0000-0000-0000-000000075005','authenticated','authenticated','r75_partL@t.test',now(),now()), -- L participant learner (tA)
- ('00000000-0000-0000-0000-000000075006','authenticated','authenticated','r75_learnX@t.test',now(),now());-- X non-participant learner (tA)
+ ('00000000-0000-0000-0000-000000075006','authenticated','authenticated','r75_learnX@t.test',now(),now()),-- X non-participant learner (tA)
+ ('00000000-0000-0000-0000-000000075007','authenticated','authenticated','r75_mgrTA@t.test',now(),now()), -- MG same-tenant MANAGER (tA)
+ ('00000000-0000-0000-0000-000000075008','authenticated','authenticated','r75_mgrTB@t.test',now(),now()), -- MGX cross-tenant MANAGER (tB)
+ ('00000000-0000-0000-0000-000000075009','authenticated','authenticated','r75_userhost@t.test',now(),now());-- UH host whose role is 'user' (tA)
 UPDATE public.profiles SET role='orgAdmin',   tenant_id='00000000-0000-0000-0000-0000000750a0', status='active' WHERE id='00000000-0000-0000-0000-000000075001';
 UPDATE public.profiles SET role='orgAdmin',   tenant_id='00000000-0000-0000-0000-0000000750a0', status='active' WHERE id='00000000-0000-0000-0000-000000075002';
 UPDATE public.profiles SET role='orgAdmin',   tenant_id='00000000-0000-0000-0000-0000000750b0', status='active' WHERE id='00000000-0000-0000-0000-000000075003';
 UPDATE public.profiles SET role='ralli_admin', tenant_id=NULL,                                    status='active' WHERE id='00000000-0000-0000-0000-000000075004';
 UPDATE public.profiles SET role='user',        tenant_id='00000000-0000-0000-0000-0000000750a0', status='active' WHERE id='00000000-0000-0000-0000-000000075005';
 UPDATE public.profiles SET role='user',        tenant_id='00000000-0000-0000-0000-0000000750a0', status='active' WHERE id='00000000-0000-0000-0000-000000075006';
+UPDATE public.profiles SET role='manager',      tenant_id='00000000-0000-0000-0000-0000000750a0', status='active' WHERE id='00000000-0000-0000-0000-000000075007';
+UPDATE public.profiles SET role='manager',      tenant_id='00000000-0000-0000-0000-0000000750b0', status='active' WHERE id='00000000-0000-0000-0000-000000075008';
+UPDATE public.profiles SET role='user',         tenant_id='00000000-0000-0000-0000-0000000750a0', status='active' WHERE id='00000000-0000-0000-0000-000000075009';
 
 -- Completed session S (tA, hosted by HU) + active session S2 (tA) + other-tenant session S3 (tB).
 INSERT INTO public.game_sessions (id, tenant_id, quiz_id, host_id, pin, name, status, question_count, demo_mode, ended_at, question_snapshot) VALUES
  ('00000000-0000-0000-0000-0000000750f1','00000000-0000-0000-0000-0000000750a0','q','00000000-0000-0000-0000-000000075001','750001','S','completed',1,false,now(),'[{"id":"qa","type":"mc","correct":1}]'::jsonb),
  ('00000000-0000-0000-0000-0000000750f2','00000000-0000-0000-0000-0000000750a0','q','00000000-0000-0000-0000-000000075001','750002','S2','started',1,false,NULL,'[{"id":"qb","type":"mc","correct":0}]'::jsonb),
- ('00000000-0000-0000-0000-0000000750f3','00000000-0000-0000-0000-0000000750b0','q','00000000-0000-0000-0000-000000075003','750003','S3','completed',1,false,now(),'[{"id":"qc","type":"mc","correct":1}]'::jsonb);
+ ('00000000-0000-0000-0000-0000000750f3','00000000-0000-0000-0000-0000000750b0','q','00000000-0000-0000-0000-000000075003','750003','S3','completed',1,false,now(),'[{"id":"qc","type":"mc","correct":1}]'::jsonb),
+ ('00000000-0000-0000-0000-0000000750f4','00000000-0000-0000-0000-0000000750a0','q','00000000-0000-0000-0000-000000075009','750004','S4','started',1,false,NULL,'[{"id":"qd","type":"mc","correct":0}]'::jsonb);
 INSERT INTO public.game_answers (session_id, tenant_id, player_id, question_idx, option_idx, is_correct, points) VALUES
  ('00000000-0000-0000-0000-0000000750f1','00000000-0000-0000-0000-0000000750a0','00000000-0000-0000-0000-000000075005',0,1,true,100);
 INSERT INTO public.game_players (session_id, tenant_id, player_id, name, final_score, final_rank) VALUES
@@ -135,8 +142,8 @@ DO $$
 DECLARE ok boolean; v jsonb;
   S  uuid := '00000000-0000-0000-0000-0000000750f1';
   S2 uuid := '00000000-0000-0000-0000-0000000750f2';
+  S4 uuid := '00000000-0000-0000-0000-0000000750f4';
   tA uuid := '00000000-0000-0000-0000-0000000750a0';
-  PROCEDURE_dummy int;
 BEGIN
   -- helper macro via dynamic: set identity
   -- 1. host_session_restore: HU host ok; MA same-tenant ok; RA ok; MB denied; L(participant) denied; X denied; anon denied.
@@ -228,6 +235,35 @@ BEGIN
   BEGIN v := public.rpc_lobby_participants(S); ok:=true; EXCEPTION WHEN OTHERS THEN ok:=false; END; IF ok THEN RAISE EXCEPTION 'T6 lobby(other-tenant) NOT denied'; END IF;
   RESET ROLE;
   RAISE NOTICE '6. lobby_participants host/manager/participant only: PASS';
+
+  -- 7. MANAGER role: same-tenant manager MG(075007,tA) authorized like orgAdmin;
+  --    cross-tenant manager MGX(075008,tB) denied on tA data.
+  PERFORM set_config('request.jwt.claims','{"sub":"00000000-0000-0000-0000-000000075007","role":"authenticated"}',true); SET LOCAL ROLE authenticated;
+  IF (public.rpc_host_session_restore(S)->'session'->>'id') <> S::text THEN RAISE EXCEPTION 'T7 same-tenant manager restore denied'; END IF;
+  IF jsonb_typeof(public.rpc_manager_session_analytics(S)->'snapshot') <> 'array' THEN RAISE EXCEPTION 'T7 manager analytics denied'; END IF;
+  IF NOT EXISTS(SELECT 1 FROM jsonb_array_elements(public.rpc_manager_active_sessions(tA)) e WHERE e->>'id'=S2::text) THEN RAISE EXCEPTION 'T7 manager active empty'; END IF;
+  IF NOT EXISTS(SELECT 1 FROM jsonb_array_elements(public.rpc_manager_session_history(tA,20)) e WHERE e->>'id'=S::text) THEN RAISE EXCEPTION 'T7 manager history empty'; END IF;
+  IF (public.rpc_session_player_counts(ARRAY[S]) ->> S::text) <> '1' THEN RAISE EXCEPTION 'T7 manager counts wrong'; END IF;
+  IF jsonb_array_length(public.rpc_lobby_participants(S)) <> 1 THEN RAISE EXCEPTION 'T7 manager lobby wrong'; END IF;
+  RESET ROLE;
+  PERFORM set_config('request.jwt.claims','{"sub":"00000000-0000-0000-0000-000000075008","role":"authenticated"}',true); SET LOCAL ROLE authenticated;
+  BEGIN v:=public.rpc_host_session_restore(S); ok:=true; EXCEPTION WHEN OTHERS THEN ok:=false; END; IF ok THEN RAISE EXCEPTION 'T7 cross-tenant manager restore NOT denied'; END IF;
+  BEGIN v:=public.rpc_manager_session_analytics(S); ok:=true; EXCEPTION WHEN OTHERS THEN ok:=false; END; IF ok THEN RAISE EXCEPTION 'T7 cross-tenant manager analytics NOT denied'; END IF;
+  IF public.rpc_session_player_counts(ARRAY[S]) <> '{}'::jsonb THEN RAISE EXCEPTION 'T7 cross-tenant manager counts leaked'; END IF;
+  BEGIN v:=public.rpc_lobby_participants(S); ok:=true; EXCEPTION WHEN OTHERS THEN ok:=false; END; IF ok THEN RAISE EXCEPTION 'T7 cross-tenant manager lobby NOT denied'; END IF;
+  IF EXISTS(SELECT 1 FROM jsonb_array_elements(public.rpc_manager_active_sessions(tA)) e WHERE e->>'id'=S2::text) THEN RAISE EXCEPTION 'T7 cross-tenant manager saw tA active'; END IF;
+  RESET ROLE;
+  RAISE NOTICE '7. manager role (same-tenant allowed / cross-tenant denied): PASS';
+
+  -- 8. EXACT HOST valid even when host profile role is 'user': UH(075009,user,tA) hosts
+  --    S4 → may host-restore it; a same-tenant non-host learner (X) is still denied S4.
+  PERFORM set_config('request.jwt.claims','{"sub":"00000000-0000-0000-0000-000000075009","role":"authenticated"}',true); SET LOCAL ROLE authenticated;
+  IF (public.rpc_host_session_restore(S4)->'session'->>'id') <> S4::text THEN RAISE EXCEPTION 'T8 user-role exact host denied'; END IF;
+  RESET ROLE;
+  PERFORM set_config('request.jwt.claims','{"sub":"00000000-0000-0000-0000-000000075006","role":"authenticated"}',true); SET LOCAL ROLE authenticated;
+  BEGIN v:=public.rpc_host_session_restore(S4); ok:=true; EXCEPTION WHEN OTHERS THEN ok:=false; END; IF ok THEN RAISE EXCEPTION 'T8 non-host learner NOT denied'; END IF;
+  RESET ROLE;
+  RAISE NOTICE '8. exact host valid for role=user; non-host learner denied: PASS';
 
   RAISE NOTICE '075 ALL TESTS PASSED';
 END $$;
