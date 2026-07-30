@@ -21,6 +21,7 @@ import {
   startGameSession,
   endGameSession,
   getActiveSessions,
+  getLearnerJoinableSessions,
   joinGameSession,
   getLobbyParticipants,
   subscribeToLobbyParticipants,
@@ -6769,10 +6770,15 @@ function RankdNameEntryScreen({ onNav, pin, sessionName, onConfirm, defaultName,
 
 // ── RANKD LOBBY SCREEN ───────────────────────────────────────
 
-function RankdLobbyScreen({ onNav, pin, playerName, playerEmoji, sessionName, role, sessions = [], currentUser, onGameStart, chPlayers, broadcast, trackPlayerPresence, playerId, chMsg, onHostEnd }) {
+function RankdLobbyScreen({ onNav, pin, sessionDbId: propSessionDbId = null, playerName, playerEmoji, sessionName, role, sessions = [], currentUser, onGameStart, chPlayers, broadcast, trackPlayerPresence, playerId, chMsg, onHostEnd }) {
   const mobile = useMobile();
   const session     = sessions.find(s => s.code === pin);
-  const sessionDbId = session?.dbId ?? null;
+  // Lobby membership must derive from the DURABLE join-established id (App state,
+  // set at handleEnterPin), NOT the mutable `sessions` list — a session-list refresh
+  // returning [] (e.g. a learner whose manager-list RPC is empty) must never null the
+  // lobby's sessionDbId and tear down presence/heartbeat. Fall back to the list only
+  // for demo/legacy paths where no durable id exists.
+  const sessionDbId = propSessionDbId ?? session?.dbId ?? null;
 
   // demoMode: true only when admin has explicitly created a demo session.
   // A real tenant session always has demoMode: false (set in handleCreateSession).
@@ -7999,7 +8005,12 @@ function NewSessionScreen({ onNav, quizzes, onCreateSession }) {
   };
 
   return (
-    <div style={{ maxWidth: 680, display: "flex", flexDirection: "column", gap: 28 }}>
+    // Center the New Game Session form container within the area right of the nav
+    // sidebar: full-width flex wrapper centers the fixed-max-width column with
+    // comfortable side padding. Only the CONTAINER is centered — text and form
+    // fields stay left-aligned; on small screens the column is full-width and usable.
+    <div style={{ width: "100%", display: "flex", justifyContent: "center", padding: "0 24px", boxSizing: "border-box" }}>
+    <div style={{ width: "100%", maxWidth: 680, display: "flex", flexDirection: "column", gap: 28 }}>
       {/* Header */}
       <div style={{ display: "flex", alignItems: "center", gap: 14 }}>
         <button onClick={() => onNav("rankd")} style={{
@@ -8135,6 +8146,7 @@ function NewSessionScreen({ onNav, quizzes, onCreateSession }) {
           </button>
         </div>
       )}
+    </div>
     </div>
   );
 }
@@ -24571,10 +24583,15 @@ export default function App() {
     const tenantId = currentUser.orgId ?? null;
     if (!tenantId) return;
 
-    // Sessions
-    getActiveSessions(tenantId).then(({ data }) => {
-      if (data) setSessions(data);
-    });
+    // Sessions — each actor calls the RPC for its OWN contract (migration 077):
+    // admin-panel users (gameRole "admin" = orgAdmin/ralli_admin) get the manager
+    // Active Games list; everyone else (join panel: managers + learners) gets the
+    // learner-safe joinable list. Never route learners through the manager RPC
+    // (which returns [] and previously erased their joinable list + lobby identity).
+    (gameRole === "admin"
+      ? getActiveSessions(tenantId)
+      : getLearnerJoinableSessions()
+    ).then(({ data }) => { if (data) setSessions(data); });
     getGameHistory(tenantId).then(({ data, error }) => {
       if (error) console.error("[ralli:game] getGameHistory failed:", error);
       if (data) setPastSessions(data);
@@ -24738,8 +24755,11 @@ export default function App() {
     const tenantId = currentUser.orgId;
 
     const refresh = () => {
-      getActiveSessions(tenantId).then(({ data, error }) => {
-        if (error) console.error("[ralli:game] getActiveSessions error:", error);
+      (gameRole === "admin"
+        ? getActiveSessions(tenantId)
+        : getLearnerJoinableSessions()
+      ).then(({ data, error }) => {
+        if (error) console.error("[ralli:game] session list refresh error:", error);
         if (data) setSessions(data);
       });
       // Past Sessions shares the same "keep it current while on this screen"
@@ -25754,7 +25774,7 @@ export default function App() {
       case "rankd-new":         return <NewSessionScreen onNav={navigate} quizzes={quizzes} onCreateSession={handleCreateSession} />;
       case "rankd-quiz-builder":return <QuizBuilderScreen onNav={navigate} onSave={handleSaveQuiz} onDone={handleQuizBuilderDone} initialQuiz={editingQuiz} onEditQuiz={handleEditQuiz} isReal={!!user?._isReal} tenantId={currentOrg?.id ?? null} role={currentUser?.role ?? null} />;
       case "rankd-name-entry":  return <RankdNameEntryScreen onNav={navigate} pin={lobbyPin} sessionName={lobbySessionName} onConfirm={handleEnterName} defaultName={userProfile.nickname?.trim() || user?.name || ""} defaultAvatar={userProfile.avatarEmoji} />;
-      case "rankd-lobby":       return <RankdLobbyScreen onNav={navigate} pin={lobbyPin} playerName={lobbyPlayerName} playerEmoji={lobbyPlayerEmoji} sessionName={lobbySessionName} role={gameRole} sessions={sessions} currentUser={currentUser} onGameStart={handleGameStart} chPlayers={chPlayers} broadcast={broadcast} trackPlayerPresence={trackPlayerPresence} playerId={gamePlayerId} chMsg={chMsg} onHostEnd={async () => {
+      case "rankd-lobby":       return <RankdLobbyScreen onNav={navigate} pin={lobbyPin} sessionDbId={activeGameSessionDbId} playerName={lobbyPlayerName} playerEmoji={lobbyPlayerEmoji} sessionName={lobbySessionName} role={gameRole} sessions={sessions} currentUser={currentUser} onGameStart={handleGameStart} chPlayers={chPlayers} broadcast={broadcast} trackPlayerPresence={trackPlayerPresence} playerId={gamePlayerId} chMsg={chMsg} onHostEnd={async () => {
         // Ending from the LOBBY (before gameplay) is a CANCELLATION, not a
         // completed game. Durable cancellation is the source of truth and MUST
         // succeed before we tell anyone the game ended: cancel the DB row and

@@ -587,6 +587,35 @@ export async function getManagerSessionAnalytics(sessionId) {
  * @param {number} [limit=30]
  * @returns {Promise<{ data: Object[]|null, error: Object|null }>}
  */
+/**
+ * Learner-safe JOINABLE session list (migration 077) — the same-tenant waiting,
+ * non-demo sessions any authenticated tenant member may see to find/select a game
+ * to join. Server derives the tenant from the caller's profile. Returns ONLY safe
+ * display fields (no question_snapshot / live_question / answers / analytics), so
+ * ordinary learners (for whom the manager list returns []) get their joinable games
+ * back. Normalized to the SAME shape as getActiveSessions so the join panel is
+ * unchanged.
+ *
+ * @returns {Promise<{ data: Object[]|null, error: Object|null }>}
+ */
+export async function getLearnerJoinableSessions() {
+  const { data, error } = await supabase.rpc("rpc_learner_joinable_sessions");
+  if (error) return { data: null, error };
+  const rows = Array.isArray(data) ? data : [];
+  const normalised = rows.map(s => ({
+    code:          s.pin,
+    name:          s.name,
+    quizId:        s.quiz_id,
+    questionCount: s.question_count,
+    status:        s.status,
+    playerCount:   s.player_count ?? 0,
+    demoMode:      s.demo_mode ?? false,
+    players:       [],
+    dbId:          s.id,
+  }));
+  return { data: normalised, error: null };
+}
+
 export async function getActiveSessions(tenantId, limit = 30) { // eslint-disable-line no-unused-vars
   // Safe-read cutover (migration 075): server derives the caller's manager scope
   // from auth.uid()+profiles. orgAdmin → own tenant (p_tenant_id ignored server-side);
