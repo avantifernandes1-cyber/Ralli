@@ -17,6 +17,7 @@
  */
 
 import { supabase } from "./supabase.js";
+import { ACTIVE_SESSION_STATUSES, REVEAL_PRE_PHASES, classifyRevealPublish } from "./revealPublish.js";
 
 // ── SESSION ────────────────────────────────────────────────────────────────────
 
@@ -341,22 +342,30 @@ export async function updateSessionPhase(sessionId, { phase, currentQuestionInde
 }
 
 /**
- * Durable REVEAL publication — the confirmed, stale-guarded write that must
- * succeed BEFORE the host broadcasts the correct answer. Conditionally updates
- * ONLY the current question of a live session:
- *   - exact session id
- *   - current_question_index === the reveal's expected qIdx
- *   - session not terminal (status not completed/canceled; phase not ended)
- * If nothing matches (the game advanced to a newer question or ended), it returns
- * `{ stale: true }` and writes NOTHING — a delayed reveal can never overwrite a
- * newer live_question. Idempotent: re-persisting the same reveal for the same
- * question updates the same row again with the identical payload. Touches only
- * `phase` + `live_question`; never scoring/answers/timers.
+ * Durable REVEAL publication — the confirmed, state-guarded write that MUST
+ * succeed before the host broadcasts the correct answer.
+ *
+ * FIRST PUBLICATION (atomic, strict): flips phase→'reveal' + persists the reveal
+ * ONLY when the session is on the exact question, in a pre-reveal phase
+ * (`question`, or `open-review` for open-ended), and an ACTIVE status. This
+ * requirement — not merely "not terminal" — is what stops a delayed reveal from
+ * overwriting a same-index `countdown` (which cleared live_question) or any other
+ * non-question phase.
+ *
+ * 0-ROW OUTCOME is classified (read-only) from the current row:
+ *   - `idempotent`: phase already 'reveal' for this exact qIdx with the SAME
+ *     payload (a lost response after a successful persist) → success; the host may
+ *     broadcast the already-durable reveal without rewriting it.
+ *   - `conflict`: phase 'reveal' for this qIdx but a DIFFERENT payload → reject.
+ *   - `stale`: anything else (countdown/scoreboard/ended/unknown phase, newer/older
+ *     qIdx, terminal status) → reject, never overwrite.
+ *
+ * Touches only `phase` + `live_question`; never scoring/answers/timers.
  *
  * @param {string} sessionId
- * @param {number} expectedQIdx - the question index this reveal belongs to
+ * @param {number} expectedQIdx
  * @param {Object} liveQuestion - the frozen safe live_question payload incl. its `reveal` block
- * @returns {Promise<{ ok: boolean, stale: boolean, error: Object|null }>}
+ * @returns {Promise<{ ok: boolean, outcome: 'applied'|'idempotent'|'conflict'|'stale'|'error', error: Object|null }>}
  */
 export async function publishRevealDurable(sessionId, expectedQIdx, liveQuestion) {
   const { data, error } = await supabase
@@ -364,12 +373,23 @@ export async function publishRevealDurable(sessionId, expectedQIdx, liveQuestion
     .update({ phase: "reveal", live_question: liveQuestion })
     .eq("id", sessionId)
     .eq("current_question_index", expectedQIdx)
-    .not("status", "in", "(completed,canceled)")
-    .neq("phase", "ended")
+    .in("phase", REVEAL_PRE_PHASES)
+    .in("status", ACTIVE_SESSION_STATUSES)
     .select("id");
-  if (error) return { ok: false, stale: false, error };
-  if (!data || data.length === 0) return { ok: false, stale: true, error: null };
-  return { ok: true, stale: false, error: null };
+  if (error) return { ok: false, outcome: "error", error };
+  if (data && data.length === 1) return { ok: true, outcome: "applied", error: null };
+
+  // 0 rows: classify (read-only). No write occurred, so this only decides the
+  // return reason (idempotent lost-response / integrity conflict / stale).
+  const { data: cur, error: selErr } = await supabase
+    .from("game_sessions")
+    .select("phase, current_question_index, live_question")
+    .eq("id", sessionId)
+    .maybeSingle();
+  if (selErr) return { ok: false, outcome: "error", error: selErr };
+  const cls = classifyRevealPublish(cur, expectedQIdx, liveQuestion);
+  if (cls === "idempotent") return { ok: true, outcome: "idempotent", error: null };
+  return { ok: false, outcome: cls, error: null }; // 'conflict' | 'stale'
 }
 
 /**

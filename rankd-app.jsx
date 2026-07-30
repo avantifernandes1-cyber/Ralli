@@ -2440,14 +2440,17 @@ function KahootHostView({ onNav, sessionName, pin, sessionDbId, demoMode, tenant
     revealPublishingRef.current = true;
     try {
       if (sessionDbId) {
-        // Conditional durable write bound to THIS exact session + question. Broadcast
-        // only after it is confirmed. A stale (newer question / terminal) result is
-        // rejected and never overwrites a newer live_question.
+        // Strict, state-guarded durable write bound to THIS exact session + question.
+        // Broadcast ONLY after it is confirmed (applied) or already durably present
+        // with the identical payload (idempotent — a lost response). A stale result
+        // (newer/older question, countdown/scoreboard/ended, terminal) is abandoned;
+        // a conflict (a DIFFERENT reveal already stored for this qIdx) is surfaced.
         const res = await publishRevealDurable(sessionDbId, frozen.qIdx, frozen.liveQuestion);
-        if (res.stale) { revealPubRef.current = null; setRevealPublishError(false); return; } // superseded — abandon quietly
-        if (!res.ok)   { setRevealPublishError(true); return; }                                 // failure → host Retry; NO broadcast, NO reveal
+        if (res.outcome === "stale")    { revealPubRef.current = null; setRevealPublishError(false); return; } // superseded — abandon quietly
+        if (res.outcome === "conflict") { setRevealPublishError(true); return; }                                // integrity conflict → host Retry/End
+        if (!res.ok)                    { setRevealPublishError(true); return; }                                // error → host Retry; NO broadcast
       }
-      // Success (or demo / no-DB): broadcast EXACTLY once, show reveal, clear error.
+      // applied OR idempotent (or demo / no-DB): broadcast EXACTLY once, show reveal.
       broadcast(frozen.broadcastMsg);
       setPhase("reveal");
       setRevealPublishError(false);
@@ -2459,13 +2462,16 @@ function KahootHostView({ onNav, sessionName, pin, sessionDbId, demoMode, tenant
     }
   }, [sessionDbId]); // eslint-disable-line react-hooks/exhaustive-deps
 
-  // Freeze the reveal payload once, then publish. `revealInfo` → live_question.reveal
-  // (post-reveal correct-answer info for recovery); `broadcastMsg` → the exact REVEAL
-  // frame. Captured verbatim so Retry replays them unchanged (no re-grade/re-insert).
-  const publishReveal = useCallback((revealInfo, broadcastMsg) => {
+  // Freeze ONE canonical reveal object and publish. `revealAnswer` is the single
+  // source of the correct-answer details: it is persisted verbatim as
+  // live_question.reveal AND spread into the REVEAL broadcast, so the durable and
+  // broadcast reveals can never drift. Retry replays this exact frozen object
+  // (no re-grade / re-insert). `scores` is the already-computed ranking.
+  const publishReveal = useCallback((revealAnswer, scores) => {
+    const broadcastMsg = { type: GM.REVEAL, correctIdx: revealAnswer.correctIdx ?? null, scores, ...revealAnswer };
     revealPubRef.current = {
       qIdx,
-      liveQuestion: { ...(liveQuestionRef.current ?? {}), reveal: revealInfo },
+      liveQuestion: { ...(liveQuestionRef.current ?? {}), reveal: revealAnswer },
       broadcastMsg,
     };
     setRevealPublishError(false);
@@ -2635,7 +2641,7 @@ function KahootHostView({ onNav, sessionName, pin, sessionDbId, demoMode, tenant
       });
       newScores.sort((a, b) => b.score - a.score);
       setScores(newScores);
-      publishReveal({ acceptedAnswers: q.acceptedAnswers ?? [] }, { type: GM.REVEAL, correctIdx: null, scores: newScores, acceptedAnswers: q.acceptedAnswers ?? [] });
+      publishReveal({ acceptedAnswers: q.acceptedAnswers ?? [] }, newScores);
       if (sessionDbId) {
         // One row per known player, not just answerers — a player with no
         // chAnswers entry gets an explicit "unanswered" row (null text,
@@ -2680,7 +2686,7 @@ function KahootHostView({ onNav, sessionName, pin, sessionDbId, demoMode, tenant
       });
       newScores.sort((a, b) => b.score - a.score);
       setScores(newScores);
-      publishReveal({ sliderTarget: target, sliderTolerance: tol }, { type: GM.REVEAL, correctIdx: null, scores: newScores, sliderTarget: target, sliderTolerance: tol });
+      publishReveal({ sliderTarget: target, sliderTolerance: tol }, newScores);
       if (sessionDbId) {
         // See the "type" branch above for why this covers every known
         // player, not just answerers — needed to distinguish "unanswered"
@@ -2727,7 +2733,7 @@ function KahootHostView({ onNav, sessionName, pin, sessionDbId, demoMode, tenant
       });
       newScores.sort((a, b) => b.score - a.score);
       setScores(newScores);
-      publishReveal({ matchPairsCorrect: pairs, shuffledRight }, { type: GM.REVEAL, correctIdx: null, scores: newScores, matchPairsCorrect: pairs, shuffledRight });
+      publishReveal({ matchPairsCorrect: pairs, shuffledRight }, newScores);
       if (sessionDbId) {
         // See the "type" branch above for why this covers every known
         // player, not just answerers.
@@ -2771,7 +2777,7 @@ function KahootHostView({ onNav, sessionName, pin, sessionDbId, demoMode, tenant
     });
     newScores.sort((a, b) => b.score - a.score);
     setScores(newScores);
-    publishReveal({ correctIdx: q.correct }, { type: GM.REVEAL, correctIdx: q.correct, scores: newScores });
+    publishReveal({ correctIdx: q.correct }, newScores);
     // Persist each player's answer to game_answers (fire-and-forget).
     // Covers every known player, not just answerers — see the "type" branch
     // above for why: an explicit "unanswered" row is what lets post-game
@@ -2808,7 +2814,7 @@ function KahootHostView({ onNav, sessionName, pin, sessionDbId, demoMode, tenant
     });
     newScores.sort((a, b) => b.score - a.score);
     setScores(newScores);
-    publishReveal({ isOpen: true }, { type: GM.REVEAL, correctIdx: null, scores: newScores, isOpen: true });
+    publishReveal({ isOpen: true }, newScores);
     // Persist open-ended answers (fire-and-forget)
     if (sessionDbId) {
       const scoreMap = Object.fromEntries(newScores.map(p => [p.id, p]));

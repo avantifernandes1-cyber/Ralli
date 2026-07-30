@@ -10,51 +10,76 @@ BEGIN;
 INSERT INTO public.game_sessions (id, tenant_id, quiz_id, host_id, pin, name, status, question_count, demo_mode, phase, current_question_index)
  VALUES ('00000000-0000-0000-0000-0000000face1','00000000-0000-0000-0000-0000000face0','q','h','740001','R','live',3,false,'question',1);
 
+-- Exact FIRST-PUBLICATION guard used by publishRevealDurable():
+--   .eq(id).eq(current_question_index, expected)
+--   .in(phase, [question, open-review]).in(status, [waiting,started,live,active,paused])
+-- (idempotent/conflict for phase='reveal' are classified client-side, not by this UPDATE)
 DO $$
 DECLARE v_n int;
 BEGIN
-  -- Helper semantics = supabase.update({phase:'reveal',live_question}).eq(id).eq(current_question_index,expected)
-  --                    .not(status,in,(completed,canceled)).neq(phase,'ended')
-
-  -- 1. Matching current question (expected=1) → 1 row updated (reveal set).
+  -- 1. phase='question', matching qIdx, active status → applies (1 row → reveal).
   UPDATE public.game_sessions SET phase='reveal', live_question='{"qIdx":1,"reveal":{"correctIdx":1}}'::jsonb
    WHERE id='00000000-0000-0000-0000-0000000face1' AND current_question_index=1
-     AND status NOT IN ('completed','canceled') AND phase <> 'ended';
+     AND phase IN ('question','open-review') AND status IN ('waiting','started','live','active','paused');
   GET DIAGNOSTICS v_n = ROW_COUNT;
-  IF v_n <> 1 THEN RAISE EXCEPTION 'T1 FAIL: current-question reveal did not apply (%)', v_n; END IF;
-  IF (SELECT phase FROM public.game_sessions WHERE id='00000000-0000-0000-0000-0000000face1') <> 'reveal' THEN RAISE EXCEPTION 'T1 FAIL: phase not reveal'; END IF;
-  RAISE NOTICE '1. reveal for the CURRENT question applies (phase=reveal): PASS';
+  IF v_n <> 1 OR (SELECT phase FROM public.game_sessions WHERE id='00000000-0000-0000-0000-0000000face1') <> 'reveal'
+    THEN RAISE EXCEPTION 'T1 FAIL: reveal from phase=question did not apply (%)', v_n; END IF;
+  RAISE NOTICE '1. reveal from phase=question (current qIdx, active) applies: PASS';
 
-  -- 2. Idempotent re-publish for the SAME question (still index 1) → applies again (1 row), same payload.
+  -- 2. open-ended path: reveal transitions from phase='open-review'.
+  UPDATE public.game_sessions SET phase='open-review' WHERE id='00000000-0000-0000-0000-0000000face1';
+  UPDATE public.game_sessions SET phase='reveal', live_question='{"qIdx":1,"reveal":{"isOpen":true}}'::jsonb
+   WHERE id='00000000-0000-0000-0000-0000000face1' AND current_question_index=1
+     AND phase IN ('question','open-review') AND status IN ('waiting','started','live','active','paused');
+  GET DIAGNOSTICS v_n = ROW_COUNT;
+  IF v_n <> 1 THEN RAISE EXCEPTION 'T2 FAIL: open-ended reveal from open-review did not apply'; END IF;
+  RAISE NOTICE '2. reveal from phase=open-review (open-ended) applies: PASS';
+
+  -- 3. THE FIX — phase='countdown' with the SAME qIdx must be rejected (0 rows),
+  --    so a delayed reveal cannot overwrite the cleared live_question in countdown.
+  UPDATE public.game_sessions SET phase='countdown', current_question_index=1, live_question=NULL WHERE id='00000000-0000-0000-0000-0000000face1';
   UPDATE public.game_sessions SET phase='reveal', live_question='{"qIdx":1,"reveal":{"correctIdx":1}}'::jsonb
    WHERE id='00000000-0000-0000-0000-0000000face1' AND current_question_index=1
-     AND status NOT IN ('completed','canceled') AND phase <> 'ended';
+     AND phase IN ('question','open-review') AND status IN ('waiting','started','live','active','paused');
   GET DIAGNOSTICS v_n = ROW_COUNT;
-  IF v_n <> 1 THEN RAISE EXCEPTION 'T2 FAIL: idempotent re-publish should still match'; END IF;
-  RAISE NOTICE '2. idempotent re-publish of the same reveal matches (1 row): PASS';
+  IF v_n <> 0 THEN RAISE EXCEPTION 'T3 FAIL: reveal overwrote a same-qIdx COUNTDOWN'; END IF;
+  IF (SELECT live_question FROM public.game_sessions WHERE id='00000000-0000-0000-0000-0000000face1') IS NOT NULL
+     THEN RAISE EXCEPTION 'T3 FAIL: cleared countdown live_question was clobbered'; END IF;
+  RAISE NOTICE '3. delayed reveal during same-qIdx COUNTDOWN is rejected; cleared live_question intact: PASS';
 
-  -- Advance the game to question index 2 (host moved to the next question).
-  UPDATE public.game_sessions SET phase='question', current_question_index=2,
-         live_question='{"qIdx":2}'::jsonb WHERE id='00000000-0000-0000-0000-0000000face1';
-
-  -- 3. A DELAYED reveal for the OLD question (expected=1) must NOT apply (0 rows) — never overwrite the newer question.
+  -- 4. phase='scoreboard' same qIdx → rejected.
+  UPDATE public.game_sessions SET phase='scoreboard' WHERE id='00000000-0000-0000-0000-0000000face1';
   UPDATE public.game_sessions SET phase='reveal', live_question='{"qIdx":1,"reveal":{"correctIdx":1}}'::jsonb
    WHERE id='00000000-0000-0000-0000-0000000face1' AND current_question_index=1
-     AND status NOT IN ('completed','canceled') AND phase <> 'ended';
+     AND phase IN ('question','open-review') AND status IN ('waiting','started','live','active','paused');
   GET DIAGNOSTICS v_n = ROW_COUNT;
-  IF v_n <> 0 THEN RAISE EXCEPTION 'T3 FAIL: stale reveal for an old question overwrote a newer one (%)', v_n; END IF;
-  IF (SELECT live_question->>'qIdx' FROM public.game_sessions WHERE id='00000000-0000-0000-0000-0000000face1') <> '2'
-     THEN RAISE EXCEPTION 'T3 FAIL: newer question payload was clobbered'; END IF;
-  RAISE NOTICE '3. delayed old-question reveal is rejected; newer live_question intact: PASS';
+  IF v_n <> 0 THEN RAISE EXCEPTION 'T4 FAIL: reveal applied during scoreboard'; END IF;
+  RAISE NOTICE '4. reveal during scoreboard is rejected: PASS';
 
-  -- 4. Terminal session (completed) → reveal for its current question is rejected (0 rows).
-  UPDATE public.game_sessions SET status='completed' WHERE id='00000000-0000-0000-0000-0000000face1';
+  -- 5. newer qIdx → rejected (delayed old reveal cannot touch a newer question).
+  UPDATE public.game_sessions SET phase='question', current_question_index=2, live_question='{"qIdx":2}'::jsonb WHERE id='00000000-0000-0000-0000-0000000face1';
+  UPDATE public.game_sessions SET phase='reveal', live_question='{"qIdx":1,"reveal":{"correctIdx":1}}'::jsonb
+   WHERE id='00000000-0000-0000-0000-0000000face1' AND current_question_index=1
+     AND phase IN ('question','open-review') AND status IN ('waiting','started','live','active','paused');
+  GET DIAGNOSTICS v_n = ROW_COUNT;
+  IF v_n <> 0 OR (SELECT live_question->>'qIdx' FROM public.game_sessions WHERE id='00000000-0000-0000-0000-0000000face1') <> '2'
+    THEN RAISE EXCEPTION 'T5 FAIL: stale old-qIdx reveal overwrote a newer question'; END IF;
+  RAISE NOTICE '5. delayed old-qIdx reveal is rejected; newer question intact: PASS';
+
+  -- 6. terminal status (completed/canceled — exact spellings) → rejected.
+  UPDATE public.game_sessions SET phase='question', current_question_index=2, status='completed' WHERE id='00000000-0000-0000-0000-0000000face1';
   UPDATE public.game_sessions SET phase='reveal', live_question='{"qIdx":2,"reveal":{"correctIdx":1}}'::jsonb
    WHERE id='00000000-0000-0000-0000-0000000face1' AND current_question_index=2
-     AND status NOT IN ('completed','canceled') AND phase <> 'ended';
+     AND phase IN ('question','open-review') AND status IN ('waiting','started','live','active','paused');
   GET DIAGNOSTICS v_n = ROW_COUNT;
-  IF v_n <> 0 THEN RAISE EXCEPTION 'T4 FAIL: reveal applied to a completed session'; END IF;
-  RAISE NOTICE '4. reveal on a terminal (completed/canceled) session is rejected: PASS';
+  IF v_n <> 0 THEN RAISE EXCEPTION 'T6 FAIL: reveal applied to a completed session'; END IF;
+  UPDATE public.game_sessions SET status='canceled' WHERE id='00000000-0000-0000-0000-0000000face1';
+  UPDATE public.game_sessions SET phase='reveal', live_question='{"qIdx":2}'::jsonb
+   WHERE id='00000000-0000-0000-0000-0000000face1' AND current_question_index=2
+     AND phase IN ('question','open-review') AND status IN ('waiting','started','live','active','paused');
+  GET DIAGNOSTICS v_n = ROW_COUNT;
+  IF v_n <> 0 THEN RAISE EXCEPTION 'T6 FAIL: reveal applied to a canceled session'; END IF;
+  RAISE NOTICE '6. reveal on terminal (completed / canceled) sessions is rejected: PASS';
 
   RAISE NOTICE 'REVEAL STALE-GUARD ALL TESTS PASSED';
 END $$;
