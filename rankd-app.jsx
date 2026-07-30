@@ -23467,6 +23467,34 @@ function clearLearnNavSessionState() {
   try { for (const k of LEARN_NAV_SESSION_KEYS) sessionStorage.removeItem(k); } catch {}
 }
 
+// ── Active-game refresh reconnect ────────────────────────────────────────────
+// Minimal, server-validated context that lets an AUTHENTICATED learner who
+// REFRESHES mid-game land back in the exact same game instead of the login/
+// marketing screen or Home. Only the sessionDbId and the player's chosen display
+// identity are stored — the PIN, session name, status and phase are read
+// authoritatively from rpc_player_session_restore on reload, which also verifies
+// the caller is a participant of that (same-tenant) session. Kept in
+// sessionStorage (not localStorage) so a genuine tab-close discards it (manual
+// rejoin), while a same-tab refresh preserves it. Scoped by authenticated user id
+// and re-validated server-side on restore, so it can never restore one user into
+// another user's game, a completed/canceled game, or a cross-tenant session.
+const ACTIVE_GAME_KEY = "ralli_active_game";
+function readActiveGameContext() {
+  try {
+    const raw = sessionStorage.getItem(ACTIVE_GAME_KEY);
+    if (!raw) return null;
+    const c = JSON.parse(raw);
+    if (!c || c.v !== 1 || !c.userId || !c.sessionDbId) return null;
+    return c;
+  } catch { return null; }
+}
+function writeActiveGameContext(c) {
+  try { sessionStorage.setItem(ACTIVE_GAME_KEY, JSON.stringify({ v: 1, ...c })); } catch {}
+}
+function clearActiveGameContext() {
+  try { sessionStorage.removeItem(ACTIVE_GAME_KEY); } catch {}
+}
+
 // Fallback when there's no valid persisted screen to restore (first login,
 // stale/invalid value, or role no longer matches). Ralli platform admins land
 // on Organizations; everyone else lands on "home", which itself renders the
@@ -24390,7 +24418,16 @@ export default function App() {
   // Superadmin always passes. Use this throughout the render tree.
   const perm = (scope, key) => hasPermission(rolePermissions, role, scope, key);
 
-  const navigate = (s) => setScreen(s);
+  const navigate = (s) => {
+    // Leaving an active game (explicit Leave / Back to Games / end screen) → drop the
+    // refresh reconnect context so a later refresh never re-enters a game the player
+    // already left. Staying within the game/lobby/name-entry join flow keeps it.
+    if ((screen === "rankd-game" || screen === "rankd-lobby")
+        && s !== "rankd-game" && s !== "rankd-lobby" && s !== "rankd-name-entry") {
+      clearActiveGameContext();
+    }
+    setScreen(s);
+  };
   // A FRESH click of a top-level nav item. Clicking "Learn" always opens its
   // primary view (manager: Assignments) — we seed the persisted subtab so a
   // deliberate nav is distinguishable from a browser refresh (which restores the
@@ -24467,8 +24504,42 @@ export default function App() {
               setScreen(restoredScreen ?? defaultScreenForRestore(false));
             }
           } else {
-            // Standard user (rep) — restore their last screen, else Personal Dashboard.
-            setScreen(restoredScreen ?? defaultScreenForRestore(false));
+            // Standard user (rep). FIRST try to restore an ACTIVE Ralli Live game the
+            // player was in when they refreshed — auth is now resolved, so we validate
+            // the saved sessionDbId through the learner-safe restore RPC (which proves
+            // participant + same-tenant) and only re-enter if the session is still
+            // active. Else fall back to their last screen / Personal Dashboard.
+            let reconnected = false;
+            const gameCtx = readActiveGameContext();
+            if (gameCtx && gameCtx.userId === profile.id) {
+              try {
+                const { session } = await getPlayerSessionRestore(gameCtx.sessionDbId);
+                const s = session?.data;
+                const terminal = !s || s.status === "completed" || s.status === "canceled" || s.phase === "ended";
+                if (s && !terminal) {
+                  // Valid, active, RPC-verified as this user's participant session.
+                  setActiveGameSessionDbId(gameCtx.sessionDbId);
+                  setActiveGameIsDemo(false);
+                  setLobbyPin(s.pin ?? null);
+                  setLobbySessionName(s.name ?? null);
+                  setLobbyPlayerName(gameCtx.playerName ?? profile.name ?? null);
+                  setLobbyPlayerEmoji(gameCtx.playerEmoji ?? null);
+                  // Live (started or past waiting) → game view; still waiting → lobby.
+                  // KahootPlayerView.reconcile then restores the exact phase/question/score.
+                  const live = s.status === "started" || (s.phase && s.phase !== "waiting");
+                  setScreen(live ? "rankd-game" : "rankd-lobby");
+                  reconnected = true;
+                } else {
+                  clearActiveGameContext(); // completed / canceled / ended → never restore
+                }
+              } catch (e) {
+                console.error("[ralli:game] active-game reconnect failed:", e);
+                clearActiveGameContext(); // denied / not a participant / cross-tenant
+              }
+            } else if (gameCtx) {
+              clearActiveGameContext(); // cross-user stale context → never restore into another user's game
+            }
+            if (!reconnected) setScreen(restoredScreen ?? defaultScreenForRestore(false));
           }
         }
       }
@@ -24497,6 +24568,7 @@ export default function App() {
         setPastSessions([]);                     // prevent real past sessions leaking to next demo user
         setBattleCards(INITIAL_BATTLE_CARDS);    // prevent real BC data leaking to next demo user
         clearLearnNavSessionState();              // don't leak screen / Learn subtab / pending quiz review into the next login
+        clearActiveGameContext();                 // never restore the signed-out user's game into the next login
         clearBattleCardDrafts();                  // don't leak an unsaved Battle Card draft into the next login
         window.location.replace("/login");        // hard-navigate so URL matches the login screen
       }
@@ -24716,6 +24788,28 @@ export default function App() {
   const lobbySessionDbId = activeGameSessionDbId;
   const gameChannelKey = isInGame ? (lobbySessionDbId ?? lobbyPin) : null;
   const { chPlayers, chAnswers, setChAnswers, chMsg, broadcast, chStatus, trackPlayerPresence } = useGameChannel(gameChannelKey, gameRole);
+
+  // Persist minimal active-game reconnect context (see readActiveGameContext) while
+  // an authenticated learner is in a REAL game, so a page refresh restores them into
+  // the exact same game. Never clears here — that would wipe the context during the
+  // pre-auth boot render; clearing is explicit (leave / sign-out / game end / invalid
+  // restore). Validation on restore rejects anything stale, completed, or cross-user.
+  useEffect(() => {
+    const inRealGame = !!currentUser?._isReal
+      && !!currentUser?.id
+      && gameRole === "user"
+      && (screen === "rankd-game" || screen === "rankd-lobby")
+      && activeGameSessionDbId != null
+      && !activeGameIsDemo;
+    if (inRealGame) {
+      writeActiveGameContext({
+        userId:      currentUser.id,
+        sessionDbId: activeGameSessionDbId,
+        playerName:  lobbyPlayerName ?? currentUser.name ?? null,
+        playerEmoji: lobbyPlayerEmoji ?? null,
+      });
+    }
+  }, [currentUser, gameRole, screen, activeGameSessionDbId, activeGameIsDemo, lobbyPlayerName, lobbyPlayerEmoji]);
 
   // Recovery mode takes priority over normal routing — show the reset form regardless
   // of whether a session exists. This prevents the app from routing past the form if
@@ -25568,6 +25662,7 @@ export default function App() {
     }
     // Accepted. Persisted → exact dbId; demo → null id with code identity.
     const endedDbId = isDemoGame ? null : appDbId;
+    clearActiveGameContext(); // game finished — a later refresh must not re-enter it
     setGameResultsData({ ...data, sessionDbId: endedDbId, sessionCode: lobbyPin });
     setViewResultsDbId(endedDbId);
     setViewResultsCode(lobbyPin);
@@ -25725,7 +25820,7 @@ export default function App() {
       case "settings":
         if (isSuperAdmin)  return <RoleAccessScreen rolePermissions={rolePermissions} onSave={handleSaveRolePermissions} currentOrg={currentOrg} />;
         if (isOrgAdmin)    return <OrgAdminSettingsScreen rolePermissions={rolePermissions} onSaveRolePermissions={handleSaveRolePermissions} currentOrg={currentOrg} orgId={user.orgId} orgName={currentOrg?.name ?? "Your Team"} orgUsers={orgUsers} onAddUser={handleAddUser} readinessThreshold={readinessThreshold} onSaveReadinessThreshold={handleSaveReadinessThreshold} />;
-        return <UserSettingsScreen user={user} profile={userProfile} notifPrefs={notifPrefs} onSaveProfile={handleSaveProfile} onSaveNotifs={handleSaveNotifs} currentOrg={currentOrg} onSignOut={async () => { if (user?._isReal) { await supabase.auth.signOut(); /* SIGNED_OUT handler redirects */ } else { setCurrentUser(null); setLastSeenAt(null); setNewAssignmentCount(0); setPendingLessonId(null); setPendingCourseId(null); setPendingQuizId(null); setOrgs(INITIAL_ORGS); setOrgUsers(INITIAL_ORG_USERS); setQuizzesReady(false); setSessions(INITIAL_SESSIONS); setBattleCards(INITIAL_BATTLE_CARDS); clearLearnNavSessionState(); clearBattleCardDrafts(); window.location.replace("/login"); } }} />;
+        return <UserSettingsScreen user={user} profile={userProfile} notifPrefs={notifPrefs} onSaveProfile={handleSaveProfile} onSaveNotifs={handleSaveNotifs} currentOrg={currentOrg} onSignOut={async () => { if (user?._isReal) { await supabase.auth.signOut(); /* SIGNED_OUT handler redirects */ } else { setCurrentUser(null); setLastSeenAt(null); setNewAssignmentCount(0); setPendingLessonId(null); setPendingCourseId(null); setPendingQuizId(null); setOrgs(INITIAL_ORGS); setOrgUsers(INITIAL_ORG_USERS); setQuizzesReady(false); setSessions(INITIAL_SESSIONS); setBattleCards(INITIAL_BATTLE_CARDS); clearLearnNavSessionState(); clearActiveGameContext(); clearBattleCardDrafts(); window.location.replace("/login"); } }} />;
       default:                  return <HomeScreen user={user} />;
     }
   };
@@ -25872,6 +25967,7 @@ export default function App() {
                     setBattleCards(INITIAL_BATTLE_CARDS);
 
                     clearLearnNavSessionState();
+                    clearActiveGameContext();
                     clearBattleCardDrafts();
                     window.location.replace("/login");
                   }
