@@ -341,6 +341,38 @@ export async function updateSessionPhase(sessionId, { phase, currentQuestionInde
 }
 
 /**
+ * Durable REVEAL publication — the confirmed, stale-guarded write that must
+ * succeed BEFORE the host broadcasts the correct answer. Conditionally updates
+ * ONLY the current question of a live session:
+ *   - exact session id
+ *   - current_question_index === the reveal's expected qIdx
+ *   - session not terminal (status not completed/canceled; phase not ended)
+ * If nothing matches (the game advanced to a newer question or ended), it returns
+ * `{ stale: true }` and writes NOTHING — a delayed reveal can never overwrite a
+ * newer live_question. Idempotent: re-persisting the same reveal for the same
+ * question updates the same row again with the identical payload. Touches only
+ * `phase` + `live_question`; never scoring/answers/timers.
+ *
+ * @param {string} sessionId
+ * @param {number} expectedQIdx - the question index this reveal belongs to
+ * @param {Object} liveQuestion - the frozen safe live_question payload incl. its `reveal` block
+ * @returns {Promise<{ ok: boolean, stale: boolean, error: Object|null }>}
+ */
+export async function publishRevealDurable(sessionId, expectedQIdx, liveQuestion) {
+  const { data, error } = await supabase
+    .from("game_sessions")
+    .update({ phase: "reveal", live_question: liveQuestion })
+    .eq("id", sessionId)
+    .eq("current_question_index", expectedQIdx)
+    .not("status", "in", "(completed,canceled)")
+    .neq("phase", "ended")
+    .select("id");
+  if (error) return { ok: false, stale: false, error };
+  if (!data || data.length === 0) return { ok: false, stale: true, error: null };
+  return { ok: true, stale: false, error: null };
+}
+
+/**
  * Batch-insert per-question answers for all players after a reveal.
  * Called by KahootHostView.doReveal() once scores are computed.
  *

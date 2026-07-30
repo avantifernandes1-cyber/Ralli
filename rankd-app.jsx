@@ -42,6 +42,7 @@ import {
   getPlayerSessionRestore,
   getMyCompletedSessionReview,
   listMyGameHistory,
+  publishRevealDurable,
 } from "./src/lib/gameService.js";
 // Canonical, runtime-neutral answer grader — the SINGLE source of correctness
 // truth shared by the live host reveal (below) and the server verification path.
@@ -2421,20 +2422,57 @@ function KahootHostView({ onNav, sessionName, pin, sessionDbId, demoMode, tenant
   // re-broadcasting the canonical question.
   const liveQuestionRef = useRef(null);
 
-  // At REVEAL (question durably closed), persist the SAFE live_question + a
-  // `reveal` block carrying the correct-answer info the REVEAL broadcast already
-  // sends. This is the ONLY durable source reveal RECOVERY uses for the correct
-  // answer — the pre-reveal payload never contained it. Post-reveal, so safe.
-  const persistReveal = useCallback((revealInfo) => {
-    if (!sessionDbId) return;
-    const base = liveQuestionRef.current ?? {};
-    updateSessionPhase(sessionDbId, {
-      phase: "reveal",
-      currentQuestionIndex: qIdx,
-      paused: false,
-      liveQuestion: { ...base, reveal: revealInfo },
-    }).catch(e => console.error("[ralli:host] persistReveal failed:", e));
-  }, [sessionDbId, qIdx]); // eslint-disable-line react-hooks/exhaustive-deps
+  // ── Strict reveal PUBLICATION (persist-confirm-then-broadcast) ────────────────
+  // Grading/scoring/answer-inserts happen ONCE in doReveal. The REVEAL is then
+  // PUBLISHED here: the correct-answer payload is durably persisted (stale-guarded)
+  // and broadcast ONLY after that write is confirmed — so a failed persistence can
+  // never leave the DB on `question` while players are told the answer, and a
+  // delayed write can never attach an old reveal to a newer question. Retry reuses
+  // the same frozen payload and never re-grades/re-inserts.
+  const revealPubRef = useRef(null);            // frozen { qIdx, liveQuestion, broadcastMsg }
+  const revealPublishingRef = useRef(false);    // concurrent / double-click guard
+  const [revealPublishError, setRevealPublishError] = useState(false);
+
+  const runRevealPublish = useCallback(async () => {
+    const frozen = revealPubRef.current;
+    if (!frozen) return;
+    if (revealPublishingRef.current) return;    // prevent concurrent/repeated publication
+    revealPublishingRef.current = true;
+    try {
+      if (sessionDbId) {
+        // Conditional durable write bound to THIS exact session + question. Broadcast
+        // only after it is confirmed. A stale (newer question / terminal) result is
+        // rejected and never overwrites a newer live_question.
+        const res = await publishRevealDurable(sessionDbId, frozen.qIdx, frozen.liveQuestion);
+        if (res.stale) { revealPubRef.current = null; setRevealPublishError(false); return; } // superseded — abandon quietly
+        if (!res.ok)   { setRevealPublishError(true); return; }                                 // failure → host Retry; NO broadcast, NO reveal
+      }
+      // Success (or demo / no-DB): broadcast EXACTLY once, show reveal, clear error.
+      broadcast(frozen.broadcastMsg);
+      setPhase("reveal");
+      setRevealPublishError(false);
+    } catch (e) {
+      console.error("[ralli:host] reveal publish failed:", e);
+      setRevealPublishError(true);              // no broadcast on failure
+    } finally {
+      revealPublishingRef.current = false;
+    }
+  }, [sessionDbId]); // eslint-disable-line react-hooks/exhaustive-deps
+
+  // Freeze the reveal payload once, then publish. `revealInfo` → live_question.reveal
+  // (post-reveal correct-answer info for recovery); `broadcastMsg` → the exact REVEAL
+  // frame. Captured verbatim so Retry replays them unchanged (no re-grade/re-insert).
+  const publishReveal = useCallback((revealInfo, broadcastMsg) => {
+    revealPubRef.current = {
+      qIdx,
+      liveQuestion: { ...(liveQuestionRef.current ?? {}), reveal: revealInfo },
+      broadcastMsg,
+    };
+    setRevealPublishError(false);
+    runRevealPublish();
+  }, [qIdx, runRevealPublish]);
+
+  const retryRevealPublish = useCallback(() => { runRevealPublish(); }, [runRevealPublish]);
 
   const persistPhase = useCallback((nextPhase, nextQIdx, nextPaused) => {
     if (!sessionDbId) return;
@@ -2597,9 +2635,7 @@ function KahootHostView({ onNav, sessionName, pin, sessionDbId, demoMode, tenant
       });
       newScores.sort((a, b) => b.score - a.score);
       setScores(newScores);
-      setPhase("reveal");
-      persistReveal({ acceptedAnswers: q.acceptedAnswers ?? [] });
-      broadcast({ type: GM.REVEAL, correctIdx: null, scores: newScores, acceptedAnswers: q.acceptedAnswers ?? [] });
+      publishReveal({ acceptedAnswers: q.acceptedAnswers ?? [] }, { type: GM.REVEAL, correctIdx: null, scores: newScores, acceptedAnswers: q.acceptedAnswers ?? [] });
       if (sessionDbId) {
         // One row per known player, not just answerers — a player with no
         // chAnswers entry gets an explicit "unanswered" row (null text,
@@ -2644,9 +2680,7 @@ function KahootHostView({ onNav, sessionName, pin, sessionDbId, demoMode, tenant
       });
       newScores.sort((a, b) => b.score - a.score);
       setScores(newScores);
-      setPhase("reveal");
-      persistReveal({ sliderTarget: target, sliderTolerance: tol });
-      broadcast({ type: GM.REVEAL, correctIdx: null, scores: newScores, sliderTarget: target, sliderTolerance: tol });
+      publishReveal({ sliderTarget: target, sliderTolerance: tol }, { type: GM.REVEAL, correctIdx: null, scores: newScores, sliderTarget: target, sliderTolerance: tol });
       if (sessionDbId) {
         // See the "type" branch above for why this covers every known
         // player, not just answerers — needed to distinguish "unanswered"
@@ -2693,9 +2727,7 @@ function KahootHostView({ onNav, sessionName, pin, sessionDbId, demoMode, tenant
       });
       newScores.sort((a, b) => b.score - a.score);
       setScores(newScores);
-      setPhase("reveal");
-      persistReveal({ matchPairsCorrect: pairs, shuffledRight });
-      broadcast({ type: GM.REVEAL, correctIdx: null, scores: newScores, matchPairsCorrect: pairs, shuffledRight });
+      publishReveal({ matchPairsCorrect: pairs, shuffledRight }, { type: GM.REVEAL, correctIdx: null, scores: newScores, matchPairsCorrect: pairs, shuffledRight });
       if (sessionDbId) {
         // See the "type" branch above for why this covers every known
         // player, not just answerers.
@@ -2720,8 +2752,6 @@ function KahootHostView({ onNav, sessionName, pin, sessionDbId, demoMode, tenant
     const qTotal = Object.values(chAnswers).length;
     const qAvgMs = qTotal > 0 ? Object.values(chAnswers).reduce((s,a) => s+(a.timeMs||0), 0) / qTotal : 0;
     setQuestionHistory(h => [...h, { qIdx, q: q?.q, options: q?.options, correct: q?.correct, distribution: qDist, correctCount: qDist[q?.correct]||0, totalAnswers: qTotal, avgTimeMs: qAvgMs }]);
-    setPhase("reveal");
-    persistReveal({ correctIdx: q.correct });
     // Tri-level fallback: scores state → presence chPlayers → chAnswers keys (always populated at this point)
     let baseScores;
     if (scores.length > 0) {
@@ -2741,7 +2771,7 @@ function KahootHostView({ onNav, sessionName, pin, sessionDbId, demoMode, tenant
     });
     newScores.sort((a, b) => b.score - a.score);
     setScores(newScores);
-    broadcast({ type: GM.REVEAL, correctIdx: q.correct, scores: newScores });
+    publishReveal({ correctIdx: q.correct }, { type: GM.REVEAL, correctIdx: q.correct, scores: newScores });
     // Persist each player's answer to game_answers (fire-and-forget).
     // Covers every known player, not just answerers — see the "type" branch
     // above for why: an explicit "unanswered" row is what lets post-game
@@ -2778,9 +2808,7 @@ function KahootHostView({ onNav, sessionName, pin, sessionDbId, demoMode, tenant
     });
     newScores.sort((a, b) => b.score - a.score);
     setScores(newScores);
-    broadcast({ type: GM.REVEAL, correctIdx: null, scores: newScores, isOpen: true });
-    setPhase("reveal");
-    persistReveal({ isOpen: true });
+    publishReveal({ isOpen: true }, { type: GM.REVEAL, correctIdx: null, scores: newScores, isOpen: true });
     // Persist open-ended answers (fire-and-forget)
     if (sessionDbId) {
       const scoreMap = Object.fromEntries(newScores.map(p => [p.id, p]));
@@ -2930,6 +2958,37 @@ function KahootHostView({ onNav, sessionName, pin, sessionDbId, demoMode, tenant
               style={{ padding: "10px 24px", borderRadius: 12, border: `1.5px solid ${C.border}`, background: "#fff", color: C.text, fontWeight: 700, fontSize: 14, cursor: "pointer" }}
             >
               Back to Games
+            </button>
+          </div>
+        </div>
+      </div>
+    );
+  }
+
+  // Durable REVEAL persistence failed — the correct answer was NOT broadcast
+  // (players stay in their submitted/waiting state), progression is paused, and
+  // grading/scores/answers are already saved. Retry Reveal re-attempts the
+  // confirmed persist-then-broadcast with the SAME frozen payload (never re-grades
+  // or re-inserts); End Game exits cleanly. Correct answers are never shown here.
+  if (revealPublishError) {
+    return (
+      <div style={{ minHeight: "100%", display: "flex", alignItems: "center", justifyContent: "center", background: C.cream }}>
+        <div style={{ textAlign: "center", padding: 40, maxWidth: 380 }}>
+          <div style={{ fontSize: 36, marginBottom: 16 }}>⚠️</div>
+          <p style={{ margin: "0 0 8px", fontSize: 15, fontWeight: 700, color: C.text }}>Couldn’t publish the reveal</p>
+          <p style={{ margin: "0 0 24px", fontSize: 13, color: C.textMuted }}>The correct answer wasn’t sent to players and no one advanced. Your scores are safe — retry to reveal, or end the game.</p>
+          <div style={{ display: "flex", gap: 10, justifyContent: "center" }}>
+            <button
+              onClick={retryRevealPublish}
+              style={{ padding: "10px 24px", borderRadius: 12, border: "none", background: C.orange, color: "#fff", fontWeight: 700, fontSize: 14, cursor: "pointer" }}
+            >
+              Retry Reveal
+            </button>
+            <button
+              onClick={doForceEnd}
+              style={{ padding: "10px 24px", borderRadius: 12, border: `1.5px solid ${C.border}`, background: "#fff", color: C.text, fontWeight: 700, fontSize: 14, cursor: "pointer" }}
+            >
+              End Game
             </button>
           </div>
         </div>
