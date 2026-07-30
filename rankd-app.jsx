@@ -3552,6 +3552,27 @@ function KahootPlayerView({ onNav, playerName, playerEmoji, playerId, pin, sessi
   const [finalScores,   setFinalScores]   = useState(null);
   const [gamePaused,    setGamePaused]    = useState(false);
   const [showLeaveConfirm, setShowLeaveConfirm] = useState(false);
+  const leavingRef = useRef(false);
+  // Explicit Leave lifecycle (prompt departed-player cleanup): (1) durably mark the
+  // participant 'left' via the existing service and (2) confirm the write, then (3)
+  // untrack realtime presence + (4) notify the host (the PLAYER_LEAVE path calls
+  // channel.untrack(), so the host's presence sync drops this player from its
+  // connected-active roster immediately — no waiting for heartbeat-stale), then (5)
+  // navigate away. Clears the active-game reconnect context so a later refresh does
+  // not re-enter a game the player intentionally left. Never touches game_answers /
+  // game_players, so points and historical answers are preserved.
+  const doLeave = async () => {
+    if (leavingRef.current) return; // guard double-click
+    leavingRef.current = true;
+    setShowLeaveConfirm(false);
+    if (sessionDbId && playerId) {
+      const { error } = await markParticipantLeft(sessionDbId, playerId);
+      if (error) console.error("[ralli:player] leave: durable mark-left failed:", error);
+    }
+    try { broadcast?.({ type: GM.PLAYER_LEAVE, playerId }); } catch (e) { console.error("[ralli:player] leave: presence untrack failed:", e); }
+    try { clearActiveGameContext(); } catch { /* ignore */ }
+    onNav("rankd");
+  };
   const [sliderValue,     setSliderValue]     = useState(null); // Slider questions
   const [sliderSubmitted, setSliderSubmitted] = useState(false);
   const [shuffledRight,   setShuffledRight]   = useState([]);   // Matching — shared shuffle from host's SHOW_QUESTION
@@ -3891,7 +3912,7 @@ function KahootPlayerView({ onNav, playerName, playerEmoji, playerId, pin, sessi
         <p style={{ margin: "0 0 24px", color: C.textSub, fontSize: 14 }}>You can rejoin with the same PIN. Your current answers will not be saved.</p>
         <div style={{ display: "flex", gap: 10 }}>
           <button onClick={() => setShowLeaveConfirm(false)} style={{ flex: 1, padding: "12px", borderRadius: 12, border: `1px solid ${C.border}`, background: "transparent", color: C.text, fontSize: 14, fontWeight: 700, cursor: "pointer" }}>Cancel</button>
-          <button onClick={() => onNav("rankd")} style={{ flex: 1, padding: "12px", borderRadius: 12, border: "none", background: C.orange, color: "#fff", fontSize: 14, fontWeight: 900, cursor: "pointer" }}>Leave</button>
+          <button onClick={doLeave} style={{ flex: 1, padding: "12px", borderRadius: 12, border: "none", background: C.orange, color: "#fff", fontSize: 14, fontWeight: 900, cursor: "pointer" }}>Leave</button>
         </div>
       </div>
     </div>
@@ -6596,7 +6617,13 @@ function RankdAdminPanel({ onNav, sessions, pastSessions = [], onLaunch, onViewR
 
 function RankdScreen({ onNav, onJoin, sessions, pastSessions = [], onLaunch, onViewResults, onRelaunch, role, currentUser }) {
   return (
-    <div style={{ display: "flex", flexDirection: "column" }}>
+    // Center the Ralli Live hub (banner + Active/Past or Join/Scores tabs + list +
+    // New Game action) within the area right of the sidebar: full-width wrapper
+    // centers the max-width column with comfortable side padding, so the hub is no
+    // longer stranded at the far left of a wide canvas. Only the CONTAINER is
+    // centered — inner text/tabs/controls stay left-aligned; full-width on small screens.
+    <div style={{ width: "100%", display: "flex", justifyContent: "center", padding: "0 24px", boxSizing: "border-box" }}>
+    <div style={{ width: "100%", maxWidth: 920, display: "flex", flexDirection: "column" }}>
       {/* Hero */}
       <div style={{
         background: C.cream,
@@ -6646,6 +6673,7 @@ function RankdScreen({ onNav, onJoin, sessions, pastSessions = [], onLaunch, onV
           ? <RankdAdminPanel onNav={onNav} sessions={sessions} pastSessions={pastSessions} onLaunch={onLaunch} onViewResults={onViewResults} onRelaunch={onRelaunch} />
           : <RankdJoinPanel onJoin={onJoin} sessions={sessions} currentUser={currentUser} />}
       </div>
+    </div>
     </div>
   );
 }
@@ -6759,7 +6787,18 @@ function RankdNameEntryScreen({ onNav, pin, sessionName, onConfirm, defaultName,
           )}
         </div>
 
-        <button onClick={() => onNav("rankd")} style={{
+        <button onClick={async () => {
+          // Player leaving the lobby: same prompt-cleanup lifecycle as the in-game
+          // Leave — durably mark 'left' (confirm) + untrack presence so the host's
+          // connected-active roster drops us immediately (no heartbeat-stale wait) —
+          // then navigate. Host uses a plain back (no participant row of its own).
+          if (role !== "admin" && sessionDbId && playerId) {
+            const { error } = await markParticipantLeft(sessionDbId, playerId);
+            if (error) console.error("[ralli:lobby] leave: durable mark-left failed:", error);
+            try { broadcast?.({ type: GM.PLAYER_LEAVE, playerId }); } catch (e) { console.error("[ralli:lobby] leave: presence untrack failed:", e); }
+          }
+          onNav("rankd");
+        }} style={{
           width: "100%", textAlign: "center", marginTop: 16, padding: 8,
           fontSize: 13, color: C.textSub, background: "transparent", border: "none", cursor: "pointer",
         }}>← Back</button>
