@@ -25749,10 +25749,13 @@ export default function App() {
       const qs = gameQuestions ?? GAME_QUESTIONS;
       broadcast({ type: GM.GAME_START, questions: qs, totalQ: qs.length });
     }
-    // Persist status update to Supabase (fire-and-forget). startGameSession's
-    // established API takes the pin (tenant-scoped join code) — a legitimate
-    // helper-API use of the pin, not an identity derivation.
-    startGameSession(lobbyPin, currentOrg?.id ?? user?.orgId ?? null).catch(e => console.error("[ralli] startGameSession failed:", e));
+    // Persist status update to Supabase (fire-and-forget), REAL sessions only, keyed on the
+    // EXACT session id established at create/launch (activeGameSessionDbId) — never the PIN,
+    // so a reused code can never flip a different/historical session to 'started'. Demo games
+    // are in-memory and never persisted here.
+    if (!activeGameIsDemo && activeGameSessionDbId != null) {
+      startGameSession(activeGameSessionDbId).catch(e => console.error("[ralli] startGameSession failed:", e));
+    }
     setScreen("rankd-game");
   };
 

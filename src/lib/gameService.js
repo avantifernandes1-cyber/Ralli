@@ -87,13 +87,13 @@ export async function findJoinableSession(tenantId, pin) {
  * @param {string} pin
  * @returns {Promise<{ data: Object|null, error: Object|null }>}
  */
-export async function startGameSession(pin, tenantId = null) {
-  // Server-authorized write (migration 080): rpc_start_session derives the caller's tenant
-  // and authorizes host/manager server-side, then marks the same-tenant session 'started'.
-  // Moving the filtered UPDATE behind a SECURITY DEFINER RPC is what lets a later
-  // REVOKE SELECT (081) not break start. tenantId is kept for contract compatibility but is
-  // derived server-side, never trusted from the client.
-  const { error } = await supabase.rpc("rpc_start_session", { p_pin: pin });
+export async function startGameSession(sessionId) {
+  // Server-authorized write (migration 080): rpc_start_session takes the EXACT game_sessions.id
+  // the caller already holds (activeGameSessionDbId) — never a PIN lookup that could target a
+  // reused/stale session. It authorizes host/manager server-side and requires a real (non-demo),
+  // 'waiting' session that already has its immutable question snapshot. Moving the filtered
+  // UPDATE behind a SECURITY DEFINER RPC is what lets a later REVOKE SELECT (081) not break start.
+  const { error } = await supabase.rpc("rpc_start_session", { p_session_id: sessionId });
   return { data: null, error };
 }
 
@@ -108,13 +108,13 @@ export async function startGameSession(pin, tenantId = null) {
  */
 export async function endGameSession(pin, { scores = [], tenantId = null, sessionId = null } = {}) {
   // 1+2. Server-authorized ATOMIC end (migration 080): rpc_end_session authorizes host/
-  // manager server-side, then marks the session 'completed' AND completes its active
-  // participants in one transaction. The authoritative session id is passed when known
-  // (activeGameSessionDbId); the RPC also accepts the pin as a legacy fallback and returns
-  // the resolved session_id. This replaces the two direct filtered UPDATEs so a later
-  // REVOKE SELECT (081) won't break end.
+  // manager and marks the session 'completed' AND completes its active participants in one
+  // transaction — keyed on the EXACT session id (no PIN fallback), so a demo game (null id)
+  // or a mismatched id can never complete another session. A null id returns matched:false
+  // and is a no-op. This replaces the two direct filtered UPDATEs so a later REVOKE SELECT
+  // (081) won't break end. `pin` is retained only for the caller's own award/history path.
   const { data: endData, error: sessionError } = await supabase.rpc("rpc_end_session", {
-    p_session_id: sessionId, p_pin: pin,
+    p_session_id: sessionId,
   });
   if (sessionError) {
     console.error("[gameService] endGameSession: failed to end session", sessionError);
