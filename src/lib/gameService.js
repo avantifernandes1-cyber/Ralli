@@ -376,9 +376,10 @@ export async function saveGameAnswers(sessionId, answers = []) {
 export async function markParticipantLeft(sessionId, playerId) {
   // Server-authorized SELF write (migration 080): the RPC flips ONLY the caller's own row
   // (player_id = auth.uid()) to 'left'. playerId kept for contract compatibility; the write
-  // target is derived server-side so a learner can never mark another player left.
-  const { error } = await supabase.rpc("rpc_participant_leave", { p_session_id: sessionId });
-  return { error };
+  // target is derived server-side so a learner can never mark another player left. The RPC
+  // returns { ok, matched } — matched=false means the caller had no row for this session.
+  const { data, error } = await supabase.rpc("rpc_participant_leave", { p_session_id: sessionId });
+  return { data, error };
 }
 
 /**
