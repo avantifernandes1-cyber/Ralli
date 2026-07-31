@@ -194,6 +194,14 @@ const liveQuestionRemainingSecs = (lq, paused, now = Date.now()) =>
 // Monotonic timing version of a live_question (start/pause/resume moment).
 const liveQuestionTimingSeq = (lq) => (lq?.timingUpdatedAt ?? lq?.questionStartedAt ?? 0);
 
+// Durable heartbeat-freshness window (ms). A participant whose last_seen_at is within this
+// window counts as connected. This is the SINGLE connectivity model shared by the in-game
+// zero-player-halt watchdog (KahootHostView) and the lobby roster: Presence is the immediate
+// connected-now signal, and a fresh durable heartbeat bridges brief Presence interruptions so
+// an actively-heartbeating learner is never erased. A player who truly leaves stops beating and
+// drops once last_seen_at goes stale (explicit Leave also flips status='left' for instant removal).
+const HEARTBEAT_FRESH_MS = 40000;
+
 function useGameChannel(pin, role) {
   const channelRef       = useRef(null);
   // The player's Presence identity for THIS channel connection. Persistent (not
@@ -2146,7 +2154,7 @@ function KahootHostView({ onNav, sessionName, pin, sessionDbId, demoMode, tenant
     // (~45s) are needed before a player drops out — plus the halt watchdog's
     // own 5s debounce — so a real halt lands ~40-45s after the last player
     // truly leaves, without false positives from a single lost beat.
-    const HEARTBEAT_FRESH_MS = 40000;
+    // HEARTBEAT_FRESH_MS is the shared module-level connectivity window (see top of file).
     const refreshRoster = () => {
       getLobbyParticipants(sessionDbId).then(({ data }) => {
         if (!data) return;
@@ -6857,6 +6865,7 @@ function RankdLobbyScreen({ onNav, pin, sessionDbId: propSessionDbId = null, pla
     color:  p.color  ?? PLAYER_COLORS[0],
     score:  0,
     status: p.status ?? "active",
+    last_seen_at: p.last_seen_at ?? null,   // durable heartbeat — bridges brief Presence gaps
   });
 
   // ── Durable lobby roster (single source: getLobbyParticipants → rpc_lobby_participants) ──
@@ -6928,6 +6937,22 @@ function RankdLobbyScreen({ onNav, pin, sessionDbId: propSessionDbId = null, pla
     };
   }, [isDemoMode, sessionDbId, refreshRoster]); // eslint-disable-line react-hooks/exhaustive-deps
 
+  // Player: heartbeat while in the LOBBY so last_seen_at stays fresh — the durable bridge
+  // that keeps the host showing an actively-present learner across a brief Presence gap.
+  // The lobby previously had NO heartbeat (only the in-game view did), which is the root of
+  // the ~10s host-empties regression: Presence was the sole visibility signal and nothing
+  // durable proved the learner was still here. Same 15s cadence / freshness pairing as the
+  // in-game beat (KahootPlayerView) — one model. Fire once immediately so a just-joined
+  // learner is fresh right away. This is a pure participant WRITE (no table read).
+  useEffect(() => {
+    if (isDemoMode || role === "admin" || !sessionDbId || !playerId) return;
+    const beat = () => updateParticipantHeartbeat(sessionDbId, playerId)
+      .catch(e => console.error("[ralli:lobby] heartbeat failed:", e));
+    beat();
+    const interval = setInterval(beat, 15_000);
+    return () => clearInterval(interval);
+  }, [isDemoMode, role, sessionDbId, playerId]);
+
   // ── Player: poll game_sessions.phase as countdown/start fallback ─────────────
   // Broadcast (GM.GAME_START / GM.SHOW_QUESTION) can be missed in race conditions.
   // If the session phase advances past 'waiting', navigate to game.
@@ -6969,6 +6994,7 @@ function RankdLobbyScreen({ onNav, pin, sessionDbId: propSessionDbId = null, pla
     if (isDemoMode) return [];
     const dbById = new Map(dbPlayers.map(p => [p.id, p]));
     const map = new Map();
+    // 1. Presence — the immediate connected-now truth.
     chPlayers.forEach(p => {
       if (!p.id) return;
       const db = dbById.get(p.id);
@@ -6980,9 +7006,28 @@ function RankdLobbyScreen({ onNav, pin, sessionDbId: propSessionDbId = null, pla
         score: 0,
       });
     });
-    // Player's own view only: show self immediately from the optimistic DB
-    // self-entry until this client's presence syncs. Never add self for the
-    // host, so a departed player is never re-introduced by identity data.
+    // 2. Durable heartbeat bridge — keep a participant whose last_seen_at is FRESH
+    //    (actively heartbeating, active/joined) even if their Presence entry is briefly
+    //    missing. THIS is the fix for the host losing an in-lobby learner on a ~10s
+    //    Presence blip: Presence alone is not a reliable persistent visibility signal, so
+    //    a fresh durable row bridges the gap. A player who truly left stops heartbeating
+    //    (last_seen_at goes stale ⇒ dropped after the grace window) or is marked
+    //    status='left' (filtered out of dbPlayers upstream). Same freshness rule and
+    //    window (HEARTBEAT_FRESH_MS) as the zero-player-halt watchdog — one connectivity
+    //    model, not a second. A null heartbeat (e.g. the optimistic self-entry) is NOT a
+    //    bridge; the player's own self-entry is handled in step 3.
+    const now = Date.now();
+    dbPlayers.forEach(p => {
+      if (!p.id || map.has(p.id)) return;
+      const statusOk = !p.status || p.status === "active" || p.status === "joined";
+      if (!statusOk) return;
+      if (!p.last_seen_at) return;
+      if (now - new Date(p.last_seen_at).getTime() >= HEARTBEAT_FRESH_MS) return;
+      map.set(p.id, { id: p.id, name: p.name, emoji: p.emoji ?? null, color: p.color ?? null, score: 0 });
+    });
+    // 3. Player's own view only: show self immediately from the optimistic self-entry
+    //    until this client's Presence/heartbeat lands. Never add self for the host, so a
+    //    departed player is never re-introduced by identity data.
     if (role !== "admin" && playerId && !map.has(playerId)) {
       const db = dbById.get(playerId);
       map.set(playerId, { id: playerId, name: db?.name ?? playerName, emoji: db?.emoji ?? playerEmoji ?? null, color: db?.color ?? PLAYER_COLORS[0], score: 0 });
