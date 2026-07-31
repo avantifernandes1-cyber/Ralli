@@ -1,4 +1,5 @@
 import React, { useState, useEffect, useCallback, useRef, useMemo } from "react";
+import { createPortal } from "react-dom"; // TEMPORARY — Ralli trace panel (DIAGNOSTIC ONLY, remove with the fix)
 
 // ── MULTI-TENANT ARCHITECTURE ─────────────────────────────────────────────────
 // Data models, seed data, permissions, auth, and tenant service layers.
@@ -205,11 +206,14 @@ const HEARTBEAT_FRESH_MS = 40000;
 // ── TEMPORARY diagnostic instrumentation (opt-in via ?ralliTrace=1 or localStorage) ──
 // Captures the Leave/Rejoin lifecycle on BOTH host and learner to pin the first failing
 // boundary. Off by default — normal preview users never see it. REMOVE before the final fix.
+// DIAGNOSTIC BUILD — DO NOT MERGE. Trace is ON by default so it survives the login redirect
+// (which strips the ?ralliTrace query string). Can still be force-disabled with ?ralliTrace=0.
 const RALLI_TRACE = (() => {
   try {
-    return new URLSearchParams(window.location.search).get("ralliTrace") === "1"
-        || window.localStorage.getItem("ralliTrace") === "1";
-  } catch { return false; }
+    if (new URLSearchParams(window.location.search).get("ralliTrace") === "0") return false;
+    if (window.localStorage.getItem("ralliTrace") === "0") return false;
+  } catch { /* ignore */ }
+  return true;
 })();
 const _ralliTraceBuf = [];
 function ralliTrace(evt, data) {
@@ -222,27 +226,47 @@ function ralliTrace(evt, data) {
   try { window.dispatchEvent(new CustomEvent("ralli-trace")); } catch {}
 }
 function RalliTracePanel() {
-  const [open, setOpen]  = useState(true);
-  const [, force]        = useState(0);
+  // "open" = header + log body; "collapsed" = header only; "hidden" = just a reopen button.
+  const [mode, setMode] = useState("open");
+  const [, force]       = useState(0);
   useEffect(() => {
     const h = () => force(n => n + 1);
     window.addEventListener("ralli-trace", h);
     return () => window.removeEventListener("ralli-trace", h);
   }, []);
-  if (!RALLI_TRACE) return null;
+  if (!RALLI_TRACE || typeof document === "undefined") return null;
   const text = _ralliTraceBuf.map(l => JSON.stringify(l)).join("\n");
-  return (
-    <div style={{ position: "fixed", bottom: 8, right: 8, zIndex: 99999, width: 400, background: "rgba(11,18,32,0.96)", color: "#c7f9cc", font: "11px/1.35 ui-monospace, monospace", border: "1px solid #274156", borderRadius: 8, overflow: "hidden", boxShadow: "0 6px 24px rgba(0,0,0,0.45)" }}>
-      <div style={{ display: "flex", gap: 6, alignItems: "center", padding: "5px 8px", background: "#132033", cursor: "pointer" }} onClick={() => setOpen(o => !o)}>
-        <span style={{ fontWeight: 700, color: "#ffd166" }}>[RALLI_REJOIN_TRACE]</span>
+  const btn = { fontSize: 10, cursor: "pointer", background: "#274156", color: "#e8f3ff", border: "none", borderRadius: 5, padding: "3px 7px", lineHeight: 1.4 };
+
+  // Fixed to the viewport, above everything, and rendered via a portal to <body> so no
+  // screen's overflow/transform/stacking context can clip or hide it. Responsive width/height
+  // keeps it fully on-screen on phones.
+  const shell = { position: "fixed", right: "max(8px, env(safe-area-inset-right))", bottom: "max(8px, env(safe-area-inset-bottom))", zIndex: 2147483647, font: "11px/1.35 ui-monospace, SFMono-Regular, Menlo, monospace" };
+
+  if (mode === "hidden") {
+    return createPortal(
+      <div style={shell}>
+        <button onClick={() => setMode("open")} style={{ ...btn, fontSize: 12, fontWeight: 800, background: "#ffd166", color: "#0B1220", padding: "8px 12px", boxShadow: "0 6px 24px rgba(0,0,0,0.45)" }}>
+          Open Ralli Trace
+        </button>
+      </div>, document.body);
+  }
+
+  return createPortal(
+    <div style={{ ...shell, width: "min(400px, calc(100vw - 16px))", background: "rgba(11,18,32,0.97)", color: "#c7f9cc", border: "1px solid #274156", borderRadius: 8, overflow: "hidden", boxShadow: "0 6px 24px rgba(0,0,0,0.5)" }}>
+      <div style={{ display: "flex", gap: 6, alignItems: "center", flexWrap: "wrap", padding: "6px 8px", background: "#132033" }}>
+        <span style={{ fontWeight: 800, color: "#ffd166" }}>[RALLI_REJOIN_TRACE]</span>
+        <span style={{ fontSize: 9, fontWeight: 800, color: "#ff8fa3", border: "1px solid #ff8fa3", borderRadius: 4, padding: "1px 4px" }}>DIAGNOSTIC · DO NOT MERGE</span>
         <span style={{ opacity: 0.7 }}>{_ralliTraceBuf.length}</span>
-        <button onClick={(e) => { e.stopPropagation(); try { navigator.clipboard.writeText(text); } catch {} }} style={{ marginLeft: "auto", fontSize: 10, cursor: "pointer" }}>copy</button>
-        <button onClick={(e) => { e.stopPropagation(); _ralliTraceBuf.length = 0; force(n => n + 1); }} style={{ fontSize: 10, cursor: "pointer" }}>clear</button>
-        <span>{open ? "▾" : "▸"}</span>
+        <button onClick={() => { try { navigator.clipboard.writeText(text); } catch {} }} style={{ ...btn, marginLeft: "auto" }}>Copy</button>
+        <button onClick={() => { _ralliTraceBuf.length = 0; force(n => n + 1); }} style={btn}>Clear</button>
+        <button onClick={() => setMode(m => (m === "open" ? "collapsed" : "open"))} style={btn}>{mode === "open" ? "Collapse" : "Expand"}</button>
+        <button onClick={() => setMode("hidden")} style={btn}>Close</button>
       </div>
-      {open && <pre style={{ margin: 0, padding: 8, overflow: "auto", maxHeight: 300, whiteSpace: "pre-wrap", wordBreak: "break-word" }}>{text}</pre>}
-    </div>
-  );
+      {mode === "open" && (
+        <pre style={{ margin: 0, padding: 8, overflow: "auto", maxHeight: "min(46vh, 340px)", whiteSpace: "pre-wrap", wordBreak: "break-word" }}>{text || "(no events yet — reproduce Leave/Rejoin on host + learner)"}</pre>
+      )}
+    </div>, document.body);
 }
 
 function useGameChannel(pin, role) {
