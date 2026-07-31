@@ -1,5 +1,4 @@
 import React, { useState, useEffect, useCallback, useRef, useMemo } from "react";
-import { createPortal } from "react-dom"; // TEMPORARY — Ralli trace panel (DIAGNOSTIC ONLY, remove with the fix)
 
 // ── MULTI-TENANT ARCHITECTURE ─────────────────────────────────────────────────
 // Data models, seed data, permissions, auth, and tenant service layers.
@@ -203,72 +202,6 @@ const liveQuestionTimingSeq = (lq) => (lq?.timingUpdatedAt ?? lq?.questionStarte
 // drops once last_seen_at goes stale (explicit Leave also flips status='left' for instant removal).
 const HEARTBEAT_FRESH_MS = 40000;
 
-// ── TEMPORARY diagnostic instrumentation (opt-in via ?ralliTrace=1 or localStorage) ──
-// Captures the Leave/Rejoin lifecycle on BOTH host and learner to pin the first failing
-// boundary. Off by default — normal preview users never see it. REMOVE before the final fix.
-// DIAGNOSTIC BUILD — DO NOT MERGE. Trace is ON by default so it survives the login redirect
-// (which strips the ?ralliTrace query string). Can still be force-disabled with ?ralliTrace=0.
-const RALLI_TRACE = (() => {
-  try {
-    if (new URLSearchParams(window.location.search).get("ralliTrace") === "0") return false;
-    if (window.localStorage.getItem("ralliTrace") === "0") return false;
-  } catch { /* ignore */ }
-  return true;
-})();
-const _ralliTraceBuf = [];
-function ralliTrace(evt, data) {
-  if (!RALLI_TRACE) return;
-  let ts; try { ts = new Date().toISOString().slice(11, 23); } catch { ts = ""; }
-  const line = { ts, evt, ...(data || {}) };
-  _ralliTraceBuf.push(line);
-  if (_ralliTraceBuf.length > 800) _ralliTraceBuf.shift();
-  try { console.log("[RALLI_REJOIN_TRACE]", JSON.stringify(line)); } catch {}
-  try { window.dispatchEvent(new CustomEvent("ralli-trace")); } catch {}
-}
-function RalliTracePanel() {
-  // "open" = header + log body; "collapsed" = header only; "hidden" = just a reopen button.
-  const [mode, setMode] = useState("open");
-  const [, force]       = useState(0);
-  useEffect(() => {
-    const h = () => force(n => n + 1);
-    window.addEventListener("ralli-trace", h);
-    return () => window.removeEventListener("ralli-trace", h);
-  }, []);
-  if (!RALLI_TRACE || typeof document === "undefined") return null;
-  const text = _ralliTraceBuf.map(l => JSON.stringify(l)).join("\n");
-  const btn = { fontSize: 10, cursor: "pointer", background: "#274156", color: "#e8f3ff", border: "none", borderRadius: 5, padding: "3px 7px", lineHeight: 1.4 };
-
-  // Fixed to the viewport, above everything, and rendered via a portal to <body> so no
-  // screen's overflow/transform/stacking context can clip or hide it. Responsive width/height
-  // keeps it fully on-screen on phones.
-  const shell = { position: "fixed", right: "max(8px, env(safe-area-inset-right))", bottom: "max(8px, env(safe-area-inset-bottom))", zIndex: 2147483647, font: "11px/1.35 ui-monospace, SFMono-Regular, Menlo, monospace" };
-
-  if (mode === "hidden") {
-    return createPortal(
-      <div style={shell}>
-        <button onClick={() => setMode("open")} style={{ ...btn, fontSize: 12, fontWeight: 800, background: "#ffd166", color: "#0B1220", padding: "8px 12px", boxShadow: "0 6px 24px rgba(0,0,0,0.45)" }}>
-          Open Ralli Trace
-        </button>
-      </div>, document.body);
-  }
-
-  return createPortal(
-    <div style={{ ...shell, width: "min(400px, calc(100vw - 16px))", background: "rgba(11,18,32,0.97)", color: "#c7f9cc", border: "1px solid #274156", borderRadius: 8, overflow: "hidden", boxShadow: "0 6px 24px rgba(0,0,0,0.5)" }}>
-      <div style={{ display: "flex", gap: 6, alignItems: "center", flexWrap: "wrap", padding: "6px 8px", background: "#132033" }}>
-        <span style={{ fontWeight: 800, color: "#ffd166" }}>[RALLI_REJOIN_TRACE]</span>
-        <span style={{ fontSize: 9, fontWeight: 800, color: "#ff8fa3", border: "1px solid #ff8fa3", borderRadius: 4, padding: "1px 4px" }}>DIAGNOSTIC · DO NOT MERGE</span>
-        <span style={{ opacity: 0.7 }}>{_ralliTraceBuf.length}</span>
-        <button onClick={() => { try { navigator.clipboard.writeText(text); } catch {} }} style={{ ...btn, marginLeft: "auto" }}>Copy</button>
-        <button onClick={() => { _ralliTraceBuf.length = 0; force(n => n + 1); }} style={btn}>Clear</button>
-        <button onClick={() => setMode(m => (m === "open" ? "collapsed" : "open"))} style={btn}>{mode === "open" ? "Collapse" : "Expand"}</button>
-        <button onClick={() => setMode("hidden")} style={btn}>Close</button>
-      </div>
-      {mode === "open" && (
-        <pre style={{ margin: 0, padding: 8, overflow: "auto", maxHeight: "min(46vh, 340px)", whiteSpace: "pre-wrap", wordBreak: "break-word" }}>{text || "(no events yet — reproduce Leave/Rejoin on host + learner)"}</pre>
-      )}
-    </div>, document.body);
-}
-
 function useGameChannel(pin, role) {
   const channelRef       = useRef(null);
   // The player's Presence identity for THIS channel connection. Persistent (not
@@ -325,7 +258,6 @@ function useGameChannel(pin, role) {
         color: p.color ?? null,
         score: 0,
       }));
-      ralliTrace("presence.sync", { role, chKey: pin, presenceIds: players.map(p => p.id), rawCount: rawUserEntries.length });
       setChPlayers(players);
     });
 
@@ -348,17 +280,14 @@ function useGameChannel(pin, role) {
         }
       } else {
         // Players receive all host broadcasts as chMsg (same shape as before)
-        ralliTrace("broadcast.recv", { role, chKey: pin, type: event, qIdx: payload?.qIdx, paused: payload?.paused });
         setChMsg({ type: event, ...payload });
       }
     });
 
     channelRef.current = channel;
     setChStatus("init");
-    ralliTrace("channel.create", { role, chKey: pin, presenceKey });
     channel.subscribe((status) => {
       setChStatus(status);
-      ralliTrace("channel.status", { role, chKey: pin, status, willTrack: status === 'SUBSCRIBED' && !!presenceRef.current });
       // (Re)track the player's Presence on EVERY SUBSCRIBED — initial subscribe
       // and every reconnect — so presence survives a dropped websocket. Not
       // cleared here, so the identity persists across reconnects.
@@ -368,7 +297,6 @@ function useGameChannel(pin, role) {
     });
 
     return () => {
-      ralliTrace("channel.teardown", { role, chKey: pin });
       supabase.removeChannel(channel);
       channelRef.current = null;
       presenceRef.current = null; // channel torn down (pin/role change) → next game starts fresh
@@ -395,7 +323,6 @@ function useGameChannel(pin, role) {
     };
     presenceRef.current = trackData;
     const ch = channelRef.current;
-    ralliTrace("presence.track", { role, playerId: player.id, hasChannel: !!ch });
     if (ch) ch.track(trackData); // no-op until SUBSCRIBED; the callback re-tracks then
   }, []);
 
@@ -417,7 +344,6 @@ function useGameChannel(pin, role) {
 
     // PLAYER_LEAVE: untrack from presence
     if (type === GM.PLAYER_LEAVE) {
-      ralliTrace("presence.untrack", { role, playerId: payload?.playerId });
       ch.untrack();
       return;
     }
@@ -2248,7 +2174,6 @@ function KahootHostView({ onNav, sessionName, pin, sessionDbId, demoMode, tenant
           if (!p.last_seen_at) return false;
           return (now - new Date(p.last_seen_at).getTime()) < HEARTBEAT_FRESH_MS;
         }).length;
-        ralliTrace("host.durableRoster", { active, activeForHalt, rows: data.map(p => ({ id: p.player_id ?? p.id, st: p.status, age: p.last_seen_at ? Math.round((now - new Date(p.last_seen_at).getTime())/1000) : null })) });
         setDbParticipantCount(active);
         setDbActiveForHalt(activeForHalt);
         setDbParticipants(data);
@@ -2355,7 +2280,6 @@ function KahootHostView({ onNav, sessionName, pin, sessionDbId, demoMode, tenant
         durableKnown:       dbRosterLoadedRef.current,            // ≥1 successful durable roster load
         durableActiveCount: dbActiveForHaltRef.current,
       });
-      ralliTrace("host.watchdog", { verdict, presenceKnown: chStatusRef.current === "SUBSCRIBED", presenceCount: chPlayersLenRef.current, durableKnown: dbRosterLoadedRef.current, durableActiveCount: dbActiveForHaltRef.current });
       if (verdict === "connected") {
         zeroSinceRef.current = null;
         haltArmedRef.current = true; // players present again → re-arm for a future empty episode
@@ -3663,15 +3587,12 @@ function KahootPlayerView({ onNav, playerName, playerEmoji, playerId, pin, sessi
     if (leavingRef.current) return; // guard double-click
     leavingRef.current = true;
     setShowLeaveConfirm(false);
-    ralliTrace("player.doLeave.begin", { playerId, sessionDbId });
     if (sessionDbId && playerId) {
-      const { data, error } = await markParticipantLeft(sessionDbId, playerId);
-      ralliTrace("player.doLeave.markLeft", { playerId, matched: data?.matched, err: !!error });
+      const { error } = await markParticipantLeft(sessionDbId, playerId);
       if (error) console.error("[ralli:player] leave: durable mark-left failed:", error);
     }
     try { broadcast?.({ type: GM.PLAYER_LEAVE, playerId }); } catch (e) { console.error("[ralli:player] leave: presence untrack failed:", e); }
     try { clearActiveGameContext(); } catch { /* ignore */ }
-    ralliTrace("player.doLeave.nav", { playerId });
     onNav("rankd");
   };
   const [sliderValue,     setSliderValue]     = useState(null); // Slider questions
@@ -3699,7 +3620,6 @@ function KahootPlayerView({ onNav, playerName, playerEmoji, playerId, pin, sessi
   // effective start, clamped to zero — never a fresh full clock on recovery.
   const applyShowQuestion = useCallback((payload, paused = false) => {
     if (!payload?.question) return;
-    ralliTrace("player.applyShowQuestion", { playerId, qIdx: payload.qIdx, paused, appliedQIdx: appliedQIdxRef.current });
     const remaining = liveQuestionRemainingSecs(payload, paused);
     setQuestion(payload.question);
     setTimeLeft(remaining);
@@ -3732,11 +3652,10 @@ function KahootPlayerView({ onNav, playerName, playerEmoji, playerId, pin, sessi
       // Learner-safe restore RPC (073): own answers only + sanitized live_question.
       // Never another player's answers, never question_snapshot.
       const { session, answers } = await getPlayerSessionRestore(sessionDbId);
-      if (session.error || !session.data) { ralliTrace("player.reconcile.noRow", { playerId, err: !!session.error }); return; }
+      if (session.error || !session.data) return;
       const s  = session.data;
       const lq = s.live_question;
       const idxMatch = lq && lq.qIdx === s.current_question_index;
-      ralliTrace("player.reconcile.read", { playerId, phase: s.phase, cqi: s.current_question_index, lqIdx: lq?.qIdx, idxMatch: !!idxMatch, paused: s.paused, appliedQIdx: appliedQIdxRef.current });
 
       // Cumulative score — idempotent, always safe to recompute. The learner-safe
       // restore RPC already returns ONLY this caller's own answers (my_answers), and
@@ -3833,12 +3752,12 @@ function KahootPlayerView({ onNav, playerName, playerEmoji, playerId, pin, sessi
   }, [chStatus, playerId, playerName, playerEmoji]); // eslint-disable-line react-hooks/exhaustive-deps
 
   // Reconcile on: initial load / identity change …
-  useEffect(() => { ralliTrace("player.reconcile.trigger", { playerId, via: "mount", chStatus }); reconcile(); }, [sessionDbId, playerId]); // eslint-disable-line react-hooks/exhaustive-deps
+  useEffect(() => { reconcile(); }, [sessionDbId, playerId]); // eslint-disable-line react-hooks/exhaustive-deps
   // … channel (re)subscribe — recovers a broadcast missed while (re)connecting …
-  useEffect(() => { if (chStatus === "SUBSCRIBED") { ralliTrace("player.reconcile.trigger", { playerId, via: "SUBSCRIBED" }); reconcile(); } }, [chStatus]); // eslint-disable-line react-hooks/exhaustive-deps
+  useEffect(() => { if (chStatus === "SUBSCRIBED") reconcile(); }, [chStatus]); // eslint-disable-line react-hooks/exhaustive-deps
   // … and tab focus / becoming visible after being backgrounded/throttled.
   useEffect(() => {
-    const onVisible = () => { if (document.visibilityState === "visible") { ralliTrace("player.reconcile.trigger", { playerId, via: "focus" }); reconcile(); } };
+    const onVisible = () => { if (document.visibilityState === "visible") reconcile(); };
     window.addEventListener("visibilitychange", onVisible);
     window.addEventListener("focus", onVisible);
     return () => {
@@ -3846,6 +3765,25 @@ function KahootPlayerView({ onNav, playerName, playerEmoji, playerId, pin, sessi
       window.removeEventListener("focus", onVisible);
     };
   }, [reconcile]);
+  // … and a light periodic DURABLE safety-net. Broadcasts remain the fast path, but a
+  // transient frame (SHOW_QUESTION / PAUSE / RESUME / REVEAL / SCOREBOARD) missed during the
+  // (re)subscribe gap — the exact hazard for a Leave→Rejoin learner — would otherwise strand
+  // them until they tabbed away and back (the "Hang tight until you click" symptom). This
+  // recovers the current durable state within one interval with NO user interaction, reusing
+  // the SAME idempotent, stale-guarded reconcile() (appliedQIdxRef / timingSeqRef never roll a
+  // player backward, never restart a running timer). Recovery only — no new lifecycle, no new
+  // subscription. Paused so a backgrounded tab (already handled by the focus path) doesn't poll,
+  // and stopped once terminal so the ended screen doesn't keep reading.
+  const phaseRef = useRef(phase); phaseRef.current = phase;
+  useEffect(() => {
+    if (!sessionDbId || !playerId) return;
+    const id = setInterval(() => {
+      if (phaseRef.current === "ended") return;
+      if (typeof document !== "undefined" && document.visibilityState === "hidden") return;
+      reconcile();
+    }, 2500);
+    return () => clearInterval(id);
+  }, [sessionDbId, playerId, reconcile]);
 
   // Heartbeat: keep last_seen_at fresh while in-game so the host can detect
   // stale connections. 15s interval pairs with the host's 25s freshness window
@@ -3854,12 +3792,11 @@ function KahootPlayerView({ onNav, playerName, playerEmoji, playerId, pin, sessi
   // player has a fresh timestamp right away, not only after the first interval.
   useEffect(() => {
     if (!sessionDbId || !playerId) return;
-    const beat = () => { ralliTrace("player.heartbeat.beat", { playerId }); return updateParticipantHeartbeat(sessionDbId, playerId)
-      .catch(e => console.error("[ralli:player] heartbeat failed:", e)); };
+    const beat = () => updateParticipantHeartbeat(sessionDbId, playerId)
+      .catch(e => console.error("[ralli:player] heartbeat failed:", e));
     beat();
-    ralliTrace("player.heartbeat.start", { playerId });
     const interval = setInterval(beat, 15_000);
-    return () => { ralliTrace("player.heartbeat.stop", { playerId }); clearInterval(interval); };
+    return () => clearInterval(interval);
   }, [sessionDbId, playerId]);
 
   useEffect(() => {
@@ -6904,13 +6841,10 @@ function RankdNameEntryScreen({ onNav, pin, sessionName, onConfirm, defaultName,
           // connected-active roster drops us immediately (no heartbeat-stale wait) —
           // then navigate. Host uses a plain back (no participant row of its own).
           if (role !== "admin" && sessionDbId && playerId) {
-            ralliTrace("lobby.doLeave.begin", { playerId, sessionDbId });
-            const { data, error } = await markParticipantLeft(sessionDbId, playerId);
-            ralliTrace("lobby.doLeave.markLeft", { playerId, matched: data?.matched, err: !!error });
+            const { error } = await markParticipantLeft(sessionDbId, playerId);
             if (error) console.error("[ralli:lobby] leave: durable mark-left failed:", error);
             try { broadcast?.({ type: GM.PLAYER_LEAVE, playerId }); } catch (e) { console.error("[ralli:lobby] leave: presence untrack failed:", e); }
           }
-          ralliTrace("lobby.doLeave.nav", { playerId });
           onNav("rankd");
         }} style={{
           width: "100%", textAlign: "center", marginTop: 16, padding: 8,
@@ -25636,7 +25570,6 @@ export default function App() {
           // sees the closed-game message; a returning participant is restored into the
           // game via the existing safe player reconcile, with the host still paused.
           const { data: rj, error: rjErr } = await rejoinSession(pin);
-          ralliTrace("app.rejoin.result", { pin, ok: !!rj?.session, sessionId: rj?.session?.id, status: rj?.session?.status, err: rjErr?.message ?? (rjErr ? String(rjErr) : null) });
           if (rjErr || !rj?.session) {
             console.warn("[ralli:game] rejoin denied:", rjErr?.message ?? rjErr);
             return "This game has already started.";
@@ -25747,7 +25680,6 @@ export default function App() {
           color:    pColor,
           tenantId: currentUser.orgId ?? null,
         });
-        ralliTrace("app.join.result", { sessionId: sessionDbId, playerId: gamePlayerId, err: jErr?.message ?? null });
         if (jErr) {
           console.error("[ralli:game] joinGameSession FAILED — RLS or schema issue:", jErr);
           return jErr.message ?? "Failed to join the game. Please try again."; // no local count change
@@ -26304,8 +26236,6 @@ export default function App() {
           {renderScreen()}
         </div>
       </div>
-
-      <RalliTracePanel />
 
       {/* Mobile bottom nav */}
       {!fullScreen && mobile && (
