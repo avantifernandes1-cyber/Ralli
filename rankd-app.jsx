@@ -1,5 +1,4 @@
 import React, { useState, useEffect, useCallback, useRef, useMemo } from "react";
-import { createPortal } from "react-dom"; // TEMPORARY — waiting-rejoin trace panel (DIAGNOSTIC, remove with fix)
 
 // ── MULTI-TENANT ARCHITECTURE ─────────────────────────────────────────────────
 // Data models, seed data, permissions, auth, and tenant service layers.
@@ -203,59 +202,6 @@ const liveQuestionTimingSeq = (lq) => (lq?.timingUpdatedAt ?? lq?.questionStarte
 // drops once last_seen_at goes stale (explicit Leave also flips status='left' for instant removal).
 const HEARTBEAT_FRESH_MS = 40000;
 
-// ── TEMPORARY waiting-lobby rejoin Presence-lifecycle instrumentation — DO NOT MERGE ──
-// Default-visible (survives login redirect); disable with ?wtrace=0. Captures the channel
-// generation lifecycle on host + learner to pin the exact event that invalidates a rejoined
-// Presence connection. REMOVE with the fix.
-const WTRACE = (() => {
-  try {
-    if (new URLSearchParams(window.location.search).get("wtrace") === "0") return false;
-    if (window.localStorage.getItem("wtrace") === "0") return false;
-  } catch { /* ignore */ }
-  return true;
-})();
-let _wgen = 0;                       // monotonic channel-generation id
-const wNextGen = () => (++_wgen);
-const _wbuf = [];
-function wtrace(evt, data) {
-  if (!WTRACE) return;
-  let ts; try { ts = new Date().toISOString().slice(11, 23); } catch { ts = ""; }
-  const line = { ts, evt, ...(data || {}) };
-  _wbuf.push(line);
-  if (_wbuf.length > 1200) _wbuf.shift();
-  try { console.log("[RALLI_WAITING_REJOIN_TRACE]", JSON.stringify(line)); } catch {}
-  try { window.dispatchEvent(new CustomEvent("wtrace")); } catch {}
-}
-function WTracePanel() {
-  const [mode, setMode] = useState("open");
-  const [, force]       = useState(0);
-  useEffect(() => {
-    const h = () => force(n => n + 1);
-    window.addEventListener("wtrace", h);
-    return () => window.removeEventListener("wtrace", h);
-  }, []);
-  if (!WTRACE || typeof document === "undefined") return null;
-  const text = _wbuf.map(l => JSON.stringify(l)).join("\n");
-  const btn = { fontSize: 10, cursor: "pointer", background: "#274156", color: "#e8f3ff", border: "none", borderRadius: 5, padding: "3px 7px", lineHeight: 1.4 };
-  const shell = { position: "fixed", right: "max(8px, env(safe-area-inset-right))", bottom: "max(8px, env(safe-area-inset-bottom))", zIndex: 2147483647, font: "11px/1.35 ui-monospace, SFMono-Regular, Menlo, monospace" };
-  if (mode === "hidden") {
-    return createPortal(<div style={shell}><button onClick={() => setMode("open")} style={{ ...btn, fontSize: 12, fontWeight: 800, background: "#ffd166", color: "#0B1220", padding: "8px 12px", boxShadow: "0 6px 24px rgba(0,0,0,0.45)" }}>Open Waiting-Rejoin Trace</button></div>, document.body);
-  }
-  return createPortal(
-    <div style={{ ...shell, width: "min(420px, calc(100vw - 16px))", background: "rgba(11,18,32,0.97)", color: "#c7f9cc", border: "1px solid #274156", borderRadius: 8, overflow: "hidden", boxShadow: "0 6px 24px rgba(0,0,0,0.5)" }}>
-      <div style={{ display: "flex", gap: 6, alignItems: "center", flexWrap: "wrap", padding: "6px 8px", background: "#132033" }}>
-        <span style={{ fontWeight: 800, color: "#ffd166" }}>[RALLI_WAITING_REJOIN_TRACE]</span>
-        <span style={{ fontSize: 9, fontWeight: 800, color: "#ff8fa3", border: "1px solid #ff8fa3", borderRadius: 4, padding: "1px 4px" }}>DIAGNOSTIC · DO NOT MERGE</span>
-        <span style={{ opacity: 0.7 }}>{_wbuf.length}</span>
-        <button onClick={() => { try { navigator.clipboard.writeText(text); } catch {} }} style={{ ...btn, marginLeft: "auto" }}>Copy</button>
-        <button onClick={() => { _wbuf.length = 0; force(n => n + 1); }} style={btn}>Clear</button>
-        <button onClick={() => setMode(m => (m === "open" ? "collapsed" : "open"))} style={btn}>{mode === "open" ? "Collapse" : "Expand"}</button>
-        <button onClick={() => setMode("hidden")} style={btn}>Close</button>
-      </div>
-      {mode === "open" && <pre style={{ margin: 0, padding: 8, overflow: "auto", maxHeight: "min(46vh, 340px)", whiteSpace: "pre-wrap", wordBreak: "break-word" }}>{text || "(reproduce: join → Leave → Rejoin the waiting session)"}</pre>}
-    </div>, document.body);
-}
-
 function useGameChannel(pin, role) {
   const channelRef       = useRef(null);
   // The player's Presence identity for THIS channel connection. Persistent (not
@@ -266,7 +212,9 @@ function useGameChannel(pin, role) {
   // fresh. This is what keeps a player who reconnects/rejoins directly into the
   // game present in the host's Presence roster.
   const presenceRef      = useRef(null);
-  const genRef           = useRef(0); // WTRACE: generation of the CURRENT channel instance
+  const genRef           = useRef(0);       // generation of the CURRENT channel instance
+  const teardownByUsRef  = useRef(false);   // true only while WE are tearing a channel down (vs. a server-side drop)
+  const [reconnectNonce, setReconnectNonce] = useState(0); // bump → recreate the channel after an unexpected drop
   const [chPlayers, setChPlayers] = useState([]);
   const [chAnswers, setChAnswers] = useState({});   // { playerId: { optionIdx, timeMs, name, text } }
   const [chMsg,     setChMsg]     = useState(null); // latest inbound broadcast for player side
@@ -282,8 +230,19 @@ function useGameChannel(pin, role) {
     // Each client gets a unique presence key so the host and all players
     // have distinct entries in the presence state map.
     const presenceKey = `${role}-${Date.now()}-${Math.random().toString(36).slice(2)}`;
-    const gen = (genRef.current = wNextGen());
-    wtrace("chan.create", { role, gen, topic: `game:${pin}`, chKey: pin, presenceKey });
+    const gen = (genRef.current = genRef.current + 1); // this instance's generation
+    teardownByUsRef.current = false;                    // fresh channel — any CLOSED now is a real drop
+
+    // Exactly ONE channel per topic: after a Leave→Rejoin the same `game:<id>` topic is reused,
+    // and a stale channel the previous removeChannel didn't fully clear makes Supabase close the
+    // freshly-created one ~6s after it subscribes (proven in the waiting-rejoin trace). Drop any
+    // lingering same-topic channel before creating this one.
+    try {
+      (supabase.getChannels?.() || []).forEach((c) => {
+        const t = c?.topic || "";
+        if (t === `game:${pin}` || t === `realtime:game:${pin}`) supabase.removeChannel(c);
+      });
+    } catch { /* ignore */ }
 
     const channel = supabase.channel(`game:${pin}`, {
       config: {
@@ -315,7 +274,6 @@ function useGameChannel(pin, role) {
         color: p.color ?? null,
         score: 0,
       }));
-      wtrace("presence.sync", { role, gen, isCurrent: gen === genRef.current, rawKeys: Object.keys(state), ids: players.map(p => p.id) });
       setChPlayers(players);
     });
 
@@ -345,27 +303,36 @@ function useGameChannel(pin, role) {
     channelRef.current = channel;
     setChStatus("init");
     channel.subscribe((status) => {
-      wtrace("chan.status", { role, gen, isCurrent: gen === genRef.current, status, hasPresenceRef: !!presenceRef.current });
+      if (gen !== genRef.current) return;   // a stale generation's late callback can never touch current state
       setChStatus(status);
       // (Re)track the player's Presence on EVERY SUBSCRIBED — initial subscribe
-      // and every reconnect — so presence survives a dropped websocket. Not
-      // cleared here, so the identity persists across reconnects.
+      // and every reconnect — so presence survives a dropped websocket. Identity
+      // persists across reconnects (presenceRef is NOT cleared on teardown), so a
+      // recreated channel re-registers this player without waiting for another track.
       if (status === 'SUBSCRIBED' && presenceRef.current) {
-        wtrace("chan.subTrack", { role, gen, isCurrent: gen === genRef.current, playerId: presenceRef.current?.playerId });
         channel.track(presenceRef.current);
+      }
+      // UNEXPECTED drop of the CURRENT channel (server-side close, not our teardown) →
+      // recreate a fresh channel. This is the fix for the Leave→Rejoin channel that goes
+      // SUBSCRIBED then CLOSED ~6s later and was otherwise never rebuilt (no pin/role change),
+      // stranding the learner off realtime. The reconnect gets a clean socket; the player's
+      // reconcile-on-SUBSCRIBED then restores game state. Short delay avoids a tight loop.
+      if ((status === 'CLOSED' || status === 'CHANNEL_ERROR' || status === 'TIMED_OUT') && !teardownByUsRef.current) {
+        setTimeout(() => { if (gen === genRef.current && !teardownByUsRef.current) setReconnectNonce((n) => n + 1); }, 500);
       }
     });
 
     return () => {
-      wtrace("chan.teardown", { role, gen, isCurrent: gen === genRef.current, chKey: pin });
+      teardownByUsRef.current = true;          // mark OUR teardown so its CLOSED isn't read as a drop
       supabase.removeChannel(channel);
-      channelRef.current = null;
-      presenceRef.current = null; // channel torn down (pin/role change) → next game starts fresh
+      if (genRef.current === gen) channelRef.current = null; // only if still current
+      // presenceRef is intentionally NOT nulled here: keeping the identity lets a reconnect
+      // re-track immediately. A genuinely new game overwrites it via trackPlayerPresence on mount.
       setChPlayers([]);
       setChAnswers({});
       setChMsg(null);
     };
-  }, [pin, role]);
+  }, [pin, role, reconnectNonce]);
 
   // ── Shared player-Presence registration ─────────────────────────────────────
   // The ONE path that registers a player in Presence for the whole connection
@@ -384,7 +351,6 @@ function useGameChannel(pin, role) {
     };
     presenceRef.current = trackData;
     const ch = channelRef.current;
-    wtrace("presence.track", { role, gen: genRef.current, playerId: player.id, hasChannel: !!ch });
     if (ch) ch.track(trackData); // no-op until SUBSCRIBED; the callback re-tracks then
   }, []);
 
@@ -406,7 +372,6 @@ function useGameChannel(pin, role) {
 
     // PLAYER_LEAVE: untrack from presence
     if (type === GM.PLAYER_LEAVE) {
-      wtrace("presence.untrack", { role, gen: genRef.current, playerId: payload?.playerId });
       ch.untrack();
       return;
     }
@@ -6913,13 +6878,10 @@ function RankdNameEntryScreen({ onNav, pin, sessionName, onConfirm, defaultName,
           // connected-active roster drops us immediately (no heartbeat-stale wait) —
           // then navigate. Host uses a plain back (no participant row of its own).
           if (role !== "admin" && sessionDbId && playerId) {
-            wtrace("lobby.doLeave.begin", { playerId, sessionDbId });
             const { error } = await markParticipantLeft(sessionDbId, playerId);
-            wtrace("lobby.doLeave.markLeft", { playerId, err: !!error });
             if (error) console.error("[ralli:lobby] leave: durable mark-left failed:", error);
             try { broadcast?.({ type: GM.PLAYER_LEAVE, playerId }); } catch (e) { console.error("[ralli:lobby] leave: presence untrack failed:", e); }
           }
-          wtrace("lobby.doLeave.nav", { playerId });
           onNav("rankd");
         }} style={{
           width: "100%", textAlign: "center", marginTop: 16, padding: 8,
@@ -7050,9 +7012,8 @@ function RankdLobbyScreen({ onNav, pin, sessionDbId: propSessionDbId = null, pla
     const beat = () => updateParticipantHeartbeat(sessionDbId, playerId)
       .catch(e => console.error("[ralli:lobby] heartbeat failed:", e));
     beat();
-    wtrace("lobby.heartbeat.start", { playerId, sessionDbId });
     const interval = setInterval(beat, 15_000);
-    return () => { wtrace("lobby.heartbeat.stop", { playerId, sessionDbId }); clearInterval(interval); };
+    return () => clearInterval(interval);
   }, [isDemoMode, role, sessionDbId, playerId]);
 
   // ── Player: poll game_sessions.phase as countdown/start fallback ─────────────
@@ -7150,20 +7111,6 @@ function RankdLobbyScreen({ onNav, pin, sessionDbId: propSessionDbId = null, pla
   const realPlayers    = isDemoMode ? [] : combinedRealPlayers;
   const displayPlayers = isDemoMode ? demoAllPlayers.slice(0, visibleCount) : realPlayers;
 
-  // WTRACE: roster construction + Start-readiness reason, on every relevant change.
-  useEffect(() => {
-    if (isDemoMode) return;
-    wtrace("roster.build", {
-      role,
-      presenceIds: chPlayers.map(p => p.id),
-      dbRows: dbPlayers.map(p => ({ id: p.id, st: p.status })),
-      leftIds: Array.from(leftIds),
-      rosterIds: realPlayers.map(p => p.id),
-      realtimeReadyCount,
-      startEnabled: role === "admin" ? realtimeReadyCount >= 1 : undefined,
-    });
-  }, [chPlayers, dbPlayers, realtimeReadyCount]); // eslint-disable-line react-hooks/exhaustive-deps
-
   // Player side: announce join via channel (Presence track).
   // Identity priority: an already-loaded DB participant record (source of
   // truth, immutable after first write — see joinGameSession) > the
@@ -7181,7 +7128,6 @@ function RankdLobbyScreen({ onNav, pin, sessionDbId: propSessionDbId = null, pla
     const resolvedEmoji = dbSelf?.emoji ?? playerEmoji ?? null;
     const resolvedColor = dbSelf?.color ?? PLAYER_COLORS[pidx % PLAYER_COLORS.length];
     // Same shared registration path the game view uses (no divergent logic).
-    wtrace("lobby.presenceTrackEffect", { playerId, dbPlayersLen: dbPlayers.length });
     trackPlayerPresence?.({ id: playerId, name: playerName, emoji: resolvedEmoji, color: resolvedColor });
   }, [isDemoMode, pin, playerId, role, playerEmoji, dbPlayers]); // eslint-disable-line react-hooks/exhaustive-deps
 
@@ -25009,9 +24955,6 @@ export default function App() {
   // only for a pure demo session with no DB row. Never a PIN re-lookup.
   const lobbySessionDbId = activeGameSessionDbId;
   const gameChannelKey = isInGame ? (lobbySessionDbId ?? lobbyPin) : null;
-  // WTRACE: channel-key lifecycle — shows the null↔value transitions that drive
-  // useGameChannel teardown/recreate across screen changes (leave → home → rejoin).
-  useEffect(() => { wtrace("app.channelKey", { screen, isInGame, gameChannelKey, activeGameSessionDbId }); }, [screen, isInGame, gameChannelKey, activeGameSessionDbId]); // eslint-disable-line react-hooks/exhaustive-deps
   const { chPlayers, chAnswers, setChAnswers, chMsg, broadcast, chStatus, trackPlayerPresence } = useGameChannel(gameChannelKey, gameRole);
 
   // Persist minimal active-game reconnect context (see readActiveGameContext) while
@@ -25680,7 +25623,6 @@ export default function App() {
           // sees the closed-game message; a returning participant is restored into the
           // game via the existing safe player reconcile, with the host still paused.
           const { data: rj, error: rjErr } = await rejoinSession(pin);
-          wtrace("app.rejoin.result", { pin, ok: !!rj?.session, sessionId: rj?.session?.id, status: rj?.session?.status, err: rjErr?.message ?? (rjErr ? String(rjErr) : null) });
           if (rjErr || !rj?.session) {
             console.warn("[ralli:game] rejoin denied:", rjErr?.message ?? rjErr);
             return "This game has already started.";
@@ -25791,7 +25733,6 @@ export default function App() {
           color:    pColor,
           tenantId: currentUser.orgId ?? null,
         });
-        wtrace("app.join.result", { sessionId: sessionDbId, playerId: gamePlayerId, err: jErr?.message ?? null });
         if (jErr) {
           console.error("[ralli:game] joinGameSession FAILED — RLS or schema issue:", jErr);
           return jErr.message ?? "Failed to join the game. Please try again."; // no local count change
@@ -26346,7 +26287,6 @@ export default function App() {
           ...(fullScreen ? {} : { padding: mobile ? "16px 14px" : "28px 32px" }),
         }}>
           {renderScreen()}
-          <WTracePanel />
         </div>
       </div>
 
