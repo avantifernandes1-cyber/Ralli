@@ -234,12 +234,14 @@ export async function getLobbyParticipants(sessionId) {
   // Safe-read cutover (migration 075): presence-only roster via the server-authorized
   // rpc_lobby_participants (host/manager OR a participant of this session). Returns
   // id/name/emoji/color/status/joined_at/last_seen_at — never answers or scores.
-  // Preserves the prior "active"/"joined" filtering client-side so the host halt
-  // watchdog + lobby roster behave identically.
+  // Returns ALL rows (including status='left'/'completed'). Callers apply their own status
+  // rule: the halt watchdog + roster count ONLY active|joined, while the lobby uses a durable
+  // 'left' row to SUPPRESS a lingering ghost Presence entry immediately — so an explicit Leave
+  // disappears from the host within the normal durable refresh interval, not after the ~40s
+  // Presence timeout. (A tab close leaves the row 'active' and still uses the heartbeat grace.)
   const { data, error } = await supabase.rpc("rpc_lobby_participants", { p_session_id: sessionId });
   if (error) return { data: null, error };
-  const rows = (Array.isArray(data) ? data : []).filter(p => !p.status || p.status === "active" || p.status === "joined");
-  return { data: rows, error: null };
+  return { data: Array.isArray(data) ? data : [], error: null };
 }
 
 // NOTE: subscribeToLobbyParticipants (postgres_changes INSERT on

@@ -2242,8 +2242,17 @@ function KahootHostView({ onNav, sessionName, pin, sessionDbId, demoMode, tenant
   const haltActionedRef = useRef(false); // idempotent guard for the pause side effects (persist + broadcast)
   // Refs mirror the latest values into the watchdog interval below without
   // forcing the interval to be torn down and recreated on every tick.
-  const chPlayersLenRef = useRef(chPlayers.length);
-  chPlayersLenRef.current = chPlayers.length;
+  // Durable 'left'/'completed' overrides a lingering ghost Presence entry in the zero-player
+  // calc (same authoritative rule as the lobby roster): an explicitly-left player must not keep
+  // the game alive via a Presence entry that hasn't hit the server timeout yet. dbParticipants
+  // now carries 'left' rows; a tab close leaves the row 'active' and still uses the heartbeat grace.
+  const leftIdsHost = useMemo(
+    () => new Set((dbParticipants || []).filter(p => p.status === "left" || p.status === "completed").map(p => p.player_id ?? p.id)),
+    [dbParticipants]
+  );
+  const presenceActiveCount = chPlayers.filter(p => p.id && !leftIdsHost.has(p.id)).length;
+  const chPlayersLenRef = useRef(presenceActiveCount);
+  chPlayersLenRef.current = presenceActiveCount;
   const chStatusRef = useRef(chStatus);
   chStatusRef.current = chStatus;
   const dbActiveForHaltRef = useRef(dbActiveForHalt);
@@ -2260,7 +2269,7 @@ function KahootHostView({ onNav, sessionName, pin, sessionDbId, demoMode, tenant
   // trusted only once the roster has loaded). A momentary empty Presence sync is never
   // treated as a disconnect while the durable heartbeat is still fresh.
   const connectedNow = () => {
-    const presenceCount = chStatus === "SUBSCRIBED" ? chPlayers.length : 0;
+    const presenceCount = chStatus === "SUBSCRIBED" ? presenceActiveCount : 0;
     const durableCount  = dbRosterLoadedRef.current ? dbActiveForHalt : 0;
     return Math.max(presenceCount, durableCount);
   };
@@ -7009,20 +7018,30 @@ function RankdLobbyScreen({ onNav, pin, sessionDbId: propSessionDbId = null, pla
 
   const demoAllPlayers = [basePlayer, ...LOBBY_PLAYERS.filter(p => p.name !== basePlayer.name)];
 
-  // CANONICAL roster: Presence is the connected-now truth for lobby VISIBILITY
-  // (chPlayers is already deduped by playerId in the presence sync). A player
-  // who closes the tab or leaves drops from presence and therefore from the
-  // roster after the presence grace window. DB participant status is NOT used
-  // for visibility — it stays "active" after a socket leaves and would keep a
-  // departed player shown (the reported bug). DB rows ONLY enrich identity
-  // (name / emoji / color); emoji stays null for no-avatar players.
+  // Players the DURABLE row says have explicitly left (or completed). An explicit Leave marks
+  // the row 'left' server-side; the roster/readiness must treat that as authoritative and
+  // suppress a lingering ghost Presence entry immediately — an untrack that didn't flush before
+  // channel teardown otherwise keeps the player in the host's Presence for the ~40s server
+  // timeout. (A tab close leaves the row 'active' and still drops via the heartbeat grace.)
+  const leftIds = new Set(dbPlayers.filter(p => p.status === "left" || p.status === "completed").map(p => p.id));
+
+  // Realtime-READINESS (distinct from mere visibility): a learner is ready for gameplay only
+  // when currently tracked in Presence on THIS session channel AND not durably left. A stale
+  // durable heartbeat is NOT permission to start broadcasting. Used to gate host Start.
+  const realtimeReadyCount = isDemoMode ? 1 : chPlayers.filter(p => p.id && !leftIds.has(p.id)).length;
+
+  // CANONICAL roster: Presence is the connected-now truth for lobby VISIBILITY, EXCEPT a
+  // durable 'left' row overrides a lingering ghost Presence entry (below). The durable heartbeat
+  // bridge (step 2) still covers a brief Presence blip for an active player. DB rows enrich
+  // identity (name / emoji / color); emoji stays null for no-avatar players.
   const combinedRealPlayers = (() => {
     if (isDemoMode) return [];
     const dbById = new Map(dbPlayers.map(p => [p.id, p]));
     const map = new Map();
-    // 1. Presence — the immediate connected-now truth.
+    // 1. Presence — the immediate connected-now truth, MINUS anyone the durable row says has
+    //    left (suppresses a ghost Presence entry the moment 'left' is durably visible).
     chPlayers.forEach(p => {
-      if (!p.id) return;
+      if (!p.id || leftIds.has(p.id)) return;
       const db = dbById.get(p.id);
       map.set(p.id, {
         id:    p.id,
@@ -7160,11 +7179,17 @@ function RankdLobbyScreen({ onNav, pin, sessionDbId: propSessionDbId = null, pla
           </div>
         </div>
         {role === "admin" ? (
-          <button onClick={onGameStart} style={{
+          // Readiness gate: never start broadcasting countdown/question until at least one
+          // learner is REALTIME-ready (currently in Presence on this channel, not durably left).
+          // A rejoined learner whose new channel hasn't SUBSCRIBED yet is visible but not ready,
+          // so starting now would fire the countdown into the void. No auto-start — host clicks.
+          <button onClick={onGameStart} disabled={realtimeReadyCount < 1} style={{
             display: "flex", alignItems: "center", gap: 8,
-            padding: mobile ? "10px 18px" : "12px 24px", borderRadius: 12, border: "none", cursor: "pointer",
-            fontSize: 13, fontWeight: 800, color: "#fff", background: C.orange, minHeight: 44,
-          }}>▶ Start Game</button>
+            padding: mobile ? "10px 18px" : "12px 24px", borderRadius: 12, border: "none",
+            cursor: realtimeReadyCount < 1 ? "not-allowed" : "pointer",
+            fontSize: 13, fontWeight: 800, color: "#fff",
+            background: realtimeReadyCount < 1 ? C.muted : C.orange, opacity: realtimeReadyCount < 1 ? 0.85 : 1, minHeight: 44,
+          }}>{realtimeReadyCount < 1 ? "Waiting for player connection…" : "▶ Start Game"}</button>
         ) : (
           <div style={{ textAlign: "right" }}>
             <p style={{ margin: "0 0 6px", fontSize: 12, color: C.textMuted }}>Waiting for host{dots}</p>
