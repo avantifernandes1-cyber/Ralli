@@ -6257,10 +6257,14 @@ function RankdJoinPanel({ onJoin, sessions, currentUser }) {
       </div>
 
       {tab === "join" && (
-        <div style={{ display: "flex", gap: 32, alignItems: "flex-start" }}>
+        // Wrap so the two columns stack (PIN entry above Active Sessions) when the
+        // content area is too narrow (split-screen / tablet), and sit side-by-side on
+        // wide desktop. flex-basis drives the reflow point — no JS breakpoint needed.
+        <div style={{ display: "flex", flexWrap: "wrap", gap: 32, alignItems: "flex-start" }}>
           {/* PIN card */}
           <div style={{
-            width: 300, flexShrink: 0, borderRadius: 24, padding: 32, textAlign: "center",
+            flex: "0 1 300px", minWidth: 260, maxWidth: "100%", boxSizing: "border-box",
+            borderRadius: 24, padding: 32, textAlign: "center",
             background: C.white, border: `1px solid ${C.border}`,
             boxShadow: "0 8px 40px rgba(253,191,36,0.08)",
           }}>
@@ -6288,7 +6292,7 @@ function RankdJoinPanel({ onJoin, sessions, currentUser }) {
           </div>
 
           {/* Active sessions */}
-          <div style={{ flex: 1 }}>
+          <div style={{ flex: "1 1 380px", minWidth: 0 }}>
             <p style={{ margin: "0 0 14px", fontSize: 13, fontWeight: 700, color: C.text }}>Active sessions right now</p>
             {sessions.filter(s => s.status === "waiting").length === 0 && (
               <p style={{ fontSize: 13, color: C.textSub }}>No active sessions at the moment. Check back soon!</p>
@@ -6296,23 +6300,26 @@ function RankdJoinPanel({ onJoin, sessions, currentUser }) {
             <div style={{ display: "flex", flexDirection: "column", gap: 10 }}>
               {sessions.filter(s => s.status === "waiting").map(s => (
                 <button key={s.code} onClick={() => handleJoin(s.code)} style={{
-                  display: "flex", alignItems: "center", justifyContent: "space-between",
+                  display: "flex", alignItems: "center", justifyContent: "space-between", gap: 12,
+                  width: "100%", minWidth: 0, boxSizing: "border-box",
                   padding: "16px 20px", borderRadius: 16, cursor: "pointer", textAlign: "left",
                   background: C.white, border: `1px solid rgba(253,191,36,0.2)`,
                   boxShadow: "0 2px 8px rgba(253,191,36,0.05)",
                 }}>
-                  <div style={{ display: "flex", alignItems: "center", gap: 12 }}>
-                    <div>
-                      <p style={{ margin: 0, fontSize: 13, fontWeight: 700, color: C.text }}>{s.name}</p>
+                  {/* Left group shrinks + truncates so a long name never pushes the row wider than the card */}
+                  <div style={{ display: "flex", alignItems: "center", gap: 12, minWidth: 0 }}>
+                    <div style={{ minWidth: 0 }}>
+                      <p style={{ margin: 0, fontSize: 13, fontWeight: 700, color: C.text, whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis" }}>{s.name}</p>
                       <p style={{ margin: 0, fontSize: 11, color: C.textSub }}>{s.questionCount} questions</p>
                     </div>
                   </div>
-                  <div style={{ display: "flex", alignItems: "center", gap: 12 }}>
+                  {/* Right group never shrinks/clips — PIN chip + call-to-action stay on one line */}
+                  <div style={{ display: "flex", alignItems: "center", gap: 12, flexShrink: 0 }}>
                     <span style={{
                       fontSize: 13, fontWeight: 900, letterSpacing: "0.2em", fontFamily: "monospace",
                       padding: "6px 12px", borderRadius: 10, background: C.orange, color: "#fff",
                     }}>{s.code}</span>
-                    <span style={{ fontSize: 12, fontWeight: 600, color: C.green }}>Tap to join →</span>
+                    <span style={{ fontSize: 12, fontWeight: 600, color: C.green, whiteSpace: "nowrap" }}>Tap to join →</span>
                   </div>
                 </button>
               ))}
