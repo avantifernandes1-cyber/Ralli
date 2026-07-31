@@ -4,8 +4,34 @@
 > A numbered migration file must never hold a proposal or commented-out no-op, because
 > migration tooling could record that version as *applied* without ever enforcing the
 > intended security change. The real revocation migration will be authored, gated, tested,
-> and applied under separate approval once the prerequisite below is complete. When that
-> happens it may take the **next available** migration number (080 is **not** reserved).
+> and applied under separate approval once the prerequisites below are complete.
+>
+> **Migration numbering (updated at Stage C):** the SELECT revocation will be migration
+> **`081`**. Migration **`080_ralli_server_authorized_writes.sql`** is now taken by the
+> Stage-C write cutover (below), so the revocation is the next number after it.
+
+## Stage B finding (why a bare revoke is unsafe) — resolved by 080
+
+Rolled-back real-`authenticated` tests proved a bare `REVOKE SELECT` breaks **9 of 11**
+client writes: every filtered `UPDATE`'s `WHERE` clause and the join `UPSERT`'s `ON CONFLICT`
+path require `SELECT` on the referenced columns (`42501 permission denied`). Only the two pure
+`INSERT`s (`game_players` final scores, `game_answers`) survive. Column-level `SELECT` grants
+were rejected (they re-expose PIN / participant identity and still can't fix the join upsert).
+
+## Stage C (migration 080, applied separately) — server-authorized writes
+
+`080_ralli_server_authorized_writes.sql` moves the 9 filtered writes behind SECURITY DEFINER
+RPCs so they run as the function owner (which keeps SELECT), making the later revocation safe:
+- Host (authorized via owner-only `ralli_can_manage_session`): `rpc_start_session`,
+  `rpc_end_session` (session + participant completion, atomic), `rpc_cancel_session`,
+  `rpc_set_session_phase`, `rpc_save_question_snapshot` (write-once).
+- Learner self (`player_id = auth.uid()`): `rpc_participant_join` (idempotent upsert),
+  `rpc_participant_leave`, `rpc_participant_heartbeat`.
+- Reused, not duplicated: `rpc_rejoin_session` (078), `rpc_host_publish_reveal` (079).
+- The two pure INSERTs (`game_players`, `game_answers`) are intentionally left as direct
+  writes here; their write-trust hardening is the separate **migration 072** workstream.
+
+After 080 the only direct operations on the four tables are those two INSERTs.
 
 ## Goal
 
@@ -69,12 +95,15 @@ history. Completed learner review still works via `rpc_my_completed_session_revi
   re-close.
 - Realtime recovery: re-enable the removed subscription only alongside a re-grant.
 
-## Intended later sequence (do NOT implement steps 2–4 yet)
+## Sequence (status as of Stage C)
 
-1. Apply and validate migration 079.
-2. Remove the participant-table `postgres_changes` dependency **only after proving** Presence
-   plus the existing durable `rpc_lobby_participants` polling provides correct lobby behavior.
-3. Run full two-device lobby, leave, reconnect, refresh, and zero-player-halt QA.
-4. Only then create the **real** revocation migration that revokes `authenticated`/`anon`
-   `SELECT` from the four Ralli Live tables (next available migration number).
-5. Validate all host, learner, analytics, recovery, and tenant-isolation paths before merging.
+1. ✅ Migration 079 (reveal/award read cutover) — applied & validated.
+2. ✅ Participant-table `postgres_changes` dependency removed; Presence + durable
+   `rpc_lobby_participants` proven in two-device QA (Stage A).
+3. ✅ Stage B — proved a bare revoke breaks 9/11 writes.
+4. ✅ Stage C — migration **080** (server-authorized write RPCs) authored + tested + frontend
+   cut over. Awaiting separate controlled apply.
+5. ⏳ **Migration 081** = `REVOKE SELECT ON the four tables FROM authenticated, anon` — authored
+   only **after** 080 is applied and the full host/learner/recovery/reveal/scoring/analytics/
+   tenant-isolation QA passes on the preview. Gated + applied under separate approval.
+6. Validate all paths post-081; re-prove the confidentiality matrix before merging.

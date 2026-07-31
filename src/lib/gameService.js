@@ -88,20 +88,12 @@ export async function findJoinableSession(tenantId, pin) {
  * @returns {Promise<{ data: Object|null, error: Object|null }>}
  */
 export async function startGameSession(pin, tenantId = null) {
-  // Scoped by tenant_id whenever the caller has one — see endGameSession's
-  // comment above for why pin alone is no longer a safe match (migration
-  // 046: pins are only unique within a tenant).
-  let query = supabase
-    .from("game_sessions")
-    .update({
-      status:     "started",
-      started_at: new Date().toISOString(),
-    })
-    .eq("pin", pin);
-  if (tenantId) query = query.eq("tenant_id", tenantId);
-  // Write only — the caller does not consume the returned row (fire-and-forget), so no
-  // `.select()`/RETURNING is needed (safe-read cutover: revoking table SELECT won't break start).
-  const { error } = await query;
+  // Server-authorized write (migration 080): rpc_start_session derives the caller's tenant
+  // and authorizes host/manager server-side, then marks the same-tenant session 'started'.
+  // Moving the filtered UPDATE behind a SECURITY DEFINER RPC is what lets a later
+  // REVOKE SELECT (081) not break start. tenantId is kept for contract compatibility but is
+  // derived server-side, never trusted from the client.
+  const { error } = await supabase.rpc("rpc_start_session", { p_pin: pin });
   return { data: null, error };
 }
 
@@ -115,34 +107,22 @@ export async function startGameSession(pin, tenantId = null) {
  * @returns {Promise<{ data: Object|null, error: Object|null }>}
  */
 export async function endGameSession(pin, { scores = [], tenantId = null, sessionId = null } = {}) {
-  // 1. Update session status. Scoped by tenant_id whenever the caller has one, not
-  // just pin — pins are only unique WITHIN a tenant (migration 046). Write only: the
-  // authoritative session id is passed in (activeGameSessionDbId), so no `.select()`/
-  // RETURNING is needed and revoking table SELECT won't break end (safe-read cutover).
-  let query = supabase
-    .from("game_sessions")
-    .update({ status: "completed", ended_at: new Date().toISOString() })
-    .eq("pin", pin);
-  if (tenantId) query = query.eq("tenant_id", tenantId);
-  const { error: sessionError } = await query;
-
+  // 1+2. Server-authorized ATOMIC end (migration 080): rpc_end_session authorizes host/
+  // manager server-side, then marks the session 'completed' AND completes its active
+  // participants in one transaction. The authoritative session id is passed when known
+  // (activeGameSessionDbId); the RPC also accepts the pin as a legacy fallback and returns
+  // the resolved session_id. This replaces the two direct filtered UPDATEs so a later
+  // REVOKE SELECT (081) won't break end.
+  const { data: endData, error: sessionError } = await supabase.rpc("rpc_end_session", {
+    p_session_id: sessionId, p_pin: pin,
+  });
   if (sessionError) {
-    console.error("[gameService] endGameSession: failed to update session", sessionError);
+    console.error("[gameService] endGameSession: failed to end session", sessionError);
     return { data: null, error: sessionError };
   }
 
-  // The caller passes the exact session id it already holds — no read of the
-  // just-updated row. Without it the session is still marked completed above; the
-  // per-session participant/player writes are simply skipped (legacy fallback).
-  const sid = sessionId ?? null;
+  const sid = sessionId ?? endData?.session_id ?? null;
   if (!sid) return { data: null, error: null };
-
-  // 2. Mark all active participants as completed (so lobby no longer shows them)
-  await supabase
-    .from("game_session_participants")
-    .update({ status: "completed", last_seen_at: new Date().toISOString() })
-    .eq("session_id", sid)
-    .in("status", ["active", "joined"]);
 
   // 3. Save final player scores (ranked by position in scores array)
   if (scores.length > 0) {
@@ -214,12 +194,9 @@ export async function requestSessionVerification(sessionId) {
  * @returns {Promise<{ error: Object|null }>}
  */
 export async function cancelGameSession(sessionId, tenantId = null) {
-  let query = supabase
-    .from("game_sessions")
-    .update({ status: "canceled", ended_at: new Date().toISOString() })
-    .eq("id", sessionId);
-  if (tenantId) query = query.eq("tenant_id", tenantId);
-  const { error } = await query;
+  // Server-authorized write (migration 080): host/manager-authorized cancel by session id.
+  // tenantId kept for contract compatibility; authorization is derived server-side.
+  const { error } = await supabase.rpc("rpc_cancel_session", { p_session_id: sessionId });
   return { error };
 }
 
@@ -234,30 +211,15 @@ export async function cancelGameSession(sessionId, tenantId = null) {
  * @returns {Promise<{ data: Object|null, error: Object|null }>}
  */
 export async function joinGameSession(sessionId, { playerId, name, emoji = null, color = null, tenantId = null }) {
-  // The caller's avatar choice is AUTHORITATIVE — including null, which means
-  // "no avatar / clear any previously stored one". (A prior read of the stored
-  // emoji/color existed here but its result was unused — the upsert always writes
-  // the caller's value — so it was removed as a dead direct read.)
-  const finalEmoji = emoji;   // caller-authoritative — null clears any prior avatar
-  const finalColor = color;
-
-  // Write only — the caller consumes only `error` (join succeeded / failed), never the
-  // upserted row, so no `.select()`/RETURNING is needed. This keeps join working after
-  // table SELECT is revoked (a `.select().single()` would otherwise fail on no returned row).
-  const { error } = await supabase
-    .from("game_session_participants")
-    .upsert(
-      {
-        session_id: sessionId,
-        player_id:  playerId,
-        tenant_id:  tenantId,
-        name,
-        emoji: finalEmoji,
-        color: finalColor,
-        joined_at:  new Date().toISOString(),
-      },
-      { onConflict: "session_id,player_id" }
-    );
+  // Server-authorized SELF-join (migration 080): rpc_participant_join forces
+  // player_id = auth.uid() and derives tenant server-side, so a learner can only ever write
+  // THEIR OWN participant row into a SAME-TENANT session (no impersonation, no cross-tenant).
+  // Idempotent upsert (no duplicate). The caller's avatar choice — including null, which
+  // means "no avatar" — is authoritative and passed through unchanged. The playerId/tenantId
+  // params are kept for contract compatibility but are NOT trusted for the write.
+  const { error } = await supabase.rpc("rpc_participant_join", {
+    p_session_id: sessionId, p_name: name, p_emoji: emoji, p_color: color,
+  });
   return { data: null, error };
 }
 
@@ -299,17 +261,21 @@ export async function getLobbyParticipants(sessionId) {
  * @returns {Promise<{ error: Object|null }>}
  */
 export async function updateSessionPhase(sessionId, { phase, currentQuestionIndex, paused, liveQuestion } = {}) {
-  const patch = { phase };
-  if (currentQuestionIndex !== undefined) patch.current_question_index = currentQuestionIndex;
-  if (paused !== undefined) patch.paused = paused;
-  // live_question is the durable recovery source (migration 048). Passing an
-  // object stores the current SHOW_QUESTION payload; passing null clears it
-  // (host moved off the question); passing undefined leaves it untouched.
-  if (liveQuestion !== undefined) patch.live_question = liveQuestion;
-  const { error } = await supabase
-    .from("game_sessions")
-    .update(patch)
-    .eq("id", sessionId);
+  // Server-authorized write (migration 080): rpc_set_session_phase authorizes host/manager
+  // and persists phase (always) plus the optional fields via tri-state flags — preserving
+  // the exact prior semantics: live_question object=store / null=clear / undefined=leave
+  // untouched (same for current_question_index and paused). No reveal logic here (reveal is
+  // rpc_host_publish_reveal, 079).
+  const { error } = await supabase.rpc("rpc_set_session_phase", {
+    p_session_id:  sessionId,
+    p_phase:       phase,
+    p_set_cqi:     currentQuestionIndex !== undefined,
+    p_cqi:         currentQuestionIndex ?? null,
+    p_set_paused:  paused !== undefined,
+    p_paused:      paused ?? null,
+    p_set_live:    liveQuestion !== undefined,
+    p_live_question: liveQuestion ?? null,
+  });
   return { error };
 }
 
@@ -408,11 +374,10 @@ export async function saveGameAnswers(sessionId, answers = []) {
  * @returns {Promise<{ error: Object|null }>}
  */
 export async function markParticipantLeft(sessionId, playerId) {
-  const { error } = await supabase
-    .from("game_session_participants")
-    .update({ status: "left", last_seen_at: new Date().toISOString() })
-    .eq("session_id", sessionId)
-    .eq("player_id", playerId);
+  // Server-authorized SELF write (migration 080): the RPC flips ONLY the caller's own row
+  // (player_id = auth.uid()) to 'left'. playerId kept for contract compatibility; the write
+  // target is derived server-side so a learner can never mark another player left.
+  const { error } = await supabase.rpc("rpc_participant_leave", { p_session_id: sessionId });
   return { error };
 }
 
@@ -425,11 +390,9 @@ export async function markParticipantLeft(sessionId, playerId) {
  * @returns {Promise<{ error: Object|null }>}
  */
 export async function updateParticipantHeartbeat(sessionId, playerId) {
-  const { error } = await supabase
-    .from("game_session_participants")
-    .update({ last_seen_at: new Date().toISOString() })
-    .eq("session_id", sessionId)
-    .eq("player_id", playerId);
+  // Server-authorized SELF write (migration 080): refreshes ONLY the caller's own
+  // last_seen_at (player_id = auth.uid()). playerId kept for contract compatibility.
+  const { error } = await supabase.rpc("rpc_participant_heartbeat", { p_session_id: sessionId });
   return { error };
 }
 
@@ -465,10 +428,12 @@ export async function getSessionPlayerCounts(sessionIds) {
  */
 export async function saveSessionQuestionSnapshot(sessionId, questions) {
   if (!sessionId || !Array.isArray(questions) || questions.length === 0) return { error: null };
-  const { error } = await supabase
-    .from("game_sessions")
-    .update({ question_snapshot: questions })
-    .eq("id", sessionId);
+  // Server-authorized write (migration 080): host/manager-authorized, WRITE-ONCE (the RPC
+  // only sets question_snapshot when still null), preserving the immutable historical-
+  // question contract. Accepts DEFINITIONS only — never answers or scores.
+  const { error } = await supabase.rpc("rpc_save_question_snapshot", {
+    p_session_id: sessionId, p_questions: questions,
+  });
   return { error };
 }
 
