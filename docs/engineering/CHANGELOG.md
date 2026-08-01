@@ -2,6 +2,44 @@
 
 ## July 2026
 
+Ralli Live — Lifecycle & Confidentiality Foundation (in progress, not beta-complete)
+
+On `feature/ralli-live-leaderboard` (not merged). Migrations 071 and 073–080 applied and verified
+in production; 072 intentionally unapplied. Completed in this slice:
+
+- Learner-safe and host/manager-safe session reads: all Ralli Live reads (host recovery, active/
+  past sessions, analytics, counts, lobby roster, learner joinable list, reveal/award context)
+  moved behind server-authorized SECURITY DEFINER RPCs (073/075/077/078/079); the frontend does
+  zero direct table `.select()`. `ralli_can_manage_session` is owner-only (076).
+- Server-authorized lifecycle writes (080): start / end (session + participant completion, atomic)
+  / cancel / phase-and-live-state / question-snapshot (write-once) and participant join / leave /
+  heartbeat now run through authorized RPCs with exact-session identity and truthful state-
+  transition guards. Only two direct pure INSERTs remain (final scores, answers).
+- Waiting-lobby Leave/Rejoin reliability: explicit Leave durably marks the participant `left` and
+  untracks Presence; rejoin reactivates the same row (no duplicate); host roster and player count
+  clear promptly on Leave and show exactly one on rejoin.
+- Realtime channel reconnection: an unexpectedly closed game channel (the reused-topic drop after
+  rejoin) is detected and recreated with a generation-guarded lifecycle — one channel per topic.
+- Participant roster/count consistency: a single canonical Presence-plus-durable-heartbeat roster;
+  a durable `left` row overrides a lingering ghost Presence entry; Start is gated on live Presence.
+- Pause/Resume and refresh recovery foundations: durable phase/question/pause state with a periodic
+  idempotent reconcile so a missed broadcast recovers without user interaction; timers derive from
+  persisted timestamps and never restart.
+- Tenant/role authorization hardening: every RPC derives caller identity/tenant server-side,
+  authorizes the exact session/tenant, and denies cross-tenant, anon, and learner-to-host mutation.
+
+Still pending (Ralli Live NOT beta-complete):
+- Archived quizzes must be excluded from playable Ralli Live quizzes (enforced at the canonical
+  query/service boundary).
+- Durable scoreboard recovery (future migration 081).
+- Server-authoritative verification foundation (migration 072, unapplied).
+- Integrated Ralli Live leaderboard.
+- Final direct-table SELECT revocation (future migration 082) — direct authenticated table SELECT
+  currently remains open.
+- Final Ralli Live beta QA.
+
+---
+
 Battle Cards — Beta Complete
 
 - Migrations 068 (lifecycle + provenance + RLS hardening + hard-delete closure), 069 (category→tag data conversion), 070 (server-authoritative required-content enforcement) applied and verified in production (versions `20260728175949`, `20260728232125`, `20260729151513`). Frontend on `feature/battle-cards-audit`, ready to merge.

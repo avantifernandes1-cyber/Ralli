@@ -723,3 +723,471 @@ Operator: applied by Claude Code via exactly one controlled Supabase `apply_migr
 call under explicit user production approval (no db push / repair / manual ledger SQL /
 fallback). Ledger row 34. **Frontend NOT merged or deployed** — next step is final Battle
 Cards live QA and merge readiness. This ledger update is intentionally left uncommitted.
+
+---
+
+## 2026-07-30 — Ralli Live team-at-game-time snapshot / leaderboard trust foundation (071) — **APPLIED TO PRODUCTION**
+
+Branch `feature/ralli-live-leaderboard` @ `ac6cd2c`. Applied via EXACTLY ONE controlled
+`apply_migration` (Strategy A) after a passing immediate pre-apply gate; byte-identity
+re-confirmed against the committed blob. Additive — does NOT edit any applied migration;
+touches only Ralli Live `game_players` (two nullable columns + one BEFORE INSERT/UPDATE
+trigger). **This slice ships the trust foundation ONLY** — the leaderboard read RPC and UI
+remain BLOCKED on the server-authoritative grading decision (see
+`docs/engineering/071_LEADERBOARD_DESIGN.md §1`).
+
+| Order | Prod version (ledger) | Prod name | Git file | Commit | SQL SHA-256 | Applied (UTC) | Verification |
+|---|---|---|---|---|---|---|---|
+| 35 | `20260730002403` | 071_game_team_snapshot | supabase/migrations/071_game_team_snapshot.sql | ac6cd2c | 07450d812fcf9fd822d5b0e0c56d3b14fbb7f75ce47256b2e33a6280fd75fcbb | 2026-07-30 (version 20260730002403) | PASS — see below |
+
+Approved SHA-256: `07450d812fcf9fd822d5b0e0c56d3b14fbb7f75ce47256b2e33a6280fd75fcbb`. Apply result: `{"success":true}`.
+
+**What 071 adds:** `game_players.team_id uuid` + `team_name text` (both nullable, additive,
+**no FK** — so a later `tenant_teams` deletion can never erase a historical snapshot); one
+SECURITY DEFINER (`search_path=''`) function `game_players_stamp_team()` + BEFORE INSERT/UPDATE
+trigger `trg_game_players_stamp_team`. On INSERT the trigger stamps team_id/team_name from the
+`player_id`'s SAME-TENANT profile (client-supplied values ignored/overwritten; NULL for
+guests / name-based ids / no-team / cross-tenant / no-tenant). On UPDATE it freezes **ONLY**
+team_id/team_name (never `NEW := OLD`) — every other column (final_score, final_rank, accuracy,
+name, emoji, color, future fields) passes through unchanged. No historical backfill.
+
+**Immediate pre-apply gate (all 7 PASS):** working-tree bytes = approved SHA `07450d81…fdb`;
+071 absent from ledger (max `20260728232125`… i.e. beyond 070 `20260729151513`, nothing ≥071)
+and both objects absent; no conflicting team_id/team_name columns, function, or trigger; **21**
+historical `game_players` rows; migrations ≤070 unchanged; RLS enabled + 2 policies
+(`anon_all_game_players`, `auth_all_game_players`) / grants exactly as preflighted; no active
+schema drift / in-progress migration.
+
+**Structural / security verification (read-only, post-apply):**
+- Recorded version `20260730002403` / name `071_game_team_snapshot`; **exactly one** row; **no
+  migration applied beyond 071**.
+- `team_id` uuid nullable + `team_name` text nullable present. Function `game_players_stamp_team()`
+  present, **SECURITY DEFINER=true**, empty `search_path`, VOLATILE. Trigger
+  `trg_game_players_stamp_team` **enabled**, ROW BEFORE INSERT/UPDATE (tgtype 23).
+- **All 21 historical rows have team_id = NULL AND team_name = NULL** (no backfill); every
+  historical row's prior columns/timestamps **unchanged** — existing-columns fingerprint
+  `960041aab30e2b3364acb59ea5305e0a`, byte-identical to the pre-apply snapshot (the DDL rewrote
+  no rows; the trigger did not fire on ADD COLUMN).
+- RLS remains enabled; the 2 pre-existing policies intact; grants unchanged. No unrelated
+  schema / policy / grant / trigger / data change.
+
+**Behavioral matrix against production (ONE `BEGIN…ROLLBACK` pass — ephemeral fixtures, rolled
+back → nothing persisted; confirmed afterward: 21 rows, 0 non-null snapshots, 0 fixture
+rows/tenants/teams/users):** `PROD_071_BEHAVIOR_ALL_PASSED` — valid authenticated INSERT captures
+the same-tenant completion-time team (id + name); guest / no-team / cross-tenant → NULL;
+client-supplied team_id/team_name ignored (overwritten from the profile); legacy TEXT tenant
+(`org_momence`) does not throw and yields NULL; UPDATE cannot change team_id/team_name; UPDATE
+CAN change final_score/final_rank/accuracy/name/emoji/color; a team transfer (profile.team_id
+change) does not rewrite the existing snapshot; a later NEW game for the transferred player
+captures the NEW team; a team rename does not rewrite the historical snapshot; a team DELETION
+does not erase the snapshot (team_id/team_name survive — no FK).
+
+- Tests (local, against the byte-identical `ac6cd2c` bytes): committed 071 harness **12/12**;
+  SQL regressions 054–070 **17/17**; 065 concurrency suite PASS; JS suite **13/13**; esbuild
+  parse; Vite build — all PASS.
+
+Operator: applied by Claude Code via exactly one controlled Supabase `apply_migration` call
+under explicit user production approval (no db push / repair / manual ledger SQL / fallback; no
+other migration applied; frontend NOT merged or deployed). Ledger row 35. **Leaderboard read
+RPC + UI remain BLOCKED** pending the server-authoritative grading/verification foundation (the
+next approved phase). This ledger update is intentionally left uncommitted.
+
+---
+
+## 2026-07-30 — Ralli Live learner-safe read RPCs (073) — **APPLIED TO PRODUCTION**
+
+Branch `feature/ralli-live-leaderboard` @ `4bb4c08`. Applied via EXACTLY ONE controlled
+`apply_migration` (Strategy A) after a passing immediate pre-apply gate; byte-identity
+re-confirmed against the committed blob. **Additive only** — creates three SECURITY DEFINER
+learner-safe read RPCs; does NOT edit any prior migration, drop any policy, revoke any table
+permission, or change any gameplay data. NOTE: migration **072 remains UNAPPLIED** (073 has no
+dependency on 072 — it needs only existing tables + `get_my_tenant_id` + `auth.uid`, all present).
+
+| Order | Prod version (ledger) | Prod name | Git file | Commit | SQL SHA-256 | Applied (UTC) | Verification |
+|---|---|---|---|---|---|---|---|
+| 36 | `20260730154929` | 073_ralli_learner_safe_reads | supabase/migrations/073_ralli_learner_safe_reads.sql | 4bb4c08 | d2e3d331e48646c28bc982903ce8351d146056a9e37ec8e7a47aedd54051a757 | 2026-07-30 (version 20260730154929) | PASS — see below |
+
+Approved SHA-256: `d2e3d331e48646c28bc982903ce8351d146056a9e37ec8e7a47aedd54051a757`. Apply result: `{"success":true}`.
+
+**Pre-apply gate (all PASS):** working-tree == committed(`4bb4c08`) bytes IDENTICAL; SHA-256 both
+`d2e3d331…4051a757` = approved; 073 absent from ledger (max was `20260730002403`); all three RPC
+names absent; tables/columns/roles/`get_my_tenant_id`/`auth.uid` present; migration contains no
+DML/backfill/DROP POLICY/table REVOKE/gameplay mutation (only new-function EXECUTE scoping).
+
+**What 073 adds (3 functions; SECURITY DEFINER; `search_path=''`):**
+- `rpc_player_session_restore(uuid)` — active-player reconnect: durable phase/state + the
+  already-sanitized `live_question` + the caller's OWN per-question points/correctness; never
+  `question_snapshot`, never another player's answer. Participant-only (participant row or own
+  answer) AND same-tenant. EXECUTE = authenticated, service_role (anon explicitly revoked).
+- `rpc_my_completed_session_review(uuid)` — participant-only review of a durably COMPLETED
+  session: snapshot (post-completion) + OWN answers + player count. EXECUTE = authenticated,
+  service_role (anon retains the Supabase schema-default EXECUTE but the body rejects anon via
+  `auth.uid()` null → "authentication required").
+- `rpc_list_my_game_history(int)` — the caller's OWN game_players rows + session display metadata;
+  identity from `auth.uid()`; no player-id parameter. Same anon note as review.
+
+**Structural verification (read-only, post-apply):**
+- Recorded version `20260730154929` / name `073_ralli_learner_safe_reads`; **exactly one** row;
+  nothing beyond it. All three functions present with approved signatures, `prosecdef=true`,
+  `search_path=""`. `authenticated` holds EXECUTE on all three; **anon EXECUTE on
+  rpc_player_session_restore = false** (revoked). game_sessions (6) + game_answers (2) RLS
+  policies intact; `authenticated` SELECT on game_sessions still granted (NOT revoked). Gameplay
+  counts unchanged: sessions 58 / answers 89 / players 21.
+
+**Behavioral verification (production, ONE `BEGIN…ROLLBACK`, ephemeral identities, rolled back —
+0 residual test users/sessions afterward):** `PROD_073_BEHAVIOR_ALL_PASSED` — participant restore
+returns own answers only + no `question_snapshot`; same-tenant non-participant denied;
+cross-tenant denied; completed review (participant + completed) returns snapshot + own answers;
+review on a non-completed session denied; non-participant review denied; own history derived from
+`auth.uid()` (own rows only); anon on review/history functionally denied ("authentication
+required").
+
+**Known follow-up (does NOT block 073; blocks calling the frontend production-ready):**
+`rpc_my_completed_session_review` / `rpc_list_my_game_history` retain the Supabase schema-default
+anon EXECUTE grant (my `REVOKE … FROM PUBLIC` did not remove the explicit anon default grant);
+anon is functionally denied by the body but a future additive `REVOKE … FROM anon` should tighten
+this to grant-level parity with `restore`.
+
+Operator: applied by Claude Code via exactly one controlled Supabase `apply_migration` call under
+explicit user production approval (no db push / repair / manual ledger SQL / fallback; no other
+migration applied). Ledger row 36. **Frontend NOT pushed or deployed** (commit `4bb4c08` held).
+Migration 072 verification foundation remains unapplied. This ledger update is intentionally left uncommitted.
+
+## 2026-07-30 — Area (Ralli Live learner-safe reads) — 074 anon-grant hardening
+
+Branch `feature/ralli-live-leaderboard`. Applied via exactly one controlled `apply_migration`
+call under explicit user production approval. Closes the 073 follow-up: brings
+`rpc_my_completed_session_review` / `rpc_list_my_game_history` to grant-level parity with
+`rpc_player_session_restore` by revoking the explicit Supabase schema-default anon EXECUTE grant.
+
+| Order | Prod version (ledger) | Prod name | Git file | Commit | SQL SHA-256 | Applied (UTC) | Verification |
+|---|---|---|---|---|---|---|---|
+| 37 | `20260730180007` | 074_revoke_anon_ralli_read_rpcs | supabase/migrations/074_revoke_anon_ralli_read_rpcs.sql | `887698f` | fc6d44b3e8b7b36a8b83941cde005be3f16f6b716da401e0e3384101007a2574 | 2026-07-30 18:00:07 | PASS |
+
+**Pre-apply gate (immediately before applying):** committed-bytes SHA-256 re-confirmed
+`fc6d44b3…07007a2574` (working tree == HEAD, clean); anon EXECUTE = **true**, authenticated +
+service_role = **true** on both target RPCs; 074 absent from `schema_migrations`.
+
+**Structural verification (read-only, post-apply):**
+- Recorded version `20260730180007` / name `074_revoke_anon_ralli_read_rpcs`; **exactly one** row.
+- `rpc_my_completed_session_review(uuid)` and `rpc_list_my_game_history(integer)`: anon EXECUTE =
+  **false**; authenticated + service_role EXECUTE = **true**. Both ACLs now
+  `postgres=X/postgres | authenticated=X/postgres | service_role=X/postgres` — **identical** to
+  `rpc_player_session_restore(uuid)` (parity achieved; no anon entry remains, no PUBLIC grant).
+- No unrelated change: `game_sessions` (6) + `game_answers` (2) RLS policies intact; `authenticated`
+  SELECT on `game_sessions` still granted; no function body/signature altered; no table grant,
+  data, or unrelated function ACL changed (migration is two `REVOKE EXECUTE … FROM anon` statements
+  only).
+
+**Frontend compatibility:** both RPCs are invoked only from authenticated real-user paths
+(`listMyGameHistory` behind a `currentUser._isReal` guard; `getMyCompletedSessionReview` inside
+`PlayerSessionDetail`, reached from the signed-in history flow); anon never invokes them and the
+bodies reject anon regardless. No frontend change required or made.
+
+Operator: applied by Claude Code via exactly one controlled Supabase `apply_migration` call under
+explicit user production approval (no db push / repair / manual ledger SQL / fallback; no other
+migration applied). Ledger row 37. **No frontend push/deploy, no Edge Function deploy, no merge, no
+leaderboard UI exposure; migration 072 remains unapplied.** This ledger update is intentionally left
+uncommitted.
+
+## 2026-07-30 — Area (Ralli Live host/manager safe reads) — 075 applied
+
+Branch `feature/ralli-live-leaderboard`. Applied via exactly one controlled `apply_migration`
+call under explicit user production approval. Creates seven server-authorized read RPCs (host
+recovery, Active Games, Past Sessions, exact-session analytics, session player counts, lobby
+roster) + the `ralli_can_manage_session` authz helper. Corrected before apply to include the
+`manager` product role alongside `orgAdmin` (both tenant management roles), and to harden the
+new functions' grants up front.
+
+| Order | Prod version (ledger) | Prod name | Git file | Commit | SQL SHA-256 | Applied (UTC) | Verification |
+|---|---|---|---|---|---|---|---|
+| 38 | `20260730185455` | 075_host_manager_safe_reads | supabase/migrations/075_host_manager_safe_reads.sql | `9b52786` | cd77d196cbd7e2dd34a77ef71a0ef590e8dd490883135277fd29dab5d1e39eb4 | 2026-07-30 18:54:55 | PASS (one finding — see below) |
+
+**Pre-apply gate (immediately before applying):** committed==working-tree bytes, SHA-256
+re-confirmed `cd77d196…39eb4`; 075 absent; all seven function signatures absent; dependency
+tables (game_sessions/game_answers/game_players/game_session_participants/profiles) + roles
+(anon/authenticated/service_role) present; migration contains 0 table INSERT/UPDATE/DELETE, 0
+POLICY statements, 0 ALTER TABLE, 0 table-grant REVOKE (all 7 REVOKEs are ON FUNCTION).
+
+**Structural verification (read-only, post-apply):** recorded version `20260730185455`, exactly
+one row. All 7 functions present, `prosecdef=true`, `search_path=""`. PUBLIC + anon EXECUTE =
+false on all 7. authenticated + service_role EXECUTE = true on the 6 client RPCs.
+
+**Behavioral verification (production, ONE BEGIN…ROLLBACK, ephemeral identities, 0 residual
+rows):** APPLIED-075 BEHAVIORAL MATRIX PASSED — same-tenant manager + orgAdmin + ralli_admin +
+exact host (host profile role='user') all allowed; ordinary same-tenant learner, cross-tenant
+manager, and anon all denied.
+
+**No collateral change:** RLS policies unchanged (game_sessions 6 / game_answers 2 /
+game_players 2 / game_session_participants 2); `authenticated` SELECT on game_sessions still
+granted (tables NOT revoked); migration has no DML so no gameplay data changed.
+
+**FINDING (open, low severity):** the internal helper `ralli_can_manage_session(text,text)`
+retains an EXPLICIT `authenticated` + `service_role` EXECUTE grant added by Supabase's
+default-privilege trigger on creation; the migration's `REVOKE ALL … FROM PUBLIC, anon` did not
+strip those explicit grants, so the helper is client-executable by `authenticated` — contrary to
+the intended "internal only". Security impact is low (the helper returns only the CALLER's own
+management rights for a given host/tenant, leaks no other data; the SECURITY DEFINER RPCs call it
+as owner and are unaffected). Recommended corrective (next controlled apply, awaiting approval):
+`REVOKE EXECUTE ON FUNCTION public.ralli_can_manage_session(text,text) FROM authenticated, service_role;`
+
+Operator: applied by Claude Code via exactly one controlled `apply_migration` call under explicit
+user production approval (no db push / repair / manual ledger SQL / fallback; no other migration
+applied). Ledger row 38. **No frontend push/deploy this step; no Edge Function deploy; no merge;
+no leaderboard UI; no table-read revocation; migration 072 remains unapplied.** This ledger update
+is intentionally left uncommitted.
+
+## 2026-07-30 — Area (Ralli Live host/manager safe reads) — 076 helper grant lock-down
+
+Branch `feature/ralli-live-leaderboard`. Applied via exactly one controlled `apply_migration`
+call under explicit user production approval. Forward-only correction to the 075 finding: the
+internal authz helper `ralli_can_manage_session(text,text)` retained an explicit
+`authenticated` + `service_role` EXECUTE grant (Supabase default-privilege trigger) that 075's
+`REVOKE … FROM PUBLIC, anon` did not strip. 076 is a single function-level REVOKE making the
+helper owner-only. 075 was NOT edited or renamed.
+
+| Order | Prod version (ledger) | Prod name | Git file | Commit | SQL SHA-256 | Applied (UTC) | Verification |
+|---|---|---|---|---|---|---|---|
+| 39 | `20260730190727` | 076_revoke_ralli_can_manage_session_helper | supabase/migrations/076_revoke_ralli_can_manage_session_helper.sql | `6391df6` | 403baee9b9ed43a318dd7cc09d971b0486371a489c9ec33f9df2ce401a6a7f21 | 2026-07-30 19:07:27 | PASS |
+
+**Pre-apply gate:** committed==working-tree bytes, SHA-256 re-confirmed `403baee9…a6a7f21`; 076
+absent; helper existed with `authenticated`+`service_role` EXECUTE present; migration = exactly
+one function-level REVOKE (0 CREATE/DROP/ALTER/DML/POLICY/table-grant). NOTE: the first
+apply_migration call returned a transient connector error; a read-only state check confirmed 076
+was NOT recorded and the helper grant was unchanged, so the single apply was safely retried once.
+
+**Structural verification (read-only, post-apply):** recorded version `20260730190727`, exactly
+one row. Helper proacl is now `postgres=X/postgres` ONLY — `authenticated`/`service_role`/`anon`/
+`PUBLIC` EXECUTE = false, owner (postgres) EXECUTE = true. The six RPC grants are UNCHANGED
+(authenticated EXECUTE on all six; anon EXECUTE on none). RLS policies unchanged (game_sessions 6
+/ game_answers 2 / game_players 2 / game_session_participants 2); `authenticated` SELECT on
+game_sessions still granted (tables untouched).
+
+**Behavioral verification (production, ONE BEGIN…ROLLBACK, ephemeral identities, 0 residual
+rows):** POST-076 RPCs STILL FUNCTION PASSED — with the helper owner-only, the six SECURITY
+DEFINER RPCs still succeed for same-tenant manager (all six) and exact host (role='user'); an
+ordinary learner and anon remain denied. Confirms the RPCs reach the helper as owner despite the
+client REVOKE.
+
+**No collateral change / no frontend impact:** migration has no DML; no table grant, RLS policy,
+or unrelated ACL changed; the frontend never calls the helper directly (RPC-only), so no
+compatibility impact.
+
+Operator: applied by Claude Code via exactly one controlled `apply_migration` call (after one
+transient-error safe retry) under explicit user production approval (no db push / repair / manual
+ledger SQL / fallback; no other migration applied). Ledger row 39. **No merge; no table-read
+revocation; no Edge Function deploy; no leaderboard UI; migration 072 remains unapplied.** This
+ledger update is intentionally left uncommitted.
+
+## 2026-07-30 — Area (Ralli Live) — 077 learner-safe joinable-session list (post-075 regression fix)
+
+Branch `feature/ralli-live-leaderboard`. Applied via exactly one controlled `apply_migration`
+call under explicit user production approval. Fixes the post-075 regression: 075 routed the whole
+session list through rpc_manager_active_sessions (manager-only → [] for learners), which emptied
+the learner joinable list AND (via the lobby deriving sessionDbId from that list) dropped learners
+from the lobby. 077 adds a separate learner contract; rpc_manager_active_sessions is unchanged.
+
+| Order | Prod version (ledger) | Prod name | Git file | Commit | SQL SHA-256 | Applied (UTC) | Verification |
+|---|---|---|---|---|---|---|---|
+| 40 | `20260730194350` | 077_learner_joinable_sessions | supabase/migrations/077_learner_joinable_sessions.sql | `173f62b` | 46bddac4859a66d2cd75371289741a4a455ad3e6f9f24e4a37757b1cde372e2d | 2026-07-30 19:43:50 | PASS |
+
+**Pre-apply gate:** committed==working-tree bytes, SHA-256 re-confirmed `46bddac4…372e2d`; 077 absent;
+rpc_learner_joinable_sessions absent; game_sessions+profiles + roles present; rpc_manager_active_sessions
+present/unchanged; additive only (0 table DML / POLICY / ALTER TABLE / table-grant REVOKE); returned
+payload = safe display fields only (id/pin/name/quiz_id/question_count/status/player_count/demo_mode) —
+no question_snapshot/live_question/answers/correct/analytics (the three forbidden-keyword hits were all
+in comments).
+
+**Structural verification (read-only, post-apply):** recorded version `20260730194350`, exactly one row.
+Function present, prosecdef=true, search_path="". ACL `postgres=X | authenticated=X | service_role=X`
+(no PUBLIC, no anon). anon+public EXECUTE=false; authenticated+service_role EXECUTE=true.
+rpc_manager_active_sessions ACL UNCHANGED (`postgres | authenticated | service_role`). RLS policies
+unchanged (game_sessions 6 / game_answers 2 / game_players 2 / game_session_participants 2);
+`authenticated` SELECT on game_sessions still granted (tables untouched).
+
+**Behavioral verification (production, ONE BEGIN…ROLLBACK, ephemeral identities, 0 residual rows):**
+APPLIED-077 BEHAVIORAL PASSED — a same-tenant learner sees ONLY the tenant's WAITING real session;
+started/completed/canceled/demo/cross-tenant sessions excluded; payload carries no
+snapshot/live_question/answers/correct/points; anon is grant-level denied (raises, not []).
+
+**No collateral change:** migration has no DML; no table grant, RLS policy, or unrelated function
+changed. The manager active-session RPC is unchanged.
+
+Operator: applied by Claude Code via exactly one controlled `apply_migration` call under explicit user
+production approval (no db push / repair / manual ledger SQL / fallback; no other migration applied).
+Ledger row 40. **No merge; no table-read revocation; no Edge Function deploy; no leaderboard UI; migration
+072 remains unapplied.** This ledger update is intentionally left uncommitted.
+
+## 2026-07-30 — Area (Ralli Live) — 078 safe rejoin to started/paused session
+
+Branch `feature/ralli-live-leaderboard`. Applied via exactly one controlled `apply_migration`
+call under explicit user production approval. Adds `rpc_rejoin_session(text)`: one atomic
+server-authorized op letting a PRIOR same-tenant participant (auth.uid()) re-enter a
+started/paused session by PIN — verifies eligibility and reactivates their existing
+participant row. Started games remain closed to brand-new players.
+
+| Order | Prod version (ledger) | Prod name | Git file | Commit | SQL SHA-256 | Applied (UTC) | Verification |
+|---|---|---|---|---|---|---|---|
+| 41 | `20260730202237` | 078_rejoin_started_session | supabase/migrations/078_rejoin_started_session.sql | `6614f26` | 200eda5d35d7b3fd869a78bfcb250f950f192dc3d8f3882bec703b367e5fcc67 | 2026-07-30 20:22:37 | PASS |
+
+**Pre-apply gate:** committed==working-tree bytes, SHA-256 re-confirmed `200eda5d…fcc67`; 078 +
+`rpc_rejoin_session` absent; game_sessions(pin/tenant_id/status/paused/phase)=5,
+game_session_participants(session_id/player_id/status/last_seen_at/name/emoji)=6,
+profiles.tenant_id present; roles present; `find_joinable_session(text,text)` (normal
+waiting-join) intact; additive (0 top-level table DML / POLICY / ALTER TABLE / table-grant
+REVOKE — the only write is the participant status/last_seen UPDATE inside the function body).
+Contract confirmed from bytes: user+tenant derived server-side (auth.uid() + profiles.tenant_id);
+reactivation writes ONLY status='active' + last_seen_at; never rewrites player_id/name/emoji/
+color/points/answers/final_score; participant match by player_id = auth.uid().
+NOTE: a transient Supabase connector outage delayed the DB-side gate; it was retried until it
+succeeded, and the single apply ran only after all gates passed.
+
+**Structural verification (read-only, post-apply):** recorded version `20260730202237`, exactly
+one row. Function present, prosecdef=true, search_path="". ACL `postgres=X | authenticated=X |
+service_role=X` (no PUBLIC/anon). anon+public EXECUTE=false; authenticated+service_role
+EXECUTE=true. RLS policies unchanged (game_sessions 6 / game_answers 2 / game_players 2 /
+game_session_participants 2). `find_joinable_session` (normal join) unchanged.
+
+**Behavioral verification (production, ONE BEGIN…ROLLBACK, ephemeral identities, 0 residual
+rows):** APPLIED-078 BEHAVIORAL PASSED — a prior participant (status='left') rejoins a started+
+paused session: exactly ONE row, reactivated to status='active'; name/emoji/color and
+game_answers/points unchanged; session.paused unchanged (no auto-resume). Brand-new (never-
+participated) user, waiting session, completed session, and anon are all denied.
+
+**No collateral change:** migration adds one function; the only data write is the intended
+participant status/last_seen reactivation (verified in the rolled-back probe). No table grant,
+RLS policy, or unrelated function changed.
+
+Operator: applied by Claude Code via exactly one controlled `apply_migration` call under explicit
+user production approval (no db push / repair / manual ledger SQL / fallback; no other migration
+applied). Ledger row 41. **No merge; no table-read revocation; no Edge Function deploy; no
+leaderboard UI; migration 072 remains unapplied.** This ledger update is intentionally left
+uncommitted.
+
+## 2026-07-30 — Area (Ralli Live) — 079 residual host-read cutover RPCs (prerequisite for table-SELECT revocation)
+
+Branch `feature/ralli-live-leaderboard`. Applied via exactly one controlled `apply_migration`
+call under explicit user production approval. ADDITIVE ONLY — two new server-authorized
+SECURITY DEFINER RPCs so a later `REVOKE SELECT … FROM authenticated` on the four Ralli Live
+tables won't break gameplay: `rpc_host_publish_reveal(uuid,integer,jsonb)` (moves the reveal
+durable-state conditional first-publication write + 0-row classification read server-side; 0-row
+outcome still classified by the unchanged shared JS `classifyRevealPublish`) and
+`rpc_host_award_context(text)` (moves the points-award session-by-pin + participant lookup
+server-side; scoring math stays in scoringService). Both authorize via the existing owner-only
+`ralli_can_manage_session` helper (exact host / same-tenant orgAdmin|manager / ralli_admin) —
+no duplicated authorization or scoring logic. Frontend at commit `e53c9a2` already calls these.
+
+| Order | Prod version (ledger) | Prod name | Git file | Commit | SQL SHA-256 | Applied (UTC) | Verification |
+|---|---|---|---|---|---|---|---|
+| 42 | `20260730222110` | 079_ralli_residual_read_rpcs | supabase/migrations/079_ralli_residual_read_rpcs.sql | `2e2a567` | 5e84a9d521374b0d5f3ae0680d0b1bc7f9f29ee6f51b003c9cb7c3e00c7378b6 | 2026-07-30 22:21:10 | PASS |
+
+**Pre-apply gate:** committed==working-tree bytes, SHA-256 re-confirmed `5e84a9d5…78b6`; 079 +
+both RPCs absent; `ralli_can_manage_session(text,text)` present and owner-only (no
+authenticated/anon/service_role EXECUTE); game_sessions + game_session_participants exist;
+game_sessions.tenant_id=text, profiles.tenant_id=uuid; required columns present
+(game_sessions: phase/live_question/current_question_index/status/paused/pin/host_id/created_at;
+participants: session_id/player_id/name/joined_at); migration contains ONLY the two approved RPC
+definitions + their REVOKE/GRANT (no table grant, RLS policy, data, scoring formula, or unrelated
+function change).
+
+**Structural verification (read-only, post-apply):** recorded version `20260730222110`, exactly
+one row. Both functions prosecdef=true, proconfig=`search_path=""`. EXECUTE: authenticated=true,
+service_role=true, anon=false, PUBLIC=false (both). Helper `ralli_can_manage_session` STILL
+owner-only (no authenticated/anon/service_role EXECUTE). authenticated SELECT on all four tables
+UNCHANGED (still granted — revocation is a separate later stage). Migration is pure DDL (2
+CREATE FUNCTION + 4 grants) → 0 DML → no production data rows modified.
+
+**Behavioral verification (production, ONE BEGIN…ROLLBACK, ephemeral identities, 0 residual
+rows):** APPLIED-079 BEHAVIORAL PASSED — T0 stale question index → zero, session phase NOT
+corrupted (stays 'question'); T1 exact host publishes reveal → applied; T2 duplicate publish →
+zero + honest current{phase=reveal,cqi=0}, session state uncorrupted; T3 same-tenant manager
+(non-host) publishes → applied; T4 learner, T5 cross-tenant manager, T6 anon → publish denied;
+T7 host award_context → resolves only the authorized session + its one participant; T8 same-tenant
+manager award → authorized; T9 cross-tenant → another tenant's session NOT resolvable (null);
+T10 learner award → session not exposed. Zero fixtures remain after rollback (verified).
+
+**Regression / build:** JS suites zeroPlayerHalt 12/12, playerSafeQuestion 9/9, revealPublish 7/7
+(0 fail); gameService + scoringService parse clean; `npm run build` ✓ (2.08s).
+
+Operator: applied by Claude Code via exactly one controlled `apply_migration` call under explicit
+user production approval (no db push / repair / manual ledger SQL / fallback; no other migration
+applied). Ledger row 42. **No merge; no table-read revocation; realtime participant subscription
+NOT removed; no migration 080 created; no Edge Function deploy; no leaderboard UI; migration 072
+remains unapplied.** This ledger update is intentionally left uncommitted.
+
+## 2026-07-31 — Ralli Live server-authorized lifecycle write RPCs (080, Stage C) — **APPLIED TO PRODUCTION**
+
+Branch `feature/ralli-live-leaderboard`. Applied via exactly one controlled `apply_migration`
+call under explicit user production approval. ADDITIVE ONLY — eight SECURITY DEFINER RPCs that
+move the 9 filtered Ralli Live lifecycle writes off direct table access (Stage B proved a bare
+REVOKE SELECT breaks them), so the later revocation (now migration **082** — see roadmap note
+below) is safe. Corrected build:
+exact-session identity (start/end by exact game_sessions.id, no PIN lookup / no PIN fallback),
+smallest truthful state-transition guards, canonical joinability (real+waiting; started/paused →
+rpc_rejoin_session 078), self-only participant writes (player_id=auth.uid()). The two pure INSERTs
+(game_players, game_answers) are unchanged (migration 072 scope).
+
+| Order | Prod version (ledger) | Prod name | Git file | Commit | SQL SHA-256 | Applied (UTC) | Verification |
+|---|---|---|---|---|---|---|---|
+| 43 | `20260731010835` | 080_ralli_server_authorized_writes | supabase/migrations/080_ralli_server_authorized_writes.sql | `2868de7` | db0a518bcca38cca9086501286b12312d4fe5b13ffee4aeaa0e8394b58f96d5f | 2026-07-31 01:08:35 | PASS |
+
+**Pre-apply gate:** committed==working-tree bytes, SHA-256 re-confirmed `db0a518b…f96d5f`; 080 +
+all eight corrected RPCs absent; obsolete overloads `rpc_start_session(text)` /
+`rpc_end_session(uuid,text)` absent; `ralli_can_manage_session` owner-only; 078 `rpc_rejoin_session`
++ 079 `rpc_host_publish_reveal` + canonical `find_joinable_session` present; tables/columns/unique
+(session_id,player_id)/roles present; demo_mode default false + participant status default 'active';
+authenticated table SELECT unchanged; migration is only the 8 RPC defs + REVOKE/GRANT (no table
+grant, RLS policy, scoring formula, answer, or data change).
+
+**Structural verification (read-only, post-apply):** recorded version `20260731010835`, exactly
+one row. All 8 RPCs exist with corrected signatures; all prosecdef=true + proconfig `search_path=""`;
+EXECUTE authenticated+service_role=true, anon+PUBLIC=false; obsolete overloads absent; helper still
+owner-only; authenticated table SELECT UNCHANGED on all four tables; RLS policy count unchanged (12);
+migration is pure DDL → 0 DML → no production data modified.
+
+**Behavioral verification (production, ONE BEGIN…ROLLBACK, ephemeral identities, 0 residual rows):**
+APPLIED-080 BEHAVIORAL ALL PASS — waiting-real-with-snapshot starts by exact id; sibling session
+untouched (reused-PIN independence); null/random/no-snapshot/demo/re-start rejected; learner joins a
+waiting session; a 'left' participant re-joining a waiting session returns to 'active' with no
+duplicate; started session rejects normal join (rejoin path is 078); phase mutates live but not a
+completed/canceled session; cancel only from waiting + idempotent; end is exact-id, atomic
+(session+participants) and idempotent, null id = matched:false no-op; leave/heartbeat affect only the
+caller with honest matched/not-matched; null avatar preserved; learner/cross-tenant/anon mutations
+denied. JS regressions 12/9/7 green; build clean.
+
+Operator: applied by Claude Code via exactly one controlled `apply_migration` call under explicit
+user production approval (no db push / repair / manual ledger SQL / fallback; no other migration
+applied). Ledger row 43. **No merge; migrations 081 (scoreboard recovery) and 082 (table-SELECT
+revocation) NOT created; direct authenticated table SELECT remains OPEN (not revoked); migration
+072 remains unapplied; no Edge Function deploy; no leaderboard UI.** This ledger update is
+intentionally left uncommitted.
+
+---
+
+## Ralli Live migration roadmap (corrected numbering — as of the 2026-07-31 checkpoint)
+
+Applied to production and verified: **071** (team-at-game-time snapshot / trust foundation),
+**073** (learner-safe reads), **074** (anon read-RPC grant hardening), **075** (host/manager safe
+reads, incl. the `manager` role), **076** (`ralli_can_manage_session` locked to owner-only),
+**077** (learner joinable-session list), **078** (safe rejoin to started/paused), **079**
+(residual host-read cutover RPCs), **080** (server-authorized lifecycle write RPCs).
+
+Honest current confidentiality/lifecycle state:
+- Application READS have moved to authorized SECURITY DEFINER RPCs (073/075/077/078/079); the
+  frontend performs zero direct `.select()` on the four Ralli Live tables.
+- Application lifecycle WRITES have moved to authorized RPCs (080); the only remaining direct
+  operations are the two pure INSERTs (`game_players` final scores, `game_answers`).
+- `ralli_can_manage_session` is owner-only (076).
+- **Direct authenticated table SELECT on the four Ralli Live tables REMAINS OPEN** — no
+  confidentiality revocation has been applied. The app no longer reads directly, but the GRANT
+  is still present until the revocation stage below.
+
+NOT YET CREATED / NOT APPLIED (corrected numbering):
+- **072** — server-authoritative verification foundation: remains **unapplied** (leaderboard-trust
+  prerequisite).
+- **081** — durable Ralli Live scoreboard recovery: **pending** (design only; not created/applied).
+- **082** — final direct-table SELECT revocation (`REVOKE SELECT … FROM authenticated, anon` on the
+  four tables): **pending** the later stage (not created/applied). *(Supersedes earlier notes that
+  called the revocation "migration 081"; the revocation is now 082 and 081 is reserved for the
+  scoreboard recovery. The separate `RALLI_TABLE_SELECT_REVOCATION_PLAN.md` still uses the older
+  "081" label and will be corrected when that revocation work begins.)*
