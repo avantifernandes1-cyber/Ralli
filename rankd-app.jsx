@@ -1,5 +1,4 @@
 import React, { useState, useEffect, useCallback, useRef, useMemo } from "react";
-import { createPortal } from "react-dom"; // DIAGNOSTIC · DO NOT MERGE — [RALLI_HOST_LOBBY_CANCEL_TRACE]
 
 // ── MULTI-TENANT ARCHITECTURE ─────────────────────────────────────────────────
 // Data models, seed data, permissions, auth, and tenant service layers.
@@ -6896,57 +6895,9 @@ function RankdNameEntryScreen({ onNav, pin, sessionName, onConfirm, defaultName,
 
 // ── RANKD LOBBY SCREEN ───────────────────────────────────────
 
-// ─────────────────────────────────────────────────────────────────────────────
-// DIAGNOSTIC · DO NOT MERGE — [RALLI_HOST_LOBBY_CANCEL_TRACE]
-// Runtime trace of the HOST waiting-lobby durable-cancellation recovery path. Portal-mounted,
-// default-visible, copyable. Remove entirely (this block + its <HostLobbyCancelTracePanel/> render
-// + the RHT.* calls + the react-dom import) once the failing boundary is proven.
-const RHT = {
-  lines: [],
-  subs: 0,          // host-poll effect subscribe count
-  cleanups: 0,      // host-poll effect cleanup count
-  listeners: new Set(),
-  push(evt, data) {
-    let t = "??:??:??";
-    try { t = new Date().toISOString().slice(11, 23); } catch {}
-    this.lines.push(t + "  " + evt + (data !== undefined ? "  " + (() => { try { return JSON.stringify(data); } catch { return String(data); } })() : ""));
-    if (this.lines.length > 400) this.lines.shift();
-    this.listeners.forEach((fn) => { try { fn(); } catch {} });
-  },
-};
-function HostLobbyCancelTracePanel() {
-  const [, force] = useState(0);
-  const [copied, setCopied] = useState(false);
-  useEffect(() => {
-    const fn = () => force((n) => n + 1);
-    RHT.listeners.add(fn);
-    return () => RHT.listeners.delete(fn);
-  }, []);
-  const text = RHT.lines.join("\n");
-  const panel = (
-    <div style={{
-      position: "fixed", right: 8, bottom: 8, zIndex: 2147483647, width: 340, maxWidth: "46vw",
-      maxHeight: "40vh", overflow: "auto", background: "rgba(10,12,20,0.94)", color: "#c8f7c8",
-      font: "10px/1.35 ui-monospace,Menlo,monospace", border: "1px solid #2b7", borderRadius: 8,
-      padding: "6px 8px", boxShadow: "0 4px 18px rgba(0,0,0,0.4)", pointerEvents: "auto",
-    }}>
-      <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", gap: 6, marginBottom: 4 }}>
-        <b style={{ color: "#ffd166", fontSize: 9 }}>DIAGNOSTIC · DO NOT MERGE — HOST CANCEL TRACE</b>
-        <button onClick={() => { try { navigator.clipboard.writeText(text); setCopied(true); setTimeout(() => setCopied(false), 1200); } catch {} }}
-          style={{ font: "9px monospace", background: "#2b7", color: "#031", border: "none", borderRadius: 4, padding: "2px 6px", cursor: "pointer" }}>
-          {copied ? "copied" : "copy"}
-        </button>
-      </div>
-      <pre style={{ margin: 0, whiteSpace: "pre-wrap", wordBreak: "break-word" }}>{text || "(waiting for events…)"}</pre>
-    </div>
-  );
-  if (typeof document === "undefined" || !document.body) return null;
-  return createPortal(panel, document.body);
-}
-// ─────────────────────────────────────────────────────────────────────────────
-
 function RankdLobbyScreen({ onNav, pin, sessionDbId: propSessionDbId = null, playerName, playerEmoji, sessionName, role, sessions = [], currentUser, onGameStart, chPlayers, broadcast, trackPlayerPresence, playerId, chMsg, onHostEnd }) {
   const mobile = useMobile();
+  const toast  = useToast(); // in-scope notifications (host cancel-recovery message, etc.)
   const session     = sessions.find(s => s.code === pin);
   // Lobby membership must derive from the DURABLE join-established id (App state,
   // set at handleEnterPin), NOT the mutable `sessions` list — a session-list refresh
@@ -7111,44 +7062,27 @@ function RankdLobbyScreen({ onNav, pin, sessionDbId: propSessionDbId = null, pla
   // The effect re-subscribes per sessionDbId; its cleanup sets `stale`, so a delayed response
   // from a prior session id can never navigate (it is verified current before changing screens).
   useEffect(() => {
-    // DIAGNOSTIC · DO NOT MERGE — [RALLI_HOST_LOBBY_CANCEL_TRACE]
-    const guardGameRole = role, guardDemo = session?.demoMode, guardSid = sessionDbId,
-          appRole = currentUser?.role ?? null, sessFound = !!session;
-    if (role !== "admin" || session?.demoMode === true || !sessionDbId) {
-      RHT.push("host-poll GUARD-SKIP", { gameRole: guardGameRole, appRole, demo: guardDemo, sessionFound: sessFound, sessionDbId: guardSid, pin });
-      return;
-    }
-    const myGen = ++RHT.subs;
-    RHT.push("host-poll SUBSCRIBE #" + myGen, { gameRole: guardGameRole, appRole, demo: guardDemo, sessionFound: sessFound, sessionDbId: guardSid, pin });
+    if (role !== "admin" || session?.demoMode === true || !sessionDbId) return;
     let stale = false;
     const check = () => {
-      RHT.push("host-poll REQUEST gen#" + myGen, { sessionDbId });
-      getSessionRestoreData(sessionDbId).then(({ session: s, answers }) => {
+      getSessionRestoreData(sessionDbId).then(({ session: s }) => {
         const data = s?.data;
-        RHT.push("host-poll RESULT gen#" + myGen, { stale, hasData: !!data, status: data?.status ?? null, err: s?.error?.message ?? null });
-        if (stale || !data) { RHT.push("host-poll IGNORED gen#" + myGen, { reason: stale ? "stale" : "no-data" }); return; }
+        if (stale || !data) return;
         if (["canceled", "ended", "completed"].includes(data.status)) {
           stale = true;
-          RHT.push("host-poll TERMINAL gen#" + myGen, { status: data.status });
-          try { clearActiveGameContext(); RHT.push("host-poll CTX-CLEARED gen#" + myGen); } catch (e) { RHT.push("host-poll CTX-ERR", String(e)); }
-          toast.error("This game was canceled because its quiz is no longer available.");
-          RHT.push("host-poll NAV -> rankd gen#" + myGen);
+          // Navigate FIRST so the host always leaves the canceled lobby, even if the toast
+          // (or any later call) throws — the runtime trace proved a `toast is not defined`
+          // ReferenceError here previously aborted navigation and stranded the host.
+          try { clearActiveGameContext(); } catch { /* ignore */ }
           onNav("rankd");
-          try { RHT.push("host-poll POST-NAV screen", { screen: (typeof window !== "undefined" && window.__ralliScreen) || "?" }); } catch {}
+          try { toast.error("This game was canceled because its quiz is no longer available."); } catch { /* non-fatal */ }
         }
-      }).catch((e) => { RHT.push("host-poll CATCH gen#" + myGen, String(e?.message ?? e)); });
+      }).catch(() => {});
     };
     check(); // immediate on mount so a refresh after cancellation resolves at once
     const interval = setInterval(check, 4000);
-    return () => { stale = true; RHT.push("host-poll CLEANUP #" + myGen + " (cleanups=" + (++RHT.cleanups) + ")"); clearInterval(interval); };
+    return () => { stale = true; clearInterval(interval); };
   }, [role, session?.demoMode, sessionDbId, onNav]); // eslint-disable-line react-hooks/exhaustive-deps
-
-  // DIAGNOSTIC · DO NOT MERGE — [RALLI_HOST_LOBBY_CANCEL_TRACE] mount/unmount of the host lobby.
-  useEffect(() => {
-    if (role !== "admin") return;
-    RHT.push("LOBBY MOUNT (host)", { pin, sessionDbId, appRole: currentUser?.role ?? null });
-    return () => RHT.push("LOBBY UNMOUNT (host)", { pin });
-  }, []); // eslint-disable-line react-hooks/exhaustive-deps
 
   const basePlayer = role === "admin"
     ? { name: currentUser?.name ?? "Host", emoji: "🦁", color: C.green }
@@ -7313,8 +7247,6 @@ function RankdLobbyScreen({ onNav, pin, sessionDbId: propSessionDbId = null, pla
       display: "flex", flexDirection: "column", minHeight: "100%",
       background: C.cream,
     }}>
-      {/* DIAGNOSTIC · DO NOT MERGE — [RALLI_HOST_LOBBY_CANCEL_TRACE] */}
-      {role === "admin" && <HostLobbyCancelTracePanel />}
       {/* Header — preserves original PIN-prominent layout */}
       <div style={{
         position: "relative", zIndex: 10, padding: mobile ? "16px 16px 12px" : "20px 28px 16px",
@@ -24756,9 +24688,6 @@ export default function App() {
     if (!RESTORABLE_SCREENS.has(screen)) return;
     try { sessionStorage.setItem(LAST_SCREEN_KEY, screen); } catch {}
   }, [screen, currentUser?.id]);
-
-  // DIAGNOSTIC · DO NOT MERGE — [RALLI_HOST_LOBBY_CANCEL_TRACE] expose current screen for the trace.
-  useEffect(() => { try { window.__ralliScreen = screen; } catch {} }, [screen]);
 
   // ── Supabase Auth session restore ─────────────────────────────────────────
   // On mount: check for an existing Supabase session (survives page refresh).

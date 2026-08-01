@@ -122,8 +122,18 @@ ok("host poll does NOT gate on the fragile derived isDemoMode",
    !/if \(role !== "admin" \|\| isDemoMode \|\| !sessionDbId\) return;/.test(lobby));
 ok("host poll ejects on any terminal status (canceled/ended/completed)",
    /\["canceled", "ended", "completed"\]\.includes\(data\.status\)/.test(lobby));
-ok("host poll clears active-game context and returns the host to the hub with the required message",
-   /clearActiveGameContext\(\);[\s\S]{0,220}This game was canceled because its quiz is no longer available\.[\s\S]{0,80}onNav\("rankd"\)/.test(lobby));
+// Navigation must happen BEFORE the toast, so the host always leaves the canceled lobby even if
+// the toast throws (a runtime trace proved a `toast is not defined` ReferenceError previously
+// aborted navigation between clearActiveGameContext and onNav, stranding the host).
+ok("host poll clears context, navigates to the hub, THEN toasts the required message (nav before toast)",
+   /clearActiveGameContext\(\);[\s\S]{0,120}onNav\("rankd"\);[\s\S]{0,160}This game was canceled because its quiz is no longer available\./.test(lobby));
+// REGRESSION GUARD: RankdLobbyScreen must obtain `toast` in scope (useToast) — the host poll calls
+// toast.error(...), which threw ReferenceError when the component lacked its own toast hook.
+ok("RankdLobbyScreen has `toast` in scope (useToast) so host-poll toast.error cannot throw",
+   /function RankdLobbyScreen\([\s\S]{0,300}const toast\s*=\s*useToast\(\)/.test(app));
+// The toast call is wrapped so it can never abort the navigation even if it throws.
+ok("host-poll toast.error is guarded (try/catch) after navigation",
+   /onNav\("rankd"\);[\s\S]{0,120}try \{ toast\.error\("This game was canceled because its quiz is no longer available\.".*catch/.test(lobby));
 ok("learner waiting-lobby status poll still present (getPlayerSessionRestore → terminal)",
    /getPlayerSessionRestore\(sessionDbId\)[\s\S]{0,800}\["canceled", "ended", "completed"\]\.includes\(data\.status\)/.test(lobby));
 
