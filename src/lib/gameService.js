@@ -101,6 +101,29 @@ export async function startGameSession(sessionId) {
 }
 
 /**
+ * Durably publish the scoreboard the host already computed (migration 081), so a learner who
+ * misses the transient SCOREBOARD broadcast can reconstruct it from game_sessions.live_scoreboard.
+ * The RPC validates host authorization + state (started, publishable phase, matching qIdx),
+ * rejects non-participant ids, resolves names/avatars server-side, computes canonical rank/tie
+ * ordering, bumps scoreboard_version, and atomically persists phase='scoreboard' + payload. It
+ * returns the EXACT canonical payload saved (the host must broadcast/render THAT, not its input).
+ *
+ * @param {string} sessionId - game_sessions.id (UUID)
+ * @param {number} qIdx - the current question index the scoreboard is for
+ * @param {Array<{id:string, score:number, delta?:number}>} scores - minimal per-player inputs
+ * @returns {Promise<{ data: Object|null, error: Object|null }>} data = canonical scoreboard payload
+ */
+export async function publishScoreboard(sessionId, qIdx, scores) {
+  const minimal = (scores ?? []).map(s => ({
+    id: s.id, score: Number(s.score ?? 0), delta: Number(s.delta ?? 0),
+  }));
+  const { data, error } = await supabase.rpc("rpc_publish_scoreboard", {
+    p_session_id: sessionId, p_qidx: qIdx, p_scores: minimal,
+  });
+  return { data, error };
+}
+
+/**
  * Mark a session as completed, record end time, and save final player scores.
  * Called in handleGameEnd (fire-and-forget — UI navigates immediately).
  *

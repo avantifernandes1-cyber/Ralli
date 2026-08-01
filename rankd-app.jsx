@@ -19,6 +19,7 @@ import {
   createGameSession,
   findJoinableSession,
   startGameSession,
+  publishScoreboard,
   endGameSession,
   getActiveSessions,
   getLearnerJoinableSessions,
@@ -153,6 +154,21 @@ const GM = {
   RESUME:        "RESUME",        // host broadcasts: game resumed
   FORCE_END:     "FORCE_END",     // host broadcasts: game ended early
 };
+
+// ── Shared durable-scoreboard apply decision (migration 081) ─────────────────
+// ONE canonical guard used by every learner scoreboard consumer (realtime SCOREBOARD, initial
+// restore, reconnect/SUBSCRIBED recovery, focus/visibility recovery) so ordering / normalization /
+// version logic is never duplicated. Returns the canonical entries + version to apply, or null to
+// ignore. Guards: valid payload shape, exact session match, and MONOTONIC version — a delayed DB
+// restore can never overwrite a newer realtime scoreboard (appliedVersion is a monotonic ref value,
+// not a stale render closure). Legacy null payloads → null (caller shows the neutral empty state).
+function scoreboardApplyDecision(payload, { sessionDbId = null, appliedVersion = -Infinity } = {}) {
+  if (!payload || typeof payload !== "object" || !Array.isArray(payload.entries)) return null;
+  if (sessionDbId && payload.session_id && String(payload.session_id) !== String(sessionDbId)) return null;
+  const version = Number(payload.version ?? 0);
+  if (Number.isFinite(appliedVersion) && version < appliedVersion) return null; // older than applied → drop
+  return { entries: payload.entries, version, qIdx: payload.q_idx ?? null };
+}
 
 const PLAYER_EMOJIS = ["🦊","🐯","🦁","🐺","🦅","🐬","🦄","🐉","🦋","🐙","🦖","🦈","🐸","🐼","🦝"];
 const PLAYER_COLORS = ["#F97316","#3B82F6","#10B981","#8B5CF6","#F43F5E","#EAB308","#0EA5E9","#EC4899","#84CC16","#6366F1","#F59E0B","#14B8A6","#EF4444","#A855F7","#22C55E"];
@@ -1989,6 +2005,7 @@ const PURPLE = "#8B5CF6";
 
 function KahootHostView({ onNav, sessionName, pin, sessionDbId, demoMode, tenantId, questions, broadcast, chAnswers, chPlayers, chStatus, onGameEnd, setChAnswers }) {
   const mobile       = useMobile();
+  const toast        = useToast(); // in-scope notifications (scoreboard-publish failure, etc.)
   const [phase,      setPhase]      = useState("countdown");
   const [qIdx,       setQIdx]       = useState(0);
   const [cdNum,      setCdNum]      = useState(3);
@@ -3585,7 +3602,26 @@ function KahootHostView({ onNav, sessionName, pin, sessionDbId, demoMode, tenant
               </div>
             ))}
           </div>
-          <button onClick={() => { broadcast({ type: GM.SCOREBOARD, scores, isFinal: isFinalQ }); setPhase("scoreboard"); persistPhase("scoreboard", qIdx, false); }} style={{ padding: "14px 44px", borderRadius: 18, border: "none", background: C.orange, color: "#fff", fontWeight: 900, fontSize: 15, cursor: "pointer", boxShadow: "0 0 40px rgba(253,191,36,0.4)" }}>
+          <button onClick={async () => {
+            // DEMO / no server session → client-only scoreboard, unchanged fast path.
+            if (demoMode || !sessionDbId) {
+              broadcast({ type: GM.SCOREBOARD, scores, isFinal: isFinalQ });
+              setPhase("scoreboard"); persistPhase("scoreboard", qIdx, false);
+              return;
+            }
+            // REAL (081): durably PUBLISH first. The RPC validates state/identity, resolves names +
+            // rank server-side, persists phase='scoreboard' + payload, and returns the canonical
+            // board — we broadcast/render THAT. On failure: stay in reveal (retryable), no broadcast.
+            const minScores = scores.map(p => ({ id: p.id, score: p.score ?? 0, delta: p.delta ?? 0 }));
+            const { data: board, error } = await publishScoreboard(sessionDbId, qIdx, minScores);
+            if (error || !board) {
+              console.error("[ralli:host] publishScoreboard failed:", error);
+              try { toast.error("Couldn't publish the scoreboard — please try again."); } catch { /* non-fatal */ }
+              return;
+            }
+            broadcast({ type: GM.SCOREBOARD, board, isFinal: isFinalQ });
+            setPhase("scoreboard"); // RPC already persisted phase + payload server-side
+          }} style={{ padding: "14px 44px", borderRadius: 18, border: "none", background: C.orange, color: "#fff", fontWeight: 900, fontSize: 15, cursor: "pointer", boxShadow: "0 0 40px rgba(253,191,36,0.4)" }}>
             Reveal Leaderboard →
           </button>
         </div>
@@ -3613,6 +3649,19 @@ function KahootPlayerView({ onNav, playerName, playerEmoji, playerId, pin, sessi
   const [gamePaused,    setGamePaused]    = useState(false);
   const [showLeaveConfirm, setShowLeaveConfirm] = useState(false);
   const leavingRef = useRef(false);
+  // Monotonic guard for the durable scoreboard (migration 081): the highest scoreboard version
+  // already applied to finalScores. A delayed DB restore carrying an older/equal version is dropped
+  // so it can never overwrite a newer realtime SCOREBOARD. ONE shared apply path for realtime,
+  // initial restore, and reconnect/focus/visibility recovery.
+  const appliedSbVersionRef = useRef(-Infinity);
+  const applyScoreboard = useCallback((payload) => {
+    const d = scoreboardApplyDecision(payload, { sessionDbId, appliedVersion: appliedSbVersionRef.current });
+    if (!d) return false;
+    appliedSbVersionRef.current = d.version;
+    setFinalScores(d.entries);
+    setPhase("scoreboard");
+    return true;
+  }, [sessionDbId]);
   // Explicit Leave lifecycle (prompt departed-player cleanup): (1) durably mark the
   // participant 'left' via the existing service and (2) confirm the write, then (3)
   // untrack realtime presence + (4) notify the host (the PLAYER_LEAVE path calls
@@ -3711,7 +3760,14 @@ function KahootPlayerView({ onNav, playerName, playerEmoji, playerId, pin, sessi
       if (timingFresh) setGamePaused(!!s.paused);
 
       if (s.phase === "waiting")    return;                       // still in lobby
-      if (s.phase === "scoreboard") { setPhase("scoreboard"); return; }
+      if (s.phase === "scoreboard") {
+        // Durable recovery (081): reconstruct the exact published scoreboard from the session row
+        // (only present while phase='scoreboard'); the monotonic guard drops it if a newer realtime
+        // board already applied. Legacy null → neutral empty board (applyScoreboard is a no-op).
+        applyScoreboard(s.live_scoreboard);
+        setPhase("scoreboard");
+        return;
+      }
       if (s.phase === "ended")      { setPhase("ended");      return; }
 
       // Core fix: recover the current question the player never received. Pass
@@ -3908,7 +3964,14 @@ function KahootPlayerView({ onNav, playerName, playerEmoji, playerId, pin, sessi
       }
     }
     if (chMsg.type === GM.FORCE_END) { setFinalScores(chMsg.scores); setPhase("ended"); }
-    if (chMsg.type === GM.SCOREBOARD) { if (chMsg.scores) setFinalScores(chMsg.scores); setPhase("scoreboard"); }
+    if (chMsg.type === GM.SCOREBOARD) {
+      // Realtime fast path (081): a real game broadcasts the canonical server payload in `board`
+      // (routed through the monotonic apply guard); demo/legacy hosts still send a raw `scores`
+      // array. Either way, enter the scoreboard phase.
+      if (chMsg.board) applyScoreboard(chMsg.board);
+      else if (chMsg.scores) setFinalScores(chMsg.scores);
+      setPhase("scoreboard");
+    }
   }, [chMsg]);
 
   useEffect(() => {
