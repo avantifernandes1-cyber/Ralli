@@ -92,9 +92,12 @@ export async function startGameSession(sessionId) {
   // the caller already holds (activeGameSessionDbId) — never a PIN lookup that could target a
   // reused/stale session. It authorizes host/manager server-side and requires a real (non-demo),
   // 'waiting' session that already has its immutable question snapshot. Moving the filtered
-  // UPDATE behind a SECURITY DEFINER RPC is what lets a later REVOKE SELECT (081) not break start.
-  const { error } = await supabase.rpc("rpc_start_session", { p_session_id: sessionId });
-  return { data: null, error };
+  // UPDATE behind a SECURITY DEFINER RPC is what lets a later REVOKE SELECT (082) not break start.
+  // Returns the RPC's structured result so the caller can honor a non-start outcome: on
+  // { ok: false, reason: 'quiz_unavailable' } (migration 083) the session was durably canceled
+  // server-side because its quiz was archived before start; the host must NOT enter the game.
+  const { data, error } = await supabase.rpc("rpc_start_session", { p_session_id: sessionId });
+  return { data, error };
 }
 
 /**

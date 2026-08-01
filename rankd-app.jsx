@@ -91,6 +91,7 @@ import {
   updateUserProfile as dbUpdateUserProfile,
   updateLastSeenAssignmentsAt,
   subscribeToTenantAssignments,
+  isQuizPlayable,
 } from "./src/lib/contentService.js";
 import { resolveAssignmentStatus, resolveLatestQuizAssignment, resolveLearnerAssignments, lessonUnlockState, isQualifyingEvent, daysUntilDue } from "./src/lib/assignmentEngine.js";
 import {
@@ -8158,12 +8159,29 @@ function RankdResultsScreen({ onNav, sessionDbId, sessionCode, sessions, gameDat
 // ── NEW SESSION SCREEN ───────────────────────────────────────
 
 function NewSessionScreen({ onNav, quizzes, onCreateSession }) {
-  const [selectedId,  setSelectedId]  = useState(quizzes[0]?.id ?? null);
-  const [sessionName, setSessionName] = useState(quizzes[0]?.name ?? "");
+  // Only ACTIVE quizzes are eligible to launch a Ralli Live game — archived (or otherwise
+  // non-active) quizzes must never appear as selectable here. This uses the ONE canonical
+  // eligibility helper (contentService.isQuizPlayable), mirroring the authoritative server
+  // guard in migration 083; the UI filter is a first line, not the enforcement boundary.
+  const playableQuizzes = useMemo(() => quizzes.filter(isQuizPlayable), [quizzes]);
+
+  const [selectedId,  setSelectedId]  = useState(playableQuizzes[0]?.id ?? null);
+  const [sessionName, setSessionName] = useState(playableQuizzes[0]?.name ?? "");
   const [demoMode,    setDemoMode]    = useState(false);
   const [creating,    setCreating]    = useState(false);
 
-  const selectedQuiz = quizzes.find(q => q.id === selectedId);
+  const selectedQuiz = playableQuizzes.find(q => q.id === selectedId);
+
+  // If the currently-selected quiz drops out of the playable set (e.g. archived in another tab
+  // while this screen is open), fall back to the first still-playable quiz so the form never
+  // holds a stale, unlaunchable selection.
+  useEffect(() => {
+    if (selectedId && !playableQuizzes.some(q => q.id === selectedId)) {
+      const next = playableQuizzes[0] ?? null;
+      setSelectedId(next?.id ?? null);
+      setSessionName(next?.name ?? "");
+    }
+  }, [playableQuizzes, selectedId]);
 
   const selectQuiz = (quiz) => {
     setSelectedId(quiz.id);
@@ -8222,14 +8240,14 @@ function NewSessionScreen({ onNav, quizzes, onCreateSession }) {
           }}>+ Build new quiz</button>
         </div>
 
-        {quizzes.length === 0 ? (
+        {playableQuizzes.length === 0 ? (
           <div style={{
             padding: 40, borderRadius: 16, border: `2px dashed ${C.border}`,
             textAlign: "center", background: C.white,
           }}>
-            
-            <p style={{ fontSize: 15, fontWeight: 700, color: C.text, margin: "0 0 4px" }}>No quizzes yet</p>
-            <p style={{ fontSize: 13, color: C.textSub, margin: "0 0 20px" }}>Build one first to launch a session</p>
+
+            <p style={{ fontSize: 15, fontWeight: 700, color: C.text, margin: "0 0 4px" }}>No active quizzes</p>
+            <p style={{ fontSize: 13, color: C.textSub, margin: "0 0 20px" }}>Build one (or restore an archived quiz) to launch a session</p>
             <button onClick={() => onNav("rankd-quiz-builder")} style={{
               padding: "10px 24px", borderRadius: 12, border: "none", cursor: "pointer",
               fontSize: 14, fontWeight: 700, background: C.orange, color: "#fff",
@@ -8237,7 +8255,7 @@ function NewSessionScreen({ onNav, quizzes, onCreateSession }) {
           </div>
         ) : (
           <div style={{ display: "flex", flexDirection: "column", gap: 10 }}>
-            {quizzes.map(quiz => (
+            {playableQuizzes.map(quiz => (
               <button key={quiz.id} onClick={() => selectQuiz(quiz)} style={{
                 display: "flex", alignItems: "center", gap: 16, padding: "16px 20px", borderRadius: 14,
                 border: `2px solid ${selectedId === quiz.id ? C.orange : C.border}`,
@@ -25570,6 +25588,15 @@ export default function App() {
     });
     if (error || !data?.pin) {
       console.error("[ralli:game] createGameSession FAILED:", error);
+      // The server (migration 083 create_game_session_atomic) rejects creating a game from a
+      // quiz that isn't active (archived / not found / cross-tenant) by raising 'quiz_unavailable'.
+      // Surface a specific, retryable message so the host knows to pick an active quiz, rather
+      // than the generic create-failure text. (The UI already lists only active quizzes; this
+      // covers a quiz archived between listing and Create.)
+      if (error?.message === "quiz_unavailable") {
+        toast.error("This quiz is no longer available. Create a new game with an active quiz.");
+        return;
+      }
       toast.error("Couldn't create the game session. Please try again.");
       return;
     }
@@ -25822,7 +25849,7 @@ export default function App() {
   };
 
   // Admin: start real game from lobby
-  const handleGameStart = () => {
+  const handleGameStart = async () => {
     // EARLIEST safe boundary for a real game: it must never enter gameplay
     // without its exact session id — that id is required to persist phase, save
     // answers, and complete durably. Blocking here makes the completion-time
@@ -25833,24 +25860,67 @@ export default function App() {
       toast.error("Couldn't start the game — its session id is unavailable. Please refresh and try again.");
       return;
     }
-    // Mark the exact active session started locally (keyed by its dbId when
-    // known, so a reused pin can't flip another local row).
+
+    // DEMO games are in-memory only — no server round-trip, no eligibility check.
+    // Preserve the original behavior exactly: mark started locally and navigate; demo
+    // never broadcasts GAME_START (isolated single-device flow).
+    if (activeGameIsDemo) {
+      setSessions(prev => prev.map(s =>
+        (activeGameSessionDbId != null ? s.dbId === activeGameSessionDbId : s.code === lobbyPin)
+          ? { ...s, status: "started" } : s
+      ));
+      setScreen("rankd-game");
+      return;
+    }
+
+    // REAL games: the quiz's eligibility is re-checked AUTHORITATIVELY at start by
+    // rpc_start_session (migration 083). We AWAIT that result BEFORE broadcasting GAME_START
+    // or navigating, so a quiz archived between create and start can never pull the host and
+    // learners into a game with no active quiz. Keyed on the EXACT session id established at
+    // create/launch (never the PIN), so a reused code can't flip a different/historical row.
+    let startRes;
+    try {
+      startRes = await startGameSession(activeGameSessionDbId);
+    } catch (e) {
+      // Network/unexpected failure — stay in the lobby (players still connected), broadcast
+      // nothing, navigate nowhere; the host can retry Start.
+      console.error("[ralli] startGameSession failed:", e);
+      toast.error("Couldn't start the game — please try again.");
+      return;
+    }
+    const { data: startData, error: startError } = startRes ?? {};
+    if (startError) {
+      console.error("[ralli] startGameSession error:", startError);
+      toast.error("Couldn't start the game — please try again.");
+      return;
+    }
+
+    // Quiz became unavailable (archived / no longer active) after create but before start.
+    // The server has ALREADY durably canceled the still-waiting session and cleared its live
+    // state (migration 083 rpc_start_session). Do NOT broadcast GAME_START and do NOT enter
+    // gameplay. Terminally close the lobby (FORCE_END → learners leave safely), drop the
+    // active-game context so a refresh can't re-enter it, mark the exact local row canceled,
+    // and route the host back to New Game with a retryable message.
+    if (startData && startData.ok === false && startData.reason === "quiz_unavailable") {
+      broadcast({ type: GM.FORCE_END });
+      setSessions(prev => prev.map(s =>
+        (activeGameSessionDbId != null ? s.dbId === activeGameSessionDbId : s.code === lobbyPin)
+          ? { ...s, status: "canceled" } : s
+      ));
+      clearActiveGameContext();
+      toast.error("This quiz is no longer available. Create a new game with an active quiz.");
+      setScreen("rankd-new");
+      return;
+    }
+
+    // Started successfully — mark the exact active session started locally, broadcast
+    // GAME_START so all players navigate to the game, then navigate the host.
     setSessions(prev => prev.map(s =>
       (activeGameSessionDbId != null ? s.dbId === activeGameSessionDbId : s.code === lobbyPin)
         ? { ...s, status: "started" } : s
     ));
-    // For real mode, broadcast GAME_START so all players navigate to game.
-    if (!activeGameIsDemo) {
-      const qs = gameQuestions ?? GAME_QUESTIONS;
-      broadcast({ type: GM.GAME_START, questions: qs, totalQ: qs.length });
-    }
-    // Persist status update to Supabase (fire-and-forget), REAL sessions only, keyed on the
-    // EXACT session id established at create/launch (activeGameSessionDbId) — never the PIN,
-    // so a reused code can never flip a different/historical session to 'started'. Demo games
-    // are in-memory and never persisted here.
-    if (!activeGameIsDemo && activeGameSessionDbId != null) {
-      startGameSession(activeGameSessionDbId).catch(e => console.error("[ralli] startGameSession failed:", e));
-    }
+    const qs = gameQuestions ?? GAME_QUESTIONS;
+    broadcast({ type: GM.GAME_START, questions: qs, totalQ: qs.length });
     setScreen("rankd-game");
   };
 
