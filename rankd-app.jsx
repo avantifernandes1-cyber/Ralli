@@ -7052,25 +7052,33 @@ function RankdLobbyScreen({ onNav, pin, sessionDbId: propSessionDbId = null, pla
   // terminal status, clear the active-game context (so a refresh can't re-enter it)
   // and return the host to the hub with a message. The host-safe restore RPC (075)
   // authorizes the exact host / same-tenant admin, so this is not a direct table read.
+  // Demo gate uses the EXPLICIT per-session flag, NOT the derived `isDemoMode`: once the
+  // just-canceled session drops out of the local `sessions` list (App active-session refresh
+  // removes terminal rows), `session` becomes undefined and `isDemoMode` (session?.demoMode
+  // !== false) would flip TRUE for a real host — silently killing this poll and stranding the
+  // host in a canceled lobby. `session?.demoMode === true` is true ONLY for a real demo
+  // session (its contract), so a missing session reads as non-demo and the poll keeps running.
+  // The effect re-subscribes per sessionDbId; its cleanup sets `stale`, so a delayed response
+  // from a prior session id can never navigate (it is verified current before changing screens).
   useEffect(() => {
-    if (role !== "admin" || isDemoMode || !sessionDbId) return;
-    let done = false;
+    if (role !== "admin" || session?.demoMode === true || !sessionDbId) return;
+    let stale = false;
     const check = () => {
-      getSessionRestoreData(sessionDbId).then(({ session }) => {
-        const data = session?.data;
-        if (done || !data) return;
+      getSessionRestoreData(sessionDbId).then(({ session: s }) => {
+        const data = s?.data;
+        if (stale || !data) return;
         if (["canceled", "ended", "completed"].includes(data.status)) {
-          done = true;
+          stale = true;
           try { clearActiveGameContext(); } catch { /* ignore */ }
-          toast.error("This game was canceled — its quiz is no longer available.");
+          toast.error("This game was canceled because its quiz is no longer available.");
           onNav("rankd");
         }
       }).catch(() => {});
     };
     check(); // immediate on mount so a refresh after cancellation resolves at once
     const interval = setInterval(check, 4000);
-    return () => clearInterval(interval);
-  }, [role, isDemoMode, sessionDbId, onNav]); // eslint-disable-line react-hooks/exhaustive-deps
+    return () => { stale = true; clearInterval(interval); };
+  }, [role, session?.demoMode, sessionDbId, onNav]); // eslint-disable-line react-hooks/exhaustive-deps
 
   const basePlayer = role === "admin"
     ? { name: currentUser?.name ?? "Host", emoji: "🦁", color: C.green }

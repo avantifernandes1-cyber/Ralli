@@ -115,11 +115,15 @@ ok("handleCreateSession special-cases a 'quiz_unavailable' create error",
 // already has one). Assert the host-side poll exists, keys off terminal status, and exits cleanly.
 const lobby = app.slice(app.indexOf("function RankdLobbyScreen("), app.indexOf("function RankdLobbyScreen(") + 40000);
 ok("host waiting-lobby has a durable session-status poll (role==='admin', via getSessionRestoreData)",
-   /if \(role !== "admin" \|\| isDemoMode \|\| !sessionDbId\) return;[\s\S]{0,400}getSessionRestoreData\(sessionDbId\)/.test(lobby));
+   /if \(role !== "admin" \|\| session\?\.demoMode === true \|\| !sessionDbId\) return;[\s\S]{0,400}getSessionRestoreData\(sessionDbId\)/.test(lobby));
+// REGRESSION GUARD: the host poll must NOT gate on the derived `isDemoMode` — it flips true for a
+// real host once the canceled session leaves the local `sessions` list, stranding the host.
+ok("host poll does NOT gate on the fragile derived isDemoMode",
+   !/if \(role !== "admin" \|\| isDemoMode \|\| !sessionDbId\) return;/.test(lobby));
 ok("host poll ejects on any terminal status (canceled/ended/completed)",
    /\["canceled", "ended", "completed"\]\.includes\(data\.status\)/.test(lobby));
-ok("host poll clears active-game context and returns the host to the hub",
-   /clearActiveGameContext\(\);[\s\S]{0,200}onNav\("rankd"\)/.test(lobby));
+ok("host poll clears active-game context and returns the host to the hub with the required message",
+   /clearActiveGameContext\(\);[\s\S]{0,220}This game was canceled because its quiz is no longer available\.[\s\S]{0,80}onNav\("rankd"\)/.test(lobby));
 ok("learner waiting-lobby status poll still present (getPlayerSessionRestore → terminal)",
    /getPlayerSessionRestore\(sessionDbId\)[\s\S]{0,800}\["canceled", "ended", "completed"\]\.includes\(data\.status\)/.test(lobby));
 
