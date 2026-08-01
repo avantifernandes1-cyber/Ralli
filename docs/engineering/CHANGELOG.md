@@ -27,10 +27,17 @@ in production; 072 intentionally unapplied. Completed in this slice:
   persisted timestamps and never restart.
 - Tenant/role authorization hardening: every RPC derives caller identity/tenant server-side,
   authorizes the exact session/tenant, and denies cross-tenant, anon, and learner-to-host mutation.
+- Active-quiz eligibility + durable waiting-session integrity (migration 083, applied & verified in
+  production, version `20260801214829`): only ACTIVE quizzes can create / join / start a new Ralli
+  Live session (enforced server-side in the create/start/join RPCs, mirrored in New Game); archiving
+  OR deleting a quiz durably cancels every waiting lobby on it via source-of-truth triggers
+  (`AFTER UPDATE OF status` + `BEFORE DELETE`), so the host and learners are removed even with no
+  broadcast; already-started games are untouched and continue from their immutable question
+  snapshot; completed historical sessions, snapshots, scores, and analytics remain intact.
+  Concurrency-safe (quiz-row `FOR SHARE` locking, one consistent lock order) and idempotently
+  corrected two pre-existing orphaned waiting sessions on apply.
 
 Still pending (Ralli Live NOT beta-complete):
-- Archived quizzes must be excluded from playable Ralli Live quizzes (enforced at the canonical
-  query/service boundary).
 - Durable scoreboard recovery (future migration 081).
 - Server-authoritative verification foundation (migration 072, unapplied).
 - Integrated Ralli Live leaderboard.

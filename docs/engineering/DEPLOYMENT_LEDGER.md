@@ -1191,3 +1191,96 @@ NOT YET CREATED / NOT APPLIED (corrected numbering):
   called the revocation "migration 081"; the revocation is now 082 and 081 is reserved for the
   scoreboard recovery. The separate `RALLI_TABLE_SELECT_REVOCATION_PLAN.md` still uses the older
   "081" label and will be corrected when that revocation work begins.)*
+
+---
+
+## 2026-08-01 — Ralli Live active-quiz eligibility + durable waiting-session integrity (083) — **APPLIED TO PRODUCTION**
+
+Branch `feature/ralli-live-leaderboard` @ commit `f9925d0`. Applied via exactly one controlled
+`apply_migration` call (Strategy A) under explicit user production approval — no `db push`, no
+migration repair, no manual `schema_migrations` write, no SQL-editor copy/paste, no fallback file,
+no second migration number. ADDITIVE / forward-only. Does NOT edit any applied migration; does NOT
+create/apply 072/081/082; no merge, no frontend production deploy.
+
+| Order | Prod version (ledger) | Prod name | Git file | Commit | SQL SHA-256 | Applied (UTC) | Verification |
+|---|---|---|---|---|---|---|---|
+| 44 | `20260801214829` | 083_ralli_active_quiz_eligibility | supabase/migrations/083_ralli_active_quiz_eligibility.sql | `f9925d0` | d7d1d65ea4a68297431dac8b1ff8af90f97cc42bf1ec2d0aeaf3102c80ad88f6 | 2026-08-01 (version `20260801214829`) | PASS — see below |
+
+Approved SHA-256: `d7d1d65ea4a68297431dac8b1ff8af90f97cc42bf1ec2d0aeaf3102c80ad88f6`. Apply result: `{"success":true}`.
+
+**What 083 does:** only ACTIVE quizzes may create / join / start a Ralli Live game, and a real
+waiting session cannot remain joinable once its quiz stops being active or is deleted.
+- Four faithful-superset RPCs (CREATE OR REPLACE — signatures/returns/owner/SECURITY DEFINER/
+  search_path/ACLs preserved): `create_game_session_atomic` (create guard), `rpc_start_session`
+  (start guard + concurrency-safe conditional transition), `rpc_participant_join` (join guard),
+  `rpc_learner_joinable_sessions` (list filter). Create/start/join `SELECT … FOR SHARE` the
+  canonical `tenant_quizzes` row and re-check `status='active'` (safe text id compare); start's
+  final `UPDATE … WHERE status='waiting'` + `IF NOT FOUND` returns `not_startable` instead of
+  reviving a canceled session. Quiz-row-before-session-row lock order everywhere (no deadlock).
+- Two source-of-truth triggers on `tenant_quizzes`: `AFTER UPDATE OF status WHEN OLD='active' AND
+  NEW<>'active'` and `BEFORE DELETE`, each cancelling every same-tenant, non-demo `waiting` session
+  for that quiz (`status='canceled', ended_at=now(), live_question=NULL`) in the same transaction.
+- One-time bounded, idempotent correction of pre-existing orphans.
+
+**Pre-apply gate (read-only, all PASS):** working-tree == committed(`f9925d0`) SHA-256 both
+`d7d1d65e…88f6`; 083 absent from ledger (latest `080`); 072/081/082 absent; no `tenant_quizzes`
+083 triggers/functions; all four RPCs at pre-083 defs (no `FOR SHARE`); public-schema CREATE denied
+to anon/authenticated; correction predicate matched **exactly 2** real waiting sessions; 0 active-
+quiz-waiting / started / completed / demo rows matched. The two affected session IDs were captured
+privately before applying for exact post-apply reconciliation.
+
+**Structural verification (read-only, post-apply):**
+- Recorded version `20260801214829` / name `083_ralli_active_quiz_eligibility`; **exactly one** row.
+- Four RPCs: `create_game_session_atomic` (ret game_sessions, secdef, owner postgres, search_path
+  `public`, ACL `{PUBLIC,anon,authenticated,service_role}`, now `FOR SHARE`); `rpc_start_session`,
+  `rpc_participant_join` (secdef, search_path `''`, ACL `{authenticated,service_role}`, `FOR SHARE`);
+  `rpc_learner_joinable_sessions` (STABLE secdef, search_path `''`, `{authenticated,service_role}`,
+  EXISTS-filter). Signatures/returns/owners/security/search_path/ACLs unchanged from pre-083.
+- Both trigger functions present once, owner postgres, SECURITY DEFINER, `search_path=''`, fully
+  qualified; `pg_get_triggerdef` confirms `AFTER UPDATE OF status … WHEN (old.status='active' AND
+  new.status IS DISTINCT FROM 'active')` and `BEFORE DELETE`; no duplicate/conflicting trigger.
+  `REVOKE EXECUTE … FROM PUBLIC` applied (`has_function_privilege('public',…)=false`).
+  NOTE: Supabase default privileges independently grant EXECUTE to `anon`/`authenticated` on new
+  public functions, which `REVOKE … FROM PUBLIC` does not remove, so `has_function_privilege` shows
+  true for those roles — but this is INERT: a `RETURNS trigger` function raises `0A000 trigger
+  functions can only be called as triggers` when invoked directly (verified), so no client can
+  execute them to any effect; they run only as triggers. A future grant-hygiene follow-up
+  (`REVOKE EXECUTE … FROM anon, authenticated`) is optional and was NOT applied here.
+- `delete_quiz` unchanged (still blocks on assignments/attempts); `archive_quiz` unchanged;
+  `tenant_quizzes` client DELETE grant still 0 (anon/authenticated); no RLS policy change (15 on the
+  five game/quiz tables); no new client delete permission.
+
+**Existing-row impact (read-only, post-apply):** correction predicate now **0**. The exact two
+captured session IDs are both `status='canceled'`, `ended_at IS NOT NULL`, `live_question IS NULL`.
+Inventory moved exactly `false|waiting|quiz_unavailable` 2 → 0 and `false|canceled|quiz_unavailable`
+0 → 2; unchanged: `false|canceled|quiz_active`=3, `false|started|quiz_active`=1,
+`false|completed|quiz_active`=40, `false|completed|quiz_unavailable`=16, `true|waiting|quiz_unavailable`
+=15 (demo untouched). game_players=35, game_answers=156 unchanged; 0 players/0 answers on the two
+affected rows. Re-running the correction would affect 0 rows. No score/answer/snapshot row touched.
+
+**Historical integrity:** completed sessions (56) and their immutable snapshots unchanged; started
+game (1) unaffected; Past Sessions / My Scores / analytics untouched; canceled pre-start sessions do
+not become completed history.
+
+**Behavioral verification (production, ONE BEGIN…ROLLBACK against the LIVE applied objects, ephemeral
+fixtures, zero residual rows):** LIVE PASS — create(active) succeeds; create(archived) + create(malformed)
+rejected honestly (no raw uuid-cast); the live AFTER-UPDATE trigger cancels a waiting session on archive;
+a stale `rpc_start_session` cannot revive the canceled session; the live BEFORE-DELETE trigger cancels a
+waiting session on hard delete. Plus: exact-artifact two-connection concurrency suite (Docker, prelude +
+the verbatim committed 083 file, `lock_timeout`/`statement_timeout` armed) **17/17 PASS** across
+create-wins / archive-wins / start-wins / archive-vs-start (no revive) / delete-vs-start (no revive) /
+create-vs-delete / burst (no deadlock, no orphans); focused eligibility JS + full JS suite + Vite build
+all PASS; trace-marker scan clean.
+
+**Scope guardrails honored:** migrations 072 (verification foundation), 081 (scoreboard recovery), and
+082 (table-SELECT revocation) remain **unapplied**; no merge or push to main; no frontend production
+deployment; no scoreboard/leaderboard work.
+
+Operator: applied by Claude Code via exactly one controlled `apply_migration` call under explicit user
+production approval. Ledger row 44. **083 documentation closeout (2026-08-01):** all live QA passed
+(archived quizzes excluded from New Game; waiting lobby canceled on archive; host and learner both
+exit; old PIN rejected; active-quiz games work; already-started games continue from their immutable
+snapshot; completed historical results intact; refresh does not reopen canceled lobbies), so this
+applied-migration record is now committed to the branch. Production migration 083 remains applied
+exactly once (version `20260801214829`) and byte-identical to the committed file (SHA
+`d7d1d65e…88f6`); nothing rewritten. Migrations 072/081/082 remain unapplied; no merge to main.
