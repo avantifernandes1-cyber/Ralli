@@ -74,7 +74,7 @@ ok("does NOT map over the unfiltered quizzes prop for the picker list",
    !/\{quizzes\.map\(quiz => \(/.test(newSess));
 
 // ── (4) handleGameStart: await + quiz_unavailable branch ─────────────────────
-const hgs = app.slice(app.indexOf("const handleGameStart = async"), app.indexOf("const handleGameStart = async") + 4400);
+const hgs = app.slice(app.indexOf("const handleGameStart = async"), app.indexOf("const handleGameStart = async") + 5400);
 ok("handleGameStart is async", /const handleGameStart = async \(\) => \{/.test(app));
 ok("handleGameStart AWAITs startGameSession (result-driven, not fire-and-forget)",
    /startRes = await startGameSession\(activeGameSessionDbId\)/.test(hgs));
@@ -94,6 +94,14 @@ ok("GAME_START broadcast happens only AFTER (below) the quiz_unavailable early-r
    uaIdx !== -1 && gsIdx !== -1 && uaIdx < gsIdx);
 ok("demo start path is preserved (no RPC round-trip, still navigates)",
    /if \(activeGameIsDemo\) \{[\s\S]*?setScreen\("rankd-game"\);[\s\S]*?return;\s*\n\s*\}/.test(hgs));
+// A non-quiz_unavailable non-start result (e.g. reason 'not_startable' from the concurrency-safe
+// conditional UPDATE) must NOT enter gameplay — keep the host in the lobby to refresh/retry.
+ok("handleGameStart handles a generic ok:false (not_startable) without broadcasting GAME_START",
+   /if \(startData && startData\.ok === false\) \{[\s\S]{0,260}no longer waiting[\s\S]{0,80}return;/.test(hgs));
+const uaEnd = hgs.indexOf('reason === "quiz_unavailable"');
+const genFalse = hgs.indexOf("startData.ok === false) {", uaEnd);
+ok("generic ok:false branch comes AFTER the quiz_unavailable branch and BEFORE GAME_START",
+   uaEnd !== -1 && genFalse !== -1 && uaEnd < genFalse && genFalse < hgs.indexOf("broadcast({ type: GM.GAME_START"));
 
 // ── (5) handleCreateSession surfaces the create rejection ────────────────────
 const hcs = app.slice(app.indexOf("const handleCreateSession = async"), app.indexOf("const handleCreateSession = async") + 2200);

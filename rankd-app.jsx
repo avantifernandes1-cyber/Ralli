@@ -25940,6 +25940,15 @@ export default function App() {
       setScreen("rankd-new");
       return;
     }
+    // Any other non-start outcome (e.g. reason 'not_startable' — the session was concurrently
+    // canceled / started / its quiz deleted between our read and the transition): do NOT broadcast
+    // GAME_START or enter gameplay. Keep the host in the lobby to refresh/retry; if the session
+    // was durably canceled, the host lobby's status poll routes them out with a message.
+    if (startData && startData.ok === false) {
+      console.warn("[ralli] start returned non-ok:", startData);
+      toast.error("Couldn't start the game — it's no longer waiting. Please refresh and try again.");
+      return;
+    }
 
     // Started successfully — mark the exact active session started locally, broadcast
     // GAME_START so all players navigate to the game, then navigate the host.

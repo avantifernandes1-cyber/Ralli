@@ -12,12 +12,14 @@ BEGIN;
 CREATE OR REPLACE FUNCTION public.create_game_session_atomic(
   p_tenant_id text, p_host_id text, p_quiz_id text, p_name text, p_question_count integer, p_demo_mode boolean DEFAULT false)
 RETURNS game_sessions LANGUAGE plpgsql SECURITY DEFINER SET search_path TO 'public' AS $function$
-DECLARE v_tenant text; v_code text; v_row game_sessions; v_attempt integer := 0;
+DECLARE v_tenant text; v_qstatus text; v_code text; v_row game_sessions; v_attempt integer := 0;
 BEGIN
   v_tenant := get_my_tenant_id()::text;
   IF p_demo_mode IS DISTINCT FROM true THEN
-    IF NOT EXISTS (SELECT 1 FROM public.tenant_quizzes q WHERE q.id::text=p_quiz_id AND q.tenant_id::text=v_tenant AND q.status='active') THEN
-      RAISE EXCEPTION 'quiz_unavailable' USING ERRCODE='check_violation', DETAIL='quiz is archived, not found, or not in tenant';
+    SELECT q.status INTO v_qstatus FROM public.tenant_quizzes q
+      WHERE q.id::text=p_quiz_id AND q.tenant_id::text=v_tenant FOR SHARE;
+    IF v_qstatus IS DISTINCT FROM 'active' THEN
+      RAISE EXCEPTION 'quiz_unavailable' USING ERRCODE='check_violation', DETAIL='quiz is archived, deleted, not found, or not in tenant';
     END IF;
   END IF;
   LOOP
@@ -35,7 +37,7 @@ END; $function$;
 -- ── 083 §2 start guard superset ──
 CREATE OR REPLACE FUNCTION public.rpc_start_session(p_session_id uuid)
 RETURNS jsonb LANGUAGE plpgsql SECURITY DEFINER SET search_path TO '' AS $function$
-DECLARE v_uid uuid := auth.uid(); v_s public.game_sessions;
+DECLARE v_uid uuid := auth.uid(); v_s public.game_sessions; v_qstatus text;
 BEGIN
   IF v_uid IS NULL THEN RAISE EXCEPTION 'auth' USING ERRCODE='insufficient_privilege'; END IF;
   IF p_session_id IS NULL THEN RAISE EXCEPTION 'id required' USING ERRCODE='no_data_found'; END IF;
@@ -45,18 +47,21 @@ BEGIN
   IF v_s.demo_mode IS DISTINCT FROM false THEN RAISE EXCEPTION 'demo' USING ERRCODE='check_violation'; END IF;
   IF v_s.status <> 'waiting' THEN RAISE EXCEPTION 'not startable (%)',v_s.status USING ERRCODE='check_violation'; END IF;
   IF v_s.question_snapshot IS NULL THEN RAISE EXCEPTION 'no snapshot' USING ERRCODE='check_violation'; END IF;
-  IF NOT EXISTS (SELECT 1 FROM public.tenant_quizzes q WHERE q.id::text=v_s.quiz_id AND q.tenant_id::text=v_s.tenant_id AND q.status='active') THEN
+  SELECT q.status INTO v_qstatus FROM public.tenant_quizzes q
+    WHERE q.id::text=v_s.quiz_id AND q.tenant_id::text=v_s.tenant_id FOR SHARE;
+  IF v_qstatus IS DISTINCT FROM 'active' THEN
     UPDATE public.game_sessions SET status='canceled', ended_at=now(), live_question=NULL WHERE id=v_s.id AND status='waiting';
     RETURN jsonb_build_object('ok',false,'reason','quiz_unavailable','session_id',v_s.id);
   END IF;
-  UPDATE public.game_sessions SET status='started', started_at=now() WHERE id=v_s.id;
+  UPDATE public.game_sessions SET status='started', started_at=now() WHERE id=v_s.id AND status='waiting';
+  IF NOT FOUND THEN RETURN jsonb_build_object('ok',false,'reason','not_startable','session_id',v_s.id); END IF;
   RETURN jsonb_build_object('ok',true,'session_id',v_s.id);
 END; $function$;
 
 -- ── 083 §3 join-boundary guard superset ──
 CREATE OR REPLACE FUNCTION public.rpc_participant_join(p_session_id uuid, p_name text, p_emoji text, p_color text)
 RETURNS jsonb LANGUAGE plpgsql SECURITY DEFINER SET search_path TO '' AS $function$
-DECLARE v_uid uuid := auth.uid(); v_tenant uuid; v_s public.game_sessions;
+DECLARE v_uid uuid := auth.uid(); v_tenant uuid; v_s public.game_sessions; v_qstatus text; v_sstatus text;
 BEGIN
   IF v_uid IS NULL THEN RAISE EXCEPTION 'auth' USING ERRCODE='insufficient_privilege'; END IF;
   SELECT tenant_id INTO v_tenant FROM public.profiles WHERE id=v_uid;
@@ -65,9 +70,11 @@ BEGIN
   IF v_s.id IS NULL OR v_s.tenant_id IS DISTINCT FROM v_tenant::text THEN RAISE EXCEPTION 'nf' USING ERRCODE='no_data_found'; END IF;
   IF v_s.demo_mode IS DISTINCT FROM false THEN RAISE EXCEPTION 'demo' USING ERRCODE='check_violation'; END IF;
   IF v_s.status <> 'waiting' THEN RAISE EXCEPTION 'not joinable (%)',v_s.status USING ERRCODE='check_violation'; END IF;
-  IF NOT EXISTS (SELECT 1 FROM public.tenant_quizzes q WHERE q.id::text=v_s.quiz_id AND q.tenant_id::text=v_s.tenant_id AND q.status='active') THEN
-    RAISE EXCEPTION 'quiz_unavailable' USING ERRCODE='check_violation';
-  END IF;
+  SELECT q.status INTO v_qstatus FROM public.tenant_quizzes q
+    WHERE q.id::text=v_s.quiz_id AND q.tenant_id::text=v_s.tenant_id FOR SHARE;
+  IF v_qstatus IS DISTINCT FROM 'active' THEN RAISE EXCEPTION 'quiz_unavailable' USING ERRCODE='check_violation'; END IF;
+  SELECT status INTO v_sstatus FROM public.game_sessions WHERE id=v_s.id;
+  IF v_sstatus <> 'waiting' THEN RAISE EXCEPTION 'not joinable (%)',v_sstatus USING ERRCODE='check_violation'; END IF;
   INSERT INTO public.game_session_participants (session_id, player_id, tenant_id, name, emoji, color, status, joined_at, last_seen_at)
   VALUES (v_s.id, v_uid::text, v_tenant::text, p_name, p_emoji, p_color, 'active', now(), now())
   ON CONFLICT (session_id, player_id) DO UPDATE SET status='active', last_seen_at=EXCLUDED.last_seen_at;
@@ -98,11 +105,22 @@ BEGIN
    WHERE quiz_id=NEW.id::text AND tenant_id=NEW.tenant_id::text AND demo_mode=false AND status='waiting';
   RETURN NULL;
 END; $function$;
+CREATE OR REPLACE FUNCTION public.ralli_cancel_waiting_sessions_before_quiz_delete()
+RETURNS trigger LANGUAGE plpgsql SECURITY DEFINER SET search_path TO '' AS $function$
+BEGIN
+  UPDATE public.game_sessions SET status='canceled', ended_at=now(), live_question=NULL
+   WHERE quiz_id=OLD.id::text AND tenant_id=OLD.tenant_id::text AND demo_mode=false AND status='waiting';
+  RETURN OLD;
+END; $function$;
 DROP TRIGGER IF EXISTS trg_ralli_cancel_waiting_sessions_on_quiz_deactivate ON public.tenant_quizzes;
 CREATE TRIGGER trg_ralli_cancel_waiting_sessions_on_quiz_deactivate
   AFTER UPDATE OF status ON public.tenant_quizzes FOR EACH ROW
   WHEN (OLD.status='active' AND NEW.status IS DISTINCT FROM 'active')
   EXECUTE FUNCTION public.ralli_cancel_waiting_sessions_for_quiz();
+DROP TRIGGER IF EXISTS trg_ralli_cancel_waiting_sessions_on_quiz_delete ON public.tenant_quizzes;
+CREATE TRIGGER trg_ralli_cancel_waiting_sessions_on_quiz_delete
+  BEFORE DELETE ON public.tenant_quizzes FOR EACH ROW
+  EXECUTE FUNCTION public.ralli_cancel_waiting_sessions_before_quiz_delete();
 
 -- ── Seed ──
 INSERT INTO public.tenants (id, slug, name) VALUES
@@ -119,7 +137,8 @@ INSERT INTO public.tenant_quizzes (id, tenant_id, name, questions, status, is_fa
  ('00000000-0000-0000-0000-0000008300b1','00000000-0000-0000-0000-0000000830b0','QB','[]'::jsonb,'active',false,now(),now()),
  ('00000000-0000-0000-0000-0000008300a3','00000000-0000-0000-0000-0000000830a0','QS','[]'::jsonb,'active',false,now(),now()),
  ('00000000-0000-0000-0000-0000008300a4','00000000-0000-0000-0000-0000000830a0','QH','[]'::jsonb,'active',false,now(),now()),
- ('00000000-0000-0000-0000-0000008300a5','00000000-0000-0000-0000-0000000830a0','QT','[]'::jsonb,'active',false,now(),now());
+ ('00000000-0000-0000-0000-0000008300a5','00000000-0000-0000-0000-0000000830a0','QT','[]'::jsonb,'active',false,now(),now()),
+ ('00000000-0000-0000-0000-0000008300a6','00000000-0000-0000-0000-0000000830a0','QD','[]'::jsonb,'active',false,now(),now());
 -- sessions: completed hist(qh); orphans + keepers for the correction; forged sessions for guards;
 -- trigger-target waiting(qt); started(qx)
 INSERT INTO public.game_sessions (id, tenant_id, quiz_id, host_id, pin, name, status, question_count, demo_mode, phase, current_question_index, question_snapshot, live_question, started_at) VALUES
@@ -131,7 +150,8 @@ INSERT INTO public.game_sessions (id, tenant_id, quiz_id, host_id, pin, name, st
  ('00000000-0000-0000-0000-0000008300e5','00000000-0000-0000-0000-0000000830a0','00000000-0000-0000-0000-0000008300a2','00000000-0000-0000-0000-000000083001','830055','KEEP-DEMO','waiting',1,true,'waiting',0,NULL,NULL,NULL),
  ('00000000-0000-0000-0000-0000008300e6','00000000-0000-0000-0000-0000000830a0','00000000-0000-0000-0000-0000008300a2','00000000-0000-0000-0000-000000083001','830066','FORGE-JOIN','waiting',1,false,'waiting',0,NULL,NULL,NULL),
  ('00000000-0000-0000-0000-0000008300e7','00000000-0000-0000-0000-0000000830a0','00000000-0000-0000-0000-0000008300a5','00000000-0000-0000-0000-000000083001','830077','TRIG-TARGET','waiting',1,false,'waiting',0,NULL,'{"live":1}'::jsonb,NULL),
- ('00000000-0000-0000-0000-0000008300e8','00000000-0000-0000-0000-0000000830a0','00000000-0000-0000-0000-0000008300a2','00000000-0000-0000-0000-000000083001','830088','FORGE-START','waiting',1,false,'waiting',0,'[{"q":1}]'::jsonb,NULL,NULL);
+ ('00000000-0000-0000-0000-0000008300e8','00000000-0000-0000-0000-0000000830a0','00000000-0000-0000-0000-0000008300a2','00000000-0000-0000-0000-000000083001','830088','FORGE-START','waiting',1,false,'waiting',0,'[{"q":1}]'::jsonb,NULL,NULL),
+ ('00000000-0000-0000-0000-0000008300ea','00000000-0000-0000-0000-0000000830a0','00000000-0000-0000-0000-0000008300a6','00000000-0000-0000-0000-000000083001','830100','DEL-TARGET','waiting',1,false,'waiting',0,NULL,'{"live":1}'::jsonb,NULL);
 
 DO $$
 DECLARE v jsonb; ok boolean; sid uuid; st text; lq jsonb; ea timestamptz; n int;
@@ -167,6 +187,16 @@ BEGIN
   IF lq IS NOT NULL THEN RAISE EXCEPTION 'req7 live_question not cleared'; END IF;
   IF ea IS NULL THEN RAISE EXCEPTION 'req7 ended_at not set'; END IF;
   RAISE NOTICE 'req7 archive-active-quiz trigger: waiting session canceled + live cleared + ended_at set: PASS';
+
+  -- ═══ delete-path — hard-deleting a quiz cancels its waiting real session (BEFORE DELETE) ═══
+  RESET ROLE;
+  DELETE FROM public.tenant_quizzes WHERE id='00000000-0000-0000-0000-0000008300a6';   -- fires BEFORE DELETE trigger
+  SELECT status, live_question, ended_at INTO st, lq, ea FROM public.game_sessions WHERE id='00000000-0000-0000-0000-0000008300ea';
+  IF st<>'canceled' THEN RAISE EXCEPTION 'delete-path trigger did not cancel waiting session (%)',st; END IF;
+  IF lq IS NOT NULL THEN RAISE EXCEPTION 'delete-path live_question not cleared'; END IF;
+  IF ea IS NULL THEN RAISE EXCEPTION 'delete-path ended_at not set'; END IF;
+  IF EXISTS (SELECT 1 FROM public.tenant_quizzes WHERE id='00000000-0000-0000-0000-0000008300a6') THEN RAISE EXCEPTION 'delete-path quiz not deleted'; END IF;
+  RAISE NOTICE 'delete-path: hard-delete cancels waiting session (before delete) + quiz removed: PASS';
 
   -- ═══ req 12 — a concurrent/stale Start cannot revive the trigger-canceled session ═══
   UPDATE public.game_sessions SET question_snapshot='[{"q":1}]'::jsonb WHERE id=e7;   -- even with a snapshot
