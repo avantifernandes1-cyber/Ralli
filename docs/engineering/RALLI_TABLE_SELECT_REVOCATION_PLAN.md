@@ -6,9 +6,12 @@
 > intended security change. The real revocation migration will be authored, gated, tested,
 > and applied under separate approval once the prerequisites below are complete.
 >
-> **Migration numbering (updated at Stage C):** the SELECT revocation will be migration
-> **`081`**. Migration **`080_ralli_server_authorized_writes.sql`** is now taken by the
-> Stage-C write cutover (below), so the revocation is the next number after it.
+> **Migration numbering (corrected at the 2026-07-31 checkpoint):** the final SELECT revocation
+> will be migration **`082`**. Migration **`080_ralli_server_authorized_writes.sql`** is the
+> Stage-C write cutover (applied); **`081`** is reserved for durable Ralli Live scoreboard
+> recovery; so the revocation is **`082`**. (This supersedes the earlier note that called the
+> revocation "081" — that was a numbering error only; the security design is unchanged.) Neither
+> 081 nor 082 exists or is applied; neither is approved or complete.
 
 ## Stage B finding (why a bare revoke is unsafe) — resolved by 080
 
@@ -102,8 +105,9 @@ history. Completed learner review still works via `rpc_my_completed_session_revi
    `rpc_lobby_participants` proven in two-device QA (Stage A).
 3. ✅ Stage B — proved a bare revoke breaks 9/11 writes.
 4. ✅ Stage C — migration **080** (server-authorized write RPCs) authored + tested + frontend
-   cut over. Awaiting separate controlled apply.
-5. ⏳ **Migration 081** = `REVOKE SELECT ON the four tables FROM authenticated, anon` — authored
-   only **after** 080 is applied and the full host/learner/recovery/reveal/scoring/analytics/
-   tenant-isolation QA passes on the preview. Gated + applied under separate approval.
-6. Validate all paths post-081; re-prove the confidentiality matrix before merging.
+   cut over, and **applied to production** (version `20260731010835`).
+5. ⏳ **Migration 082** = `REVOKE SELECT ON the four tables FROM authenticated, anon` — the final
+   direct-table SELECT revocation (081 is reserved for durable scoreboard recovery). Authored only
+   **after** the full host/learner/recovery/reveal/scoring/analytics/tenant-isolation QA passes,
+   then gated + applied under separate approval. Does not exist / not applied / not approved.
+6. Validate all paths post-082; re-prove the confidentiality matrix before merging.
