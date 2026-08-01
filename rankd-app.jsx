@@ -6920,6 +6920,9 @@ function RankdLobbyScreen({ onNav, pin, sessionDbId: propSessionDbId = null, pla
   // DB-backed participant list for the manager lobby.
   // Source of truth: game_session_participants rows for this session.
   const [dbPlayers, setDbPlayers] = useState([]);
+  // True once we're advancing this learner from lobby → game, so the leave-on-unmount handler
+  // below does NOT mark them 'left' when the game actually starts.
+  const advancingToGameRef = useRef(false);
 
   const normParticipant = (p) => ({
     id:     p.player_id ?? p.id,
@@ -7137,9 +7140,29 @@ function RankdLobbyScreen({ onNav, pin, sessionDbId: propSessionDbId = null, pla
   // rather than inventing a new one.
   useEffect(() => {
     if (isDemoMode || role === "admin") return;
-    if (chMsg?.type === GM.SHOW_QUESTION || chMsg?.type === GM.GAME_START) onNav("rankd-game");
+    if (chMsg?.type === GM.SHOW_QUESTION || chMsg?.type === GM.GAME_START) { advancingToGameRef.current = true; onNav("rankd-game"); }
     if (chMsg?.type === GM.FORCE_END || chMsg?.type === GM.GAME_END) setHostEnded(true);
   }, [chMsg, isDemoMode, role]);
+
+  // Explicit waiting-lobby LEAVE = navigating away from the lobby to anything that is NOT the
+  // game. The lobby had no durable-leave handler, so a learner who left kept status='active'
+  // and the durable-heartbeat bridge showed them (and counted them) for up to HEARTBEAT_FRESH_MS
+  // (~40s) until their frozen last_seen_at went stale — the reported stale roster/count. Mark the
+  // caller's row 'left' (canonical markParticipantLeft → rpc_participant_leave) and untrack
+  // Presence on unmount, so the host's next durable poll (≤4s) excludes them via status='left'.
+  //   • advancing to the game is guarded out (advancingToGameRef) — that's not a Leave.
+  //   • React cleanup does NOT run on full-page refresh or tab close, so those correctly keep
+  //     the existing heartbeat grace period (row stays 'active' → drops when last_seen goes stale).
+  // Reuses the exact lifecycle of the name-entry ← Back / in-game Leave — no new roster/count path.
+  useEffect(() => {
+    if (isDemoMode || role === "admin") return;
+    return () => {
+      if (advancingToGameRef.current) return;         // lobby → game is not a Leave
+      if (!sessionDbId || !playerId) return;
+      markParticipantLeft(sessionDbId, playerId).catch(e => console.error("[ralli:lobby] leave: durable mark-left failed:", e));
+      try { broadcast?.({ type: GM.PLAYER_LEAVE, playerId }); } catch (e) { console.error("[ralli:lobby] leave: presence untrack failed:", e); }
+    };
+  }, [isDemoMode, role, sessionDbId, playerId]); // eslint-disable-line react-hooks/exhaustive-deps
 
   useEffect(() => {
     if (!isDemoMode) return;
