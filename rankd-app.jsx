@@ -7044,6 +7044,34 @@ function RankdLobbyScreen({ onNav, pin, sessionDbId: propSessionDbId = null, pla
     return () => clearInterval(interval);
   }, [sessionDbId, isDemoMode, role]); // eslint-disable-line react-hooks/exhaustive-deps
 
+  // ── Host: durable session-status recovery in the WAITING lobby ───────────────
+  // A quiz archived while the host waits (migration 083 trigger, or any path that
+  // cancels the session) durably CANCELS this session server-side with NO game
+  // broadcast. Mirror the learner status poll so the host is also removed from a
+  // lobby whose game can never start, even if no realtime event arrives. On any
+  // terminal status, clear the active-game context (so a refresh can't re-enter it)
+  // and return the host to the hub with a message. The host-safe restore RPC (075)
+  // authorizes the exact host / same-tenant admin, so this is not a direct table read.
+  useEffect(() => {
+    if (role !== "admin" || isDemoMode || !sessionDbId) return;
+    let done = false;
+    const check = () => {
+      getSessionRestoreData(sessionDbId).then(({ session }) => {
+        const data = session?.data;
+        if (done || !data) return;
+        if (["canceled", "ended", "completed"].includes(data.status)) {
+          done = true;
+          try { clearActiveGameContext(); } catch { /* ignore */ }
+          toast.error("This game was canceled — its quiz is no longer available.");
+          onNav("rankd");
+        }
+      }).catch(() => {});
+    };
+    check(); // immediate on mount so a refresh after cancellation resolves at once
+    const interval = setInterval(check, 4000);
+    return () => clearInterval(interval);
+  }, [role, isDemoMode, sessionDbId, onNav]); // eslint-disable-line react-hooks/exhaustive-deps
+
   const basePlayer = role === "admin"
     ? { name: currentUser?.name ?? "Host", emoji: "🦁", color: C.green }
     : { name: playerName || "You", emoji: playerEmoji ?? null, color: C.orange };

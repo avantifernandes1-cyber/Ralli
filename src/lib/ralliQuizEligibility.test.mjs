@@ -101,6 +101,20 @@ ok("handleCreateSession special-cases a 'quiz_unavailable' create error",
    /error\?\.message === "quiz_unavailable"/.test(hcs) &&
    /This quiz is no longer available\. Create a new game with an active quiz\./.test(hcs));
 
+// ── (5b) Host durable-recovery poll in the waiting lobby ─────────────────────
+// The migration-083 trigger cancels a waiting session the instant its quiz is archived, with NO
+// game broadcast. The host must be removed from the lobby by a durable status poll (the learner
+// already has one). Assert the host-side poll exists, keys off terminal status, and exits cleanly.
+const lobby = app.slice(app.indexOf("function RankdLobbyScreen("), app.indexOf("function RankdLobbyScreen(") + 40000);
+ok("host waiting-lobby has a durable session-status poll (role==='admin', via getSessionRestoreData)",
+   /if \(role !== "admin" \|\| isDemoMode \|\| !sessionDbId\) return;[\s\S]{0,400}getSessionRestoreData\(sessionDbId\)/.test(lobby));
+ok("host poll ejects on any terminal status (canceled/ended/completed)",
+   /\["canceled", "ended", "completed"\]\.includes\(data\.status\)/.test(lobby));
+ok("host poll clears active-game context and returns the host to the hub",
+   /clearActiveGameContext\(\);[\s\S]{0,200}onNav\("rankd"\)/.test(lobby));
+ok("learner waiting-lobby status poll still present (getPlayerSessionRestore → terminal)",
+   /getPlayerSessionRestore\(sessionDbId\)[\s\S]{0,800}\["canceled", "ended", "completed"\]\.includes\(data\.status\)/.test(lobby));
+
 // ── (6) gameService.startGameSession returns the structured RPC result ───────
 const sgs = gameSvc.slice(gameSvc.indexOf("export async function startGameSession"), gameSvc.indexOf("export async function startGameSession") + 1400);
 ok("startGameSession destructures { data, error } from rpc_start_session",
