@@ -278,6 +278,19 @@ function dbToQuiz(row) {
   };
 }
 
+/**
+ * Canonical quiz eligibility predicate (the ONE source of truth for "playable").
+ * A quiz is playable/selectable ONLY when its persisted status is EXACTLY 'active' — never
+ * "not archived". Unknown/null/malformed/future statuses are NOT playable. Quizzes loaded via
+ * this service are already normalized (dbToQuiz: status = row.status ?? 'active'), so a trusted
+ * legacy null reads as 'active'. This mirrors the authoritative server guard in migration 083
+ * (create_game_session_atomic / rpc_start_session require tenant_quizzes.status = 'active').
+ * Use this everywhere a quiz must be gated for play — do not re-interpret quiz status ad hoc.
+ */
+export function isQuizPlayable(quiz) {
+  return (quiz?.status ?? "active") === "active";
+}
+
 /** Normalise an app quiz → DB payload.
  *  Writes both `q` and `text` to the canonical text value so the DB is
  *  always consistent regardless of which field the builder or seed data wrote.

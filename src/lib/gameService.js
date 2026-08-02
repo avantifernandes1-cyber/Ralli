@@ -17,6 +17,7 @@
  */
 
 import { supabase } from "./supabase.js";
+import { REVEAL_ALLOWED_STATUSES, REVEAL_PRE_PHASES, classifyRevealPublish } from "./revealPublish.js";
 
 // ── SESSION ────────────────────────────────────────────────────────────────────
 
@@ -86,19 +87,44 @@ export async function findJoinableSession(tenantId, pin) {
  * @param {string} pin
  * @returns {Promise<{ data: Object|null, error: Object|null }>}
  */
-export async function startGameSession(pin, tenantId = null) {
-  // Scoped by tenant_id whenever the caller has one — see endGameSession's
-  // comment above for why pin alone is no longer a safe match (migration
-  // 046: pins are only unique within a tenant).
-  let query = supabase
-    .from("game_sessions")
-    .update({
-      status:     "started",
-      started_at: new Date().toISOString(),
-    })
-    .eq("pin", pin);
-  if (tenantId) query = query.eq("tenant_id", tenantId);
-  const { data, error } = await query.select().single();
+export async function startGameSession(sessionId) {
+  // Server-authorized write (migration 080): rpc_start_session takes the EXACT game_sessions.id
+  // the caller already holds (activeGameSessionDbId) — never a PIN lookup that could target a
+  // reused/stale session. It authorizes host/manager server-side and requires a real (non-demo),
+  // 'waiting' session that already has its immutable question snapshot. Moving the filtered
+  // UPDATE behind a SECURITY DEFINER RPC is what lets a later REVOKE SELECT (082) not break start.
+  // Returns the RPC's structured result so the caller can honor a non-start outcome: on
+  // { ok: false, reason: 'quiz_unavailable' } (migration 083) the session was durably canceled
+  // server-side because its quiz was archived before start; the host must NOT enter the game.
+  const { data, error } = await supabase.rpc("rpc_start_session", { p_session_id: sessionId });
+  return { data, error };
+}
+
+/**
+ * Durably publish the scoreboard the host already computed (migration 081), so a learner who
+ * misses the transient SCOREBOARD broadcast can reconstruct it from game_sessions.live_scoreboard.
+ * The RPC validates host authorization + state (started, publishable phase, matching qIdx),
+ * rejects non-participant ids, resolves names/avatars server-side, computes canonical rank/tie
+ * ordering, bumps scoreboard_version, and atomically persists phase='scoreboard' + payload. It
+ * returns the EXACT canonical payload saved (the host must broadcast/render THAT, not its input).
+ *
+ * Idempotent: a stable `publishKey` for the exact (session, question) scoreboard episode makes a
+ * retry after a lost success response return the already-persisted board unchanged (no double
+ * increment); a different key can never replace an existing board (migration 081).
+ *
+ * @param {string} sessionId - game_sessions.id (UUID)
+ * @param {number} qIdx - the current question index the scoreboard is for
+ * @param {Array<{id:string, score:number, delta?:number}>} scores - minimal per-player inputs
+ * @param {string} publishKey - stable per-episode idempotency key (NOT trusted for auth)
+ * @returns {Promise<{ data: Object|null, error: Object|null }>} data = canonical scoreboard payload
+ */
+export async function publishScoreboard(sessionId, qIdx, scores, publishKey) {
+  const minimal = (scores ?? []).map(s => ({
+    id: s.id, score: Number(s.score ?? 0), delta: Number(s.delta ?? 0),
+  }));
+  const { data, error } = await supabase.rpc("rpc_publish_scoreboard", {
+    p_session_id: sessionId, p_qidx: qIdx, p_scores: minimal, p_publish_key: publishKey,
+  });
   return { data, error };
 }
 
@@ -111,39 +137,28 @@ export async function startGameSession(pin, tenantId = null) {
  *   scores: [{ id?, name, score, emoji?, color? }]
  * @returns {Promise<{ data: Object|null, error: Object|null }>}
  */
-export async function endGameSession(pin, { scores = [], tenantId = null } = {}) {
-  // 1. Update session status. Scoped by tenant_id whenever the caller has
-  // one, not just pin — pins are only unique WITHIN a tenant (migration
-  // 046), so a code-only match here could otherwise end a different
-  // tenant's session that happens to share the same visible pin.
-  let query = supabase
-    .from("game_sessions")
-    .update({
-      status:   "completed",
-      ended_at: new Date().toISOString(),
-    })
-    .eq("pin", pin);
-  if (tenantId) query = query.eq("tenant_id", tenantId);
-  const { data: session, error: sessionError } = await query.select().single();
-
+export async function endGameSession(pin, { scores = [], tenantId = null, sessionId = null } = {}) {
+  // 1+2. Server-authorized ATOMIC end (migration 080): rpc_end_session authorizes host/
+  // manager and marks the session 'completed' AND completes its active participants in one
+  // transaction — keyed on the EXACT session id (no PIN fallback), so a demo game (null id)
+  // or a mismatched id can never complete another session. A null id returns matched:false
+  // and is a no-op. This replaces the two direct filtered UPDATEs so a later REVOKE SELECT
+  // (081) won't break end. `pin` is retained only for the caller's own award/history path.
+  const { data: endData, error: sessionError } = await supabase.rpc("rpc_end_session", {
+    p_session_id: sessionId,
+  });
   if (sessionError) {
-    console.error("[gameService] endGameSession: failed to update session", sessionError);
+    console.error("[gameService] endGameSession: failed to end session", sessionError);
     return { data: null, error: sessionError };
   }
 
-  if (!session?.id) return { data: null, error: new Error("session not found") };
-
-  // 2. Mark all active participants as completed (so lobby no longer shows them)
-  await supabase
-    .from("game_session_participants")
-    .update({ status: "completed", last_seen_at: new Date().toISOString() })
-    .eq("session_id", session.id)
-    .in("status", ["active", "joined"]);
+  const sid = sessionId ?? endData?.session_id ?? null;
+  if (!sid) return { data: null, error: null };
 
   // 3. Save final player scores (ranked by position in scores array)
   if (scores.length > 0) {
     const playerRows = scores.map((p, idx) => ({
-      session_id:  session.id,
+      session_id:  sid,
       tenant_id:   tenantId,
       player_id:   p.id ?? p.playerId ?? p.name ?? `player-${idx}`,
       name:        p.name,
@@ -163,7 +178,39 @@ export async function endGameSession(pin, { scores = [], tenantId = null } = {})
     }
   }
 
-  return { data: session, error: null };
+  return { data: { id: sid }, error: null };
+}
+
+/**
+ * Request server-authoritative verification of a durably-completed session
+ * (migration 072 + the verify-game-session Edge Function). The function
+ * re-grades the session against its frozen snapshot with the shared canonical
+ * grader and writes immutable verification records; the underlying RPC is
+ * idempotent, so retries / reconnect / repeated completion never duplicate them.
+ *
+ * SAFE-BY-DEFAULT: the Edge Function is not deployed in every environment yet.
+ * When it is absent/unreachable, this resolves as `{ unavailable: true }`
+ * WITHOUT throwing — the caller treats the session as simply "unverified" (never
+ * leaderboard-eligible) and MUST NOT let this affect gameplay results or the end
+ * screen. Service errors are never surfaced to the player.
+ *
+ * @param {string} sessionId - game_sessions.id (UUID)
+ * @returns {Promise<{ data: Object|null, error: Object|null, unavailable: boolean }>}
+ */
+export async function requestSessionVerification(sessionId) {
+  if (!sessionId) return { data: null, error: null, unavailable: true };
+  try {
+    const { data, error } = await supabase.functions.invoke("verify-game-session", {
+      body: { session_id: sessionId },
+    });
+    // A not-deployed / unreachable function (FunctionsFetchError, 404) is an
+    // expected pre-deploy state, not a failure — report it as unavailable so the
+    // caller degrades to "unverified" rather than erroring.
+    if (error) return { data: null, error, unavailable: true };
+    return { data, error: null, unavailable: false };
+  } catch (e) {
+    return { data: null, error: e, unavailable: true };
+  }
 }
 
 /**
@@ -178,12 +225,9 @@ export async function endGameSession(pin, { scores = [], tenantId = null } = {})
  * @returns {Promise<{ error: Object|null }>}
  */
 export async function cancelGameSession(sessionId, tenantId = null) {
-  let query = supabase
-    .from("game_sessions")
-    .update({ status: "canceled", ended_at: new Date().toISOString() })
-    .eq("id", sessionId);
-  if (tenantId) query = query.eq("tenant_id", tenantId);
-  const { error } = await query;
+  // Server-authorized write (migration 080): host/manager-authorized cancel by session id.
+  // tenantId kept for contract compatibility; authorization is derived server-side.
+  const { error } = await supabase.rpc("rpc_cancel_session", { p_session_id: sessionId });
   return { error };
 }
 
@@ -198,40 +242,16 @@ export async function cancelGameSession(sessionId, tenantId = null) {
  * @returns {Promise<{ data: Object|null, error: Object|null }>}
  */
 export async function joinGameSession(sessionId, { playerId, name, emoji = null, color = null, tenantId = null }) {
-  // The caller's avatar choice is AUTHORITATIVE — including null, which means
-  // "no avatar / clear any previously stored one". The previous logic
-  // (existing?.emoji ?? emoji) preserved a prior stored avatar over the
-  // caller's value, so a player who once had an avatar and later chose "None"
-  // had the old avatar silently restored on rejoin. Emoji no longer drifts on
-  // reconnect (name-entry passes the actual selection or null, never a
-  // recomputed hash), so preservation is obsolete and was the bug.
-  const { data: existing } = await supabase
-    .from("game_session_participants")
-    .select("emoji, color")
-    .eq("session_id", sessionId)
-    .eq("player_id", playerId)
-    .maybeSingle();
-
-  const finalEmoji = emoji;   // caller-authoritative — null clears any prior avatar
-  const finalColor = color;
-
-  const { data, error } = await supabase
-    .from("game_session_participants")
-    .upsert(
-      {
-        session_id: sessionId,
-        player_id:  playerId,
-        tenant_id:  tenantId,
-        name,
-        emoji: finalEmoji,
-        color: finalColor,
-        joined_at:  new Date().toISOString(),
-      },
-      { onConflict: "session_id,player_id" }
-    )
-    .select()
-    .single();
-  return { data, error };
+  // Server-authorized SELF-join (migration 080): rpc_participant_join forces
+  // player_id = auth.uid() and derives tenant server-side, so a learner can only ever write
+  // THEIR OWN participant row into a SAME-TENANT session (no impersonation, no cross-tenant).
+  // Idempotent upsert (no duplicate). The caller's avatar choice — including null, which
+  // means "no avatar" — is authoritative and passed through unchanged. The playerId/tenantId
+  // params are kept for contract compatibility but are NOT trusted for the write.
+  const { error } = await supabase.rpc("rpc_participant_join", {
+    p_session_id: sessionId, p_name: name, p_emoji: emoji, p_color: color,
+  });
+  return { data: null, error };
 }
 
 /**
@@ -242,46 +262,26 @@ export async function joinGameSession(sessionId, { playerId, name, emoji = null,
  * @returns {Promise<{ data: Object[]|null, error: Object|null }>}
  */
 export async function getLobbyParticipants(sessionId) {
-  const { data, error } = await supabase
-    .from("game_session_participants")
-    .select("*")
-    .eq("session_id", sessionId)
-    .in("status", ["active", "joined"])
-    .order("joined_at", { ascending: true });
-  return { data, error };
+  // Safe-read cutover (migration 075): presence-only roster via the server-authorized
+  // rpc_lobby_participants (host/manager OR a participant of this session). Returns
+  // id/name/emoji/color/status/joined_at/last_seen_at — never answers or scores.
+  // Returns ALL rows (including status='left'/'completed'). Callers apply their own status
+  // rule: the halt watchdog + roster count ONLY active|joined, while the lobby uses a durable
+  // 'left' row to SUPPRESS a lingering ghost Presence entry immediately — so an explicit Leave
+  // disappears from the host within the normal durable refresh interval, not after the ~40s
+  // Presence timeout. (A tab close leaves the row 'active' and still uses the heartbeat grace.)
+  const { data, error } = await supabase.rpc("rpc_lobby_participants", { p_session_id: sessionId });
+  if (error) return { data: null, error };
+  return { data: Array.isArray(data) ? data : [], error: null };
 }
 
-/**
- * Subscribe to new participants joining this lobby (postgres_changes INSERT).
- * Returns the Supabase channel so the caller can unsubscribe on cleanup.
- *
- * Usage:
- *   const channel = subscribeToLobbyParticipants(sessionId, (row) => addPlayer(row));
- *   // cleanup:
- *   supabase.removeChannel(channel);
- *
- * @param {string} sessionId - game_sessions.id (UUID)
- * @param {(row: Object) => void} onInsert - called with the new participant row
- * @returns {RealtimeChannel}
- */
-export function subscribeToLobbyParticipants(sessionId, onInsert) {
-  const channel = supabase
-    .channel(`lobby_participants:${sessionId}`)
-    .on(
-      "postgres_changes",
-      {
-        event:  "INSERT",
-        schema: "public",
-        table:  "game_session_participants",
-        filter: `session_id=eq.${sessionId}`,
-      },
-      (payload) => {
-        if (payload.new) onInsert(payload.new);
-      }
-    )
-    .subscribe();
-  return channel;
-}
+// NOTE: subscribeToLobbyParticipants (postgres_changes INSERT on
+// game_session_participants) was removed as a prerequisite for revoking direct table
+// SELECT. Its only job was to notify the lobby that a new participant row appeared;
+// the roster's visibility/count is driven by Realtime Presence (chPlayers), and the
+// durable identity/status truth is getLobbyParticipants() → rpc_lobby_participants.
+// The lobby now refreshes that durable roster on presence change / focus / poll, so
+// no client needs a direct postgres_changes subscription on this table.
 
 // ── LIVE GAME PERSISTENCE ─────────────────────────────────────────────────────
 
@@ -294,18 +294,66 @@ export function subscribeToLobbyParticipants(sessionId, onInsert) {
  * @returns {Promise<{ error: Object|null }>}
  */
 export async function updateSessionPhase(sessionId, { phase, currentQuestionIndex, paused, liveQuestion } = {}) {
-  const patch = { phase };
-  if (currentQuestionIndex !== undefined) patch.current_question_index = currentQuestionIndex;
-  if (paused !== undefined) patch.paused = paused;
-  // live_question is the durable recovery source (migration 048). Passing an
-  // object stores the current SHOW_QUESTION payload; passing null clears it
-  // (host moved off the question); passing undefined leaves it untouched.
-  if (liveQuestion !== undefined) patch.live_question = liveQuestion;
-  const { error } = await supabase
-    .from("game_sessions")
-    .update(patch)
-    .eq("id", sessionId);
+  // Server-authorized write (migration 080): rpc_set_session_phase authorizes host/manager
+  // and persists phase (always) plus the optional fields via tri-state flags — preserving
+  // the exact prior semantics: live_question object=store / null=clear / undefined=leave
+  // untouched (same for current_question_index and paused). No reveal logic here (reveal is
+  // rpc_host_publish_reveal, 079).
+  const { error } = await supabase.rpc("rpc_set_session_phase", {
+    p_session_id:  sessionId,
+    p_phase:       phase,
+    p_set_cqi:     currentQuestionIndex !== undefined,
+    p_cqi:         currentQuestionIndex ?? null,
+    p_set_paused:  paused !== undefined,
+    p_paused:      paused ?? null,
+    p_set_live:    liveQuestion !== undefined,
+    p_live_question: liveQuestion ?? null,
+  });
   return { error };
+}
+
+/**
+ * Durable REVEAL publication — the confirmed, state-guarded write that MUST
+ * succeed before the host broadcasts the correct answer.
+ *
+ * FIRST PUBLICATION (atomic, strict): flips phase→'reveal' + persists the reveal
+ * ONLY when the session is on the exact question, in a pre-reveal phase
+ * (`question`, or `open-review` for open-ended), the status is exactly a RUNNING
+ * game (`started`), AND it is not paused (`paused=false`). Requiring the running
+ * status + unpaused — not merely "not terminal" — is what stops a delayed reveal
+ * from overwriting a same-index `countdown`/`scoreboard`, a `waiting` lobby, or a
+ * paused game.
+ *
+ * 0-ROW OUTCOME is classified (read-only) from the current row:
+ *   - `idempotent`: phase already 'reveal' for this exact qIdx with the SAME
+ *     payload (a lost response after a successful persist) → success; the host may
+ *     broadcast the already-durable reveal without rewriting it.
+ *   - `conflict`: phase 'reveal' for this qIdx but a DIFFERENT payload → reject.
+ *   - `stale`: anything else (countdown/scoreboard/ended/unknown phase, newer/older
+ *     qIdx, terminal status) → reject, never overwrite.
+ *
+ * Touches only `phase` + `live_question`; never scoring/answers/timers.
+ *
+ * @param {string} sessionId
+ * @param {number} expectedQIdx
+ * @param {Object} liveQuestion - the frozen safe live_question payload incl. its `reveal` block
+ * @returns {Promise<{ ok: boolean, outcome: 'applied'|'idempotent'|'conflict'|'stale'|'error', error: Object|null }>}
+ */
+export async function publishRevealDurable(sessionId, expectedQIdx, liveQuestion) {
+  // Safe-read cutover (migration 079): the strict conditional first-publication UPDATE
+  // and the 0-row current-row read now run server-side, host/manager-authorized, via
+  // rpc_host_publish_reveal — so no direct game_sessions read/write here. The 0-row
+  // outcome is still classified with the SAME shared JS (classifyRevealPublish); the
+  // reveal state machine's semantics are unchanged.
+  const { data, error } = await supabase.rpc("rpc_host_publish_reveal", {
+    p_session_id: sessionId, p_expected_qidx: expectedQIdx, p_live_question: liveQuestion,
+  });
+  if (error) return { ok: false, outcome: "error", error };
+  if (data?.outcome === "applied") return { ok: true, outcome: "applied", error: null };
+  // 0 rows → classify the returned current row (idempotent lost-response / conflict / stale).
+  const cls = classifyRevealPublish(data?.current ?? null, expectedQIdx, liveQuestion);
+  if (cls === "idempotent") return { ok: true, outcome: "idempotent", error: null };
+  return { ok: false, outcome: cls, error: null }; // 'conflict' | 'stale'
 }
 
 /**
@@ -351,24 +399,6 @@ export async function saveGameAnswers(sessionId, answers = []) {
 }
 
 /**
- * Fetch every per-question, per-player answer row for a completed (or
- * in-progress) session — the canonical data source for post-game analytics
- * drill-down (Player Breakdown / Questions tabs in RankdResultsScreen).
- * Ordered by question_idx so callers can group by question cheaply.
- *
- * @param {string} sessionId - game_sessions.id (UUID)
- * @returns {Promise<{ data: Object[]|null, error: Object|null }>}
- */
-export async function getGameAnswersForSession(sessionId) {
-  const { data, error } = await supabase
-    .from("game_answers")
-    .select("*")
-    .eq("session_id", sessionId)
-    .order("question_idx", { ascending: true });
-  return { data, error };
-}
-
-/**
  * Mark a lobby participant as having left the session.
  * Called when a player disconnects (presence untrack) or manually leaves.
  *
@@ -377,11 +407,10 @@ export async function getGameAnswersForSession(sessionId) {
  * @returns {Promise<{ error: Object|null }>}
  */
 export async function markParticipantLeft(sessionId, playerId) {
-  const { error } = await supabase
-    .from("game_session_participants")
-    .update({ status: "left", last_seen_at: new Date().toISOString() })
-    .eq("session_id", sessionId)
-    .eq("player_id", playerId);
+  // Server-authorized SELF write (migration 080): the RPC flips ONLY the caller's own row
+  // (player_id = auth.uid()) to 'left'. playerId kept for contract compatibility; the write
+  // target is derived server-side so a learner can never mark another player left.
+  const { error } = await supabase.rpc("rpc_participant_leave", { p_session_id: sessionId });
   return { error };
 }
 
@@ -394,56 +423,10 @@ export async function markParticipantLeft(sessionId, playerId) {
  * @returns {Promise<{ error: Object|null }>}
  */
 export async function updateParticipantHeartbeat(sessionId, playerId) {
-  const { error } = await supabase
-    .from("game_session_participants")
-    .update({ last_seen_at: new Date().toISOString() })
-    .eq("session_id", sessionId)
-    .eq("player_id", playerId);
+  // Server-authorized SELF write (migration 080): refreshes ONLY the caller's own
+  // last_seen_at (player_id = auth.uid()). playerId kept for contract compatibility.
+  const { error } = await supabase.rpc("rpc_participant_heartbeat", { p_session_id: sessionId });
   return { error };
-}
-
-/**
- * Fetch game history for a player from game_players table.
- * Used on the "My Scores" tab to replace the static USER_GAME_HISTORY seed.
- *
- * @param {string} playerId - auth user id
- * @param {number} [limit=20]
- * @returns {Promise<{ data: Array|null, error: Object|null }>}
- */
-export async function getPlayerGameHistory(playerId, limit = 20) {
-  // ORDER BY joined_at — game_players has NO created_at column, so the previous
-  // .order("created_at") made PostgREST return a 42703 error for EVERY call.
-  // The caller swallowed that error into [] and always showed "No games yet",
-  // even though the player's rows existed. joined_at is the real timestamp
-  // column; callers may additionally sort by the joined session's ended_at.
-  const { data, error } = await supabase
-    .from("game_players")
-    .select("*, game_sessions(name, question_count, ended_at, pin, status)")
-    .eq("player_id", playerId)
-    .order("joined_at", { ascending: false })
-    .limit(limit);
-  return { data, error };
-}
-
-/**
- * Fetch ONE player's own answer rows for ONE session — the player-scoped source
- * for the "My Scores" detail view. Scoped by BOTH exact session_id AND the exact
- * authenticated player_id so a player can never read another player's
- * submissions (RLS additionally confines it to the caller's tenant). Ordered by
- * question_idx for stable rendering.
- *
- * @param {string} sessionId - game_sessions.id (UUID)
- * @param {string} playerId  - the authenticated user's id
- * @returns {Promise<{ data: Object[]|null, error: Object|null }>}
- */
-export async function getPlayerAnswersForSession(sessionId, playerId) {
-  const { data, error } = await supabase
-    .from("game_answers")
-    .select("question_idx, option_idx, answer_text, numeric_value, answer_json, is_correct, points, time_ms, was_skipped, answered_at, id")
-    .eq("session_id", sessionId)
-    .eq("player_id", playerId)
-    .order("question_idx", { ascending: true });
-  return { data, error };
 }
 
 /**
@@ -458,30 +441,12 @@ export async function getPlayerAnswersForSession(sessionId, playerId) {
 export async function getSessionPlayerCounts(sessionIds) {
   const ids = (sessionIds ?? []).filter(Boolean);
   if (ids.length === 0) return { data: {}, error: null };
-  const { data, error } = await supabase
-    .from("game_players")
-    .select("session_id")
-    .in("session_id", ids);
+  // Safe-read cutover (migration 075): server returns counts ONLY for sessions the
+  // caller may see (a manager of it, or a participant of it) — count only, never
+  // identities. Same { [sessionId]: n } shape as before.
+  const { data, error } = await supabase.rpc("rpc_session_player_counts", { p_session_ids: ids });
   if (error) return { data: null, error };
-  const counts = {};
-  for (const r of data ?? []) counts[r.session_id] = (counts[r.session_id] ?? 0) + 1;
-  return { data: counts, error: null };
-}
-
-/**
- * Fetch final results for a completed session from game_players.
- * Used by RankdResultsScreen when gameData is not in memory (after refresh).
- *
- * @param {string} sessionId - game_sessions.id (UUID)
- * @returns {Promise<{ data: Array|null, error: Object|null }>}
- */
-export async function getSessionPlayers(sessionId) {
-  const { data, error } = await supabase
-    .from("game_players")
-    .select("*")
-    .eq("session_id", sessionId)
-    .order("final_rank", { ascending: true });
-  return { data, error };
+  return { data: data ?? {}, error: null };
 }
 
 /**
@@ -496,28 +461,13 @@ export async function getSessionPlayers(sessionId) {
  */
 export async function saveSessionQuestionSnapshot(sessionId, questions) {
   if (!sessionId || !Array.isArray(questions) || questions.length === 0) return { error: null };
-  const { error } = await supabase
-    .from("game_sessions")
-    .update({ question_snapshot: questions })
-    .eq("id", sessionId);
+  // Server-authorized write (migration 080): host/manager-authorized, WRITE-ONCE (the RPC
+  // only sets question_snapshot when still null), preserving the immutable historical-
+  // question contract. Accepts DEFINITIONS only — never answers or scores.
+  const { error } = await supabase.rpc("rpc_save_question_snapshot", {
+    p_session_id: sessionId, p_questions: questions,
+  });
   return { error };
-}
-
-/**
- * Fetch the durable question snapshot for a session. Returns null (not an
- * error) for legacy sessions created before the snapshot existed — callers
- * must degrade honestly rather than fall back to the mutable current quiz.
- *
- * @param {string} sessionId - game_sessions.id (UUID)
- * @returns {Promise<{ data: Array|null, error: Object|null }>}
- */
-export async function getSessionQuestionSnapshot(sessionId) {
-  const { data, error } = await supabase
-    .from("game_sessions")
-    .select("question_snapshot")
-    .eq("id", sessionId)
-    .single();
-  return { data: data?.question_snapshot ?? null, error };
 }
 
 // ── ANALYTICS ─────────────────────────────────────────────────────────────────
@@ -544,66 +494,57 @@ export async function getSessionQuestionSnapshot(sessionId) {
  * @returns {Promise<{ data: Array|null, error: Object|null }>}
  */
 export async function getGameHistory(tenantId, limit = 20) {
-  const { data, error } = await supabase
-    .from("game_sessions")
-    .select("*, game_players(*)")
-    .eq("tenant_id", tenantId)
-    .eq("status", "completed")
-    .order("ended_at", { ascending: false })
-    .limit(limit);
-
-  if (error || !data) return { data: null, error };
-
-  // Resolve host display names for real (UUID) host_ids in one batch query.
-  // Mock/demo host_ids (seed data, e.g. "demo-host") never match a profiles
-  // row and safely fall back to null (rendered as "Unknown host") below —
-  // never fabricated.
-  const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
-  const hostIds = [...new Set(data.map(s => s.host_id).filter(id => id && UUID_RE.test(id)))];
-  let hostNames = {};
-  if (hostIds.length > 0) {
-    const { data: hosts } = await supabase.from("profiles").select("id, name, email").in("id", hostIds);
-    hostNames = Object.fromEntries((hosts ?? []).map(h => [h.id, h.name ?? h.email ?? null]));
-  }
-
-  const normalised = data.map(s => {
-    const players = (s.game_players ?? []).slice().sort((a, b) => (a.final_rank ?? 999) - (b.final_rank ?? 999));
-    const top = players[0] ?? null;
-    return {
-      code:          s.pin,
-      name:          s.name,
-      quizId:        s.quiz_id,
-      questionCount: s.question_count,
-      status:        s.status,
-      playerCount:   players.length,
-      demoMode:      s.demo_mode ?? false,
-      players:       [],
-      dbId:          s.id,
-      endedAt:       s.ended_at,
-      createdAt:     s.created_at,
-      hostId:        s.host_id ?? null,
-      hostName:      hostNames[s.host_id] ?? null,
-      topPlayer:     top ? { name: top.name, score: top.final_score ?? 0, emoji: top.emoji ?? null } : null,
-    };
-  });
-
+  // Safe-read cutover (migration 075): server-authorized manager history. Returns
+  // completed sessions + per-session player summary + host display name, WITHOUT
+  // any question_snapshot. Tenant scope is derived server-side (orgAdmin → own;
+  // ralli_admin → passed tenant; learner → []).
+  const { data, error } = await supabase.rpc("rpc_manager_session_history", { p_tenant_id: tenantId ?? null, p_limit: limit });
+  if (error) return { data: null, error };
+  const rows = Array.isArray(data) ? data : [];
+  const normalised = rows.map(s => ({
+    code:          s.pin,
+    name:          s.name,
+    quizId:        s.quiz_id,
+    questionCount: s.question_count,
+    status:        s.status,
+    playerCount:   s.player_count ?? 0,
+    demoMode:      s.demo_mode ?? false,
+    players:       [],
+    dbId:          s.id,
+    endedAt:       s.ended_at,
+    createdAt:     s.created_at,
+    hostId:        s.host_id ?? null,
+    hostName:      s.host_name ?? null,
+    topPlayer:     s.top_player
+      ? { name: s.top_player.name, score: s.top_player.score ?? 0, emoji: s.top_player.emoji ?? null }
+      : null,
+  }));
   return { data: normalised, error: null };
 }
 
 /**
- * Fetch a single session with all player scores.
- * Used by results screens when navigating from game history.
+ * Manager exact-session analytics (migration 075) — the single server-authorized
+ * source for the RankdResultsScreen Overview / Player Breakdown / Questions tabs.
+ * Returns { session, players, answers, snapshot } for a session the caller HOSTS
+ * or is a same-tenant orgAdmin / ralli_admin for; raises server-side otherwise.
+ * Replaces the three direct reads (getSessionPlayers + getGameAnswersForSession +
+ * getSessionQuestionSnapshot). Ordinary learners can never call it successfully.
  *
- * @param {string} sessionId
- * @returns {Promise<{ data: Object|null, error: Object|null }>}
+ * @param {string} sessionId - game_sessions.id (UUID)
+ * @returns {Promise<{ data: { session: Object, players: Object[], answers: Object[], snapshot: Array|null }|null, error: Object|null }>}
  */
-export async function getSessionWithResults(sessionId) {
-  const { data, error } = await supabase
-    .from("game_sessions")
-    .select("*, game_players(*), game_answers(*)")
-    .eq("id", sessionId)
-    .single();
-  return { data, error };
+export async function getManagerSessionAnalytics(sessionId) {
+  const { data, error } = await supabase.rpc("rpc_manager_session_analytics", { p_session_id: sessionId });
+  if (error) return { data: null, error };
+  return {
+    data: {
+      session:  data?.session ?? null,
+      players:  data?.players ?? [],
+      answers:  data?.answers ?? [],
+      snapshot: data?.snapshot ?? null,
+    },
+    error: null,
+  };
 }
 
 /**
@@ -615,18 +556,40 @@ export async function getSessionWithResults(sessionId) {
  * @param {number} [limit=30]
  * @returns {Promise<{ data: Object[]|null, error: Object|null }>}
  */
-export async function getActiveSessions(tenantId, limit = 30) {
-  const { data, error } = await supabase
-    .from("game_sessions")
-    .select("*")
-    .eq("tenant_id", tenantId)
-    .in("status", ["waiting", "started", "live", "active", "paused"])
-    .order("created_at", { ascending: false })
-    .limit(limit);
+/**
+ * Learner-safe JOINABLE session list (migration 077) — the same-tenant waiting,
+ * non-demo sessions any authenticated tenant member may see to find/select a game
+ * to join. Server derives the tenant from the caller's profile. Returns ONLY safe
+ * display fields (no question_snapshot / live_question / answers / analytics), so
+ * ordinary learners (for whom the manager list returns []) get their joinable games
+ * back. Normalized to the SAME shape as getActiveSessions so the join panel is
+ * unchanged.
+ *
+ * @returns {Promise<{ data: Object[]|null, error: Object|null }>}
+ */
+/**
+ * Atomic safe rejoin (migration 078) — a prior same-tenant participant re-entering a
+ * STARTED/paused session by PIN. The server verifies eligibility (authenticated,
+ * same-tenant real session, status='started', caller already a participant by
+ * auth.uid()) and reactivates their existing participant row in one op — never a
+ * duplicate, never a resume, never admitting a non-participant. Returns the session
+ * (id/pin/name/status/phase/paused/…) + the caller's stored participant identity, or
+ * an error the caller maps to a user message.
+ *
+ * @param {string} pin
+ * @returns {Promise<{ data: { session: Object, participant: Object }|null, error: Object|null }>}
+ */
+export async function rejoinSession(pin) {
+  const { data, error } = await supabase.rpc("rpc_rejoin_session", { p_pin: pin });
+  if (error) return { data: null, error };
+  return { data: { session: data?.session ?? null, participant: data?.participant ?? null }, error: null };
+}
 
-  if (error || !data) return { data: null, error };
-
-  const normalised = data.map(s => ({
+export async function getLearnerJoinableSessions() {
+  const { data, error } = await supabase.rpc("rpc_learner_joinable_sessions");
+  if (error) return { data: null, error };
+  const rows = Array.isArray(data) ? data : [];
+  const normalised = rows.map(s => ({
     code:          s.pin,
     name:          s.name,
     quizId:        s.quiz_id,
@@ -637,7 +600,27 @@ export async function getActiveSessions(tenantId, limit = 30) {
     players:       [],
     dbId:          s.id,
   }));
+  return { data: normalised, error: null };
+}
 
+export async function getActiveSessions(tenantId, limit = 30) { // eslint-disable-line no-unused-vars
+  // Safe-read cutover (migration 075): server derives the caller's manager scope
+  // from auth.uid()+profiles. orgAdmin → own tenant (p_tenant_id ignored server-side);
+  // ralli_admin → the passed tenant; ordinary learner → []. No question_snapshot.
+  const { data, error } = await supabase.rpc("rpc_manager_active_sessions", { p_tenant_id: tenantId ?? null });
+  if (error) return { data: null, error };
+  const rows = Array.isArray(data) ? data : [];
+  const normalised = rows.map(s => ({
+    code:          s.pin,
+    name:          s.name,
+    quizId:        s.quiz_id,
+    questionCount: s.question_count,
+    status:        s.status,
+    playerCount:   s.player_count ?? 0,
+    demoMode:      s.demo_mode ?? false,
+    players:       [],
+    dbId:          s.id,
+  }));
   return { data: normalised, error: null };
 }
 
@@ -649,20 +632,70 @@ export async function getActiveSessions(tenantId, limit = 30) {
  * @returns {Promise<{ session: { data: Object|null, error: Object|null }, answers: { data: Object[]|null, error: Object|null } }>}
  */
 export async function getSessionRestoreData(sessionId) {
-  const [sessionResult, answersResult] = await Promise.all([
-    supabase
-      .from("game_sessions")
-      .select("id, phase, current_question_index, paused, status, pin, name, quiz_id, question_count, player_count, tenant_id, live_question")
-      .eq("id", sessionId)
-      .single(),
-    supabase
-      .from("game_answers")
-      .select("player_id, player_name, question_idx, points, is_correct, answer_text")
-      .eq("session_id", sessionId),
-  ]);
-
+  // Safe-read cutover (migration 075): host recovery via the server-authorized
+  // rpc_host_session_restore (exact host / same-tenant orgAdmin / ralli_admin only).
+  // Returns the SAME { session, answers } shape as before, plus `participants`
+  // (id/name/emoji/color) so the host restore no longer reads the participants table
+  // directly. Errors are surfaced identically on both sub-results (retryable).
+  const { data, error } = await supabase.rpc("rpc_host_session_restore", { p_session_id: sessionId });
+  if (error) {
+    return {
+      session:      { data: null, error },
+      answers:      { data: null, error },
+      participants: { data: null, error },
+    };
+  }
   return {
-    session: { data: sessionResult.data ?? null, error: sessionResult.error ?? null },
-    answers: { data: answersResult.data ?? null, error: answersResult.error ?? null },
+    session:      { data: data?.session ?? null, error: null },
+    answers:      { data: data?.answers ?? [], error: null },
+    participants: { data: data?.participants ?? [], error: null },
   };
+}
+
+// ── LEARNER-SAFE READ RPCs (migration 073) ──────────────────────────────────────
+
+/**
+ * Active-player reconnect via the learner-safe RPC (073). Returns the SAME shape
+ * as getSessionRestoreData ({ session:{data,error}, answers:{data,error} }) so the
+ * player reconcile is unchanged — but `answers` contains ONLY the caller's own
+ * per-question points/correctness, and the session's live_question is the
+ * already-sanitized payload (correct answers only inside its post-reveal block).
+ * Never returns question_snapshot or another player's answer. Errors are explicit
+ * and retryable (never coerced to empty gameplay state).
+ *
+ * @param {string} sessionId - game_sessions.id (UUID)
+ */
+export async function getPlayerSessionRestore(sessionId) {
+  const { data, error } = await supabase.rpc("rpc_player_session_restore", { p_session_id: sessionId });
+  if (error) return { session: { data: null, error }, answers: { data: null, error } };
+  return {
+    session: { data: data?.session ?? null, error: null },
+    answers: { data: data?.my_answers ?? [], error: null },
+  };
+}
+
+/**
+ * A participant's own review of a durably COMPLETED session via the learner-safe
+ * RPC (073). Correct answers (snapshot) are returned only post-completion to a
+ * participant; never another player's raw answer.
+ *
+ * @param {string} sessionId - game_sessions.id (UUID)
+ * @returns {Promise<{ data: { snapshot: Array|null, myAnswers: Array, playerCount: number|null }|null, error: Object|null }>}
+ */
+export async function getMyCompletedSessionReview(sessionId) {
+  const { data, error } = await supabase.rpc("rpc_my_completed_session_review", { p_session_id: sessionId });
+  if (error) return { data: null, error };
+  return { data: { snapshot: data?.snapshot ?? null, myAnswers: data?.my_answers ?? [], playerCount: data?.player_count ?? null }, error: null };
+}
+
+/**
+ * The caller's own game history via the learner-safe RPC (073) — same row shape
+ * as getPlayerGameHistory (game_players fields + a `game_sessions` metadata
+ * object), but server-enforced to the caller's own rows.
+ *
+ * @param {number} [limit=20]
+ */
+export async function listMyGameHistory(limit = 20) {
+  const { data, error } = await supabase.rpc("rpc_list_my_game_history", { p_limit: limit });
+  return { data: error ? null : (data ?? []), error };
 }

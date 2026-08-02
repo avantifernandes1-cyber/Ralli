@@ -19,26 +19,41 @@ import {
   createGameSession,
   findJoinableSession,
   startGameSession,
+  publishScoreboard,
   endGameSession,
   getActiveSessions,
+  getLearnerJoinableSessions,
+  rejoinSession,
   joinGameSession,
   getLobbyParticipants,
-  subscribeToLobbyParticipants,
   saveGameAnswers,
   updateSessionPhase,
   markParticipantLeft,
   updateParticipantHeartbeat,
-  getPlayerGameHistory,
-  getPlayerAnswersForSession,
   getSessionPlayerCounts,
   getGameHistory,
-  getSessionPlayers,
   getSessionRestoreData,
-  getGameAnswersForSession,
+  getManagerSessionAnalytics,
   saveSessionQuestionSnapshot,
-  getSessionQuestionSnapshot,
   cancelGameSession,
+  requestSessionVerification,
+  getPlayerSessionRestore,
+  getMyCompletedSessionReview,
+  listMyGameHistory,
+  publishRevealDurable,
 } from "./src/lib/gameService.js";
+// Canonical, runtime-neutral answer grader — the SINGLE source of correctness
+// truth shared by the live host reveal (below) and the server verification path.
+// Lives in supabase/functions/_shared so the Deno Edge Function can bundle the
+// exact same file (deploy bundles within supabase/functions); the browser imports
+// it here. One canonical grader, no copy. See supabase/functions/_shared/gameGrading.js.
+import { gradeAnswer } from "./supabase/functions/_shared/gameGrading.js";
+// Canonical player-safe question serializer — the SINGLE place that strips
+// correct-answer/grading fields before a question is sent to or restored by a
+// player (SHOW_QUESTION broadcast + persisted live_question). The host keeps the
+// canonical question locally for its own reveal/scoring. See src/lib/playerSafeQuestion.js.
+import { toPlayerSafeQuestion, applyRevealToQuestion } from "./src/lib/playerSafeQuestion.js";
+import { evaluateConnectivity } from "./src/lib/zeroPlayerHalt.js";
 import {
   getTenantCourses,
   getTenantLessons,
@@ -77,7 +92,9 @@ import {
   updateUserProfile as dbUpdateUserProfile,
   updateLastSeenAssignmentsAt,
   subscribeToTenantAssignments,
+  isQuizPlayable,
 } from "./src/lib/contentService.js";
+import { scoreboardApplyDecision, durableRestoreDecision, scoreboardRows, scoreboardPublishKey } from "./src/lib/scoreboardRecovery.js";
 import { resolveAssignmentStatus, resolveLatestQuizAssignment, resolveLearnerAssignments, lessonUnlockState, isQualifyingEvent, daysUntilDue } from "./src/lib/assignmentEngine.js";
 import {
   metaListToCatalog,
@@ -180,6 +197,14 @@ const liveQuestionRemainingSecs = (lq, paused, now = Date.now()) =>
 // Monotonic timing version of a live_question (start/pause/resume moment).
 const liveQuestionTimingSeq = (lq) => (lq?.timingUpdatedAt ?? lq?.questionStartedAt ?? 0);
 
+// Durable heartbeat-freshness window (ms). A participant whose last_seen_at is within this
+// window counts as connected. This is the SINGLE connectivity model shared by the in-game
+// zero-player-halt watchdog (KahootHostView) and the lobby roster: Presence is the immediate
+// connected-now signal, and a fresh durable heartbeat bridges brief Presence interruptions so
+// an actively-heartbeating learner is never erased. A player who truly leaves stops beating and
+// drops once last_seen_at goes stale (explicit Leave also flips status='left' for instant removal).
+const HEARTBEAT_FRESH_MS = 40000;
+
 function useGameChannel(pin, role) {
   const channelRef       = useRef(null);
   // The player's Presence identity for THIS channel connection. Persistent (not
@@ -190,6 +215,9 @@ function useGameChannel(pin, role) {
   // fresh. This is what keeps a player who reconnects/rejoins directly into the
   // game present in the host's Presence roster.
   const presenceRef      = useRef(null);
+  const genRef           = useRef(0);       // generation of the CURRENT channel instance
+  const teardownByUsRef  = useRef(false);   // true only while WE are tearing a channel down (vs. a server-side drop)
+  const [reconnectNonce, setReconnectNonce] = useState(0); // bump → recreate the channel after an unexpected drop
   const [chPlayers, setChPlayers] = useState([]);
   const [chAnswers, setChAnswers] = useState({});   // { playerId: { optionIdx, timeMs, name, text } }
   const [chMsg,     setChMsg]     = useState(null); // latest inbound broadcast for player side
@@ -205,6 +233,19 @@ function useGameChannel(pin, role) {
     // Each client gets a unique presence key so the host and all players
     // have distinct entries in the presence state map.
     const presenceKey = `${role}-${Date.now()}-${Math.random().toString(36).slice(2)}`;
+    const gen = (genRef.current = genRef.current + 1); // this instance's generation
+    teardownByUsRef.current = false;                    // fresh channel — any CLOSED now is a real drop
+
+    // Exactly ONE channel per topic: after a Leave→Rejoin the same `game:<id>` topic is reused,
+    // and a stale channel the previous removeChannel didn't fully clear makes Supabase close the
+    // freshly-created one ~6s after it subscribes (proven in the waiting-rejoin trace). Drop any
+    // lingering same-topic channel before creating this one.
+    try {
+      (supabase.getChannels?.() || []).forEach((c) => {
+        const t = c?.topic || "";
+        if (t === `game:${pin}` || t === `realtime:game:${pin}`) supabase.removeChannel(c);
+      });
+    } catch { /* ignore */ }
 
     const channel = supabase.channel(`game:${pin}`, {
       config: {
@@ -265,24 +306,36 @@ function useGameChannel(pin, role) {
     channelRef.current = channel;
     setChStatus("init");
     channel.subscribe((status) => {
+      if (gen !== genRef.current) return;   // a stale generation's late callback can never touch current state
       setChStatus(status);
       // (Re)track the player's Presence on EVERY SUBSCRIBED — initial subscribe
-      // and every reconnect — so presence survives a dropped websocket. Not
-      // cleared here, so the identity persists across reconnects.
+      // and every reconnect — so presence survives a dropped websocket. Identity
+      // persists across reconnects (presenceRef is NOT cleared on teardown), so a
+      // recreated channel re-registers this player without waiting for another track.
       if (status === 'SUBSCRIBED' && presenceRef.current) {
         channel.track(presenceRef.current);
+      }
+      // UNEXPECTED drop of the CURRENT channel (server-side close, not our teardown) →
+      // recreate a fresh channel. This is the fix for the Leave→Rejoin channel that goes
+      // SUBSCRIBED then CLOSED ~6s later and was otherwise never rebuilt (no pin/role change),
+      // stranding the learner off realtime. The reconnect gets a clean socket; the player's
+      // reconcile-on-SUBSCRIBED then restores game state. Short delay avoids a tight loop.
+      if ((status === 'CLOSED' || status === 'CHANNEL_ERROR' || status === 'TIMED_OUT') && !teardownByUsRef.current) {
+        setTimeout(() => { if (gen === genRef.current && !teardownByUsRef.current) setReconnectNonce((n) => n + 1); }, 500);
       }
     });
 
     return () => {
+      teardownByUsRef.current = true;          // mark OUR teardown so its CLOSED isn't read as a drop
       supabase.removeChannel(channel);
-      channelRef.current = null;
-      presenceRef.current = null; // channel torn down (pin/role change) → next game starts fresh
+      if (genRef.current === gen) channelRef.current = null; // only if still current
+      // presenceRef is intentionally NOT nulled here: keeping the identity lets a reconnect
+      // re-track immediately. A genuinely new game overwrites it via trackPlayerPresence on mount.
       setChPlayers([]);
       setChAnswers({});
       setChMsg(null);
     };
-  }, [pin, role]);
+  }, [pin, role, reconnectNonce]);
 
   // ── Shared player-Presence registration ─────────────────────────────────────
   // The ONE path that registers a player in Presence for the whole connection
@@ -1938,6 +1991,8 @@ const PURPLE = "#8B5CF6";
 
 function KahootHostView({ onNav, sessionName, pin, sessionDbId, demoMode, tenantId, questions, broadcast, chAnswers, chPlayers, chStatus, onGameEnd, setChAnswers }) {
   const mobile       = useMobile();
+  const toast        = useToast(); // in-scope notifications (scoreboard-publish failure, etc.)
+  const publishingRef = useRef(false); // client double-click guard for scoreboard publication (DB idempotency is authoritative)
   const [phase,      setPhase]      = useState("countdown");
   const [qIdx,       setQIdx]       = useState(0);
   const [cdNum,      setCdNum]      = useState(3);
@@ -2001,8 +2056,9 @@ function KahootHostView({ onNav, sessionName, pin, sessionDbId, demoMode, tenant
 
     (async () => {
       try {
-        // 1. Parallel fetch: session state + per-question answer history
-        const { session, answers } = await getSessionRestoreData(sessionDbId);
+        // 1. Server-authorized host restore (migration 075): session state +
+        // per-question answer history + participant identity, in ONE RPC call.
+        const { session, answers, participants: participantsResult } = await getSessionRestoreData(sessionDbId);
         if (cancelled) return;
 
         if (session.error) throw new Error(session.error.message ?? "Failed to load session");
@@ -2042,8 +2098,15 @@ function KahootHostView({ onNav, sessionName, pin, sessionDbId, demoMode, tenant
         // Set phase after other state so countdown/question effects don't fire prematurely
         setPhase(safePhase);
 
-        // 4. Reconstruct cumulative scores from saved game_answers
-        if (answers.data?.length) {
+        // 081: if the host refreshed DURING the scoreboard, render the EXACT durable board it
+        // published (server order/rank/name/avatar preserved via the shared adapter) instead of
+        // recomputing from answers. durableRestoreDecision rejects any payload/column mismatch.
+        const hostBoard = durableRestoreDecision(sess);
+        if (hostBoard) setScores(scoreboardRows(hostBoard.entries));
+
+        // 4. Reconstruct cumulative scores from saved game_answers (skipped when a durable
+        //    scoreboard was restored above, so we never re-rank/overwrite the published board).
+        if (!hostBoard && answers.data?.length) {
           // Deduplicate: for each (player_id, question_idx) keep the highest-points row
           const best = new Map();
           for (const row of answers.data) {
@@ -2060,13 +2123,9 @@ function KahootHostView({ onNav, sessionName, pin, sessionDbId, demoMode, tenant
             else totals.set(row.player_id, { name: row.player_name, score: row.points ?? 0 });
           }
 
-          // Fetch all participants (no status filter) for emoji/color
-          const { data: participants } = await supabase
-            .from("game_session_participants")
-            .select("player_id, name, emoji, color")
-            .eq("session_id", sessionDbId)
-            .order("joined_at", { ascending: true });
-          if (cancelled) return;
+          // All participants (no status filter) for emoji/color — from the host
+          // restore RPC above (migration 075), not a direct participants read.
+          const participants = participantsResult?.data ?? [];
 
           // Build merged score rows, starting from full participant list (preserves 0-score players)
           const seen = new Set();
@@ -2135,7 +2194,7 @@ function KahootHostView({ onNav, sessionName, pin, sessionDbId, demoMode, tenant
     // (~45s) are needed before a player drops out — plus the halt watchdog's
     // own 5s debounce — so a real halt lands ~40-45s after the last player
     // truly leaves, without false positives from a single lost beat.
-    const HEARTBEAT_FRESH_MS = 40000;
+    // HEARTBEAT_FRESH_MS is the shared module-level connectivity window (see top of file).
     const refreshRoster = () => {
       getLobbyParticipants(sessionDbId).then(({ data }) => {
         if (!data) return;
@@ -2158,6 +2217,7 @@ function KahootHostView({ onNav, sessionName, pin, sessionDbId, demoMode, tenant
         setDbParticipantCount(active);
         setDbActiveForHalt(activeForHalt);
         setDbParticipants(data);
+        dbRosterLoadedRef.current = true; // ≥1 successful durable roster load → its count is now KNOWN
       });
     };
     refreshRoster();
@@ -2185,14 +2245,22 @@ function KahootHostView({ onNav, sessionName, pin, sessionDbId, demoMode, tenant
 
   // ── Zero-active-players halt ──────────────────────────────────────────────
   // If every CONNECTED player leaves mid-game, pause the game instead of letting
-  // it run unattended and silently mark people wrong. Connected-now truth is
-  // Presence (chPlayers, deduped by playerId) whenever the host channel is
-  // SUBSCRIBED — we do NOT max() with the DB heartbeat count, because a durable
-  // participant row lingers (heartbeat freshness window) after the player is
-  // already gone from Presence. Only when the host channel is NOT subscribed do
-  // we fall back to the fresh, non-null DB heartbeat count. A short grace period
-  // absorbs a reconnect blip before halting. Once halted, the game only resumes
-  // when the host explicitly does so — reconnecting players never auto-resume.
+  // it run unattended and silently mark people wrong. A player counts as connected
+  // if EITHER realtime Presence OR the durable fresh participant heartbeat shows an
+  // eligible player — so a momentary empty Presence sync (roster resync, channel
+  // re-subscribe, or a start-of-game presence gap) never halts a game while the
+  // durable heartbeat still proves an active player. The host may enter the halt
+  // ONLY when BOTH sources are KNOWN and definitively zero:
+  //   • Presence is KNOWN only while the host channel is SUBSCRIBED.
+  //   • Durable is KNOWN only after ≥1 successful roster load (dbRosterLoadedRef);
+  //     a failed/incomplete query retains the last value and is retried — never a
+  //     false zero.
+  // If either source is loading/unknown/error the tick HOLDS (never concludes zero)
+  // and retries. Presence stays the fast path; the durable heartbeat is the veto, so
+  // a genuine tab-close / dropped websocket halts only after the heartbeat goes stale
+  // (HEARTBEAT_FRESH_MS) AND the grace window — never on a reconnect/refresh blip.
+  // Once halted, the game resumes only when the host explicitly does so; a
+  // reconnecting player never auto-resumes.
   const [halted, setHalted] = useState(false);
   const [resumeBlocked, setResumeBlocked] = useState(false); // tried to resume with nobody connected
   const [pauseError, setPauseError]   = useState(false);     // last pause persist FAILED (retryable)
@@ -2214,28 +2282,65 @@ function KahootHostView({ onNav, sessionName, pin, sessionDbId, demoMode, tenant
   const haltActionedRef = useRef(false); // idempotent guard for the pause side effects (persist + broadcast)
   // Refs mirror the latest values into the watchdog interval below without
   // forcing the interval to be torn down and recreated on every tick.
-  const chPlayersLenRef = useRef(chPlayers.length);
-  chPlayersLenRef.current = chPlayers.length;
+  // Durable 'left'/'completed' overrides a lingering ghost Presence entry in the zero-player
+  // calc (same authoritative rule as the lobby roster): an explicitly-left player must not keep
+  // the game alive via a Presence entry that hasn't hit the server timeout yet. dbParticipants
+  // now carries 'left' rows; a tab close leaves the row 'active' and still uses the heartbeat grace.
+  const leftIdsHost = useMemo(
+    () => new Set((dbParticipants || []).filter(p => p.status === "left" || p.status === "completed").map(p => p.player_id ?? p.id)),
+    [dbParticipants]
+  );
+  const presenceActiveCount = chPlayers.filter(p => p.id && !leftIdsHost.has(p.id)).length;
+  const chPlayersLenRef = useRef(presenceActiveCount);
+  chPlayersLenRef.current = presenceActiveCount;
   const chStatusRef = useRef(chStatus);
   chStatusRef.current = chStatus;
   const dbActiveForHaltRef = useRef(dbActiveForHalt);
   dbActiveForHaltRef.current = dbActiveForHalt;
+  // True once the durable participant roster has loaded at least once. Until then a
+  // dbActiveForHalt of 0 means "unknown", NOT "zero players" — the halt watchdog must
+  // never conclude zero from a roster that has not loaded (or a transient query fail
+  // that retains the last value). Set in the roster poll above; never reset.
+  const dbRosterLoadedRef = useRef(false);
 
-  // Connected-now count: Presence when subscribed, fresh DB heartbeats otherwise.
-  const connectedNow = () => (chStatus === "SUBSCRIBED" ? chPlayers.length : dbActiveForHalt);
+  // Connected-now truth: a player counts as connected if EITHER source proves an
+  // eligible active player — realtime Presence (fast path, trusted only while the host
+  // channel is SUBSCRIBED) OR the durable fresh participant heartbeat (recovery/veto,
+  // trusted only once the roster has loaded). A momentary empty Presence sync is never
+  // treated as a disconnect while the durable heartbeat is still fresh.
+  const connectedNow = () => {
+    const presenceCount = chStatus === "SUBSCRIBED" ? presenceActiveCount : 0;
+    const durableCount  = dbRosterLoadedRef.current ? dbActiveForHalt : 0;
+    return Math.max(presenceCount, durableCount);
+  };
 
   useEffect(() => {
     if (!sessionDbId || restoreState !== "done") return;
     const HALT_GRACE_MS = 5000; // reconnect grace before halting
     const interval = setInterval(() => {
-      const subscribed = chStatusRef.current === "SUBSCRIBED";
-      const active = subscribed ? chPlayersLenRef.current : dbActiveForHaltRef.current;
-      if (active > 0) {
+      // Single-sourced connectivity rule (see src/lib/zeroPlayerHalt.js):
+      //   'connected' — Presence OR fresh durable heartbeat proves an active player.
+      //   'unknown'   — a source is loading/unknown (host not SUBSCRIBED, or roster
+      //                 not yet loaded) → hold, never conclude a disconnect.
+      //   'zero'      — BOTH sources KNOWN and definitively zero → eligible to halt.
+      const verdict = evaluateConnectivity({
+        presenceKnown:      chStatusRef.current === "SUBSCRIBED", // roster authoritative only while SUBSCRIBED
+        presenceCount:      chPlayersLenRef.current,
+        durableKnown:       dbRosterLoadedRef.current,            // ≥1 successful durable roster load
+        durableActiveCount: dbActiveForHaltRef.current,
+      });
+      if (verdict === "connected") {
         zeroSinceRef.current = null;
         haltArmedRef.current = true; // players present again → re-arm for a future empty episode
         return;
       }
-      // active === 0
+      if (verdict === "unknown") {
+        // A transient empty presence or an unloaded/failed roster must not be read as
+        // a disconnect — hold and retry next tick without arming the halt.
+        zeroSinceRef.current = null;
+        return;
+      }
+      // verdict === "zero": both sources known and definitively zero.
       if (!haltArmedRef.current) return;       // already handled this empty episode (host chose Stay Paused / End)
       if (zeroSinceRef.current == null) { zeroSinceRef.current = Date.now(); return; }
       if (Date.now() - zeroSinceRef.current >= HALT_GRACE_MS) {
@@ -2401,6 +2506,69 @@ function KahootHostView({ onNav, sessionName, pin, sessionDbId, demoMode, tenant
   };
 
   // Persist phase transitions to DB so host can recover on refresh
+  // Holds the exact player-SAFE live_question payload built at startQuestion, so
+  // reveal recovery can be augmented with post-reveal answer info without ever
+  // re-broadcasting the canonical question.
+  const liveQuestionRef = useRef(null);
+
+  // ── Strict reveal PUBLICATION (persist-confirm-then-broadcast) ────────────────
+  // Grading/scoring/answer-inserts happen ONCE in doReveal. The REVEAL is then
+  // PUBLISHED here: the correct-answer payload is durably persisted (stale-guarded)
+  // and broadcast ONLY after that write is confirmed — so a failed persistence can
+  // never leave the DB on `question` while players are told the answer, and a
+  // delayed write can never attach an old reveal to a newer question. Retry reuses
+  // the same frozen payload and never re-grades/re-inserts.
+  const revealPubRef = useRef(null);            // frozen { qIdx, liveQuestion, broadcastMsg }
+  const revealPublishingRef = useRef(false);    // concurrent / double-click guard
+  const [revealPublishError, setRevealPublishError] = useState(false);
+
+  const runRevealPublish = useCallback(async () => {
+    const frozen = revealPubRef.current;
+    if (!frozen) return;
+    if (revealPublishingRef.current) return;    // prevent concurrent/repeated publication
+    revealPublishingRef.current = true;
+    try {
+      if (sessionDbId) {
+        // Strict, state-guarded durable write bound to THIS exact session + question.
+        // Broadcast ONLY after it is confirmed (applied) or already durably present
+        // with the identical payload (idempotent — a lost response). A stale result
+        // (newer/older question, countdown/scoreboard/ended, terminal) is abandoned;
+        // a conflict (a DIFFERENT reveal already stored for this qIdx) is surfaced.
+        const res = await publishRevealDurable(sessionDbId, frozen.qIdx, frozen.liveQuestion);
+        if (res.outcome === "stale")    { revealPubRef.current = null; setRevealPublishError(false); return; } // superseded — abandon quietly
+        if (res.outcome === "conflict") { setRevealPublishError(true); return; }                                // integrity conflict → host Retry/End
+        if (!res.ok)                    { setRevealPublishError(true); return; }                                // error → host Retry; NO broadcast
+      }
+      // applied OR idempotent (or demo / no-DB): broadcast EXACTLY once, show reveal.
+      broadcast(frozen.broadcastMsg);
+      setPhase("reveal");
+      setRevealPublishError(false);
+    } catch (e) {
+      console.error("[ralli:host] reveal publish failed:", e);
+      setRevealPublishError(true);              // no broadcast on failure
+    } finally {
+      revealPublishingRef.current = false;
+    }
+  }, [sessionDbId]); // eslint-disable-line react-hooks/exhaustive-deps
+
+  // Freeze ONE canonical reveal object and publish. `revealAnswer` is the single
+  // source of the correct-answer details: it is persisted verbatim as
+  // live_question.reveal AND spread into the REVEAL broadcast, so the durable and
+  // broadcast reveals can never drift. Retry replays this exact frozen object
+  // (no re-grade / re-insert). `scores` is the already-computed ranking.
+  const publishReveal = useCallback((revealAnswer, scores) => {
+    const broadcastMsg = { type: GM.REVEAL, correctIdx: revealAnswer.correctIdx ?? null, scores, ...revealAnswer };
+    revealPubRef.current = {
+      qIdx,
+      liveQuestion: { ...(liveQuestionRef.current ?? {}), reveal: revealAnswer },
+      broadcastMsg,
+    };
+    setRevealPublishError(false);
+    runRevealPublish();
+  }, [qIdx, runRevealPublish]);
+
+  const retryRevealPublish = useCallback(() => { runRevealPublish(); }, [runRevealPublish]);
+
   const persistPhase = useCallback((nextPhase, nextQIdx, nextPaused) => {
     if (!sessionDbId) return;
     const resolvedPhase = nextPhase ?? phase;
@@ -2468,7 +2636,13 @@ function KahootHostView({ onNav, sessionName, pin, sessionDbId, demoMode, tenant
     const shuffled = q.type === "match" && q.pairs?.length
       ? [...q.pairs].sort(() => Math.random() - 0.5)
       : [];
-    const liveQuestion = { qIdx, question: q, timeLimit: q.timeLimit, questionStartedAt: startedAt, shuffledRight: shuffled, pausedAt: null, remainingTimeMs: null, timingUpdatedAt: startedAt };
+    // PLAYER-SAFE payload: strip every correct-answer/grading field via the one
+    // canonical serializer. This exact object is BOTH persisted to live_question
+    // AND broadcast in SHOW_QUESTION — never the canonical question. The host
+    // keeps `q` (canonical) locally for its own reveal/scoring. shuffledRight is
+    // the player-visible shuffled Matching choices (safe; no left→right mapping).
+    const liveQuestion = { qIdx, question: toPlayerSafeQuestion(q), timeLimit: q.timeLimit, questionStartedAt: startedAt, shuffledRight: shuffled, pausedAt: null, remainingTimeMs: null, timingUpdatedAt: startedAt };
+    liveQuestionRef.current = liveQuestion;
 
     if (sessionDbId) {
       const { error } = await updateSessionPhase(sessionDbId, {
@@ -2537,8 +2711,9 @@ function KahootHostView({ onNav, sessionName, pin, sessionDbId, demoMode, tenant
       return;
     }
     if (q.type === "type") {
-      // Auto-grade typed answers against acceptedAnswers (case-insensitive)
-      const accepted = (q.acceptedAnswers ?? []).map(a => a.toLowerCase().trim());
+      // Auto-grade typed answers via the canonical shared grader (case-insensitive
+      // acceptedAnswers match — identical rule, now single-sourced). See
+      // src/lib/gameGrading.js.
       const qDist = []; // no option distribution for type questions
       setQuestionHistory(h => [...h, { qIdx, q: q?.q, options: [], correct: null, distribution: qDist, correctCount: 0, totalAnswers: Object.values(chAnswers).length, avgTimeMs: 0 }]);
       let baseScores;
@@ -2548,16 +2723,14 @@ function KahootHostView({ onNav, sessionName, pin, sessionDbId, demoMode, tenant
       const newScores = baseScores.map(p => {
         const ans = chAnswers[p.id];
         if (!ans?.text) return { ...p, delta: 0, wasCorrect: false };
-        const correct = accepted.length > 0 && accepted.some(a => ans.text.toLowerCase().trim() === a);
+        const correct = gradeAnswer(q, ans.text).correct === true;
         const speedBonus = correct && ans.timeMs ? Math.max(0, Math.round((1 - ans.timeMs / (q.timeLimit * 1000)) * 50)) : 0;
         const delta = correct ? 100 + speedBonus : 0;
         return { ...p, score: p.score + delta, delta, wasCorrect: correct };
       });
       newScores.sort((a, b) => b.score - a.score);
       setScores(newScores);
-      setPhase("reveal");
-      persistPhase("reveal", qIdx, false);
-      broadcast({ type: GM.REVEAL, correctIdx: null, scores: newScores, acceptedAnswers: q.acceptedAnswers ?? [] });
+      publishReveal({ acceptedAnswers: q.acceptedAnswers ?? [] }, newScores);
       if (sessionDbId) {
         // One row per known player, not just answerers — a player with no
         // chAnswers entry gets an explicit "unanswered" row (null text,
@@ -2568,7 +2741,7 @@ function KahootHostView({ onNav, sessionName, pin, sessionDbId, demoMode, tenant
         const answerRows = newScores.map(p => {
           const ans = chAnswers[p.id];
           if (!ans?.text) return { playerId: p.id, playerName: p.name, questionIdx: qIdx, optionIdx: null, text: null, timeMs: null, isCorrect: false, points: 0, tenantId };
-          const correct = (q.acceptedAnswers ?? []).some(a => (ans.text ?? "").toLowerCase().trim() === a.toLowerCase().trim());
+          const correct = gradeAnswer(q, ans.text ?? null).correct === true;
           return { playerId: p.id, playerName: ans.name ?? p.name, questionIdx: qIdx, optionIdx: null, text: ans.text ?? null, timeMs: ans.timeMs ?? null, isCorrect: correct, points: p.delta ?? 0, tenantId };
         });
         saveGameAnswers(sessionDbId, answerRows).then(({ error }) => { if (error) console.error("[ralli:host] saveGameAnswers (type) failed:", error); });
@@ -2592,17 +2765,17 @@ function KahootHostView({ onNav, sessionName, pin, sessionDbId, demoMode, tenant
       const newScores = baseScores.map(p => {
         const ans = chAnswers[p.id];
         if (ans?.sliderValue == null) return { ...p, delta: 0, wasCorrect: false };
-        const diff    = Math.abs(ans.sliderValue - target);
-        const correct = diff <= tol;
+        // Canonical grader applies the SAME tolerance rule (|value - target| <= tolerance,
+        // with target/tolerance defaults via ?? so 0 is preserved). target/tol below
+        // still drive the reveal broadcast + question history unchanged.
+        const correct = gradeAnswer(q, ans.sliderValue).correct === true;
         const speedBonus = correct && ans.timeMs ? Math.max(0, Math.round((1 - ans.timeMs / (q.timeLimit * 1000)) * 50)) : 0;
         const delta = correct ? 100 + speedBonus : 0;
         return { ...p, score: p.score + delta, delta, wasCorrect: correct };
       });
       newScores.sort((a, b) => b.score - a.score);
       setScores(newScores);
-      setPhase("reveal");
-      persistPhase("reveal", qIdx, false);
-      broadcast({ type: GM.REVEAL, correctIdx: null, scores: newScores, sliderTarget: target, sliderTolerance: tol });
+      publishReveal({ sliderTarget: target, sliderTolerance: tol }, newScores);
       if (sessionDbId) {
         // See the "type" branch above for why this covers every known
         // player, not just answerers — needed to distinguish "unanswered"
@@ -2610,8 +2783,7 @@ function KahootHostView({ onNav, sessionName, pin, sessionDbId, demoMode, tenant
         const answerRows = newScores.map(p => {
           const ans = chAnswers[p.id];
           if (ans?.sliderValue == null) return { playerId: p.id, playerName: p.name, questionIdx: qIdx, optionIdx: null, text: null, timeMs: null, isCorrect: false, points: 0, tenantId, numericValue: null };
-          const diff = Math.abs(ans.sliderValue - target);
-          return { playerId: p.id, playerName: ans.name ?? p.name, questionIdx: qIdx, optionIdx: null, text: null, timeMs: ans.timeMs ?? null, isCorrect: diff <= tol, points: p.delta ?? 0, tenantId, numericValue: ans.sliderValue ?? null };
+          return { playerId: p.id, playerName: ans.name ?? p.name, questionIdx: qIdx, optionIdx: null, text: null, timeMs: ans.timeMs ?? null, isCorrect: gradeAnswer(q, ans.sliderValue).correct === true, points: p.delta ?? 0, tenantId, numericValue: ans.sliderValue ?? null };
         });
         saveGameAnswers(sessionDbId, answerRows).then(({ error }) => { if (error) console.error("[ralli:host] saveGameAnswers (slider) failed:", error); });
       }
@@ -2632,24 +2804,25 @@ function KahootHostView({ onNav, sessionName, pin, sessionDbId, demoMode, tenant
       if (scores.length > 0) { baseScores = scores; }
       else if (chPlayers.length > 0) { baseScores = chPlayers.map(p => ({ ...p, score: 0 })); }
       else { baseScores = Object.entries(chAnswers).map(([pid, ans]) => buildScoreRowFromAnswer(pid, ans)); }
-      const scoreMatch = (mps) => {
-        if (!Array.isArray(mps) || mps.length === 0) return 0;
-        return mps.filter(mp => shuffledRight[mp.rightIdx]?.right === pairs[mp.leftIdx]?.right).length;
-      };
+      // Resolve each submitted rightIdx to its right TEXT against this question's
+      // shuffle, producing the canonical [{leftIdx, rightText}] that the shared
+      // grader AND the persisted answer_json use — one Matching correctness rule
+      // (all pairs correct AND count == pairs.length). detail.matched gives the
+      // per-pair count for the reveal display (matchCorrectCount), single-sourced.
+      const resolveSubmitted = (mps) => (Array.isArray(mps) ? mps.map(mp => ({ leftIdx: mp.leftIdx, rightText: shuffledRight[mp.rightIdx]?.right ?? null })) : []);
       const newScores = baseScores.map(p => {
         const ans = chAnswers[p.id];
         if (!ans?.matchPairs?.length) return { ...p, delta: 0, wasCorrect: false };
-        const correctCount = scoreMatch(ans.matchPairs);
-        const correct = pairs.length > 0 && correctCount === pairs.length;
+        const g = gradeAnswer(q, resolveSubmitted(ans.matchPairs));
+        const correctCount = g.detail?.matched ?? 0;
+        const correct = g.correct === true;
         const speedBonus = correct && ans.timeMs ? Math.max(0, Math.round((1 - ans.timeMs / (q.timeLimit * 1000)) * 50)) : 0;
         const delta = correct ? 100 + speedBonus : 0;
         return { ...p, score: p.score + delta, delta, wasCorrect: correct, matchCorrectCount: correctCount };
       });
       newScores.sort((a, b) => b.score - a.score);
       setScores(newScores);
-      setPhase("reveal");
-      persistPhase("reveal", qIdx, false);
-      broadcast({ type: GM.REVEAL, correctIdx: null, scores: newScores, matchPairsCorrect: pairs, shuffledRight });
+      publishReveal({ matchPairsCorrect: pairs, shuffledRight }, newScores);
       if (sessionDbId) {
         // See the "type" branch above for why this covers every known
         // player, not just answerers.
@@ -2674,8 +2847,6 @@ function KahootHostView({ onNav, sessionName, pin, sessionDbId, demoMode, tenant
     const qTotal = Object.values(chAnswers).length;
     const qAvgMs = qTotal > 0 ? Object.values(chAnswers).reduce((s,a) => s+(a.timeMs||0), 0) / qTotal : 0;
     setQuestionHistory(h => [...h, { qIdx, q: q?.q, options: q?.options, correct: q?.correct, distribution: qDist, correctCount: qDist[q?.correct]||0, totalAnswers: qTotal, avgTimeMs: qAvgMs }]);
-    setPhase("reveal");
-    persistPhase("reveal", qIdx, false);
     // Tri-level fallback: scores state → presence chPlayers → chAnswers keys (always populated at this point)
     let baseScores;
     if (scores.length > 0) {
@@ -2688,14 +2859,14 @@ function KahootHostView({ onNav, sessionName, pin, sessionDbId, demoMode, tenant
     const newScores = baseScores.map(p => {
       const ans = chAnswers[p.id];
       if (!ans) return { ...p, delta: 0, wasCorrect: false };
-      const correct = ans.optionIdx === q.correct;
+      const correct = gradeAnswer(q, ans.optionIdx).correct === true;
       const speedBonus = correct && ans.timeMs ? Math.max(0, Math.round((1 - ans.timeMs / (q.timeLimit * 1000)) * 50)) : 0;
       const delta = correct ? 100 + speedBonus : 0;
       return { ...p, score: p.score + delta, delta, wasCorrect: correct };
     });
     newScores.sort((a, b) => b.score - a.score);
     setScores(newScores);
-    broadcast({ type: GM.REVEAL, correctIdx: q.correct, scores: newScores });
+    publishReveal({ correctIdx: q.correct }, newScores);
     // Persist each player's answer to game_answers (fire-and-forget).
     // Covers every known player, not just answerers — see the "type" branch
     // above for why: an explicit "unanswered" row is what lets post-game
@@ -2711,7 +2882,7 @@ function KahootHostView({ onNav, sessionName, pin, sessionDbId, demoMode, tenant
           optionIdx:   ans.optionIdx ?? null,
           text:        ans.text ?? null,
           timeMs:      ans.timeMs ?? null,
-          isCorrect:   ans.optionIdx === q.correct,
+          isCorrect:   gradeAnswer(q, ans.optionIdx).correct === true,
           points:      p.delta ?? 0,
           tenantId,
         };
@@ -2732,9 +2903,7 @@ function KahootHostView({ onNav, sessionName, pin, sessionDbId, demoMode, tenant
     });
     newScores.sort((a, b) => b.score - a.score);
     setScores(newScores);
-    broadcast({ type: GM.REVEAL, correctIdx: null, scores: newScores, isOpen: true });
-    setPhase("reveal");
-    persistPhase("reveal", qIdx, false);
+    publishReveal({ isOpen: true }, newScores);
     // Persist open-ended answers (fire-and-forget)
     if (sessionDbId) {
       const scoreMap = Object.fromEntries(newScores.map(p => [p.id, p]));
@@ -2884,6 +3053,37 @@ function KahootHostView({ onNav, sessionName, pin, sessionDbId, demoMode, tenant
               style={{ padding: "10px 24px", borderRadius: 12, border: `1.5px solid ${C.border}`, background: "#fff", color: C.text, fontWeight: 700, fontSize: 14, cursor: "pointer" }}
             >
               Back to Games
+            </button>
+          </div>
+        </div>
+      </div>
+    );
+  }
+
+  // Durable REVEAL persistence failed — the correct answer was NOT broadcast
+  // (players stay in their submitted/waiting state), progression is paused, and
+  // grading/scores/answers are already saved. Retry Reveal re-attempts the
+  // confirmed persist-then-broadcast with the SAME frozen payload (never re-grades
+  // or re-inserts); End Game exits cleanly. Correct answers are never shown here.
+  if (revealPublishError) {
+    return (
+      <div style={{ minHeight: "100%", display: "flex", alignItems: "center", justifyContent: "center", background: C.cream }}>
+        <div style={{ textAlign: "center", padding: 40, maxWidth: 380 }}>
+          <div style={{ fontSize: 36, marginBottom: 16 }}>⚠️</div>
+          <p style={{ margin: "0 0 8px", fontSize: 15, fontWeight: 700, color: C.text }}>Couldn’t publish the reveal</p>
+          <p style={{ margin: "0 0 24px", fontSize: 13, color: C.textMuted }}>The correct answer wasn’t sent to players and no one advanced. Your scores are safe — retry to reveal, or end the game.</p>
+          <div style={{ display: "flex", gap: 10, justifyContent: "center" }}>
+            <button
+              onClick={retryRevealPublish}
+              style={{ padding: "10px 24px", borderRadius: 12, border: "none", background: C.orange, color: "#fff", fontWeight: 700, fontSize: 14, cursor: "pointer" }}
+            >
+              Retry Reveal
+            </button>
+            <button
+              onClick={doForceEnd}
+              style={{ padding: "10px 24px", borderRadius: 12, border: `1.5px solid ${C.border}`, background: "#fff", color: C.text, fontWeight: 700, fontSize: 14, cursor: "pointer" }}
+            >
+              End Game
             </button>
           </div>
         </div>
@@ -3133,9 +3333,23 @@ function KahootHostView({ onNav, sessionName, pin, sessionDbId, demoMode, tenant
                 </button>
               </>
             ) : (
-              <button onClick={doTogglePause} style={{ padding: "14px 36px", borderRadius: 14, border: "none", background: C.orange, color: "#fff", fontSize: 17, fontWeight: 900, cursor: "pointer", display: "flex", alignItems: "center", gap: 10 }}>
-                ▶ Resume
-              </button>
+              // Normal paused overlay (incl. the resting state after "Stay Paused"):
+              // End Game (authoritative force-end via the confirm modal → doForceEnd)
+              // AND Resume. Resume stays disabled until at least one active player is
+              // back (connectedNow ≥ 1); a rejoining player never auto-resumes.
+              <>
+                <button onClick={() => setShowEndConfirm(true)} style={{ padding: "14px 28px", borderRadius: 14, border: `1px solid rgba(255,255,255,0.35)`, background: "transparent", color: "#fff", fontSize: 16, fontWeight: 900, cursor: "pointer" }}>
+                  End Game
+                </button>
+                {(() => {
+                  const canResume = connectedNow() >= 1;
+                  return (
+                    <button onClick={doTogglePause} disabled={!canResume} style={{ padding: "14px 36px", borderRadius: 14, border: "none", background: canResume ? C.orange : "rgba(255,255,255,0.25)", color: "#fff", fontSize: 17, fontWeight: 900, cursor: canResume ? "pointer" : "not-allowed", opacity: canResume ? 1 : 0.6, display: "flex", alignItems: "center", gap: 10 }}>
+                      ▶ Resume
+                    </button>
+                  );
+                })()}
+              </>
             )}
           </div>
         </div>
@@ -3382,7 +3596,36 @@ function KahootHostView({ onNav, sessionName, pin, sessionDbId, demoMode, tenant
               </div>
             ))}
           </div>
-          <button onClick={() => { broadcast({ type: GM.SCOREBOARD, scores, isFinal: isFinalQ }); setPhase("scoreboard"); persistPhase("scoreboard", qIdx, false); }} style={{ padding: "14px 44px", borderRadius: 18, border: "none", background: C.orange, color: "#fff", fontWeight: 900, fontSize: 15, cursor: "pointer", boxShadow: "0 0 40px rgba(253,191,36,0.4)" }}>
+          <button onClick={async () => {
+            // DEMO / no server session → client-only scoreboard, unchanged fast path.
+            if (demoMode || !sessionDbId) {
+              broadcast({ type: GM.SCOREBOARD, scores, isFinal: isFinalQ });
+              setPhase("scoreboard"); persistPhase("scoreboard", qIdx, false);
+              return;
+            }
+            // REAL (081): durably PUBLISH first (idempotent). The RPC validates state/identity,
+            // resolves names + rank server-side, persists phase='scoreboard' + payload, and returns
+            // the canonical board — we broadcast/render THAT. On failure: stay in reveal (retryable),
+            // no broadcast. Client in-flight guard prevents double-submit; a STABLE per-episode key
+            // (session:q<idx>) makes any retry after a lost response return the same saved board
+            // without a second version bump (DB idempotency is authoritative).
+            if (publishingRef.current) return;
+            publishingRef.current = true;
+            try {
+              const minScores = scores.map(p => ({ id: p.id, score: p.score ?? 0, delta: p.delta ?? 0 }));
+              const publishKey = scoreboardPublishKey(sessionDbId, qIdx);
+              const { data: board, error } = await publishScoreboard(sessionDbId, qIdx, minScores, publishKey);
+              if (error || !board) {
+                console.error("[ralli:host] publishScoreboard failed:", error);
+                try { toast.error("Couldn't publish the scoreboard — please try again."); } catch { /* non-fatal */ }
+                return; // reveal preserved; same key can retry
+              }
+              broadcast({ type: GM.SCOREBOARD, board, isFinal: isFinalQ });
+              setPhase("scoreboard"); // RPC already persisted phase + payload server-side
+            } finally {
+              publishingRef.current = false;
+            }
+          }} style={{ padding: "14px 44px", borderRadius: 18, border: "none", background: C.orange, color: "#fff", fontWeight: 900, fontSize: 15, cursor: "pointer", boxShadow: "0 0 40px rgba(253,191,36,0.4)" }}>
             Reveal Leaderboard →
           </button>
         </div>
@@ -3409,6 +3652,49 @@ function KahootPlayerView({ onNav, playerName, playerEmoji, playerId, pin, sessi
   const [finalScores,   setFinalScores]   = useState(null);
   const [gamePaused,    setGamePaused]    = useState(false);
   const [showLeaveConfirm, setShowLeaveConfirm] = useState(false);
+  const leavingRef = useRef(false);
+  // Monotonic guard for the durable scoreboard (migration 081): the highest scoreboard version
+  // already applied to finalScores. A delayed DB restore carrying an older/equal version is dropped
+  // so it can never overwrite a newer realtime SCOREBOARD. ONE shared apply path for realtime,
+  // initial restore, and reconnect/focus/visibility recovery.
+  const appliedSbVersionRef = useRef(-Infinity);
+  const applyScoreboard = useCallback((payload, { allowEqualVersion = false } = {}) => {
+    // The canonical decision guards session + current qIdx + local phase (terminal/next-question) +
+    // monotonic version, reading current values from refs (never a stale render closure). Entries are
+    // applied through the shared adapter (server order/rank/name/avatar preserved — no recompute).
+    const d = scoreboardApplyDecision(payload, {
+      sessionDbId,
+      currentQIdx: appliedQIdxRef.current >= 0 ? appliedQIdxRef.current : null,
+      localPhase: phaseRef.current,
+      appliedVersion: appliedSbVersionRef.current,
+      allowEqualVersion,
+    });
+    if (!d) return false;
+    appliedSbVersionRef.current = d.version;
+    setFinalScores(scoreboardRows(d.entries));
+    setPhase("scoreboard");
+    return true;
+  }, [sessionDbId]);
+  // Explicit Leave lifecycle (prompt departed-player cleanup): (1) durably mark the
+  // participant 'left' via the existing service and (2) confirm the write, then (3)
+  // untrack realtime presence + (4) notify the host (the PLAYER_LEAVE path calls
+  // channel.untrack(), so the host's presence sync drops this player from its
+  // connected-active roster immediately — no waiting for heartbeat-stale), then (5)
+  // navigate away. Clears the active-game reconnect context so a later refresh does
+  // not re-enter a game the player intentionally left. Never touches game_answers /
+  // game_players, so points and historical answers are preserved.
+  const doLeave = async () => {
+    if (leavingRef.current) return; // guard double-click
+    leavingRef.current = true;
+    setShowLeaveConfirm(false);
+    if (sessionDbId && playerId) {
+      const { error } = await markParticipantLeft(sessionDbId, playerId);
+      if (error) console.error("[ralli:player] leave: durable mark-left failed:", error);
+    }
+    try { broadcast?.({ type: GM.PLAYER_LEAVE, playerId }); } catch (e) { console.error("[ralli:player] leave: presence untrack failed:", e); }
+    try { clearActiveGameContext(); } catch { /* ignore */ }
+    onNav("rankd");
+  };
   const [sliderValue,     setSliderValue]     = useState(null); // Slider questions
   const [sliderSubmitted, setSliderSubmitted] = useState(false);
   const [shuffledRight,   setShuffledRight]   = useState([]);   // Matching — shared shuffle from host's SHOW_QUESTION
@@ -3463,17 +3749,20 @@ function KahootPlayerView({ onNav, playerName, playerEmoji, playerId, pin, sessi
   const reconcile = useCallback(async () => {
     if (!sessionDbId || !playerId) return;
     try {
-      const { session, answers } = await getSessionRestoreData(sessionDbId);
+      // Learner-safe restore RPC (073): own answers only + sanitized live_question.
+      // Never another player's answers, never question_snapshot.
+      const { session, answers } = await getPlayerSessionRestore(sessionDbId);
       if (session.error || !session.data) return;
       const s  = session.data;
       const lq = s.live_question;
       const idxMatch = lq && lq.qIdx === s.current_question_index;
 
-      // Cumulative score — idempotent, always safe to recompute.
+      // Cumulative score — idempotent, always safe to recompute. The learner-safe
+      // restore RPC already returns ONLY this caller's own answers (my_answers), and
+      // those rows carry no player_id, so we must NOT filter by player_id here (that
+      // filter matched nothing and zeroed the score — regression fix).
       if (answers.data?.length) {
-        const sc = answers.data
-          .filter(r => r.player_id === playerId)
-          .reduce((sum, r) => sum + (r.points ?? 0), 0);
+        const sc = answers.data.reduce((sum, r) => sum + (r.points ?? 0), 0);
         setMyScore(sc);
       }
       // Adopt the read's paused flag only if its timing version is NOT older
@@ -3484,7 +3773,16 @@ function KahootPlayerView({ onNav, playerName, playerEmoji, playerId, pin, sessi
       if (timingFresh) setGamePaused(!!s.paused);
 
       if (s.phase === "waiting")    return;                       // still in lobby
-      if (s.phase === "scoreboard") { setPhase("scoreboard"); return; }
+      if (s.phase === "scoreboard") {
+        // Durable recovery (081): apply the exact published board ONLY when it agrees with the
+        // durable columns (session/qIdx/version) — durableRestoreDecision rejects any mismatch
+        // instead of guessing. allowEqualVersion lets an initial mount reapply the same version.
+        // Track qIdx so a later delayed OLD scoreboard event is rejected. Legacy null → neutral empty.
+        appliedQIdxRef.current = s.current_question_index ?? appliedQIdxRef.current;
+        if (durableRestoreDecision(s)) applyScoreboard(s.live_scoreboard, { allowEqualVersion: true });
+        setPhase("scoreboard");
+        return;
+      }
       if (s.phase === "ended")      { setPhase("ended");      return; }
 
       // Core fix: recover the current question the player never received. Pass
@@ -3513,8 +3811,14 @@ function KahootPlayerView({ onNav, playerName, playerEmoji, playerId, pin, sessi
       // reveal sees the correct answer + their score without their own pick
       // highlighted — honest, and never stranded.
       if (s.phase === "reveal" && idxMatch && lq.qIdx >= appliedQIdxRef.current) {
-        const myRow = (answers.data ?? []).find(r => r.player_id === playerId && r.question_idx === lq.qIdx);
-        setQuestion(lq.question);
+        // my_answers is already own-only (learner-safe RPC) and carries no player_id,
+        // so match on question_idx alone (filtering by player_id lost the row — fix).
+        const myRow = (answers.data ?? []).find(r => r.question_idx === lq.qIdx);
+        // Reveal recovery restores the correct-answer display from the POST-reveal
+        // `reveal` block the host persisted at reveal — never the pre-reveal payload
+        // (which is sanitized). If reveal info isn't present yet, the sanitized
+        // question renders without the answer (honest), never leaking early.
+        setQuestion(applyRevealToQuestion(lq.question, lq.reveal));
         appliedQIdxRef.current = lq.qIdx;
         if (myRow) { setIsCorrect(!!myRow.is_correct); setMyDelta(myRow.points ?? 0); }
         setPhase("reveal");
@@ -3570,6 +3874,25 @@ function KahootPlayerView({ onNav, playerName, playerEmoji, playerId, pin, sessi
       window.removeEventListener("focus", onVisible);
     };
   }, [reconcile]);
+  // … and a light periodic DURABLE safety-net. Broadcasts remain the fast path, but a
+  // transient frame (SHOW_QUESTION / PAUSE / RESUME / REVEAL / SCOREBOARD) missed during the
+  // (re)subscribe gap — the exact hazard for a Leave→Rejoin learner — would otherwise strand
+  // them until they tabbed away and back (the "Hang tight until you click" symptom). This
+  // recovers the current durable state within one interval with NO user interaction, reusing
+  // the SAME idempotent, stale-guarded reconcile() (appliedQIdxRef / timingSeqRef never roll a
+  // player backward, never restart a running timer). Recovery only — no new lifecycle, no new
+  // subscription. Paused so a backgrounded tab (already handled by the focus path) doesn't poll,
+  // and stopped once terminal so the ended screen doesn't keep reading.
+  const phaseRef = useRef(phase); phaseRef.current = phase;
+  useEffect(() => {
+    if (!sessionDbId || !playerId) return;
+    const id = setInterval(() => {
+      if (phaseRef.current === "ended") return;
+      if (typeof document !== "undefined" && document.visibilityState === "hidden") return;
+      reconcile();
+    }, 2500);
+    return () => clearInterval(id);
+  }, [sessionDbId, playerId, reconcile]);
 
   // Heartbeat: keep last_seen_at fresh while in-game so the host can detect
   // stale connections. 15s interval pairs with the host's 25s freshness window
@@ -3621,6 +3944,10 @@ function KahootPlayerView({ onNav, playerName, playerEmoji, playerId, pin, sessi
         revealCorrect = selectedIdx === chMsg.correctIdx;
       }
       setIsCorrect(revealCorrect);
+      // Post-reveal ONLY: merge the correct-answer info the REVEAL broadcast carries
+      // back into the (sanitized) question so the reveal render can display it. The
+      // pre-reveal payload never contained it. Same helper as recovery below.
+      setQuestion(prev => (prev ? applyRevealToQuestion(prev, chMsg) : prev));
       const me = chMsg.scores?.find(p => p.id === playerId) ?? chMsg.scores?.find(p => p.name === playerName);
       if (me) { setMyScore(me.score); setMyDelta(me.delta); setMyRank(chMsg.scores.indexOf(me) + 1); }
     }
@@ -3652,7 +3979,14 @@ function KahootPlayerView({ onNav, playerName, playerEmoji, playerId, pin, sessi
       }
     }
     if (chMsg.type === GM.FORCE_END) { setFinalScores(chMsg.scores); setPhase("ended"); }
-    if (chMsg.type === GM.SCOREBOARD) { if (chMsg.scores) setFinalScores(chMsg.scores); setPhase("scoreboard"); }
+    if (chMsg.type === GM.SCOREBOARD) {
+      // Realtime fast path (081): a real game broadcasts the canonical server payload in `board`
+      // (routed through the monotonic apply guard); demo/legacy hosts still send a raw `scores`
+      // array. Either way, enter the scoreboard phase.
+      if (chMsg.board) applyScoreboard(chMsg.board);
+      else if (chMsg.scores) setFinalScores(chMsg.scores);
+      setPhase("scoreboard");
+    }
   }, [chMsg]);
 
   useEffect(() => {
@@ -3735,7 +4069,7 @@ function KahootPlayerView({ onNav, playerName, playerEmoji, playerId, pin, sessi
         <p style={{ margin: "0 0 24px", color: C.textSub, fontSize: 14 }}>You can rejoin with the same PIN. Your current answers will not be saved.</p>
         <div style={{ display: "flex", gap: 10 }}>
           <button onClick={() => setShowLeaveConfirm(false)} style={{ flex: 1, padding: "12px", borderRadius: 12, border: `1px solid ${C.border}`, background: "transparent", color: C.text, fontSize: 14, fontWeight: 700, cursor: "pointer" }}>Cancel</button>
-          <button onClick={() => onNav("rankd")} style={{ flex: 1, padding: "12px", borderRadius: 12, border: "none", background: C.orange, color: "#fff", fontSize: 14, fontWeight: 900, cursor: "pointer" }}>Leave</button>
+          <button onClick={doLeave} style={{ flex: 1, padding: "12px", borderRadius: 12, border: "none", background: C.orange, color: "#fff", fontSize: 14, fontWeight: 900, cursor: "pointer" }}>Leave</button>
         </div>
       </div>
     </div>
@@ -5857,18 +6191,17 @@ function PlayerSessionDetail({ session, playerId, onBack }) {
     setSnapStatus("loading"); setAnswersStatus("loading");
     setSnapshot(null); setAnswers([]); setTotalPlayers(null);
     (async () => {
-      const [snapRes, ansRes, cntRes] = await Promise.all([
-        getSessionQuestionSnapshot(dbId),
-        getPlayerAnswersForSession(dbId, playerId),
-        getSessionPlayerCounts([dbId]),
-      ]);
+      // Learner-safe completed-session review RPC (073): snapshot (post-completion,
+      // participant-only) + the caller's OWN answers + player count in one call.
+      // Never another player's raw answer. Explicit failure (retryable), never empty-as-ok.
+      const { data: review, error: reviewErr } = await getMyCompletedSessionReview(dbId);
       if (cancelled) return;             // a delayed response must not overwrite a newer session
-      if (snapRes.error)                       setSnapStatus("failed");
-      else if (!snapRes.data || snapRes.data.length === 0) setSnapStatus("empty"); // legacy: no snapshot
-      else { setSnapshot(snapRes.data);        setSnapStatus("ok"); }
-      if (ansRes.error) setAnswersStatus("failed");
-      else { setAnswers(ansRes.data ?? []); setAnswersStatus("ok"); }
-      if (!cntRes.error && cntRes.data) setTotalPlayers(cntRes.data[dbId] ?? null); // else hidden
+      if (reviewErr) { setSnapStatus("failed"); setAnswersStatus("failed"); return; }
+      const snap = review?.snapshot ?? null;
+      if (!snap || snap.length === 0) setSnapStatus("empty"); // legacy: no snapshot
+      else { setSnapshot(snap); setSnapStatus("ok"); }
+      setAnswers(review?.myAnswers ?? []); setAnswersStatus("ok");
+      setTotalPlayers(review?.playerCount ?? null);
     })();
     return () => { cancelled = true; };
   }, [session?.dbId, playerId, reloadKey]);
@@ -6017,9 +6350,9 @@ function RankdJoinPanel({ onJoin, sessions, currentUser }) {
     if (tab !== "scores" || !currentUser?._isReal || !currentUser?.id) return;
     let cancelled = false;
     setHistoryStatus("loading");
-    getPlayerGameHistory(currentUser.id).then(({ data, error }) => {
+    listMyGameHistory().then(({ data, error }) => {  // learner-safe own history RPC (073)
       if (cancelled) return;
-      if (error) { console.error("[ralli:player] getPlayerGameHistory failed:", error); setHistoryStatus("failed"); return; }
+      if (error) { console.error("[ralli:player] listMyGameHistory failed:", error); setHistoryStatus("failed"); return; }
       const rows = data ?? [];
       setDbHistory(rows);
       setHistoryStatus("ok");
@@ -6059,10 +6392,14 @@ function RankdJoinPanel({ onJoin, sessions, currentUser }) {
       </div>
 
       {tab === "join" && (
-        <div style={{ display: "flex", gap: 32, alignItems: "flex-start" }}>
+        // Wrap so the two columns stack (PIN entry above Active Sessions) when the
+        // content area is too narrow (split-screen / tablet), and sit side-by-side on
+        // wide desktop. flex-basis drives the reflow point — no JS breakpoint needed.
+        <div style={{ display: "flex", flexWrap: "wrap", gap: 32, alignItems: "flex-start" }}>
           {/* PIN card */}
           <div style={{
-            width: 300, flexShrink: 0, borderRadius: 24, padding: 32, textAlign: "center",
+            flex: "0 1 300px", minWidth: 260, maxWidth: "100%", boxSizing: "border-box",
+            borderRadius: 24, padding: 32, textAlign: "center",
             background: C.white, border: `1px solid ${C.border}`,
             boxShadow: "0 8px 40px rgba(253,191,36,0.08)",
           }}>
@@ -6090,7 +6427,7 @@ function RankdJoinPanel({ onJoin, sessions, currentUser }) {
           </div>
 
           {/* Active sessions */}
-          <div style={{ flex: 1 }}>
+          <div style={{ flex: "1 1 380px", minWidth: 0 }}>
             <p style={{ margin: "0 0 14px", fontSize: 13, fontWeight: 700, color: C.text }}>Active sessions right now</p>
             {sessions.filter(s => s.status === "waiting").length === 0 && (
               <p style={{ fontSize: 13, color: C.textSub }}>No active sessions at the moment. Check back soon!</p>
@@ -6098,23 +6435,26 @@ function RankdJoinPanel({ onJoin, sessions, currentUser }) {
             <div style={{ display: "flex", flexDirection: "column", gap: 10 }}>
               {sessions.filter(s => s.status === "waiting").map(s => (
                 <button key={s.code} onClick={() => handleJoin(s.code)} style={{
-                  display: "flex", alignItems: "center", justifyContent: "space-between",
+                  display: "flex", alignItems: "center", justifyContent: "space-between", gap: 12,
+                  width: "100%", minWidth: 0, boxSizing: "border-box",
                   padding: "16px 20px", borderRadius: 16, cursor: "pointer", textAlign: "left",
                   background: C.white, border: `1px solid rgba(253,191,36,0.2)`,
                   boxShadow: "0 2px 8px rgba(253,191,36,0.05)",
                 }}>
-                  <div style={{ display: "flex", alignItems: "center", gap: 12 }}>
-                    <div>
-                      <p style={{ margin: 0, fontSize: 13, fontWeight: 700, color: C.text }}>{s.name}</p>
+                  {/* Left group shrinks + truncates so a long name never pushes the row wider than the card */}
+                  <div style={{ display: "flex", alignItems: "center", gap: 12, minWidth: 0 }}>
+                    <div style={{ minWidth: 0 }}>
+                      <p style={{ margin: 0, fontSize: 13, fontWeight: 700, color: C.text, whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis" }}>{s.name}</p>
                       <p style={{ margin: 0, fontSize: 11, color: C.textSub }}>{s.questionCount} questions</p>
                     </div>
                   </div>
-                  <div style={{ display: "flex", alignItems: "center", gap: 12 }}>
+                  {/* Right group never shrinks/clips — PIN chip + call-to-action stay on one line */}
+                  <div style={{ display: "flex", alignItems: "center", gap: 12, flexShrink: 0 }}>
                     <span style={{
                       fontSize: 13, fontWeight: 900, letterSpacing: "0.2em", fontFamily: "monospace",
                       padding: "6px 12px", borderRadius: 10, background: C.orange, color: "#fff",
                     }}>{s.code}</span>
-                    <span style={{ fontSize: 12, fontWeight: 600, color: C.green }}>Tap to join →</span>
+                    <span style={{ fontSize: 12, fontWeight: 600, color: C.green, whiteSpace: "nowrap" }}>Tap to join →</span>
                   </div>
                 </button>
               ))}
@@ -6441,7 +6781,13 @@ function RankdAdminPanel({ onNav, sessions, pastSessions = [], onLaunch, onViewR
 
 function RankdScreen({ onNav, onJoin, sessions, pastSessions = [], onLaunch, onViewResults, onRelaunch, role, currentUser }) {
   return (
-    <div style={{ display: "flex", flexDirection: "column" }}>
+    // Center the Ralli Live hub (banner + Active/Past or Join/Scores tabs + list +
+    // New Game action) within the area right of the sidebar: full-width wrapper
+    // centers the max-width column with comfortable side padding, so the hub is no
+    // longer stranded at the far left of a wide canvas. Only the CONTAINER is
+    // centered — inner text/tabs/controls stay left-aligned; full-width on small screens.
+    <div style={{ width: "100%", display: "flex", justifyContent: "center", padding: "0 32px", boxSizing: "border-box" }}>
+    <div style={{ width: "100%", maxWidth: 1480, display: "flex", flexDirection: "column" }}>
       {/* Hero */}
       <div style={{
         background: C.cream,
@@ -6491,6 +6837,7 @@ function RankdScreen({ onNav, onJoin, sessions, pastSessions = [], onLaunch, onV
           ? <RankdAdminPanel onNav={onNav} sessions={sessions} pastSessions={pastSessions} onLaunch={onLaunch} onViewResults={onViewResults} onRelaunch={onRelaunch} />
           : <RankdJoinPanel onJoin={onJoin} sessions={sessions} currentUser={currentUser} />}
       </div>
+    </div>
     </div>
   );
 }
@@ -6604,7 +6951,18 @@ function RankdNameEntryScreen({ onNav, pin, sessionName, onConfirm, defaultName,
           )}
         </div>
 
-        <button onClick={() => onNav("rankd")} style={{
+        <button onClick={async () => {
+          // Player leaving the lobby: same prompt-cleanup lifecycle as the in-game
+          // Leave — durably mark 'left' (confirm) + untrack presence so the host's
+          // connected-active roster drops us immediately (no heartbeat-stale wait) —
+          // then navigate. Host uses a plain back (no participant row of its own).
+          if (role !== "admin" && sessionDbId && playerId) {
+            const { error } = await markParticipantLeft(sessionDbId, playerId);
+            if (error) console.error("[ralli:lobby] leave: durable mark-left failed:", error);
+            try { broadcast?.({ type: GM.PLAYER_LEAVE, playerId }); } catch (e) { console.error("[ralli:lobby] leave: presence untrack failed:", e); }
+          }
+          onNav("rankd");
+        }} style={{
           width: "100%", textAlign: "center", marginTop: 16, padding: 8,
           fontSize: 13, color: C.textSub, background: "transparent", border: "none", cursor: "pointer",
         }}>← Back</button>
@@ -6615,10 +6973,16 @@ function RankdNameEntryScreen({ onNav, pin, sessionName, onConfirm, defaultName,
 
 // ── RANKD LOBBY SCREEN ───────────────────────────────────────
 
-function RankdLobbyScreen({ onNav, pin, playerName, playerEmoji, sessionName, role, sessions = [], currentUser, onGameStart, chPlayers, broadcast, trackPlayerPresence, playerId, chMsg, onHostEnd }) {
+function RankdLobbyScreen({ onNav, pin, sessionDbId: propSessionDbId = null, playerName, playerEmoji, sessionName, role, sessions = [], currentUser, onGameStart, chPlayers, broadcast, trackPlayerPresence, playerId, chMsg, onHostEnd }) {
   const mobile = useMobile();
+  const toast  = useToast(); // in-scope notifications (host cancel-recovery message, etc.)
   const session     = sessions.find(s => s.code === pin);
-  const sessionDbId = session?.dbId ?? null;
+  // Lobby membership must derive from the DURABLE join-established id (App state,
+  // set at handleEnterPin), NOT the mutable `sessions` list — a session-list refresh
+  // returning [] (e.g. a learner whose manager-list RPC is empty) must never null the
+  // lobby's sessionDbId and tear down presence/heartbeat. Fall back to the list only
+  // for demo/legacy paths where no durable id exists.
+  const sessionDbId = propSessionDbId ?? session?.dbId ?? null;
 
   // demoMode: true only when admin has explicitly created a demo session.
   // A real tenant session always has demoMode: false (set in handleCreateSession).
@@ -6636,6 +7000,9 @@ function RankdLobbyScreen({ onNav, pin, playerName, playerEmoji, sessionName, ro
   // DB-backed participant list for the manager lobby.
   // Source of truth: game_session_participants rows for this session.
   const [dbPlayers, setDbPlayers] = useState([]);
+  // True once we're advancing this learner from lobby → game, so the leave-on-unmount handler
+  // below does NOT mark them 'left' when the game actually starts.
+  const advancingToGameRef = useRef(false);
 
   const normParticipant = (p) => ({
     id:     p.player_id ?? p.id,
@@ -6644,89 +7011,93 @@ function RankdLobbyScreen({ onNav, pin, playerName, playerEmoji, sessionName, ro
     color:  p.color  ?? PLAYER_COLORS[0],
     score:  0,
     status: p.status ?? "active",
+    last_seen_at: p.last_seen_at ?? null,   // durable heartbeat — bridges brief Presence gaps
   });
 
-  // ── Admin: load initial participants from DB ────────────────────────────────
-  useEffect(() => {
-    if (role !== "admin" || !sessionDbId || isDemoMode) return;
-    getLobbyParticipants(sessionDbId).then(({ data, error }) => {
-      if (error) console.error("[ralli:lobby] getLobbyParticipants FAILED:", error);
-      if (data) setDbPlayers(data.map(normParticipant));
-    });
-  }, [sessionDbId, isDemoMode]); // eslint-disable-line react-hooks/exhaustive-deps
+  // ── Durable lobby roster (single source: getLobbyParticipants → rpc_lobby_participants) ──
+  // The client's direct postgres_changes subscription on game_session_participants was
+  // removed (prerequisite for revoking table SELECT). Roster VISIBILITY/COUNT is driven by
+  // Realtime Presence (chPlayers, see combinedRealPlayers below); this durable RPC is the
+  // identity/status truth and the recovery path. A monotonic request counter drops stale
+  // responses so a slow earlier fetch can never overwrite newer lobby state.
+  const rosterReqRef = useRef(0);
 
-  // ── Admin: subscribe to realtime INSERTs on game_session_participants ───────
-  // Fires immediately when a player calls joinGameSession(), cross-device.
-  useEffect(() => {
-    if (role !== "admin" || !sessionDbId || isDemoMode) return;
-    const channel = subscribeToLobbyParticipants(sessionDbId, (row) => {
-      setDbPlayers(prev => {
-        if (prev.some(p => p.id === row.player_id)) return prev; // already present
-        return [...prev, normParticipant(row)];
-      });
-    });
-    return () => { supabase.removeChannel(channel); };
-  }, [sessionDbId, isDemoMode]); // eslint-disable-line react-hooks/exhaustive-deps
-
-  // ── Admin: poll every 4s as fallback when realtime isn't enabled ────────────
-  useEffect(() => {
-    if (role !== "admin" || !sessionDbId || isDemoMode) return;
-    const interval = setInterval(() => {
-      getLobbyParticipants(sessionDbId).then(({ data }) => {
-        if (data) setDbPlayers(data.map(normParticipant));
-      });
-    }, 4000);
-    return () => clearInterval(interval);
-  }, [sessionDbId, isDemoMode]); // eslint-disable-line react-hooks/exhaustive-deps
-
-  // ── Player: load participants from DB + subscribe to INSERTs ─────────────────
-  // Mirrors the admin side so the player sees the same live count.
-  useEffect(() => {
-    if (role === "admin" || isDemoMode || !sessionDbId) return;
-
-    // Optimistic self-entry: show player count ≥ 1 immediately without waiting
-    // for joinGameSession() (fire-and-forget) or presence subscription to complete.
+  // Player-side optimistic self-entry: show count ≥ 1 immediately without waiting for the
+  // fire-and-forget join or the first durable fetch. Emoji stays null for no-avatar players.
+  const selfEntry = useMemo(() => {
+    if (role === "admin" || isDemoMode || !playerId) return null;
     const pidx = Math.abs((playerId ?? "").charCodeAt(0) + ((playerId ?? "").charCodeAt(1) || 0)) % PLAYER_EMOJIS.length;
-    // No-avatar players stay null here too — this optimistic self-entry was the
-    // last remaining placeholder source (playerEmoji ?? PLAYER_EMOJIS[pidx]).
-    const selfEntry = normParticipant({
+    return normParticipant({
       player_id: currentUser?.id ?? playerId,
       name:      playerName,
       emoji:     playerEmoji ?? null,
       color:     PLAYER_COLORS[pidx % PLAYER_COLORS.length],
       status:    "active",
     });
-    setDbPlayers([selfEntry]);
+  }, [role, isDemoMode, playerId, currentUser?.id, playerName, playerEmoji]); // eslint-disable-line react-hooks/exhaustive-deps
 
-    // Helper: merge DB rows, keeping self if not yet persisted
-    const mergeWithSelf = (rows) => {
-      const selfId   = selfEntry.id;
-      const selfInDb = rows.some(p => p.id === selfId);
-      return selfInDb ? rows : [selfEntry, ...rows];
-    };
+  // Apply durable rows; on the player side keep the optimistic self until it persists.
+  const applyRoster = useCallback((rows) => {
+    if (role === "admin" || !selfEntry) { setDbPlayers(rows); return; }
+    setDbPlayers(rows.some(p => p.id === selfEntry.id) ? rows : [selfEntry, ...rows]);
+  }, [role, selfEntry]);
 
-    // Initial load
-    getLobbyParticipants(sessionDbId).then(({ data }) => {
-      if (data) setDbPlayers(mergeWithSelf(data.map(normParticipant)));
+  // Immediate durable refresh (stale-protected). Called by every trigger below.
+  const refreshRoster = useCallback(() => {
+    if (isDemoMode || !sessionDbId) return;
+    const seq = ++rosterReqRef.current;
+    getLobbyParticipants(sessionDbId).then(({ data, error }) => {
+      if (error) { console.error("[ralli:lobby] getLobbyParticipants FAILED:", error); return; }
+      if (!data) return;
+      if (seq !== rosterReqRef.current) return; // a newer request already applied — drop this one
+      applyRoster(data.map(normParticipant));
     });
-    // Realtime INSERT subscription
-    const channel = subscribeToLobbyParticipants(sessionDbId, (row) => {
-      setDbPlayers(prev => {
-        if (prev.some(p => p.id === (row.player_id ?? row.id))) return prev;
-        return [...prev, normParticipant(row)];
-      });
-    });
-    // Poll every 3s as fallback
-    const interval = setInterval(() => {
-      getLobbyParticipants(sessionDbId).then(({ data }) => {
-        if (data) setDbPlayers(mergeWithSelf(data.map(normParticipant)));
-      });
-    }, 3000);
+  }, [isDemoMode, sessionDbId, applyRoster]); // eslint-disable-line react-hooks/exhaustive-deps
+
+  // Mount: optimistic self (player) → immediate durable load (also the post-join refresh,
+  // since the lobby mounts right after join) → polling recovery. One path for both roles.
+  useEffect(() => {
+    if (isDemoMode || !sessionDbId) return;
+    if (role !== "admin" && selfEntry) setDbPlayers([selfEntry]);
+    refreshRoster();
+    const interval = setInterval(refreshRoster, role === "admin" ? 4000 : 3000);
+    return () => clearInterval(interval);
+  }, [sessionDbId, isDemoMode, role, selfEntry, refreshRoster]); // eslint-disable-line react-hooks/exhaustive-deps
+
+  // Presence is the "someone joined / reconnected" trigger the removed postgres_changes
+  // INSERT used to serve: when the connected set changes, pull the durable roster so the
+  // new/returning player's stored identity enriches promptly (not just at the next poll tick).
+  useEffect(() => {
+    refreshRoster();
+  }, [chPlayers.length, refreshRoster]); // eslint-disable-line react-hooks/exhaustive-deps
+
+  // Window focus / tab-visible return → immediate durable refresh (missed-event recovery).
+  useEffect(() => {
+    if (isDemoMode || !sessionDbId) return;
+    const onVisible = () => { if (document.visibilityState === "visible") refreshRoster(); };
+    document.addEventListener("visibilitychange", onVisible);
+    window.addEventListener("focus", refreshRoster);
     return () => {
-      supabase.removeChannel(channel);
-      clearInterval(interval);
+      document.removeEventListener("visibilitychange", onVisible);
+      window.removeEventListener("focus", refreshRoster);
     };
-  }, [sessionDbId, isDemoMode, role]); // eslint-disable-line react-hooks/exhaustive-deps
+  }, [isDemoMode, sessionDbId, refreshRoster]); // eslint-disable-line react-hooks/exhaustive-deps
+
+  // Player: heartbeat while in the LOBBY so last_seen_at stays fresh — the durable bridge
+  // that keeps the host showing an actively-present learner across a brief Presence gap.
+  // The lobby previously had NO heartbeat (only the in-game view did), which is the root of
+  // the ~10s host-empties regression: Presence was the sole visibility signal and nothing
+  // durable proved the learner was still here. Same 15s cadence / freshness pairing as the
+  // in-game beat (KahootPlayerView) — one model. Fire once immediately so a just-joined
+  // learner is fresh right away. This is a pure participant WRITE (no table read).
+  useEffect(() => {
+    if (isDemoMode || role === "admin" || !sessionDbId || !playerId) return;
+    const beat = () => updateParticipantHeartbeat(sessionDbId, playerId)
+      .catch(e => console.error("[ralli:lobby] heartbeat failed:", e));
+    beat();
+    const interval = setInterval(beat, 15_000);
+    return () => clearInterval(interval);
+  }, [isDemoMode, role, sessionDbId, playerId]);
 
   // ── Player: poll game_sessions.phase as countdown/start fallback ─────────────
   // Broadcast (GM.GAME_START / GM.SHOW_QUESTION) can be missed in race conditions.
@@ -6734,25 +7105,62 @@ function RankdLobbyScreen({ onNav, pin, playerName, playerEmoji, sessionName, ro
   useEffect(() => {
     if (role === "admin" || isDemoMode || !sessionDbId) return;
     const check = () => {
-      supabase
-        .from("game_sessions")
-        .select("phase, status")
-        .eq("id", sessionDbId)
-        .single()
-        .then(({ data }) => {
-          if (!data) return;
-          // Durable recovery: if the host terminated the session (from the
-          // lobby or otherwise) and the realtime event was missed, resolve to
-          // the ended message rather than sitting in the lobby / "Hang tight".
-          if (["canceled", "ended", "completed"].includes(data.status)) { setHostEnded(true); return; }
-          const started = data.status === "started" || (data.phase && data.phase !== "waiting");
-          if (started) onNav("rankd-game");
-        });
+      // Learner-safe read (073 restore RPC — participant-authorized): read the
+      // session's phase/status via the server RPC, never a direct game_sessions read.
+      getPlayerSessionRestore(sessionDbId).then(({ session }) => {
+        const data = session?.data;
+        if (!data) return;
+        // Durable recovery: if the host terminated the session (from the
+        // lobby or otherwise) and the realtime event was missed, resolve to
+        // the ended message rather than sitting in the lobby / "Hang tight".
+        if (["canceled", "ended", "completed"].includes(data.status)) { setHostEnded(true); return; }
+        const started = data.status === "started" || (data.phase && data.phase !== "waiting");
+        if (started) onNav("rankd-game");
+      }).catch(() => {});
     };
     check(); // immediate on mount so a refresh after cancellation resolves at once
     const interval = setInterval(check, 2000);
     return () => clearInterval(interval);
   }, [sessionDbId, isDemoMode, role]); // eslint-disable-line react-hooks/exhaustive-deps
+
+  // ── Host: durable session-status recovery in the WAITING lobby ───────────────
+  // A quiz archived while the host waits (migration 083 trigger, or any path that
+  // cancels the session) durably CANCELS this session server-side with NO game
+  // broadcast. Mirror the learner status poll so the host is also removed from a
+  // lobby whose game can never start, even if no realtime event arrives. On any
+  // terminal status, clear the active-game context (so a refresh can't re-enter it)
+  // and return the host to the hub with a message. The host-safe restore RPC (075)
+  // authorizes the exact host / same-tenant admin, so this is not a direct table read.
+  // Demo gate uses the EXPLICIT per-session flag, NOT the derived `isDemoMode`: once the
+  // just-canceled session drops out of the local `sessions` list (App active-session refresh
+  // removes terminal rows), `session` becomes undefined and `isDemoMode` (session?.demoMode
+  // !== false) would flip TRUE for a real host — silently killing this poll and stranding the
+  // host in a canceled lobby. `session?.demoMode === true` is true ONLY for a real demo
+  // session (its contract), so a missing session reads as non-demo and the poll keeps running.
+  // The effect re-subscribes per sessionDbId; its cleanup sets `stale`, so a delayed response
+  // from a prior session id can never navigate (it is verified current before changing screens).
+  useEffect(() => {
+    if (role !== "admin" || session?.demoMode === true || !sessionDbId) return;
+    let stale = false;
+    const check = () => {
+      getSessionRestoreData(sessionDbId).then(({ session: s }) => {
+        const data = s?.data;
+        if (stale || !data) return;
+        if (["canceled", "ended", "completed"].includes(data.status)) {
+          stale = true;
+          // Navigate FIRST so the host always leaves the canceled lobby, even if the toast
+          // (or any later call) throws — the runtime trace proved a `toast is not defined`
+          // ReferenceError here previously aborted navigation and stranded the host.
+          try { clearActiveGameContext(); } catch { /* ignore */ }
+          onNav("rankd");
+          try { toast.error("This game was canceled because its quiz is no longer available."); } catch { /* non-fatal */ }
+        }
+      }).catch(() => {});
+    };
+    check(); // immediate on mount so a refresh after cancellation resolves at once
+    const interval = setInterval(check, 4000);
+    return () => { stale = true; clearInterval(interval); };
+  }, [role, session?.demoMode, sessionDbId, onNav]); // eslint-disable-line react-hooks/exhaustive-deps
 
   const basePlayer = role === "admin"
     ? { name: currentUser?.name ?? "Host", emoji: "🦁", color: C.green }
@@ -6760,19 +7168,30 @@ function RankdLobbyScreen({ onNav, pin, playerName, playerEmoji, sessionName, ro
 
   const demoAllPlayers = [basePlayer, ...LOBBY_PLAYERS.filter(p => p.name !== basePlayer.name)];
 
-  // CANONICAL roster: Presence is the connected-now truth for lobby VISIBILITY
-  // (chPlayers is already deduped by playerId in the presence sync). A player
-  // who closes the tab or leaves drops from presence and therefore from the
-  // roster after the presence grace window. DB participant status is NOT used
-  // for visibility — it stays "active" after a socket leaves and would keep a
-  // departed player shown (the reported bug). DB rows ONLY enrich identity
-  // (name / emoji / color); emoji stays null for no-avatar players.
+  // Players the DURABLE row says have explicitly left (or completed). An explicit Leave marks
+  // the row 'left' server-side; the roster/readiness must treat that as authoritative and
+  // suppress a lingering ghost Presence entry immediately — an untrack that didn't flush before
+  // channel teardown otherwise keeps the player in the host's Presence for the ~40s server
+  // timeout. (A tab close leaves the row 'active' and still drops via the heartbeat grace.)
+  const leftIds = new Set(dbPlayers.filter(p => p.status === "left" || p.status === "completed").map(p => p.id));
+
+  // Realtime-READINESS (distinct from mere visibility): a learner is ready for gameplay only
+  // when currently tracked in Presence on THIS session channel AND not durably left. A stale
+  // durable heartbeat is NOT permission to start broadcasting. Used to gate host Start.
+  const realtimeReadyCount = isDemoMode ? 1 : chPlayers.filter(p => p.id && !leftIds.has(p.id)).length;
+
+  // CANONICAL roster: Presence is the connected-now truth for lobby VISIBILITY, EXCEPT a
+  // durable 'left' row overrides a lingering ghost Presence entry (below). The durable heartbeat
+  // bridge (step 2) still covers a brief Presence blip for an active player. DB rows enrich
+  // identity (name / emoji / color); emoji stays null for no-avatar players.
   const combinedRealPlayers = (() => {
     if (isDemoMode) return [];
     const dbById = new Map(dbPlayers.map(p => [p.id, p]));
     const map = new Map();
+    // 1. Presence — the immediate connected-now truth, MINUS anyone the durable row says has
+    //    left (suppresses a ghost Presence entry the moment 'left' is durably visible).
     chPlayers.forEach(p => {
-      if (!p.id) return;
+      if (!p.id || leftIds.has(p.id)) return;
       const db = dbById.get(p.id);
       map.set(p.id, {
         id:    p.id,
@@ -6782,9 +7201,28 @@ function RankdLobbyScreen({ onNav, pin, playerName, playerEmoji, sessionName, ro
         score: 0,
       });
     });
-    // Player's own view only: show self immediately from the optimistic DB
-    // self-entry until this client's presence syncs. Never add self for the
-    // host, so a departed player is never re-introduced by identity data.
+    // 2. Durable heartbeat bridge — keep a participant whose last_seen_at is FRESH
+    //    (actively heartbeating, active/joined) even if their Presence entry is briefly
+    //    missing. THIS is the fix for the host losing an in-lobby learner on a ~10s
+    //    Presence blip: Presence alone is not a reliable persistent visibility signal, so
+    //    a fresh durable row bridges the gap. A player who truly left stops heartbeating
+    //    (last_seen_at goes stale ⇒ dropped after the grace window) or is marked
+    //    status='left' (filtered out of dbPlayers upstream). Same freshness rule and
+    //    window (HEARTBEAT_FRESH_MS) as the zero-player-halt watchdog — one connectivity
+    //    model, not a second. A null heartbeat (e.g. the optimistic self-entry) is NOT a
+    //    bridge; the player's own self-entry is handled in step 3.
+    const now = Date.now();
+    dbPlayers.forEach(p => {
+      if (!p.id || map.has(p.id)) return;
+      const statusOk = !p.status || p.status === "active" || p.status === "joined";
+      if (!statusOk) return;
+      if (!p.last_seen_at) return;
+      if (now - new Date(p.last_seen_at).getTime() >= HEARTBEAT_FRESH_MS) return;
+      map.set(p.id, { id: p.id, name: p.name, emoji: p.emoji ?? null, color: p.color ?? null, score: 0 });
+    });
+    // 3. Player's own view only: show self immediately from the optimistic self-entry
+    //    until this client's Presence/heartbeat lands. Never add self for the host, so a
+    //    departed player is never re-introduced by identity data.
     if (role !== "admin" && playerId && !map.has(playerId)) {
       const db = dbById.get(playerId);
       map.set(playerId, { id: playerId, name: db?.name ?? playerName, emoji: db?.emoji ?? playerEmoji ?? null, color: db?.color ?? PLAYER_COLORS[0], score: 0 });
@@ -6821,9 +7259,29 @@ function RankdLobbyScreen({ onNav, pin, playerName, playerEmoji, sessionName, ro
   // rather than inventing a new one.
   useEffect(() => {
     if (isDemoMode || role === "admin") return;
-    if (chMsg?.type === GM.SHOW_QUESTION || chMsg?.type === GM.GAME_START) onNav("rankd-game");
+    if (chMsg?.type === GM.SHOW_QUESTION || chMsg?.type === GM.GAME_START) { advancingToGameRef.current = true; onNav("rankd-game"); }
     if (chMsg?.type === GM.FORCE_END || chMsg?.type === GM.GAME_END) setHostEnded(true);
   }, [chMsg, isDemoMode, role]);
+
+  // Explicit waiting-lobby LEAVE = navigating away from the lobby to anything that is NOT the
+  // game. The lobby had no durable-leave handler, so a learner who left kept status='active'
+  // and the durable-heartbeat bridge showed them (and counted them) for up to HEARTBEAT_FRESH_MS
+  // (~40s) until their frozen last_seen_at went stale — the reported stale roster/count. Mark the
+  // caller's row 'left' (canonical markParticipantLeft → rpc_participant_leave) and untrack
+  // Presence on unmount, so the host's next durable poll (≤4s) excludes them via status='left'.
+  //   • advancing to the game is guarded out (advancingToGameRef) — that's not a Leave.
+  //   • React cleanup does NOT run on full-page refresh or tab close, so those correctly keep
+  //     the existing heartbeat grace period (row stays 'active' → drops when last_seen goes stale).
+  // Reuses the exact lifecycle of the name-entry ← Back / in-game Leave — no new roster/count path.
+  useEffect(() => {
+    if (isDemoMode || role === "admin") return;
+    return () => {
+      if (advancingToGameRef.current) return;         // lobby → game is not a Leave
+      if (!sessionDbId || !playerId) return;
+      markParticipantLeft(sessionDbId, playerId).catch(e => console.error("[ralli:lobby] leave: durable mark-left failed:", e));
+      try { broadcast?.({ type: GM.PLAYER_LEAVE, playerId }); } catch (e) { console.error("[ralli:lobby] leave: presence untrack failed:", e); }
+    };
+  }, [isDemoMode, role, sessionDbId, playerId]); // eslint-disable-line react-hooks/exhaustive-deps
 
   useEffect(() => {
     if (!isDemoMode) return;
@@ -6891,11 +7349,17 @@ function RankdLobbyScreen({ onNav, pin, playerName, playerEmoji, sessionName, ro
           </div>
         </div>
         {role === "admin" ? (
-          <button onClick={onGameStart} style={{
+          // Readiness gate: never start broadcasting countdown/question until at least one
+          // learner is REALTIME-ready (currently in Presence on this channel, not durably left).
+          // A rejoined learner whose new channel hasn't SUBSCRIBED yet is visible but not ready,
+          // so starting now would fire the countdown into the void. No auto-start — host clicks.
+          <button onClick={onGameStart} disabled={realtimeReadyCount < 1} style={{
             display: "flex", alignItems: "center", gap: 8,
-            padding: mobile ? "10px 18px" : "12px 24px", borderRadius: 12, border: "none", cursor: "pointer",
-            fontSize: 13, fontWeight: 800, color: "#fff", background: C.orange, minHeight: 44,
-          }}>▶ Start Game</button>
+            padding: mobile ? "10px 18px" : "12px 24px", borderRadius: 12, border: "none",
+            cursor: realtimeReadyCount < 1 ? "not-allowed" : "pointer",
+            fontSize: 13, fontWeight: 800, color: "#fff",
+            background: realtimeReadyCount < 1 ? C.muted : C.orange, opacity: realtimeReadyCount < 1 ? 0.85 : 1, minHeight: 44,
+          }}>{realtimeReadyCount < 1 ? "Waiting for player connection…" : "▶ Start Game"}</button>
         ) : (
           <div style={{ textAlign: "right" }}>
             <p style={{ margin: "0 0 6px", fontSize: 12, color: C.textMuted }}>Waiting for host{dots}</p>
@@ -7060,18 +7524,35 @@ function RankdResultsScreen({ onNav, sessionDbId, sessionCode, sessions, gameDat
   const [reloadKey,      setReloadKey]      = useState(0);
   const retryLoad = () => setReloadKey(k => k + 1);
 
-  // Load player scores from DB when not in memory (host refreshed after end, or
-  // opening from history). A failed query must never look like "no players".
+  // Manager exact-session analytics (migration 075): ONE server-authorized call
+  // (rpc_manager_session_analytics — host / same-tenant orgAdmin / ralli_admin only)
+  // provides player scores + per-answer rows + the immutable question snapshot for
+  // this EXACT session, replacing the three former direct table reads. A failed call
+  // surfaces as retryable "error" on each pane — never silently "no players" / "no
+  // responses" / "legacy session". In-memory scores still take DISPLAY precedence
+  // (realScores below); the durable snapshot remains the ONLY historical question source.
   useEffect(() => {
-    if (inMemoryForThisSession && gameData?.scores) { setPlayersStatus("ok"); return; } // matched in-memory scores
-    if (!session?.dbId)   { setPlayersStatus("ok"); return; } // demo / non-persisted
+    const haveMemScores = inMemoryForThisSession && !!gameData?.scores;
+    if (!session?.dbId) {
+      // Demo / non-persisted: no durable sources to load.
+      setPlayersStatus("ok"); setDbScores(null);
+      setDetailLoaded(true); setAnswerStatus("ok"); setSnapshotStatus("ok");
+      setAnswerRows([]); setDetailQuestions(null);
+      return;
+    }
     let cancelled = false;
-    setPlayersStatus("loading"); setDbScores(null); // clear prior session's data
-    getSessionPlayers(session.dbId).then(({ data, error }) => {
+    setPlayersStatus(haveMemScores ? "ok" : "loading"); setDbScores(null);
+    setDetailLoaded(false); setAnswerStatus("loading"); setSnapshotStatus("loading");
+    setAnswerRows(null); setDetailQuestions(null);
+    getManagerSessionAnalytics(session.dbId).then(({ data, error }) => {
       if (cancelled) return;
-      if (error) { setPlayersStatus("error"); setDbScores(null); return; }
-      setPlayersStatus("ok");
-      setDbScores((data ?? []).map((p) => ({
+      if (error) {
+        setPlayersStatus(haveMemScores ? "ok" : "error"); setDbScores(null);
+        setAnswerStatus("error"); setSnapshotStatus("error");
+        setAnswerRows(null); setDetailQuestions(null); setDetailLoaded(true);
+        return;
+      }
+      setDbScores((data?.players ?? []).map((p) => ({
         id:    p.player_id,
         name:  p.name,
         emoji: p.emoji ?? null,   // no-avatar players stay null — name only, no placeholder
@@ -7079,7 +7560,16 @@ function RankdResultsScreen({ onNav, sessionDbId, sessionCode, sessions, gameDat
         score: p.final_score ?? 0,
         delta: 0,
       })));
-    }).catch(() => { if (!cancelled) { setPlayersStatus("error"); setDbScores(null); } });
+      setPlayersStatus("ok");
+      setAnswerStatus("ok");   setAnswerRows(data?.answers ?? []);
+      setSnapshotStatus("ok"); setDetailQuestions(data?.snapshot ?? null);
+      setDetailLoaded(true);
+    }).catch(() => {
+      if (cancelled) return;
+      setPlayersStatus(haveMemScores ? "ok" : "error"); setDbScores(null);
+      setAnswerStatus("error"); setSnapshotStatus("error");
+      setAnswerRows(null); setDetailQuestions(null); setDetailLoaded(true);
+    });
     return () => { cancelled = true; };
   }, [session?.dbId, reloadKey]); // eslint-disable-line react-hooks/exhaustive-deps
 
@@ -7097,43 +7587,10 @@ function RankdResultsScreen({ onNav, sessionDbId, sessionCode, sessions, gameDat
   const [selectedPlayerId, setSelectedPlayerId] = useState(null);
   const [selectedQIdx,     setSelectedQIdx]     = useState(null);
 
-  // One retryable loader for the answer/snapshot pair. A failed query is
-  // surfaced as "error" (retryable) — NOT silently coerced to []/null, which
-  // would falsely read as "no responses" / "legacy session". `cancelled` +
-  // `reloadKey` in the deps prevent a stale/prior-session response from
-  // overwriting a newer retry or a newly selected session; state is cleared up
-  // front so another session's results can never flash or persist.
-  useEffect(() => {
-    if (!session?.dbId) {
-      // Demo / non-persisted: no durable sources to load.
-      setDetailLoaded(true); setAnswerStatus("ok"); setSnapshotStatus("ok");
-      setAnswerRows([]); setDetailQuestions(null);
-      return;
-    }
-    let cancelled = false;
-    setDetailLoaded(false);
-    setAnswerStatus("loading"); setSnapshotStatus("loading");
-    setAnswerRows(null); setDetailQuestions(null);
-    Promise.all([
-      getGameAnswersForSession(session.dbId),
-      getSessionQuestionSnapshot(session.dbId),
-    ]).then(([answersRes, snapRes]) => {
-      if (cancelled) return;
-      if (answersRes.error) { setAnswerStatus("error"); setAnswerRows(null); }
-      else                  { setAnswerStatus("ok");    setAnswerRows(answersRes.data ?? []); }
-      // Persisted session: the immutable snapshot is the ONLY canonical source.
-      // A query error is retryable ("error"); a successful null is legacy. No
-      // fallback to gameData or the mutable quiz.
-      if (snapRes.error)    { setSnapshotStatus("error"); setDetailQuestions(null); }
-      else                  { setSnapshotStatus("ok");    setDetailQuestions(snapRes.data ?? null); }
-      setDetailLoaded(true);
-    }).catch(() => {
-      if (cancelled) return;
-      setAnswerStatus("error"); setSnapshotStatus("error");
-      setAnswerRows(null); setDetailQuestions(null); setDetailLoaded(true);
-    });
-    return () => { cancelled = true; };
-  }, [session?.dbId, reloadKey]); // eslint-disable-line react-hooks/exhaustive-deps
+  // (Answer rows + question snapshot are loaded together with player scores by the
+  // single rpc_manager_session_analytics effect above — migration 075 — so there is
+  // no longer a separate direct-read loader here. The immutable snapshot remains the
+  // ONLY canonical historical question source; a query error stays retryable.)
 
   // Scores: identity-matched in-memory results (immediate) → durable game_players.
   const realScores = (inMemoryForThisSession ? gameData?.scores : null) ?? dbScores ?? null;
@@ -7820,12 +8277,29 @@ function RankdResultsScreen({ onNav, sessionDbId, sessionCode, sessions, gameDat
 // ── NEW SESSION SCREEN ───────────────────────────────────────
 
 function NewSessionScreen({ onNav, quizzes, onCreateSession }) {
-  const [selectedId,  setSelectedId]  = useState(quizzes[0]?.id ?? null);
-  const [sessionName, setSessionName] = useState(quizzes[0]?.name ?? "");
+  // Only ACTIVE quizzes are eligible to launch a Ralli Live game — archived (or otherwise
+  // non-active) quizzes must never appear as selectable here. This uses the ONE canonical
+  // eligibility helper (contentService.isQuizPlayable), mirroring the authoritative server
+  // guard in migration 083; the UI filter is a first line, not the enforcement boundary.
+  const playableQuizzes = useMemo(() => quizzes.filter(isQuizPlayable), [quizzes]);
+
+  const [selectedId,  setSelectedId]  = useState(playableQuizzes[0]?.id ?? null);
+  const [sessionName, setSessionName] = useState(playableQuizzes[0]?.name ?? "");
   const [demoMode,    setDemoMode]    = useState(false);
   const [creating,    setCreating]    = useState(false);
 
-  const selectedQuiz = quizzes.find(q => q.id === selectedId);
+  const selectedQuiz = playableQuizzes.find(q => q.id === selectedId);
+
+  // If the currently-selected quiz drops out of the playable set (e.g. archived in another tab
+  // while this screen is open), fall back to the first still-playable quiz so the form never
+  // holds a stale, unlaunchable selection.
+  useEffect(() => {
+    if (selectedId && !playableQuizzes.some(q => q.id === selectedId)) {
+      const next = playableQuizzes[0] ?? null;
+      setSelectedId(next?.id ?? null);
+      setSessionName(next?.name ?? "");
+    }
+  }, [playableQuizzes, selectedId]);
 
   const selectQuiz = (quiz) => {
     setSelectedId(quiz.id);
@@ -7854,7 +8328,12 @@ function NewSessionScreen({ onNav, quizzes, onCreateSession }) {
   };
 
   return (
-    <div style={{ maxWidth: 680, display: "flex", flexDirection: "column", gap: 28 }}>
+    // Center the New Game Session form container within the area right of the nav
+    // sidebar: full-width flex wrapper centers the fixed-max-width column with
+    // comfortable side padding. Only the CONTAINER is centered — text and form
+    // fields stay left-aligned; on small screens the column is full-width and usable.
+    <div style={{ width: "100%", display: "flex", justifyContent: "center", padding: "0 24px", boxSizing: "border-box" }}>
+    <div style={{ width: "100%", maxWidth: 680, display: "flex", flexDirection: "column", gap: 28 }}>
       {/* Header */}
       <div style={{ display: "flex", alignItems: "center", gap: 14 }}>
         <button onClick={() => onNav("rankd")} style={{
@@ -7879,14 +8358,14 @@ function NewSessionScreen({ onNav, quizzes, onCreateSession }) {
           }}>+ Build new quiz</button>
         </div>
 
-        {quizzes.length === 0 ? (
+        {playableQuizzes.length === 0 ? (
           <div style={{
             padding: 40, borderRadius: 16, border: `2px dashed ${C.border}`,
             textAlign: "center", background: C.white,
           }}>
-            
-            <p style={{ fontSize: 15, fontWeight: 700, color: C.text, margin: "0 0 4px" }}>No quizzes yet</p>
-            <p style={{ fontSize: 13, color: C.textSub, margin: "0 0 20px" }}>Build one first to launch a session</p>
+
+            <p style={{ fontSize: 15, fontWeight: 700, color: C.text, margin: "0 0 4px" }}>No active quizzes</p>
+            <p style={{ fontSize: 13, color: C.textSub, margin: "0 0 20px" }}>Build one (or restore an archived quiz) to launch a session</p>
             <button onClick={() => onNav("rankd-quiz-builder")} style={{
               padding: "10px 24px", borderRadius: 12, border: "none", cursor: "pointer",
               fontSize: 14, fontWeight: 700, background: C.orange, color: "#fff",
@@ -7894,7 +8373,7 @@ function NewSessionScreen({ onNav, quizzes, onCreateSession }) {
           </div>
         ) : (
           <div style={{ display: "flex", flexDirection: "column", gap: 10 }}>
-            {quizzes.map(quiz => (
+            {playableQuizzes.map(quiz => (
               <button key={quiz.id} onClick={() => selectQuiz(quiz)} style={{
                 display: "flex", alignItems: "center", gap: 16, padding: "16px 20px", borderRadius: 14,
                 border: `2px solid ${selectedId === quiz.id ? C.orange : C.border}`,
@@ -7990,6 +8469,7 @@ function NewSessionScreen({ onNav, quizzes, onCreateSession }) {
           </button>
         </div>
       )}
+    </div>
     </div>
   );
 }
@@ -23306,6 +23786,34 @@ function clearLearnNavSessionState() {
   try { for (const k of LEARN_NAV_SESSION_KEYS) sessionStorage.removeItem(k); } catch {}
 }
 
+// ── Active-game refresh reconnect ────────────────────────────────────────────
+// Minimal, server-validated context that lets an AUTHENTICATED learner who
+// REFRESHES mid-game land back in the exact same game instead of the login/
+// marketing screen or Home. Only the sessionDbId and the player's chosen display
+// identity are stored — the PIN, session name, status and phase are read
+// authoritatively from rpc_player_session_restore on reload, which also verifies
+// the caller is a participant of that (same-tenant) session. Kept in
+// sessionStorage (not localStorage) so a genuine tab-close discards it (manual
+// rejoin), while a same-tab refresh preserves it. Scoped by authenticated user id
+// and re-validated server-side on restore, so it can never restore one user into
+// another user's game, a completed/canceled game, or a cross-tenant session.
+const ACTIVE_GAME_KEY = "ralli_active_game";
+function readActiveGameContext() {
+  try {
+    const raw = sessionStorage.getItem(ACTIVE_GAME_KEY);
+    if (!raw) return null;
+    const c = JSON.parse(raw);
+    if (!c || c.v !== 1 || !c.userId || !c.sessionDbId) return null;
+    return c;
+  } catch { return null; }
+}
+function writeActiveGameContext(c) {
+  try { sessionStorage.setItem(ACTIVE_GAME_KEY, JSON.stringify({ v: 1, ...c })); } catch {}
+}
+function clearActiveGameContext() {
+  try { sessionStorage.removeItem(ACTIVE_GAME_KEY); } catch {}
+}
+
 // Fallback when there's no valid persisted screen to restore (first login,
 // stale/invalid value, or role no longer matches). Ralli platform admins land
 // on Organizations; everyone else lands on "home", which itself renders the
@@ -24229,7 +24737,16 @@ export default function App() {
   // Superadmin always passes. Use this throughout the render tree.
   const perm = (scope, key) => hasPermission(rolePermissions, role, scope, key);
 
-  const navigate = (s) => setScreen(s);
+  const navigate = (s) => {
+    // Leaving an active game (explicit Leave / Back to Games / end screen) → drop the
+    // refresh reconnect context so a later refresh never re-enters a game the player
+    // already left. Staying within the game/lobby/name-entry join flow keeps it.
+    if ((screen === "rankd-game" || screen === "rankd-lobby")
+        && s !== "rankd-game" && s !== "rankd-lobby" && s !== "rankd-name-entry") {
+      clearActiveGameContext();
+    }
+    setScreen(s);
+  };
   // A FRESH click of a top-level nav item. Clicking "Learn" always opens its
   // primary view (manager: Assignments) — we seed the persisted subtab so a
   // deliberate nav is distinguishable from a browser refresh (which restores the
@@ -24287,8 +24804,48 @@ export default function App() {
           // so capturing this now avoids racing our own write of the default
           // "home" state into sessionStorage ahead of the real restore value.
           const restoredScreen = getRestorableScreen();
+
+          // ── Host active-game refresh reconnect (Ralli Live host recovery) ──────────
+          // A HOST (admin-type profile; gameRole is derived "admin") who refreshes
+          // mid-game — e.g. while the intermediate scoreboard is visible — must re-enter
+          // the EXACT active session, not fall back to the Ralli Live hub / Active
+          // Sessions list. The learner path (below) already does this via the learner-safe
+          // RPC; the host uses rpc_host_session_restore (authorizes the exact host /
+          // same-tenant orgAdmin / ralli_admin). We restore only the session id + screen
+          // here; RankdGameScreen's own restore effect then reconstructs the exact phase
+          // and durable scoreboard and never advances gameplay. Terminal / cross-user /
+          // invalid context is dropped, so a refresh can never re-enter a finished game.
+          let hostReconnected = false;
+          if (isRalliAdmin(profile.role) || profile.role === "orgAdmin") {
+            const hostCtx = readActiveGameContext();
+            if (hostCtx && hostCtx.role === "admin" && hostCtx.userId === profile.id) {
+              try {
+                const { session } = await getSessionRestoreData(hostCtx.sessionDbId);
+                const s = session?.data;
+                const terminal = !s || s.status === "completed" || s.status === "canceled" || s.phase === "ended";
+                if (s && !terminal) {
+                  setActiveGameSessionDbId(hostCtx.sessionDbId);
+                  setActiveGameIsDemo(false);
+                  setLobbyPin(s.pin ?? null);
+                  setLobbySessionName(s.name ?? null);
+                  setLobbyPlayerName(hostCtx.playerName ?? profile.name ?? null);
+                  setLobbyPlayerEmoji(hostCtx.playerEmoji ?? null);
+                  // Live (started or past waiting) → game view; still waiting → lobby.
+                  const live = s.status === "started" || (s.phase && s.phase !== "waiting");
+                  setScreen(live ? "rankd-game" : "rankd-lobby");
+                  hostReconnected = true;
+                } else {
+                  clearActiveGameContext(); // completed / canceled / ended → never restore
+                }
+              } catch (e) {
+                console.error("[ralli:game] host active-game reconnect failed:", e);
+                clearActiveGameContext(); // denied / not host / cross-tenant → drop context
+              }
+            }
+          }
+
           if (isRalliAdmin(profile.role)) {
-            setScreen(restoredScreen ?? defaultScreenForRestore(true));
+            if (!hostReconnected) setScreen(restoredScreen ?? defaultScreenForRestore(true));
             setOrgs([]); // clear seed/mock orgs — ralli admin sees only real Supabase tenants
             supabase.from("tenants").select("*").order("created_at", { ascending: false })
               .then(({ data }) => { setOrgs(data ? data.map(t => ({ ...t, adminEmail: t.admin_email, seatLimit: t.seat_limit ?? 10, seats: t.seat_limit ?? 10, createdAt: t.created_at?.split("T")[0], updatedAt: t.updated_at?.split("T")[0] })) : []); });
@@ -24299,15 +24856,52 @@ export default function App() {
             // only fall back to Home/Leadership Dashboard if there isn't one.
             // Team Settings is never the fallback — only reachable by restoring
             // a screen the manager intentionally navigated to before refreshing.
-            if (profile.orgId) {
-              const { data: tenant } = await supabase.from("tenants").select("status").eq("id", profile.orgId).single();
-              setScreen(tenant?.status === "onboarding" ? "org-setup" : (restoredScreen ?? defaultScreenForRestore(false)));
-            } else {
-              setScreen(restoredScreen ?? defaultScreenForRestore(false));
+            // Skipped entirely when a host game was just reconnected above.
+            if (!hostReconnected) {
+              if (profile.orgId) {
+                const { data: tenant } = await supabase.from("tenants").select("status").eq("id", profile.orgId).single();
+                setScreen(tenant?.status === "onboarding" ? "org-setup" : (restoredScreen ?? defaultScreenForRestore(false)));
+              } else {
+                setScreen(restoredScreen ?? defaultScreenForRestore(false));
+              }
             }
           } else {
-            // Standard user (rep) — restore their last screen, else Personal Dashboard.
-            setScreen(restoredScreen ?? defaultScreenForRestore(false));
+            // Standard user (rep). FIRST try to restore an ACTIVE Ralli Live game the
+            // player was in when they refreshed — auth is now resolved, so we validate
+            // the saved sessionDbId through the learner-safe restore RPC (which proves
+            // participant + same-tenant) and only re-enter if the session is still
+            // active. Else fall back to their last screen / Personal Dashboard.
+            let reconnected = false;
+            const gameCtx = readActiveGameContext();
+            if (gameCtx && gameCtx.userId === profile.id) {
+              try {
+                const { session } = await getPlayerSessionRestore(gameCtx.sessionDbId);
+                const s = session?.data;
+                const terminal = !s || s.status === "completed" || s.status === "canceled" || s.phase === "ended";
+                if (s && !terminal) {
+                  // Valid, active, RPC-verified as this user's participant session.
+                  setActiveGameSessionDbId(gameCtx.sessionDbId);
+                  setActiveGameIsDemo(false);
+                  setLobbyPin(s.pin ?? null);
+                  setLobbySessionName(s.name ?? null);
+                  setLobbyPlayerName(gameCtx.playerName ?? profile.name ?? null);
+                  setLobbyPlayerEmoji(gameCtx.playerEmoji ?? null);
+                  // Live (started or past waiting) → game view; still waiting → lobby.
+                  // KahootPlayerView.reconcile then restores the exact phase/question/score.
+                  const live = s.status === "started" || (s.phase && s.phase !== "waiting");
+                  setScreen(live ? "rankd-game" : "rankd-lobby");
+                  reconnected = true;
+                } else {
+                  clearActiveGameContext(); // completed / canceled / ended → never restore
+                }
+              } catch (e) {
+                console.error("[ralli:game] active-game reconnect failed:", e);
+                clearActiveGameContext(); // denied / not a participant / cross-tenant
+              }
+            } else if (gameCtx) {
+              clearActiveGameContext(); // cross-user stale context → never restore into another user's game
+            }
+            if (!reconnected) setScreen(restoredScreen ?? defaultScreenForRestore(false));
           }
         }
       }
@@ -24336,6 +24930,7 @@ export default function App() {
         setPastSessions([]);                     // prevent real past sessions leaking to next demo user
         setBattleCards(INITIAL_BATTLE_CARDS);    // prevent real BC data leaking to next demo user
         clearLearnNavSessionState();              // don't leak screen / Learn subtab / pending quiz review into the next login
+        clearActiveGameContext();                 // never restore the signed-out user's game into the next login
         clearBattleCardDrafts();                  // don't leak an unsaved Battle Card draft into the next login
         window.location.replace("/login");        // hard-navigate so URL matches the login screen
       }
@@ -24354,10 +24949,15 @@ export default function App() {
     const tenantId = currentUser.orgId ?? null;
     if (!tenantId) return;
 
-    // Sessions
-    getActiveSessions(tenantId).then(({ data }) => {
-      if (data) setSessions(data);
-    });
+    // Sessions — each actor calls the RPC for its OWN contract (migration 077):
+    // admin-panel users (gameRole "admin" = orgAdmin/ralli_admin) get the manager
+    // Active Games list; everyone else (join panel: managers + learners) gets the
+    // learner-safe joinable list. Never route learners through the manager RPC
+    // (which returns [] and previously erased their joinable list + lobby identity).
+    (gameRole === "admin"
+      ? getActiveSessions(tenantId)
+      : getLearnerJoinableSessions()
+    ).then(({ data }) => { if (data) setSessions(data); });
     getGameHistory(tenantId).then(({ data, error }) => {
       if (error) console.error("[ralli:game] getGameHistory failed:", error);
       if (data) setPastSessions(data);
@@ -24521,8 +25121,11 @@ export default function App() {
     const tenantId = currentUser.orgId;
 
     const refresh = () => {
-      getActiveSessions(tenantId).then(({ data, error }) => {
-        if (error) console.error("[ralli:game] getActiveSessions error:", error);
+      (gameRole === "admin"
+        ? getActiveSessions(tenantId)
+        : getLearnerJoinableSessions()
+      ).then(({ data, error }) => {
+        if (error) console.error("[ralli:game] session list refresh error:", error);
         if (data) setSessions(data);
       });
       // Past Sessions shares the same "keep it current while on this screen"
@@ -24555,6 +25158,31 @@ export default function App() {
   const lobbySessionDbId = activeGameSessionDbId;
   const gameChannelKey = isInGame ? (lobbySessionDbId ?? lobbyPin) : null;
   const { chPlayers, chAnswers, setChAnswers, chMsg, broadcast, chStatus, trackPlayerPresence } = useGameChannel(gameChannelKey, gameRole);
+
+  // Persist minimal active-game reconnect context (see readActiveGameContext) while
+  // an authenticated HOST or learner is in a REAL game, so a page refresh restores them
+  // into the exact same game. The stored `role` selects the restore RPC on boot: a host
+  // ("admin") re-enters via rpc_host_session_restore, a learner ("user") via the
+  // learner-safe RPC. Never clears here — that would wipe the context during the pre-auth
+  // boot render; clearing is explicit (leave / sign-out / game end / invalid restore).
+  // Validation on restore rejects anything stale, completed, or cross-user.
+  useEffect(() => {
+    const inRealGame = !!currentUser?._isReal
+      && !!currentUser?.id
+      && (gameRole === "user" || gameRole === "admin")
+      && (screen === "rankd-game" || screen === "rankd-lobby")
+      && activeGameSessionDbId != null
+      && !activeGameIsDemo;
+    if (inRealGame) {
+      writeActiveGameContext({
+        userId:      currentUser.id,
+        sessionDbId: activeGameSessionDbId,
+        role:        gameRole,   // "admin" (host) | "user" (learner) — selects the restore RPC on boot
+        playerName:  lobbyPlayerName ?? currentUser.name ?? null,
+        playerEmoji: lobbyPlayerEmoji ?? null,
+      });
+    }
+  }, [currentUser, gameRole, screen, activeGameSessionDbId, activeGameIsDemo, lobbyPlayerName, lobbyPlayerEmoji]);
 
   // Recovery mode takes priority over normal routing — show the reset form regardless
   // of whether a session exists. This prevents the app from routing past the form if
@@ -25124,6 +25752,15 @@ export default function App() {
     });
     if (error || !data?.pin) {
       console.error("[ralli:game] createGameSession FAILED:", error);
+      // The server (migration 083 create_game_session_atomic) rejects creating a game from a
+      // quiz that isn't active (archived / not found / cross-tenant) by raising 'quiz_unavailable'.
+      // Surface a specific, retryable message so the host knows to pick an active quiz, rather
+      // than the generic create-failure text. (The UI already lists only active quizzes; this
+      // covers a quiz archived between listing and Create.)
+      if (error?.message === "quiz_unavailable") {
+        toast.error("This quiz is no longer available. Create a new game with an active quiz.");
+        return;
+      }
       toast.error("Couldn't create the game session. Please try again.");
       return;
     }
@@ -25186,12 +25823,36 @@ export default function App() {
       const tenantId = currentUser?.orgId ?? null;
       const { data: remote, error: pinErr } = await findJoinableSession(tenantId, pin);
       if (remote) {
-        // Only allow joining sessions that are actively waiting for players
+        // Only brand-new joins go to a 'waiting' session. A non-waiting session is
+        // either terminal (closed) or started/paused — the latter is a REJOIN, not a
+        // new join.
         if (remote.status && remote.status !== "waiting") {
-          console.warn("[ralli:game] handleEnterPin: session not accepting players, status:", remote.status);
-          return ["completed", "ended", "canceled"].includes(remote.status)
-            ? "This game has already ended."
-            : "This game has already started.";
+          if (["completed", "ended", "canceled"].includes(remote.status)) {
+            return "This game has already ended.";
+          }
+          // Started/paused → attempt a safe, server-authorized rejoin (migration 078):
+          // the RPC verifies the caller already participated in this exact same-tenant
+          // session (by auth.uid()) and atomically reactivates their existing row — no
+          // duplicate, no resume. A brand-new user (never a participant) is rejected and
+          // sees the closed-game message; a returning participant is restored into the
+          // game via the existing safe player reconcile, with the host still paused.
+          const { data: rj, error: rjErr } = await rejoinSession(pin);
+          if (rjErr || !rj?.session) {
+            console.warn("[ralli:game] rejoin denied:", rjErr?.message ?? rjErr);
+            return "This game has already started.";
+          }
+          const rs = rj.session;
+          setActiveGameSessionDbId(rs.id);
+          setActiveGameIsDemo(false);                 // rejoin only applies to real sessions
+          setLobbyPin(rs.pin ?? pin);
+          setLobbySessionName(rs.name ?? sessionName);
+          setLobbyPlayerName(rj.participant?.name ?? currentUser?.name ?? null);
+          setLobbyPlayerEmoji(rj.participant?.emoji ?? null);
+          // started / past-waiting → game view; player reconcile (getPlayerSessionRestore)
+          // restores the exact phase/question/score. Host stays paused → Resume is manual.
+          const live = rs.status === "started" || (rs.phase && rs.phase !== "waiting");
+          setScreen(live ? "rankd-game" : "rankd-lobby");
+          return null;
         }
         const fetched = {
           code:          remote.pin,
@@ -25352,7 +26013,7 @@ export default function App() {
   };
 
   // Admin: start real game from lobby
-  const handleGameStart = () => {
+  const handleGameStart = async () => {
     // EARLIEST safe boundary for a real game: it must never enter gameplay
     // without its exact session id — that id is required to persist phase, save
     // answers, and complete durably. Blocking here makes the completion-time
@@ -25363,21 +26024,76 @@ export default function App() {
       toast.error("Couldn't start the game — its session id is unavailable. Please refresh and try again.");
       return;
     }
-    // Mark the exact active session started locally (keyed by its dbId when
-    // known, so a reused pin can't flip another local row).
+
+    // DEMO games are in-memory only — no server round-trip, no eligibility check.
+    // Preserve the original behavior exactly: mark started locally and navigate; demo
+    // never broadcasts GAME_START (isolated single-device flow).
+    if (activeGameIsDemo) {
+      setSessions(prev => prev.map(s =>
+        (activeGameSessionDbId != null ? s.dbId === activeGameSessionDbId : s.code === lobbyPin)
+          ? { ...s, status: "started" } : s
+      ));
+      setScreen("rankd-game");
+      return;
+    }
+
+    // REAL games: the quiz's eligibility is re-checked AUTHORITATIVELY at start by
+    // rpc_start_session (migration 083). We AWAIT that result BEFORE broadcasting GAME_START
+    // or navigating, so a quiz archived between create and start can never pull the host and
+    // learners into a game with no active quiz. Keyed on the EXACT session id established at
+    // create/launch (never the PIN), so a reused code can't flip a different/historical row.
+    let startRes;
+    try {
+      startRes = await startGameSession(activeGameSessionDbId);
+    } catch (e) {
+      // Network/unexpected failure — stay in the lobby (players still connected), broadcast
+      // nothing, navigate nowhere; the host can retry Start.
+      console.error("[ralli] startGameSession failed:", e);
+      toast.error("Couldn't start the game — please try again.");
+      return;
+    }
+    const { data: startData, error: startError } = startRes ?? {};
+    if (startError) {
+      console.error("[ralli] startGameSession error:", startError);
+      toast.error("Couldn't start the game — please try again.");
+      return;
+    }
+
+    // Quiz became unavailable (archived / no longer active) after create but before start.
+    // The server has ALREADY durably canceled the still-waiting session and cleared its live
+    // state (migration 083 rpc_start_session). Do NOT broadcast GAME_START and do NOT enter
+    // gameplay. Terminally close the lobby (FORCE_END → learners leave safely), drop the
+    // active-game context so a refresh can't re-enter it, mark the exact local row canceled,
+    // and route the host back to New Game with a retryable message.
+    if (startData && startData.ok === false && startData.reason === "quiz_unavailable") {
+      broadcast({ type: GM.FORCE_END });
+      setSessions(prev => prev.map(s =>
+        (activeGameSessionDbId != null ? s.dbId === activeGameSessionDbId : s.code === lobbyPin)
+          ? { ...s, status: "canceled" } : s
+      ));
+      clearActiveGameContext();
+      toast.error("This quiz is no longer available. Create a new game with an active quiz.");
+      setScreen("rankd-new");
+      return;
+    }
+    // Any other non-start outcome (e.g. reason 'not_startable' — the session was concurrently
+    // canceled / started / its quiz deleted between our read and the transition): do NOT broadcast
+    // GAME_START or enter gameplay. Keep the host in the lobby to refresh/retry; if the session
+    // was durably canceled, the host lobby's status poll routes them out with a message.
+    if (startData && startData.ok === false) {
+      console.warn("[ralli] start returned non-ok:", startData);
+      toast.error("Couldn't start the game — it's no longer waiting. Please refresh and try again.");
+      return;
+    }
+
+    // Started successfully — mark the exact active session started locally, broadcast
+    // GAME_START so all players navigate to the game, then navigate the host.
     setSessions(prev => prev.map(s =>
       (activeGameSessionDbId != null ? s.dbId === activeGameSessionDbId : s.code === lobbyPin)
         ? { ...s, status: "started" } : s
     ));
-    // For real mode, broadcast GAME_START so all players navigate to game.
-    if (!activeGameIsDemo) {
-      const qs = gameQuestions ?? GAME_QUESTIONS;
-      broadcast({ type: GM.GAME_START, questions: qs, totalQ: qs.length });
-    }
-    // Persist status update to Supabase (fire-and-forget). startGameSession's
-    // established API takes the pin (tenant-scoped join code) — a legitimate
-    // helper-API use of the pin, not an identity derivation.
-    startGameSession(lobbyPin, currentOrg?.id ?? user?.orgId ?? null).catch(e => console.error("[ralli] startGameSession failed:", e));
+    const qs = gameQuestions ?? GAME_QUESTIONS;
+    broadcast({ type: GM.GAME_START, questions: qs, totalQ: qs.length });
     setScreen("rankd-game");
   };
 
@@ -25407,6 +26123,7 @@ export default function App() {
     }
     // Accepted. Persisted → exact dbId; demo → null id with code identity.
     const endedDbId = isDemoGame ? null : appDbId;
+    clearActiveGameContext(); // game finished — a later refresh must not re-enter it
     setGameResultsData({ ...data, sessionDbId: endedDbId, sessionCode: lobbyPin });
     setViewResultsDbId(endedDbId);
     setViewResultsCode(lobbyPin);
@@ -25418,10 +26135,13 @@ export default function App() {
         ? { ...s, status: "completed" } : s
     ));
     const gameTenantId = currentOrg?.id ?? user?.orgId ?? null;
-    // Persist results + mark participants completed in Supabase (fire-and-forget)
+    // Persist results + mark participants completed in Supabase (fire-and-forget).
+    // Pass the authoritative session id so endGameSession needs no read of the row it
+    // just updated (safe-read cutover — works after table SELECT is revoked).
     endGameSession(lobbyPin, {
       scores:   data?.scores ?? [],
       tenantId: gameTenantId,
+      sessionId: endedDbId,
     }).then(() => {
       // Refresh Past Sessions from the DB now that this session's status/
       // ended_at/game_players are actually persisted — without this, Past
@@ -25432,6 +26152,19 @@ export default function App() {
           if (error) console.error("[ralli] getGameHistory refresh failed:", error);
           if (history) setPastSessions(history);
         });
+      }
+      // Post-completion, request server-authoritative verification (migration 072
+      // + verify-game-session). Fire-and-forget and retryable/idempotent: it runs
+      // ONLY after durable completion, must never delay or strand the end screen,
+      // and a failure/unavailable Edge Function must never erase gameplay results
+      // — the session simply stays UNVERIFIED (and thus never leaderboard-eligible).
+      // endedDbId is null for demo games, so this is real-session-only.
+      if (endedDbId) {
+        requestSessionVerification(endedDbId)
+          .then(({ unavailable }) => {
+            if (unavailable) console.info("[ralli] session verification unavailable — session stays unverified until the verify service is deployed");
+          })
+          .catch(() => { /* never affects gameplay results */ });
       }
     }).catch(e => console.error("[ralli] endGameSession failed:", e));
     // Award game points for all real participants, then trigger readiness for each.
@@ -25501,7 +26234,7 @@ export default function App() {
       case "rankd-new":         return <NewSessionScreen onNav={navigate} quizzes={quizzes} onCreateSession={handleCreateSession} />;
       case "rankd-quiz-builder":return <QuizBuilderScreen onNav={navigate} onSave={handleSaveQuiz} onDone={handleQuizBuilderDone} initialQuiz={editingQuiz} onEditQuiz={handleEditQuiz} isReal={!!user?._isReal} tenantId={currentOrg?.id ?? null} role={currentUser?.role ?? null} />;
       case "rankd-name-entry":  return <RankdNameEntryScreen onNav={navigate} pin={lobbyPin} sessionName={lobbySessionName} onConfirm={handleEnterName} defaultName={userProfile.nickname?.trim() || user?.name || ""} defaultAvatar={userProfile.avatarEmoji} />;
-      case "rankd-lobby":       return <RankdLobbyScreen onNav={navigate} pin={lobbyPin} playerName={lobbyPlayerName} playerEmoji={lobbyPlayerEmoji} sessionName={lobbySessionName} role={gameRole} sessions={sessions} currentUser={currentUser} onGameStart={handleGameStart} chPlayers={chPlayers} broadcast={broadcast} trackPlayerPresence={trackPlayerPresence} playerId={gamePlayerId} chMsg={chMsg} onHostEnd={async () => {
+      case "rankd-lobby":       return <RankdLobbyScreen onNav={navigate} pin={lobbyPin} sessionDbId={activeGameSessionDbId} playerName={lobbyPlayerName} playerEmoji={lobbyPlayerEmoji} sessionName={lobbySessionName} role={gameRole} sessions={sessions} currentUser={currentUser} onGameStart={handleGameStart} chPlayers={chPlayers} broadcast={broadcast} trackPlayerPresence={trackPlayerPresence} playerId={gamePlayerId} chMsg={chMsg} onHostEnd={async () => {
         // Ending from the LOBBY (before gameplay) is a CANCELLATION, not a
         // completed game. Durable cancellation is the source of truth and MUST
         // succeed before we tell anyone the game ended: cancel the DB row and
@@ -25551,7 +26284,7 @@ export default function App() {
       case "settings":
         if (isSuperAdmin)  return <RoleAccessScreen rolePermissions={rolePermissions} onSave={handleSaveRolePermissions} currentOrg={currentOrg} />;
         if (isOrgAdmin)    return <OrgAdminSettingsScreen rolePermissions={rolePermissions} onSaveRolePermissions={handleSaveRolePermissions} currentOrg={currentOrg} orgId={user.orgId} orgName={currentOrg?.name ?? "Your Team"} orgUsers={orgUsers} onAddUser={handleAddUser} readinessThreshold={readinessThreshold} onSaveReadinessThreshold={handleSaveReadinessThreshold} />;
-        return <UserSettingsScreen user={user} profile={userProfile} notifPrefs={notifPrefs} onSaveProfile={handleSaveProfile} onSaveNotifs={handleSaveNotifs} currentOrg={currentOrg} onSignOut={async () => { if (user?._isReal) { await supabase.auth.signOut(); /* SIGNED_OUT handler redirects */ } else { setCurrentUser(null); setLastSeenAt(null); setNewAssignmentCount(0); setPendingLessonId(null); setPendingCourseId(null); setPendingQuizId(null); setOrgs(INITIAL_ORGS); setOrgUsers(INITIAL_ORG_USERS); setQuizzesReady(false); setSessions(INITIAL_SESSIONS); setBattleCards(INITIAL_BATTLE_CARDS); clearLearnNavSessionState(); clearBattleCardDrafts(); window.location.replace("/login"); } }} />;
+        return <UserSettingsScreen user={user} profile={userProfile} notifPrefs={notifPrefs} onSaveProfile={handleSaveProfile} onSaveNotifs={handleSaveNotifs} currentOrg={currentOrg} onSignOut={async () => { if (user?._isReal) { await supabase.auth.signOut(); /* SIGNED_OUT handler redirects */ } else { setCurrentUser(null); setLastSeenAt(null); setNewAssignmentCount(0); setPendingLessonId(null); setPendingCourseId(null); setPendingQuizId(null); setOrgs(INITIAL_ORGS); setOrgUsers(INITIAL_ORG_USERS); setQuizzesReady(false); setSessions(INITIAL_SESSIONS); setBattleCards(INITIAL_BATTLE_CARDS); clearLearnNavSessionState(); clearActiveGameContext(); clearBattleCardDrafts(); window.location.replace("/login"); } }} />;
       default:                  return <HomeScreen user={user} />;
     }
   };
@@ -25698,6 +26431,7 @@ export default function App() {
                     setBattleCards(INITIAL_BATTLE_CARDS);
 
                     clearLearnNavSessionState();
+                    clearActiveGameContext();
                     clearBattleCardDrafts();
                     window.location.replace("/login");
                   }
