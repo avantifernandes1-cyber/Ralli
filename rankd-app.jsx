@@ -2006,6 +2006,7 @@ const PURPLE = "#8B5CF6";
 function KahootHostView({ onNav, sessionName, pin, sessionDbId, demoMode, tenantId, questions, broadcast, chAnswers, chPlayers, chStatus, onGameEnd, setChAnswers }) {
   const mobile       = useMobile();
   const toast        = useToast(); // in-scope notifications (scoreboard-publish failure, etc.)
+  const publishingRef = useRef(false); // client double-click guard for scoreboard publication (DB idempotency is authoritative)
   const [phase,      setPhase]      = useState("countdown");
   const [qIdx,       setQIdx]       = useState(0);
   const [cdNum,      setCdNum]      = useState(3);
@@ -3609,18 +3610,28 @@ function KahootHostView({ onNav, sessionName, pin, sessionDbId, demoMode, tenant
               setPhase("scoreboard"); persistPhase("scoreboard", qIdx, false);
               return;
             }
-            // REAL (081): durably PUBLISH first. The RPC validates state/identity, resolves names +
-            // rank server-side, persists phase='scoreboard' + payload, and returns the canonical
-            // board — we broadcast/render THAT. On failure: stay in reveal (retryable), no broadcast.
-            const minScores = scores.map(p => ({ id: p.id, score: p.score ?? 0, delta: p.delta ?? 0 }));
-            const { data: board, error } = await publishScoreboard(sessionDbId, qIdx, minScores);
-            if (error || !board) {
-              console.error("[ralli:host] publishScoreboard failed:", error);
-              try { toast.error("Couldn't publish the scoreboard — please try again."); } catch { /* non-fatal */ }
-              return;
+            // REAL (081): durably PUBLISH first (idempotent). The RPC validates state/identity,
+            // resolves names + rank server-side, persists phase='scoreboard' + payload, and returns
+            // the canonical board — we broadcast/render THAT. On failure: stay in reveal (retryable),
+            // no broadcast. Client in-flight guard prevents double-submit; a STABLE per-episode key
+            // (session:q<idx>) makes any retry after a lost response return the same saved board
+            // without a second version bump (DB idempotency is authoritative).
+            if (publishingRef.current) return;
+            publishingRef.current = true;
+            try {
+              const minScores = scores.map(p => ({ id: p.id, score: p.score ?? 0, delta: p.delta ?? 0 }));
+              const publishKey = `${sessionDbId}:q${qIdx}`;
+              const { data: board, error } = await publishScoreboard(sessionDbId, qIdx, minScores, publishKey);
+              if (error || !board) {
+                console.error("[ralli:host] publishScoreboard failed:", error);
+                try { toast.error("Couldn't publish the scoreboard — please try again."); } catch { /* non-fatal */ }
+                return; // reveal preserved; same key can retry
+              }
+              broadcast({ type: GM.SCOREBOARD, board, isFinal: isFinalQ });
+              setPhase("scoreboard"); // RPC already persisted phase + payload server-side
+            } finally {
+              publishingRef.current = false;
             }
-            broadcast({ type: GM.SCOREBOARD, board, isFinal: isFinalQ });
-            setPhase("scoreboard"); // RPC already persisted phase + payload server-side
           }} style={{ padding: "14px 44px", borderRadius: 18, border: "none", background: C.orange, color: "#fff", fontWeight: 900, fontSize: 15, cursor: "pointer", boxShadow: "0 0 40px rgba(253,191,36,0.4)" }}>
             Reveal Leaderboard →
           </button>

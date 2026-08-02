@@ -27,8 +27,9 @@ ok("no sessionDbId → session check skipped (still applies)", decide(payload(),
 
 // ── (2) gameService.publishScoreboard ────────────────────────────────────────
 const sgs = gameSvc.slice(gameSvc.indexOf("export async function publishScoreboard"), gameSvc.indexOf("export async function publishScoreboard") + 900);
-ok("publishScoreboard calls rpc_publish_scoreboard with session/qidx/scores",
-   /supabase\.rpc\("rpc_publish_scoreboard",\s*\{[\s\S]*p_session_id: sessionId,\s*p_qidx: qIdx,\s*p_scores: minimal/.test(sgs));
+ok("publishScoreboard calls rpc_publish_scoreboard with session/qidx/scores/publish_key",
+   /supabase\.rpc\("rpc_publish_scoreboard",\s*\{[\s\S]*p_session_id: sessionId,\s*p_qidx: qIdx,\s*p_scores: minimal,\s*p_publish_key: publishKey/.test(sgs));
+ok("publishScoreboard accepts a publishKey param (idempotency)", /export async function publishScoreboard\(sessionId, qIdx, scores, publishKey\)/.test(sgs));
 ok("publishScoreboard sends only minimal {id,score,delta} (no client names/avatars)",
    /minimal = \(scores \?\? \[\]\)\.map\(s => \(\{[\s\S]*id: s\.id, score: Number\(s\.score[\s\S]*delta: Number\(s\.delta/.test(sgs));
 ok("publishScoreboard returns { data, error }", /return \{ data, error \};/.test(sgs));
@@ -38,8 +39,10 @@ ok("rankd-app imports publishScoreboard", /publishScoreboard,/.test(app));
 const host = app.slice(app.indexOf("function KahootHostView("), app.indexOf("function KahootPlayerView("));
 ok("KahootHostView has toast in scope (useToast) — host publish-failure toast cannot throw",
    /function KahootHostView\([\s\S]{0,200}const toast\s*=\s*useToast\(\)/.test(host));
-ok("host scoreboard button AWAITs publishScoreboard for a real game",
-   /const \{ data: board, error \} = await publishScoreboard\(sessionDbId, qIdx, minScores\)/.test(host));
+ok("host scoreboard button AWAITs publishScoreboard with a stable per-episode publish key",
+   /const publishKey = `\$\{sessionDbId\}:q\$\{qIdx\}`;[\s\S]{0,120}await publishScoreboard\(sessionDbId, qIdx, minScores, publishKey\)/.test(host));
+ok("host has an in-flight publish guard (double-click safe; DB idempotency authoritative)",
+   /const publishingRef = useRef\(false\)/.test(host) && /if \(publishingRef\.current\) return;[\s\S]{0,80}publishingRef\.current = true;/.test(host));
 ok("host broadcasts the RETURNED canonical board (not its raw input)",
    /broadcast\(\{ type: GM\.SCOREBOARD, board, isFinal: isFinalQ \}\)/.test(host));
 ok("host demo path stays client-only (broadcasts raw scores, no RPC)",

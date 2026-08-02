@@ -108,17 +108,22 @@ export async function startGameSession(sessionId) {
  * ordering, bumps scoreboard_version, and atomically persists phase='scoreboard' + payload. It
  * returns the EXACT canonical payload saved (the host must broadcast/render THAT, not its input).
  *
+ * Idempotent: a stable `publishKey` for the exact (session, question) scoreboard episode makes a
+ * retry after a lost success response return the already-persisted board unchanged (no double
+ * increment); a different key can never replace an existing board (migration 081).
+ *
  * @param {string} sessionId - game_sessions.id (UUID)
  * @param {number} qIdx - the current question index the scoreboard is for
  * @param {Array<{id:string, score:number, delta?:number}>} scores - minimal per-player inputs
+ * @param {string} publishKey - stable per-episode idempotency key (NOT trusted for auth)
  * @returns {Promise<{ data: Object|null, error: Object|null }>} data = canonical scoreboard payload
  */
-export async function publishScoreboard(sessionId, qIdx, scores) {
+export async function publishScoreboard(sessionId, qIdx, scores, publishKey) {
   const minimal = (scores ?? []).map(s => ({
     id: s.id, score: Number(s.score ?? 0), delta: Number(s.delta ?? 0),
   }));
   const { data, error } = await supabase.rpc("rpc_publish_scoreboard", {
-    p_session_id: sessionId, p_qidx: qIdx, p_scores: minimal,
+    p_session_id: sessionId, p_qidx: qIdx, p_scores: minimal, p_publish_key: publishKey,
   });
   return { data, error };
 }

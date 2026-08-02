@@ -31,7 +31,7 @@ ALTER TABLE public.game_sessions
 --    it validates state + identity, resolves names/avatars server-side, computes canonical rank/tie
 --    ordering, monotonically bumps the version, and atomically persists phase + payload + metadata.
 --    p_scores: jsonb array of minimal inputs [{ "id": <player_id>, "score": <num>, "delta": <num?> }].
-CREATE OR REPLACE FUNCTION public.rpc_publish_scoreboard(p_session_id uuid, p_qidx integer, p_scores jsonb)
+CREATE OR REPLACE FUNCTION public.rpc_publish_scoreboard(p_session_id uuid, p_qidx integer, p_scores jsonb, p_publish_key text)
 RETURNS jsonb
 LANGUAGE plpgsql
 SECURITY DEFINER
@@ -43,61 +43,85 @@ DECLARE
   v_new_version bigint;
   v_now timestamptz := now();
   v_entries jsonb;
-  v_unknown int;
+  v_bad int;
+  v_total int;
+  v_distinct int;
   v_payload jsonb;
 BEGIN
   IF v_uid IS NULL THEN RAISE EXCEPTION 'authentication required' USING ERRCODE = 'insufficient_privilege'; END IF;
   IF p_session_id IS NULL THEN RAISE EXCEPTION 'session id required' USING ERRCODE = 'no_data_found'; END IF;
+  -- The idempotency key is NOT trusted for authorization; it only identifies a publish episode.
+  IF p_publish_key IS NULL OR length(p_publish_key) < 8 OR length(p_publish_key) > 200 THEN
+    RAISE EXCEPTION 'publish key required (8-200 chars)' USING ERRCODE = 'check_violation';
+  END IF;
   IF p_scores IS NULL OR jsonb_typeof(p_scores) <> 'array' THEN
     RAISE EXCEPTION 'scores array required' USING ERRCODE = 'check_violation';
   END IF;
-  SELECT * INTO v_s FROM public.game_sessions WHERE id = p_session_id;
+  -- LOCK the exact session row FIRST. This serializes publish-vs-publish and publish-vs-phase/end/
+  -- cancel on the one canonical row (every mutator locks this same row → one consistent order, no
+  -- deadlock), so the idempotency + state checks below evaluate a stable snapshot.
+  SELECT * INTO v_s FROM public.game_sessions WHERE id = p_session_id FOR UPDATE;
   IF v_s.id IS NULL THEN RAISE EXCEPTION 'session not found' USING ERRCODE = 'no_data_found'; END IF;
-  -- Exact-host / authorized-manager under the existing Ralli Live authorization contract.
   IF NOT public.ralli_can_manage_session(v_s.host_id, v_s.tenant_id) THEN
     RAISE EXCEPTION 'not authorized' USING ERRCODE = 'insufficient_privilege';
   END IF;
-  -- Demo sessions are client-only — never server-persist a demo scoreboard.
   IF v_s.demo_mode IS DISTINCT FROM false THEN
     RAISE EXCEPTION 'demo session scoreboard is not server-persisted' USING ERRCODE = 'check_violation';
   END IF;
-  -- Must be an in-progress game in a pre-scoreboard live phase.
+
+  -- IDEMPOTENCY: already published THIS episode (same qidx + key) → return the stored canonical
+  -- board unchanged, WITHOUT bumping the version. Covers a lost success response and a double-click.
+  IF v_s.phase = 'scoreboard' AND v_s.live_scoreboard IS NOT NULL
+     AND (v_s.live_scoreboard->>'q_idx')::int = p_qidx
+     AND (v_s.live_scoreboard->>'publish_key') = p_publish_key THEN
+    RETURN v_s.live_scoreboard;
+  END IF;
+  -- Already published (any other key / qidx) → a DIFFERENT key can never replace the existing board.
+  IF v_s.phase = 'scoreboard' AND v_s.live_scoreboard IS NOT NULL THEN
+    RAISE EXCEPTION 'scoreboard already published for this episode' USING ERRCODE = 'check_violation';
+  END IF;
+
+  -- Fresh publish: in-progress game in a pre-scoreboard live phase, matching question index.
   IF v_s.status <> 'started' THEN
     RAISE EXCEPTION 'session not in progress (status=%)', v_s.status USING ERRCODE = 'check_violation';
   END IF;
   IF v_s.phase IS DISTINCT FROM 'question' AND v_s.phase IS DISTINCT FROM 'reveal' AND v_s.phase IS DISTINCT FROM 'open-review' THEN
     RAISE EXCEPTION 'session not in a scoreboard-publishable phase (phase=%)', v_s.phase USING ERRCODE = 'check_violation';
   END IF;
-  -- Supplied question index must match the session's current question.
   IF p_qidx IS DISTINCT FROM v_s.current_question_index THEN
     RAISE EXCEPTION 'question index mismatch (supplied=%, current=%)', p_qidx, v_s.current_question_index USING ERRCODE = 'check_violation';
   END IF;
 
-  -- Reject any supplied id that is not a participant of THIS exact session (cross-session/unknown).
-  SELECT count(*) INTO v_unknown
-  FROM jsonb_array_elements(p_scores) e
-  WHERE NOT EXISTS (
-    SELECT 1 FROM public.game_session_participants gsp
-    WHERE gsp.session_id = v_s.id AND gsp.player_id = (e->>'id')
-  );
-  IF v_unknown > 0 THEN
-    RAISE EXCEPTION 'scoreboard contains % participant id(s) not in this session', v_unknown USING ERRCODE = 'check_violation';
-  END IF;
+  -- Input hardening: each element must be an object with a text id and a NON-NEGATIVE INTEGER score
+  -- (and non-negative integer delta if present) within a sane bound. Rejects malformed / non-numeric /
+  -- fractional / negative / overflow. Client-supplied name/avatar/rank are IGNORED (never read).
+  SELECT count(*) INTO v_bad FROM jsonb_array_elements(p_scores) e
+   WHERE jsonb_typeof(e) <> 'object'
+      OR (e->>'id') IS NULL
+      OR jsonb_typeof(e->'score') <> 'number'
+      OR (e->>'score')::numeric < 0
+      OR (e->>'score')::numeric <> floor((e->>'score')::numeric)
+      OR (e->>'score')::numeric > 1000000000000000
+      OR (e ? 'delta' AND jsonb_typeof(e->'delta') = 'number' AND
+          ((e->>'delta')::numeric < 0 OR (e->>'delta')::numeric <> floor((e->>'delta')::numeric) OR (e->>'delta')::numeric > 1000000000000000))
+      OR (e ? 'delta' AND jsonb_typeof(e->'delta') <> 'number' AND jsonb_typeof(e->'delta') <> 'null');
+  IF v_bad > 0 THEN RAISE EXCEPTION 'malformed score input (% bad row(s))', v_bad USING ERRCODE = 'check_violation'; END IF;
+  -- No duplicate player ids (would produce duplicate canonical rows).
+  SELECT count(*), count(DISTINCT (e->>'id')) INTO v_total, v_distinct FROM jsonb_array_elements(p_scores) e;
+  IF v_total <> v_distinct THEN RAISE EXCEPTION 'duplicate player ids in scoreboard' USING ERRCODE = 'check_violation'; END IF;
+  -- Every id must be a participant of THIS exact session (cross-session/unknown/malformed → reject).
+  SELECT count(*) INTO v_bad FROM jsonb_array_elements(p_scores) e
+   WHERE NOT EXISTS (SELECT 1 FROM public.game_session_participants gsp WHERE gsp.session_id = v_s.id AND gsp.player_id = (e->>'id'));
+  IF v_bad > 0 THEN RAISE EXCEPTION 'scoreboard contains % participant id(s) not in this session', v_bad USING ERRCODE = 'check_violation'; END IF;
 
-  -- Canonical entries: names/avatars resolved server-side from the session participant record;
-  -- competition rank/tie ordering (equal scores share a rank; next rank skips) by score desc, name asc.
+  -- Canonical entries: names/avatars resolved server-side; competition rank/tie by score desc, name asc.
   WITH input AS (
-    SELECT (e->>'id') AS id,
-           COALESCE((e->>'score')::numeric, 0) AS score,
-           COALESCE((e->>'delta')::numeric, 0) AS delta
+    SELECT (e->>'id') AS id, (e->>'score')::bigint AS score, COALESCE((e->>'delta')::bigint, 0) AS delta
     FROM jsonb_array_elements(p_scores) e
   ),
   resolved AS (
-    SELECT gsp.player_id AS id, gsp.name AS name, gsp.emoji AS emoji,
-           i.score::bigint AS score, i.delta::bigint AS delta
-    FROM input i
-    JOIN public.game_session_participants gsp
-      ON gsp.session_id = v_s.id AND gsp.player_id = i.id
+    SELECT gsp.player_id AS id, gsp.name AS name, gsp.emoji AS emoji, i.score, i.delta
+    FROM input i JOIN public.game_session_participants gsp ON gsp.session_id = v_s.id AND gsp.player_id = i.id
   ),
   ranked AS (
     SELECT id, name, emoji, score, delta,
@@ -105,23 +129,18 @@ BEGIN
            row_number() OVER (ORDER BY score DESC, lower(coalesce(name,'')) ASC, id ASC) AS ord
     FROM resolved
   )
-  SELECT jsonb_agg(jsonb_build_object(
-           'id', id, 'name', name, 'emoji', emoji, 'score', score, 'delta', delta, 'rank', rank)
-         ORDER BY ord)
-  INTO v_entries
-  FROM ranked;
+  SELECT jsonb_agg(jsonb_build_object('id', id, 'name', name, 'emoji', emoji, 'score', score, 'delta', delta, 'rank', rank) ORDER BY ord)
+  INTO v_entries FROM ranked;
   v_entries := COALESCE(v_entries, '[]'::jsonb);
 
   v_new_version := v_s.scoreboard_version + 1;
   v_payload := jsonb_build_object(
-    'session_id', v_s.id, 'q_idx', v_s.current_question_index,
-    'version', v_new_version, 'published_at', v_now, 'entries', v_entries);
+    'session_id', v_s.id, 'q_idx', v_s.current_question_index, 'version', v_new_version,
+    'published_at', v_now, 'publish_key', p_publish_key, 'entries', v_entries);
 
   UPDATE public.game_sessions
-     SET phase = 'scoreboard',
-         live_scoreboard = v_payload,
-         scoreboard_version = v_new_version,
-         scoreboard_published_at = v_now
+     SET phase = 'scoreboard', live_scoreboard = v_payload,
+         scoreboard_version = v_new_version, scoreboard_published_at = v_now
    WHERE id = v_s.id;
 
   RETURN v_payload;
@@ -142,7 +161,7 @@ DECLARE v_uid uuid := auth.uid(); v_s public.game_sessions;
 BEGIN
   IF v_uid IS NULL THEN RAISE EXCEPTION 'authentication required' USING ERRCODE = 'insufficient_privilege'; END IF;
   IF p_session_id IS NULL THEN RAISE EXCEPTION 'session id required' USING ERRCODE = 'no_data_found'; END IF;
-  SELECT * INTO v_s FROM public.game_sessions WHERE id = p_session_id;
+  SELECT * INTO v_s FROM public.game_sessions WHERE id = p_session_id FOR UPDATE;   -- consistent session-lock order
   IF v_s.id IS NULL THEN RAISE EXCEPTION 'session not found' USING ERRCODE = 'no_data_found'; END IF;
   IF NOT public.ralli_can_manage_session(v_s.host_id, v_s.tenant_id) THEN
     RAISE EXCEPTION 'not authorized' USING ERRCODE = 'insufficient_privilege';
@@ -176,7 +195,7 @@ DECLARE v_uid uuid := auth.uid(); v_s public.game_sessions;
 BEGIN
   IF v_uid IS NULL THEN RAISE EXCEPTION 'authentication required' USING ERRCODE = 'insufficient_privilege'; END IF;
   IF p_session_id IS NULL THEN RETURN jsonb_build_object('ok', false, 'matched', false); END IF;
-  SELECT * INTO v_s FROM public.game_sessions WHERE id = p_session_id;
+  SELECT * INTO v_s FROM public.game_sessions WHERE id = p_session_id FOR UPDATE;   -- consistent session-lock order
   IF v_s.id IS NULL THEN RAISE EXCEPTION 'session not found' USING ERRCODE = 'no_data_found'; END IF;
   IF NOT public.ralli_can_manage_session(v_s.host_id, v_s.tenant_id) THEN
     RAISE EXCEPTION 'not authorized' USING ERRCODE = 'insufficient_privilege';
@@ -211,7 +230,7 @@ DECLARE v_uid uuid := auth.uid(); v_s public.game_sessions;
 BEGIN
   IF v_uid IS NULL THEN RAISE EXCEPTION 'authentication required' USING ERRCODE = 'insufficient_privilege'; END IF;
   IF p_session_id IS NULL THEN RAISE EXCEPTION 'session id required' USING ERRCODE = 'no_data_found'; END IF;
-  SELECT * INTO v_s FROM public.game_sessions WHERE id = p_session_id;
+  SELECT * INTO v_s FROM public.game_sessions WHERE id = p_session_id FOR UPDATE;   -- consistent session-lock order
   IF v_s.id IS NULL THEN RAISE EXCEPTION 'session not found' USING ERRCODE = 'no_data_found'; END IF;
   IF NOT public.ralli_can_manage_session(v_s.host_id, v_s.tenant_id) THEN
     RAISE EXCEPTION 'not authorized' USING ERRCODE = 'insufficient_privilege';
@@ -289,7 +308,7 @@ AS $function$
 DECLARE v_s public.game_sessions;
 BEGIN
   IF auth.uid() IS NULL THEN RAISE EXCEPTION 'authentication required' USING ERRCODE = 'insufficient_privilege'; END IF;
-  SELECT * INTO v_s FROM public.game_sessions WHERE id = p_session_id;
+  SELECT * INTO v_s FROM public.game_sessions WHERE id = p_session_id;   -- STABLE read (host restore); no lock
   IF v_s.id IS NULL THEN RAISE EXCEPTION 'session not found' USING ERRCODE = 'no_data_found'; END IF;
   IF NOT public.ralli_can_manage_session(v_s.host_id, v_s.tenant_id) THEN
     RAISE EXCEPTION 'not authorized' USING ERRCODE = 'insufficient_privilege';
@@ -321,8 +340,8 @@ $function$;
 -- (authenticated/service_role). The new rpc_publish_scoreboard is host/manager-authorized inside
 -- the body; grant EXECUTE to authenticated (anon has no host role); Supabase default privileges also
 -- apply. No table grant, RLS policy, or client privilege beyond this is added.
-REVOKE EXECUTE ON FUNCTION public.rpc_publish_scoreboard(uuid, integer, jsonb) FROM PUBLIC;
-GRANT EXECUTE ON FUNCTION public.rpc_publish_scoreboard(uuid, integer, jsonb) TO authenticated, service_role;
+REVOKE EXECUTE ON FUNCTION public.rpc_publish_scoreboard(uuid, integer, jsonb, text) FROM PUBLIC;
+GRANT EXECUTE ON FUNCTION public.rpc_publish_scoreboard(uuid, integer, jsonb, text) TO authenticated, service_role;
 
 -- No DML: existing sessions keep live_scoreboard=NULL, scoreboard_version=0 and degrade honestly
 -- (the client shows the neutral empty state only when neither a durable nor a realtime scoreboard
