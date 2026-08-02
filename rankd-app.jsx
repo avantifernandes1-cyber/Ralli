@@ -24804,8 +24804,48 @@ export default function App() {
           // so capturing this now avoids racing our own write of the default
           // "home" state into sessionStorage ahead of the real restore value.
           const restoredScreen = getRestorableScreen();
+
+          // ── Host active-game refresh reconnect (Ralli Live host recovery) ──────────
+          // A HOST (admin-type profile; gameRole is derived "admin") who refreshes
+          // mid-game — e.g. while the intermediate scoreboard is visible — must re-enter
+          // the EXACT active session, not fall back to the Ralli Live hub / Active
+          // Sessions list. The learner path (below) already does this via the learner-safe
+          // RPC; the host uses rpc_host_session_restore (authorizes the exact host /
+          // same-tenant orgAdmin / ralli_admin). We restore only the session id + screen
+          // here; RankdGameScreen's own restore effect then reconstructs the exact phase
+          // and durable scoreboard and never advances gameplay. Terminal / cross-user /
+          // invalid context is dropped, so a refresh can never re-enter a finished game.
+          let hostReconnected = false;
+          if (isRalliAdmin(profile.role) || profile.role === "orgAdmin") {
+            const hostCtx = readActiveGameContext();
+            if (hostCtx && hostCtx.role === "admin" && hostCtx.userId === profile.id) {
+              try {
+                const { session } = await getSessionRestoreData(hostCtx.sessionDbId);
+                const s = session?.data;
+                const terminal = !s || s.status === "completed" || s.status === "canceled" || s.phase === "ended";
+                if (s && !terminal) {
+                  setActiveGameSessionDbId(hostCtx.sessionDbId);
+                  setActiveGameIsDemo(false);
+                  setLobbyPin(s.pin ?? null);
+                  setLobbySessionName(s.name ?? null);
+                  setLobbyPlayerName(hostCtx.playerName ?? profile.name ?? null);
+                  setLobbyPlayerEmoji(hostCtx.playerEmoji ?? null);
+                  // Live (started or past waiting) → game view; still waiting → lobby.
+                  const live = s.status === "started" || (s.phase && s.phase !== "waiting");
+                  setScreen(live ? "rankd-game" : "rankd-lobby");
+                  hostReconnected = true;
+                } else {
+                  clearActiveGameContext(); // completed / canceled / ended → never restore
+                }
+              } catch (e) {
+                console.error("[ralli:game] host active-game reconnect failed:", e);
+                clearActiveGameContext(); // denied / not host / cross-tenant → drop context
+              }
+            }
+          }
+
           if (isRalliAdmin(profile.role)) {
-            setScreen(restoredScreen ?? defaultScreenForRestore(true));
+            if (!hostReconnected) setScreen(restoredScreen ?? defaultScreenForRestore(true));
             setOrgs([]); // clear seed/mock orgs — ralli admin sees only real Supabase tenants
             supabase.from("tenants").select("*").order("created_at", { ascending: false })
               .then(({ data }) => { setOrgs(data ? data.map(t => ({ ...t, adminEmail: t.admin_email, seatLimit: t.seat_limit ?? 10, seats: t.seat_limit ?? 10, createdAt: t.created_at?.split("T")[0], updatedAt: t.updated_at?.split("T")[0] })) : []); });
@@ -24816,11 +24856,14 @@ export default function App() {
             // only fall back to Home/Leadership Dashboard if there isn't one.
             // Team Settings is never the fallback — only reachable by restoring
             // a screen the manager intentionally navigated to before refreshing.
-            if (profile.orgId) {
-              const { data: tenant } = await supabase.from("tenants").select("status").eq("id", profile.orgId).single();
-              setScreen(tenant?.status === "onboarding" ? "org-setup" : (restoredScreen ?? defaultScreenForRestore(false)));
-            } else {
-              setScreen(restoredScreen ?? defaultScreenForRestore(false));
+            // Skipped entirely when a host game was just reconnected above.
+            if (!hostReconnected) {
+              if (profile.orgId) {
+                const { data: tenant } = await supabase.from("tenants").select("status").eq("id", profile.orgId).single();
+                setScreen(tenant?.status === "onboarding" ? "org-setup" : (restoredScreen ?? defaultScreenForRestore(false)));
+              } else {
+                setScreen(restoredScreen ?? defaultScreenForRestore(false));
+              }
             }
           } else {
             // Standard user (rep). FIRST try to restore an ACTIVE Ralli Live game the
@@ -25117,14 +25160,16 @@ export default function App() {
   const { chPlayers, chAnswers, setChAnswers, chMsg, broadcast, chStatus, trackPlayerPresence } = useGameChannel(gameChannelKey, gameRole);
 
   // Persist minimal active-game reconnect context (see readActiveGameContext) while
-  // an authenticated learner is in a REAL game, so a page refresh restores them into
-  // the exact same game. Never clears here — that would wipe the context during the
-  // pre-auth boot render; clearing is explicit (leave / sign-out / game end / invalid
-  // restore). Validation on restore rejects anything stale, completed, or cross-user.
+  // an authenticated HOST or learner is in a REAL game, so a page refresh restores them
+  // into the exact same game. The stored `role` selects the restore RPC on boot: a host
+  // ("admin") re-enters via rpc_host_session_restore, a learner ("user") via the
+  // learner-safe RPC. Never clears here — that would wipe the context during the pre-auth
+  // boot render; clearing is explicit (leave / sign-out / game end / invalid restore).
+  // Validation on restore rejects anything stale, completed, or cross-user.
   useEffect(() => {
     const inRealGame = !!currentUser?._isReal
       && !!currentUser?.id
-      && gameRole === "user"
+      && (gameRole === "user" || gameRole === "admin")
       && (screen === "rankd-game" || screen === "rankd-lobby")
       && activeGameSessionDbId != null
       && !activeGameIsDemo;
@@ -25132,6 +25177,7 @@ export default function App() {
       writeActiveGameContext({
         userId:      currentUser.id,
         sessionDbId: activeGameSessionDbId,
+        role:        gameRole,   // "admin" (host) | "user" (learner) — selects the restore RPC on boot
         playerName:  lobbyPlayerName ?? currentUser.name ?? null,
         playerEmoji: lobbyPlayerEmoji ?? null,
       });
