@@ -1284,3 +1284,74 @@ snapshot; completed historical results intact; refresh does not reopen canceled 
 applied-migration record is now committed to the branch. Production migration 083 remains applied
 exactly once (version `20260801214829`) and byte-identical to the committed file (SHA
 `d7d1d65e…88f6`); nothing rewritten. Migrations 072/081/082 remain unapplied; no merge to main.
+
+## 2026-08-02 — Ralli Live durable scoreboard recovery (081)
+
+Branch `feature/ralli-live-leaderboard` @ HEAD `6961baf` (081 migration + shared client recovery
+module committed in `6961baf`). Applied via exactly one controlled `apply_migration` call under
+Strategy A. SHA-256 re-confirmed against the committed HEAD blob immediately before application; the
+production-state pre-apply gate confirmed 081 absent, the three columns + publish RPC absent, latest
+migration `083`, 072/082 absent, and all five superseded RPCs at their approved
+`SECURITY DEFINER`/`search_path=''`/`{postgres,authenticated,service_role}` state.
+
+| Order | Prod version (ledger) | Prod name | Git file | Commit | SQL SHA-256 | Applied (UTC) | Verification |
+|---|---|---|---|---|---|---|---|
+| 45 | `20260802010902` | 081_ralli_live_scoreboard_recovery | supabase/migrations/081_ralli_live_scoreboard_recovery.sql | 6961baf | 0278c1c706d455355b0b0025c4d101294c546020f534d57b0f494318f5bbb489 | 2026-08-02 01:09:02 | PASS — see below |
+
+**Structural verification (read-only, post-apply):** ledger has exactly **one** 081 row (version
+`20260802010902`). `game_sessions` gained the three additive columns: `live_scoreboard jsonb` (NULL),
+`scoreboard_version bigint NOT NULL DEFAULT 0`, `scoreboard_published_at timestamptz` (NULL). New
+`rpc_publish_scoreboard(uuid,integer,jsonb,text)` present. All six RPCs (`rpc_publish_scoreboard`,
+`rpc_set_session_phase`, `rpc_end_session`, `rpc_cancel_session`, `rpc_player_session_restore`,
+`rpc_host_session_restore`) are `SECURITY DEFINER`, `search_path=''`, owner `postgres`, ACL
+`{postgres,authenticated,service_role}`. Publish-RPC ACL: `has_function_privilege` anon = **false**,
+authenticated = true, service_role = true (no `anon=X` grant; PUBLIC absent) — the explicit
+`REVOKE … FROM anon` held against Supabase default privileges.
+
+**Existing-row / collateral verification (read-only, post-apply):** `game_sessions` row count **84**,
+unchanged; all rows `live_scoreboard IS NULL`, `scoreboard_version = 0`, `scoreboard_published_at IS
+NULL` (no DML, no backfill). RLS unchanged (enabled; 6 policies on `game_sessions`); anon table grants
+on `game_sessions` unchanged (7, pre-existing). Latest three prod migrations:
+`20260802010902` (081), `20260801214829` (083), `20260731010835`. Migrations **072 and 082 remain
+unapplied**.
+
+**Behavioral verification (production, single atomic transaction against the LIVE applied RPCs,
+ephemeral fixtures, aborted → zero residual rows):** LIVE PASS — host publish returns version 1 with
+two server-resolved entries; tie ranks preserved (both rank 1); null avatar preserved; no
+answer/solution/snapshot leak in the payload; same-key retry is idempotent (version stays 1, durable
+version 1); a different key after publication is rejected; learner restore returns the exact board
+(version 1); non-participant restore rejected; learner publish rejected (`insufficient_privilege`);
+short-key / negative / duplicate-id / unknown-participant / wrong-qidx / demo-session publishes all
+rejected (`check_violation`); moving to the next question (`countdown`) clears the durable board.
+Post-run residue check: 0 residual sessions/users/tenants, 84 rows, 0 mutated. Plus exact-artifact
+two-connection concurrency suite (Docker, prelude + the verbatim committed 081 file,
+`lock_timeout`/`statement_timeout` armed, server-side `pg_sleep` barriers) **16/16 PASS** across
+same-key idempotency / different-key loser-rejected / lost-response retry / wrong-phase-then-retry /
+publish-vs-countdown (board cleared) / publish-vs-end (board cleared, terminal) — no deadlock/timeout.
+
+**Application verification:** shared helper suite `scoreboardRecovery.test.mjs` **30/30**; full JS
+suite **18/18** (`src/lib/*.test.mjs`, incl. Ralli recovery, player-safe question, quiz-learner
+confidentiality, reveal-publish, zero-player-halt, eligibility, app declarations/hook-order); Vite
+build PASS (95 modules); trace/instrumentation scan clean (no `RALLI_HOST_LOBBY_CANCEL_TRACE` or
+debug markers in `rankd-app.jsx` / `scoreboardRecovery.js` / `gameService.js`).
+
+**Scope guardrails honored:** exactly one controlled `apply_migration` (no `db push` / `migration
+repair` / manual `schema_migrations` insert / edited text / second migration / fallback); no merge or
+push to main; migrations 072 and 082 remain unapplied; no Edge Function deployed; leaderboard UI
+remains hidden/unbuilt.
+
+Operator: applied by Claude Code via exactly one controlled `apply_migration` call under explicit user
+production approval. Ledger row 45. Production migration 081 is applied exactly once (version
+`20260802010902`), byte-identical to the committed file (SHA `0278c1c7…5bbb489`); nothing rewritten.
+
+**Live QA closure (2026-08-02):** two-device live QA on the branch preview passed — normal host and
+learner scoreboards; learner refresh; host refresh now automatically reopens the exact active session
+and restores the exact durable scoreboard with **no Resume click** and no gameplay advance;
+disconnect/rejoin, background/visibility, and missed-broadcast recovery; stale-response protection;
+previous-scoreboard invalidation; ended-session protection; all five question types; final leaderboard
+and analytics intact. One QA-side migration correction was **frontend-only** (client boot routing, no
+migration change): the host active-game refresh reconnect was previously learner-only, so a host
+refresh landed on the Ralli Live hub / Active Sessions list; corrected in commit `a94e763`
+(`rpc_host_session_restore`-based host reconnect on boot). Migration 081 itself is unchanged and
+remains applied exactly once. This applied-migration record is now committed to the branch (docs only;
+no merge). Migrations 072 and 082 remain unapplied.

@@ -36,9 +36,35 @@ in production; 072 intentionally unapplied. Completed in this slice:
   snapshot; completed historical sessions, snapshots, scores, and analytics remain intact.
   Concurrency-safe (quiz-row `FOR SHARE` locking, one consistent lock order) and idempotently
   corrected two pre-existing orphaned waiting sessions on apply.
+- Durable intermediate scoreboard recovery + host-refresh restore (migration 081, applied & verified
+  in production, version `20260802010902`; live two-device QA passed 2026-08-02). Scope: the Ralli
+  Live *intermediate* scoreboard only — NOT the integrated leaderboard, which remains unbuilt.
+  - The scoreboard the host publishes between questions is now **durably persisted server-side before
+    the realtime broadcast** (`rpc_publish_scoreboard`): broadcast stays the fast path, the database
+    is the recovery source. Identity (name/avatar/rank) is resolved server-side; the client can never
+    inject them. Publication is idempotent per episode (stable `publish_key`), session-row-locked, and
+    input-hardened; demo sessions are never server-persisted.
+  - A **missed scoreboard broadcast recovers from database state** — a learner who refreshes,
+    reconnects, backgrounds/returns, or refocuses reconstructs the *exact* published scoreboard
+    (same totals, rank, order, null-avatar name-only) instead of "No scores yet" / a "Hang tight"
+    dead-end. All recovery triggers (mount, SUBSCRIBED, visibility, focus) reconcile.
+  - **Stale responses cannot roll gameplay backward**: monotonic `scoreboard_version` + question-index
+    + terminal-phase guards drop an older/late payload; advancing to countdown/question clears the
+    previous durable scoreboard; ending or cancelling a game clears it and never restores an
+    intermediate scoreboard afterward.
+  - **Host refresh now reopens the exact active session automatically** (no Resume click, no gameplay
+    advance), then restores the exact durable scoreboard. Root cause of the earlier host-refresh
+    defect: the active-game reconnect context was **learner-only** (persisted for `gameRole === "user"`
+    and reconnected only in the standard-user boot branch), so a host fell through to the Ralli Live
+    hub / Active Sessions list. Fixed **frontend-only** (client boot routing) in commit `a94e763` —
+    the host now persists a role-tagged reconnect pointer and re-enters via the host-safe
+    `rpc_host_session_restore`; learner recovery, scoring, leaderboard, analytics, and migration 081
+    are unchanged.
+  - Verification: behavioral harness against the live applied RPCs, two-connection concurrency 16/16,
+    scoreboard helper unit tests 30/30, host-restore regression test, full JS suite, Vite build, and a
+    clean trace/debug-marker scan — all green.
 
 Still pending (Ralli Live NOT beta-complete):
-- Durable scoreboard recovery (future migration 081).
 - Server-authoritative verification foundation (migration 072, unapplied).
 - Integrated Ralli Live leaderboard.
 - Final direct-table SELECT revocation (future migration 082) — direct authenticated table SELECT
