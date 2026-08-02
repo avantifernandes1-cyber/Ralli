@@ -94,6 +94,7 @@ import {
   subscribeToTenantAssignments,
   isQuizPlayable,
 } from "./src/lib/contentService.js";
+import { scoreboardApplyDecision, durableRestoreDecision, scoreboardRows, scoreboardPublishKey } from "./src/lib/scoreboardRecovery.js";
 import { resolveAssignmentStatus, resolveLatestQuizAssignment, resolveLearnerAssignments, lessonUnlockState, isQualifyingEvent, daysUntilDue } from "./src/lib/assignmentEngine.js";
 import {
   metaListToCatalog,
@@ -154,21 +155,6 @@ const GM = {
   RESUME:        "RESUME",        // host broadcasts: game resumed
   FORCE_END:     "FORCE_END",     // host broadcasts: game ended early
 };
-
-// ── Shared durable-scoreboard apply decision (migration 081) ─────────────────
-// ONE canonical guard used by every learner scoreboard consumer (realtime SCOREBOARD, initial
-// restore, reconnect/SUBSCRIBED recovery, focus/visibility recovery) so ordering / normalization /
-// version logic is never duplicated. Returns the canonical entries + version to apply, or null to
-// ignore. Guards: valid payload shape, exact session match, and MONOTONIC version — a delayed DB
-// restore can never overwrite a newer realtime scoreboard (appliedVersion is a monotonic ref value,
-// not a stale render closure). Legacy null payloads → null (caller shows the neutral empty state).
-function scoreboardApplyDecision(payload, { sessionDbId = null, appliedVersion = -Infinity } = {}) {
-  if (!payload || typeof payload !== "object" || !Array.isArray(payload.entries)) return null;
-  if (sessionDbId && payload.session_id && String(payload.session_id) !== String(sessionDbId)) return null;
-  const version = Number(payload.version ?? 0);
-  if (Number.isFinite(appliedVersion) && version < appliedVersion) return null; // older than applied → drop
-  return { entries: payload.entries, version, qIdx: payload.q_idx ?? null };
-}
 
 const PLAYER_EMOJIS = ["🦊","🐯","🦁","🐺","🦅","🐬","🦄","🐉","🦋","🐙","🦖","🦈","🐸","🐼","🦝"];
 const PLAYER_COLORS = ["#F97316","#3B82F6","#10B981","#8B5CF6","#F43F5E","#EAB308","#0EA5E9","#EC4899","#84CC16","#6366F1","#F59E0B","#14B8A6","#EF4444","#A855F7","#22C55E"];
@@ -2112,8 +2098,15 @@ function KahootHostView({ onNav, sessionName, pin, sessionDbId, demoMode, tenant
         // Set phase after other state so countdown/question effects don't fire prematurely
         setPhase(safePhase);
 
-        // 4. Reconstruct cumulative scores from saved game_answers
-        if (answers.data?.length) {
+        // 081: if the host refreshed DURING the scoreboard, render the EXACT durable board it
+        // published (server order/rank/name/avatar preserved via the shared adapter) instead of
+        // recomputing from answers. durableRestoreDecision rejects any payload/column mismatch.
+        const hostBoard = durableRestoreDecision(sess);
+        if (hostBoard) setScores(scoreboardRows(hostBoard.entries));
+
+        // 4. Reconstruct cumulative scores from saved game_answers (skipped when a durable
+        //    scoreboard was restored above, so we never re-rank/overwrite the published board).
+        if (!hostBoard && answers.data?.length) {
           // Deduplicate: for each (player_id, question_idx) keep the highest-points row
           const best = new Map();
           for (const row of answers.data) {
@@ -3620,7 +3613,7 @@ function KahootHostView({ onNav, sessionName, pin, sessionDbId, demoMode, tenant
             publishingRef.current = true;
             try {
               const minScores = scores.map(p => ({ id: p.id, score: p.score ?? 0, delta: p.delta ?? 0 }));
-              const publishKey = `${sessionDbId}:q${qIdx}`;
+              const publishKey = scoreboardPublishKey(sessionDbId, qIdx);
               const { data: board, error } = await publishScoreboard(sessionDbId, qIdx, minScores, publishKey);
               if (error || !board) {
                 console.error("[ralli:host] publishScoreboard failed:", error);
@@ -3665,11 +3658,20 @@ function KahootPlayerView({ onNav, playerName, playerEmoji, playerId, pin, sessi
   // so it can never overwrite a newer realtime SCOREBOARD. ONE shared apply path for realtime,
   // initial restore, and reconnect/focus/visibility recovery.
   const appliedSbVersionRef = useRef(-Infinity);
-  const applyScoreboard = useCallback((payload) => {
-    const d = scoreboardApplyDecision(payload, { sessionDbId, appliedVersion: appliedSbVersionRef.current });
+  const applyScoreboard = useCallback((payload, { allowEqualVersion = false } = {}) => {
+    // The canonical decision guards session + current qIdx + local phase (terminal/next-question) +
+    // monotonic version, reading current values from refs (never a stale render closure). Entries are
+    // applied through the shared adapter (server order/rank/name/avatar preserved — no recompute).
+    const d = scoreboardApplyDecision(payload, {
+      sessionDbId,
+      currentQIdx: appliedQIdxRef.current >= 0 ? appliedQIdxRef.current : null,
+      localPhase: phaseRef.current,
+      appliedVersion: appliedSbVersionRef.current,
+      allowEqualVersion,
+    });
     if (!d) return false;
     appliedSbVersionRef.current = d.version;
-    setFinalScores(d.entries);
+    setFinalScores(scoreboardRows(d.entries));
     setPhase("scoreboard");
     return true;
   }, [sessionDbId]);
@@ -3772,10 +3774,12 @@ function KahootPlayerView({ onNav, playerName, playerEmoji, playerId, pin, sessi
 
       if (s.phase === "waiting")    return;                       // still in lobby
       if (s.phase === "scoreboard") {
-        // Durable recovery (081): reconstruct the exact published scoreboard from the session row
-        // (only present while phase='scoreboard'); the monotonic guard drops it if a newer realtime
-        // board already applied. Legacy null → neutral empty board (applyScoreboard is a no-op).
-        applyScoreboard(s.live_scoreboard);
+        // Durable recovery (081): apply the exact published board ONLY when it agrees with the
+        // durable columns (session/qIdx/version) — durableRestoreDecision rejects any mismatch
+        // instead of guessing. allowEqualVersion lets an initial mount reapply the same version.
+        // Track qIdx so a later delayed OLD scoreboard event is rejected. Legacy null → neutral empty.
+        appliedQIdxRef.current = s.current_question_index ?? appliedQIdxRef.current;
+        if (durableRestoreDecision(s)) applyScoreboard(s.live_scoreboard, { allowEqualVersion: true });
         setPhase("scoreboard");
         return;
       }

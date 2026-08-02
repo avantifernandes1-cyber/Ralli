@@ -341,6 +341,9 @@ $function$;
 -- the body; grant EXECUTE to authenticated (anon has no host role); Supabase default privileges also
 -- apply. No table grant, RLS policy, or client privilege beyond this is added.
 REVOKE EXECUTE ON FUNCTION public.rpc_publish_scoreboard(uuid, integer, jsonb, text) FROM PUBLIC;
+-- Supabase default privileges add a DIRECT anon EXECUTE grant on CREATE that REVOKE ... FROM PUBLIC
+-- does NOT remove — explicitly revoke it so an anonymous caller can never invoke this host RPC.
+REVOKE EXECUTE ON FUNCTION public.rpc_publish_scoreboard(uuid, integer, jsonb, text) FROM anon;
 GRANT EXECUTE ON FUNCTION public.rpc_publish_scoreboard(uuid, integer, jsonb, text) TO authenticated, service_role;
 
 -- No DML: existing sessions keep live_scoreboard=NULL, scoreboard_version=0 and degrade honestly
