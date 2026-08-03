@@ -416,6 +416,69 @@ BEGIN
 END;
 $function$;
 
+-- ══ PART 9 — IDEMPOTENT RESULT PERSISTENCE (host) ═══════════════════════════════
+-- The ONLY write path for game_answers in the 084 flow. Host-authorized; under the session row
+-- lock it DELETEs any existing rows for (session, question) and re-inserts exactly the supplied
+-- canonical rows — so a re-reveal / host reconnect is idempotent (no duplicate rows) and every
+-- persisted row is a canonical roster member (outside-roster rows are rejected). Correctness/points
+-- are the client-computed gameplay economy (unchanged); 072 verification still re-grades independently.
+CREATE OR REPLACE FUNCTION public.rpc_record_question_results(p_session_id uuid, p_question_idx integer, p_rows jsonb)
+RETURNS jsonb
+LANGUAGE plpgsql SECURITY DEFINER SET search_path TO ''
+AS $function$
+DECLARE v_uid uuid := auth.uid(); v_s public.game_sessions; v_bad int; v_n int;
+BEGIN
+  IF v_uid IS NULL THEN RAISE EXCEPTION 'authentication required' USING ERRCODE = 'insufficient_privilege'; END IF;
+  SELECT * INTO v_s FROM public.game_sessions WHERE id = p_session_id FOR UPDATE;   -- same lock order as submit/reveal
+  IF v_s.id IS NULL THEN RAISE EXCEPTION 'session not found' USING ERRCODE = 'no_data_found'; END IF;
+  IF NOT public.ralli_can_manage_session(v_s.host_id, v_s.tenant_id) THEN
+    RAISE EXCEPTION 'not authorized' USING ERRCODE = 'insufficient_privilege';
+  END IF;
+  IF p_rows IS NULL OR jsonb_typeof(p_rows) <> 'array' THEN RAISE EXCEPTION 'rows array required' USING ERRCODE = 'check_violation'; END IF;
+  -- Every row must be a canonical roster member of THIS session (outside-roster can never enter results).
+  SELECT count(*) INTO v_bad FROM jsonb_array_elements(p_rows) e
+   WHERE NOT EXISTS (SELECT 1 FROM public.game_roster_members r
+                     WHERE r.session_id = v_s.id AND r.player_id = (e->>'playerId'));
+  IF v_bad > 0 THEN RAISE EXCEPTION '% result row(s) reference a non-canonical player', v_bad USING ERRCODE = 'check_violation'; END IF;
+
+  -- Idempotent replace: drop any prior rows for this exact (session, question), then insert the canonical set.
+  DELETE FROM public.game_answers WHERE session_id = v_s.id AND question_idx = p_question_idx;
+  INSERT INTO public.game_answers
+    (session_id, tenant_id, player_id, player_name, question_idx, option_idx, answer_text,
+     time_ms, is_correct, points, answer_json, numeric_value, was_skipped)
+  SELECT v_s.id, v_s.tenant_id, e->>'playerId', e->>'playerName', p_question_idx,
+         NULLIF(e->>'optionIdx','')::int, e->>'text',
+         NULLIF(e->>'timeMs','')::int,
+         COALESCE((e->>'isCorrect')::boolean, false),
+         COALESCE((e->>'points')::int, 0),
+         CASE WHEN jsonb_typeof(e->'answerJson') = 'array' THEN e->'answerJson' ELSE NULL END,
+         NULLIF(e->>'numericValue','')::numeric,
+         false
+  FROM jsonb_array_elements(p_rows) e;
+  GET DIAGNOSTICS v_n = ROW_COUNT;
+  RETURN jsonb_build_object('ok', true, 'written', v_n, 'question_idx', p_question_idx);
+END;
+$function$;
+
+-- ══ PART 10 — LEARNER SELF-SUBMISSION READ (reconnect restore) ══════════════════
+-- Returns ONLY the caller's own durable submission for a question (auth.uid()) so a refresh/
+-- reconnect can restore + re-lock the exact answer. Never another learner's submission.
+CREATE OR REPLACE FUNCTION public.rpc_my_submission(p_session_id uuid, p_question_idx integer)
+RETURNS jsonb
+LANGUAGE plpgsql STABLE SECURITY DEFINER SET search_path TO ''
+AS $function$
+DECLARE v_uid uuid := auth.uid(); v_r public.game_answer_submissions%ROWTYPE;
+BEGIN
+  IF v_uid IS NULL THEN RAISE EXCEPTION 'authentication required' USING ERRCODE = 'insufficient_privilege'; END IF;
+  SELECT * INTO v_r FROM public.game_answer_submissions
+    WHERE session_id = p_session_id AND player_id = v_uid::text AND question_idx = p_question_idx;
+  IF v_r.id IS NULL THEN RETURN jsonb_build_object('found', false); END IF;
+  RETURN jsonb_build_object('found', true, 'q_type', v_r.q_type, 'question_idx', v_r.question_idx,
+    'option_idx', v_r.option_idx, 'text', v_r.answer_text, 'numeric_value', v_r.numeric_value,
+    'answer_json', v_r.answer_json);
+END;
+$function$;
+
 -- ── Grants: EXECUTE to authenticated (RPCs self-authorize); anon revoked. ─────────
 REVOKE EXECUTE ON FUNCTION public.rpc_start_session(uuid) FROM PUBLIC, anon;
 GRANT  EXECUTE ON FUNCTION public.rpc_start_session(uuid) TO authenticated, service_role;
@@ -429,6 +492,10 @@ REVOKE EXECUTE ON FUNCTION public.rpc_host_game_state(uuid) FROM PUBLIC, anon;
 GRANT  EXECUTE ON FUNCTION public.rpc_host_game_state(uuid) TO authenticated, service_role;
 REVOKE EXECUTE ON FUNCTION public.rpc_answer_progress(uuid, integer) FROM PUBLIC, anon;
 GRANT  EXECUTE ON FUNCTION public.rpc_answer_progress(uuid, integer) TO authenticated, service_role;
+REVOKE EXECUTE ON FUNCTION public.rpc_record_question_results(uuid, integer, jsonb) FROM PUBLIC, anon;
+GRANT  EXECUTE ON FUNCTION public.rpc_record_question_results(uuid, integer, jsonb) TO authenticated, service_role;
+REVOKE EXECUTE ON FUNCTION public.rpc_my_submission(uuid, integer) FROM PUBLIC, anon;
+GRANT  EXECUTE ON FUNCTION public.rpc_my_submission(uuid, integer) TO authenticated, service_role;
 
 -- No DML/backfill: existing/historical sessions get no roster or submissions retroactively
 -- (they cannot be reconstructed honestly). New games use the canonical roster + durable answers.

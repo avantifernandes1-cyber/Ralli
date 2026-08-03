@@ -148,6 +148,29 @@ BEGIN
   UPDATE public.game_roster_members SET status='left' WHERE session_id=s AND player_id=u1;  -- status flip allowed
   RAISE NOTICE '10. submissions immutable; roster identity immutable (only status may flip): PASS';
 
+  -- 11. record_question_results: idempotent per (session,question); outside-roster rejected.
+  PERFORM set_config('request.jwt.claims','{"sub":"'||m1||'","role":"authenticated"}',true); SET LOCAL ROLE authenticated;
+  v := public.rpc_record_question_results(s, 0,
+    ('[{"playerId":"'||u1||'","playerName":"U1","optionIdx":1,"isCorrect":true,"points":100},'||
+      '{"playerId":"'||u2||'","playerName":"U2","optionIdx":null,"isCorrect":false,"points":0}]')::jsonb);
+  IF (v->>'written')::int <> 2 THEN RAISE EXCEPTION '11 FAIL wrote % (expected 2)', v->>'written'; END IF;
+  PERFORM public.rpc_record_question_results(s, 0,
+    ('[{"playerId":"'||u1||'","playerName":"U1","optionIdx":1,"isCorrect":true,"points":100},'||
+      '{"playerId":"'||u2||'","playerName":"U2","optionIdx":null,"isCorrect":false,"points":0}]')::jsonb);
+  SELECT count(*) INTO n FROM public.game_answers WHERE session_id=s AND question_idx=0;
+  IF n <> 2 THEN RAISE EXCEPTION '11 FAIL idempotent re-record duplicated (%)', n; END IF;
+  ok:=false; BEGIN PERFORM public.rpc_record_question_results(s, 0, ('[{"playerId":"'||b1||'","points":100}]')::jsonb); ok:=true; EXCEPTION WHEN check_violation THEN END; RESET ROLE;
+  IF ok THEN RAISE EXCEPTION '11 FAIL outside-roster result accepted'; END IF;
+  SELECT count(*) INTO n FROM public.game_answers WHERE session_id=s AND question_idx=0;   -- reject left the 2 rows intact
+  IF n <> 2 THEN RAISE EXCEPTION '11 FAIL outside-roster reject wiped rows (%)', n; END IF;
+  RAISE NOTICE '11. record_question_results idempotent (one row per canonical member); outside-roster rejected; no dup: PASS';
+
+  -- 12. rpc_my_submission returns ONLY the caller''s own durable answer (reconnect restore).
+  PERFORM set_config('request.jwt.claims','{"sub":"'||u1||'","role":"authenticated"}',true); SET LOCAL ROLE authenticated;
+  v := public.rpc_my_submission(s, 0); RESET ROLE;
+  IF (v->>'found')<>'true' OR (v->>'option_idx')<>'1' THEN RAISE EXCEPTION '12 FAIL own submission not restored (%)',v; END IF;
+  RAISE NOTICE '12. rpc_my_submission restores caller''s own locked durable answer: PASS';
+
   RAISE NOTICE '084 ALL TESTS PASSED';
 END $$;
 ROLLBACK;

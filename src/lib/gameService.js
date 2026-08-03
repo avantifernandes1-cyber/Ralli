@@ -151,6 +151,30 @@ export async function getAnswerProgress(sessionId, questionIdx) {
 }
 
 /**
+ * Idempotent host result persistence (084): under the session lock, replaces game_answers for
+ * (session, question) with exactly the supplied canonical roster rows (re-reveal/reconnect safe).
+ * Outside-roster rows are rejected server-side. Returns { data, error }.
+ */
+export async function recordQuestionResults(sessionId, questionIdx, rows) {
+  const { data, error } = await supabase.rpc("rpc_record_question_results", {
+    p_session_id: sessionId, p_question_idx: questionIdx, p_rows: rows,
+  });
+  return { data, error };
+}
+
+/** Learner reconnect restore (084): the caller's OWN durable submission for a question, or {found:false}. */
+export async function getMySubmission(sessionId, questionIdx) {
+  const { data, error } = await supabase.rpc("rpc_my_submission", {
+    p_session_id: sessionId, p_question_idx: questionIdx,
+  });
+  return { data, error };
+}
+
+// Supabase error code for "function not found" (RPC absent because 084 is not applied yet) — the
+// signal the frontend uses to degrade gracefully to the legacy realtime path during pre-084 preview.
+export const RPC_MISSING = "PGRST202";
+
+/**
  * Durably publish the scoreboard the host already computed (migration 081), so a learner who
  * misses the transient SCOREBOARD broadcast can reconstruct it from game_sessions.live_scoreboard.
  * The RPC validates host authorization + state (started, publishable phase, matching qIdx),
