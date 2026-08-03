@@ -19,6 +19,8 @@ import {
   createGameSession,
   findJoinableSession,
   startGameSession,
+  submitGameAnswer,
+  getHostGameState,
   publishScoreboard,
   endGameSession,
   getActiveSessions,
@@ -1998,6 +2000,14 @@ function KahootHostView({ onNav, sessionName, pin, sessionDbId, demoMode, tenant
   const [cdNum,      setCdNum]      = useState(3);
   const [timeLeft,   setTimeLeft]   = useState(0);
   const [scores,     setScores]     = useState(() => chPlayers.map(p => ({ ...p, score: 0 })));
+  // 084: immutable server-authoritative CANONICAL roster (eligible authenticated learners, resolved
+  // at game start). When present it is the membership truth for scoring — NEVER a Q0 presence snapshot.
+  const canonicalRosterRef = useRef([]);
+  const rosterScoreRows = () => {
+    const r = canonicalRosterRef.current;
+    if (r && r.length) return r.map(m => ({ id: m.id, name: m.name, emoji: m.emoji ?? null, color: null, score: 0 }));
+    return chPlayers.map(p => ({ ...p, score: 0 }));   // graceful pre-084 fallback (presence)
+  };
   const [openGrades, setOpenGrades] = useState({});  // { idx: "correct"|"incorrect", __showNames: bool }
   // Matching questions: one shuffle computed by the host and broadcast to all
   // players in SHOW_QUESTION, so every client renders the same right-column
@@ -2613,8 +2623,28 @@ function KahootHostView({ onNav, sessionName, pin, sessionDbId, demoMode, tenant
 
   useEffect(() => {
     if (restoreState !== "done") return; // don't reset restored scores during restoration
-    if (phase === "countdown" && (qIdx === 0 || scores.length === 0)) setScores(chPlayers.map(p => ({ ...p, score: 0 })));
+    // 084: seed from the CANONICAL roster (server truth) when available, else presence (pre-084).
+    if (phase === "countdown" && (qIdx === 0 || scores.length === 0)) setScores(rosterScoreRows());
   }, [chPlayers.length, restoreState]); // eslint-disable-line react-hooks/exhaustive-deps
+
+  // 084: load the immutable canonical roster once per game (host start OR host refresh) and merge
+  // every eligible learner into `scores` — so a durably-joined learner who missed the Q0 realtime
+  // snapshot is NEVER dropped from scoring. Degrades gracefully (roster empty → prior presence
+  // behavior) until migration 084 is applied and rpc_host_game_state exists.
+  useEffect(() => {
+    if (!sessionDbId) return;
+    let cancelled = false;
+    getHostGameState(sessionDbId).then(({ data, error }) => {
+      if (cancelled || error || !data?.roster?.length) return;
+      canonicalRosterRef.current = data.roster;
+      setScores(prev => {
+        const byId = new Map((prev ?? []).map(p => [p.id, p]));
+        for (const m of data.roster) if (!byId.has(m.id)) byId.set(m.id, { id: m.id, name: m.name, emoji: m.emoji ?? null, color: null, score: 0 });
+        return Array.from(byId.values());
+      });
+    }).catch(() => {});
+    return () => { cancelled = true; };
+  }, [sessionDbId]); // eslint-disable-line react-hooks/exhaustive-deps
 
   // ── Start a question: persist durable state BEFORE broadcasting ─────────────
   // Ordering matters. The database write (phase + current_question_index +
@@ -4003,26 +4033,56 @@ function KahootPlayerView({ onNav, playerName, playerEmoji, playerId, pin, sessi
     return () => clearTimeout(t);
   }, [phase, timeLeft, gamePaused]);
 
+  // 084 — DURABLE-FIRST submission. In a REAL game we persist the answer to the database
+  // (player_id = auth.uid(), server-authorized via rpc_submit_game_answer) BEFORE locking the UI
+  // or broadcasting. Only on durable acceptance do we lock + broadcast a realtime NOTIFICATION —
+  // the host reconciles scoring from durable submissions at reveal, so a missed/forged broadcast
+  // can never lose or forge an answer. On persistence failure we do NOT lock (learner may retry);
+  // identical retries are idempotent server-side. Demo mode (no sessionDbId) keeps the local path.
+  const submittingRef = useRef(false);
+  const [submitErr, setSubmitErr] = useState(false);
+  const persistThenLock = async (payload, lock, notify) => {
+    if (submittingRef.current) return;
+    submittingRef.current = true;
+    try {
+      if (sessionDbId && playerId) {
+        setSubmitErr(false);
+        const { ok } = await submitGameAnswer(sessionDbId, appliedQIdxRef.current, payload);
+        if (!ok) { setSubmitErr(true); return; }   // not saved → keep phase 'question'; allow retry
+      }
+      lock();
+      broadcast(notify);
+    } finally {
+      submittingRef.current = false;
+    }
+  };
+
   const handleAnswer = (idx) => {
-    if (phase !== "question" || selectedIdx !== null) return;
+    if (phase !== "question" || selectedIdx !== null || submittingRef.current) return;
     const timeMs = Date.now() - (qStartMs ?? Date.now());
-    setSelectedIdx(idx); setPhase("answered");
-    broadcast({ type: GM.ANSWER, playerId, name: playerName, optionIdx: idx, timeMs });
+    persistThenLock({ option_idx: idx },
+      () => { setSelectedIdx(idx); setPhase("answered"); },
+      { type: GM.ANSWER, playerId, name: playerName, optionIdx: idx, timeMs });
   };
 
   const handleSliderSubmit = () => {
-    if (phase !== "question" || sliderSubmitted) return;
-    // sliderValue is null until the player drags. The input/display show the
-    // midpoint via `?? midpoint`, so a player who accepts the default without
-    // dragging sees a value (e.g. 5) while state is still null — submitting the
-    // raw null erased their answer everywhere downstream. Resolve to the exact
-    // value shown (same expression as the render), lock it into state so the
-    // reveal reads it, and broadcast that. `?? ` preserves a dragged 0.
+    if (phase !== "question" || sliderSubmitted || submittingRef.current) return;
+    // `?? ` preserves a dragged 0. Resolve to the exact value shown (same expression as render).
     const submitted = sliderValue ?? Math.round(((question?.min ?? 0) + (question?.max ?? 10)) / 2);
     const timeMs = Date.now() - (qStartMs ?? Date.now());
-    setSliderValue(submitted);
-    setSliderSubmitted(true); setPhase("answered");
-    broadcast({ type: GM.ANSWER, playerId, name: playerName, sliderValue: submitted, timeMs });
+    persistThenLock({ value: submitted },
+      () => { setSliderValue(submitted); setSliderSubmitted(true); setPhase("answered"); },
+      { type: GM.ANSWER, playerId, name: playerName, sliderValue: submitted, timeMs });
+  };
+
+  // Type/Open text submit (durable-first). Shared by the button + Enter key.
+  const handleTextSubmit = () => {
+    if (phase !== "question" || openSubmitted || !openText.trim() || submittingRef.current) return;
+    const text = openText.trim();
+    const timeMs = Date.now() - (qStartMs ?? Date.now());
+    persistThenLock({ text },
+      () => { setOpenSubmitted(true); setPhase("answered"); },
+      { type: GM.ANSWER, playerId, name: playerName, text, optionIdx: null, timeMs });
   };
 
   // Matching — tap-to-pair (chosen over drag-and-drop for the live, timed,
@@ -4043,10 +4103,11 @@ function KahootPlayerView({ onNav, playerName, playerEmoji, playerId, pin, sessi
   };
   const handleMatchSubmit = () => {
     const total = question?.pairs?.length ?? 0;
-    if (phase !== "question" || matchSubmitted || matchPairs.length < total) return;
+    if (phase !== "question" || matchSubmitted || matchPairs.length < total || submittingRef.current) return;
     const timeMs = Date.now() - (qStartMs ?? Date.now());
-    setMatchSubmitted(true); setPhase("answered");
-    broadcast({ type: GM.ANSWER, playerId, name: playerName, matchPairs, timeMs });
+    persistThenLock({ pairs: matchPairs.map(mp => ({ leftIdx: mp.leftIdx, rightIdx: mp.rightIdx })) },
+      () => { setMatchSubmitted(true); setPhase("answered"); },
+      { type: GM.ANSWER, playerId, name: playerName, matchPairs, timeMs });
   };
 
   const timerPct   = question ? (timeLeft / question.timeLimit) * 100 : 0;
@@ -4404,12 +4465,7 @@ function KahootPlayerView({ onNav, playerName, playerEmoji, playerId, pin, sessi
             }}
           />
           {!openSubmitted ? (
-            <button onClick={() => {
-              if (!openText.trim()) return;
-              const timeMs = Date.now() - (qStartMs ?? Date.now());
-              setOpenSubmitted(true);
-              broadcast({ type: GM.ANSWER, playerId, name: playerName, text: openText.trim(), optionIdx: null, timeMs });
-            }} style={{ padding: "14px", borderRadius: 14, border: "none", background: openText.trim() ? C.orange : "rgba(255,255,255,0.08)", color: openText.trim() ? "#fff" : "rgba(255,255,255,0.3)", fontWeight: 900, fontSize: 15, cursor: openText.trim() ? "pointer" : "not-allowed", transition: "background 0.2s" }}>
+            <button onClick={handleTextSubmit} style={{ padding: "14px", borderRadius: 14, border: "none", background: openText.trim() ? C.orange : "rgba(255,255,255,0.08)", color: openText.trim() ? "#fff" : "rgba(255,255,255,0.3)", fontWeight: 900, fontSize: 15, cursor: openText.trim() ? "pointer" : "not-allowed", transition: "background 0.2s" }}>
               {openText.trim() ? "Submit Response →" : "Type something to submit"}
             </button>
           ) : (
@@ -4425,14 +4481,7 @@ function KahootPlayerView({ onNav, playerName, playerEmoji, playerId, pin, sessi
             type="text"
             value={openText}
             onChange={e => !openSubmitted && setOpenText(e.target.value)}
-            onKeyDown={e => {
-              if (e.key === "Enter" && openText.trim() && !openSubmitted) {
-                const timeMs = Date.now() - (qStartMs ?? Date.now());
-                setOpenSubmitted(true);
-                setPhase("answered");
-                broadcast({ type: GM.ANSWER, playerId, name: playerName, text: openText.trim(), optionIdx: null, timeMs });
-              }
-            }}
+            onKeyDown={e => { if (e.key === "Enter") handleTextSubmit(); }}
             placeholder="Type your answer…"
             readOnly={openSubmitted}
             style={{
