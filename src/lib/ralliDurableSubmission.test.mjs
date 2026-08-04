@@ -90,5 +90,29 @@ ok("27 restore preserves every type incl Slider 0 (numeric_value != null), never
    /t === "slider" && data\.numeric_value != null\) \{ setSliderValue\(Number\(data\.numeric_value\)\)/.test(player) &&
    /t === "match" && Array\.isArray\(data\.answer_json\)/.test(player) && !/submitGameAnswer/.test(player.slice(player.indexOf("getMySubmission"), player.indexOf("getMySubmission") + 700)));
 
+// ── Open-ended durable cutover ────────────────────────────────────────────────
+ok("29 open-review response list is built from canonical roster + durable submissions, not chAnswers",
+   /const buildOpenResponses = \(\) => \{[\s\S]{0,260}openReveal\?\.roster/.test(host) &&
+   /const openResponses = buildOpenResponses\(\);/.test(host));
+ok("30 doReveal(open) fetches durable roster+responses via beginQuestionReveal; error blocks (retryable)",
+   /if \(q\.type === "open"\)[\s\S]{0,400}const rev = await beginQuestionReveal\(sessionDbId, qIdx\)[\s\S]{0,220}setOpenReveal\(\{ roster: rev\.data\.roster/.test(host) &&
+   /hasRevealedRef\.current = false; setRevealErr\(true\); return;   \/\/ do not advance to review/.test(host));
+ok("31 doOpenGradeDone grades EVERY canonical member (openGrades keyed by player_id); unanswered present",
+   /const doOpenGradeDone = async \(\) =>/.test(host) &&
+   /const correct = openGrades\[m\.id\] === "correct"/.test(host) &&
+   /text: textByPlayer\.get\(String\(m\.id\)\) \?\? null/.test(host));
+ok("32 open results PERSIST (recordQuestionResults) BEFORE publishReveal; failure blocks reveal",
+   /if \(sessionDbId && openReveal\) \{[\s\S]{0,240}const persist = await recordQuestionResults\(sessionDbId, qIdx, answerRows\)[\s\S]{0,120}if \(persist\.error\) \{ setRevealErr\(true\); return; \}[\s\S]{0,120}publishReveal\(\{ isOpen: true \}/.test(host));
+ok("33 open grade buttons keyed by stable player_id (never array index)",
+   /const grade = openGrades\[r\.playerId\]/.test(host) &&
+   /\{ \.\.\.g, \[r\.playerId\]: g\[r\.playerId\] === "correct"/.test(host) && !/openGrades\[i\];/.test(host.slice(host.indexOf("open-review"), host.indexOf("open-review") + 4000)));
+ok("34 host refresh during open-review restores durable open state via rpc_host_game_state",
+   /phase !== "open-review" \|\| openReveal\) return;[\s\S]{0,160}getHostGameState\(sessionDbId\)[\s\S]{0,160}setOpenReveal\(\{ roster: data\.roster/.test(host));
+
+// ── Rollout compatibility: fail-closed start is a structured {ok:false}, not an exception ─────
+ok("35 fail-closed start returns {ok:false, no_eligible_learners} (old-client-safe), handled in the app",
+   /'no_eligible_learners'/.test(readFileSync(join(here, "..", "..", "supabase", "migrations", "084_ralli_canonical_roster_durable_answers.sql"), "utf8")) &&
+   /startData\.reason === "no_eligible_learners"/.test(app));
+
 console.log(`\n${pass} passed, ${fail} failed`);
 if (fail > 0) process.exit(1);

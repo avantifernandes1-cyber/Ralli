@@ -57,12 +57,14 @@ BEGIN
   IF EXISTS (SELECT 1 FROM public.game_roster_members WHERE session_id=s AND player_id IN (u3,m1,b1)) THEN RAISE EXCEPTION '1 FAIL ineligible in roster'; END IF;
   RAISE NOTICE '1. start atomic; canonical roster = eligible learners only (inactive/host/cross-tenant excluded): PASS';
 
-  -- 2. FAIL CLOSED: start with no eligible learners raises and does NOT start.
+  -- 2. FAIL CLOSED: start with no eligible learners returns {ok:false, reason} and does NOT start
+  -- (structured non-start — old-client compatible; not an exception).
   PERFORM set_config('request.jwt.claims','{"sub":"'||m1||'","role":"authenticated"}',true); SET LOCAL ROLE authenticated;
-  ok:=false; BEGIN PERFORM public.rpc_start_session(s2); ok:=true; EXCEPTION WHEN check_violation THEN END; RESET ROLE;
-  IF ok THEN RAISE EXCEPTION '2 FAIL started with no eligible learners'; END IF;
+  v := public.rpc_start_session(s2); RESET ROLE;
+  IF (v->>'ok')<>'false' OR (v->>'reason')<>'no_eligible_learners' THEN RAISE EXCEPTION '2 FAIL not fail-closed (%)', v; END IF;
   IF (SELECT status FROM public.game_sessions WHERE id=s2)<>'waiting' THEN RAISE EXCEPTION '2 FAIL session left non-waiting'; END IF;
-  RAISE NOTICE '2. start fails closed with zero eligible learners (session stays waiting): PASS';
+  IF (SELECT count(*) FROM public.game_roster_members WHERE session_id=s2)<>0 THEN RAISE EXCEPTION '2 FAIL roster created without start'; END IF;
+  RAISE NOTICE '2. start fails closed with zero eligible learners → {ok:false,no_eligible_learners}, stays waiting: PASS';
 
   -- Put G into question phase 0 (server-stamped start) as host.
   PERFORM set_config('request.jwt.claims','{"sub":"'||m1||'","role":"authenticated"}',true); SET LOCAL ROLE authenticated;

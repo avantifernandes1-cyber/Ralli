@@ -178,8 +178,12 @@ BEGIN
 
   SELECT count(*) INTO v_n FROM public.game_roster_members WHERE session_id = v_s.id;
   IF v_n = 0 THEN
-    -- Fail closed: never start a real game with no eligible learners. Session stays 'waiting'.
-    RAISE EXCEPTION 'no eligible learner participants; cannot start' USING ERRCODE = 'check_violation';
+    -- Fail closed WITHOUT starting. Return a STRUCTURED non-start (same {ok:false, reason} shape as
+    -- quiz_unavailable) instead of RAISE, so an OLDER cached host client — which already handles an
+    -- ok:false start result — coexists safely the moment 084 is applied (it sees "couldn't start",
+    -- not an exception). Session stays 'waiting'. This does NOT weaken the canonical-roster rule:
+    -- no eligible learners still means no start (no roster, no game).
+    RETURN jsonb_build_object('ok', false, 'reason', 'no_eligible_learners', 'session_id', v_s.id);
   END IF;
 
   UPDATE public.game_sessions SET status = 'started', started_at = now() WHERE id = v_s.id AND status = 'waiting';

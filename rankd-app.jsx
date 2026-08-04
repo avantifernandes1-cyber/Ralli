@@ -2016,6 +2016,7 @@ function KahootHostView({ onNav, sessionName, pin, sessionDbId, demoMode, tenant
   };
   const [revealErr, setRevealErr] = useState(false);   // 084: durable reveal/persist failed → block reveal, retryable
   const [answerProgress, setAnswerProgress] = useState(null); // 084: {answered,active} from rpc_answer_progress (null = legacy)
+  const [openReveal, setOpenReveal] = useState(null);  // 084: {roster,submissions,questionStartedAt} for durable open-ended manual grading (null = legacy)
   const [openGrades, setOpenGrades] = useState({});  // { idx: "correct"|"incorrect", __showNames: bool }
   // Matching questions: one shuffle computed by the host and broadcast to all
   // players in SHOW_QUESTION, so every client renders the same right-column
@@ -2629,6 +2630,18 @@ function KahootHostView({ onNav, sessionName, pin, sessionDbId, demoMode, tenant
     return () => { stale = true; clearInterval(iv); };
   }, [sessionDbId, phase, qIdx, Object.keys(chAnswers).length]); // eslint-disable-line react-hooks/exhaustive-deps
 
+  // 084: host refresh/reconnect DURING open-review — rebuild the durable open-grading input (canonical
+  // roster + durable open responses) from the server so manual grading is never lost or presence-based.
+  useEffect(() => {
+    if (!sessionDbId || phase !== "open-review" || openReveal) return;
+    let stale = false;
+    getHostGameState(sessionDbId).then(({ data, error }) => {
+      if (stale || error || !data?.roster) return;
+      setOpenReveal({ roster: data.roster, submissions: data.submissions ?? [], questionStartedAt: null });
+    }).catch(() => {});
+    return () => { stale = true; };
+  }, [sessionDbId, phase, openReveal]); // eslint-disable-line react-hooks/exhaustive-deps
+
   // Shown on both pause overlays so the host can read the EXISTING game PIN to a
   // player who needs to rejoin (the overlay otherwise covers it). Purely
   // presentational — uses the `pin` prop as-is; never generates a new PIN,
@@ -2758,8 +2771,21 @@ function KahootHostView({ onNav, sessionName, pin, sessionDbId, demoMode, tenant
     if (hasRevealedRef.current) return;
     hasRevealedRef.current = true;
     if (q.type === "open") {
-      // Collect open-ended responses and go to grading phase
+      // 084: DURABLE open-ended review. Fetch the canonical roster + durable open responses (never
+      // chAnswers) so manual grading is built only from server truth. beginQuestionReveal also closes
+      // submissions. On error (084 present) → block reveal (retryable); RPC_MISSING (pre-084) → legacy.
       setOpenGrades({});
+      if (sessionDbId) {
+        setRevealErr(false);
+        const rev = await beginQuestionReveal(sessionDbId, qIdx);
+        if (!rev.error && rev.data?.ok) {
+          setOpenReveal({ roster: rev.data.roster ?? [], submissions: rev.data.submissions ?? [], questionStartedAt: rev.data.question_started_at });
+        } else if (rev.error && rev.error.code !== RPC_MISSING) {
+          hasRevealedRef.current = false; setRevealErr(true); return;   // do not advance to review; retryable
+        } else {
+          setOpenReveal(null);   // pre-084 fallback → legacy chAnswers open path
+        }
+      }
       setPhase("open-review");
       persistPhase("open-review", qIdx, false);
       broadcast({ type: GM.OPEN_REVIEW, qText: q.q });
@@ -2984,33 +3010,50 @@ function KahootHostView({ onNav, sessionName, pin, sessionDbId, demoMode, tenant
   };
 
   // Admin finishes grading open-ended responses
-  const doOpenGradeDone = () => {
-    const openResponses = Object.entries(chAnswers).map(([pid, ans], i) => ({ id: i, playerId: pid, text: ans.text, name: ans.name }));
-    const newScores = scores.map(p => {
-      const respIdx = openResponses.findIndex(r => r.playerId === p.id);
-      const grade   = openGrades[respIdx];
-      const delta   = grade === "correct" ? 100 : 0;
-      return { ...p, score: p.score + delta, delta, wasCorrect: grade === "correct" };
-    });
+  // 084: the manual open-review response list. Built from the CANONICAL roster + DURABLE open
+  // submissions (every member; submitted text or honestly unanswered) — never chAnswers keys/names.
+  // Falls back to chAnswers only for demo / pre-084. Keyed by stable player_id (never array index).
+  const buildOpenResponses = () => {
+    if (openReveal?.roster) {
+      const subByPlayer = new Map((openReveal.submissions ?? []).map(s => [String(s.player_id), s]));
+      return openReveal.roster.map(m => ({ playerId: m.id, name: m.name, text: subByPlayer.get(String(m.id))?.text ?? null }));
+    }
+    return Object.entries(chAnswers).map(([pid, ans]) => ({ playerId: pid, name: ans.name, text: ans.text ?? null }));
+  };
+
+  const doOpenGradeDone = async () => {
+    const responses = buildOpenResponses();
+    const textByPlayer = new Map(responses.map(r => [String(r.playerId), r.text]));
+    // Membership = canonical roster (durable) OR the seeded score set (legacy). openGrades is keyed by
+    // stable player_id, so a durably-submitted learner is graded even if they never broadcast/left.
+    const members = openReveal?.roster
+      ? openReveal.roster.map(m => ({ id: m.id, name: m.name, emoji: m.emoji ?? null }))
+      : scores.map(p => ({ id: p.id, name: p.name, emoji: p.emoji ?? null }));
+    const prevById = new Map(scores.map(p => [String(p.id), p]));
+    const newScores = []; const answerRows = [];
+    for (const m of members) {
+      const correct = openGrades[m.id] === "correct";
+      const delta = correct ? 100 : 0;
+      const prev = prevById.get(String(m.id));
+      newScores.push({ ...(prev ?? {}), id: m.id, name: m.name, emoji: m.emoji ?? (prev?.emoji ?? null), color: prev?.color ?? null, score: (prev?.score ?? 0) + delta, delta, wasCorrect: correct });
+      answerRows.push({ playerId: m.id, playerName: m.name, questionIdx: qIdx, optionIdx: null, text: textByPlayer.get(String(m.id)) ?? null, timeMs: null, isCorrect: correct, points: delta, tenantId, numericValue: null, answerJson: null });
+    }
     newScores.sort((a, b) => b.score - a.score);
+
+    if (sessionDbId && openReveal) {
+      // Durable: persist idempotently BEFORE reveal broadcast; on failure do not reveal or advance.
+      setRevealErr(false);
+      const persist = await recordQuestionResults(sessionDbId, qIdx, answerRows);
+      if (persist.error) { setRevealErr(true); return; }
+      setScores(newScores);
+      publishReveal({ isOpen: true }, newScores);
+      return;
+    }
+    // Legacy (demo / pre-084): fire-and-forget direct insert (unchanged behavior).
     setScores(newScores);
     publishReveal({ isOpen: true }, newScores);
-    // Persist open-ended answers (fire-and-forget)
     if (sessionDbId) {
-      const scoreMap = Object.fromEntries(newScores.map(p => [p.id, p]));
-      const answerRows = openResponses.map(r => ({
-        playerId:    r.playerId,
-        playerName:  r.name ?? r.playerId,
-        questionIdx: qIdx,
-        optionIdx:   null,
-        text:        r.text ?? null,
-        timeMs:      null,
-        isCorrect:   openGrades[r.id] === "correct",
-        points:      scoreMap[r.playerId]?.delta ?? 0,
-        tenantId,
-      }));
-      saveGameAnswers(sessionDbId, answerRows)
-        .then(({ error }) => { if (error) console.error("[ralli:host] saveGameAnswers (open) failed:", error); });
+      saveGameAnswers(sessionDbId, answerRows).then(({ error }) => { if (error) console.error("[ralli:host] saveGameAnswers (open) failed:", error); });
     }
   };
 
@@ -3078,7 +3121,7 @@ function KahootHostView({ onNav, sessionName, pin, sessionDbId, demoMode, tenant
   };
 
   const dist = (q?.options ?? []).map((_, i) => Object.values(chAnswers).filter(a => a.optionIdx === i).length);
-  const openResponses = Object.entries(chAnswers).map(([pid, ans], i) => ({ id: i, playerId: pid, text: ans.text, name: ans.name }));
+  const openResponses = buildOpenResponses();   // 084: canonical roster + durable open text (never chAnswers keys)
   const rankBadges = ["1st","2nd","3rd","4th","5th"];
 
   // ── Loading / error states during session restoration ─────────────────────────
@@ -3212,9 +3255,9 @@ function KahootHostView({ onNav, sessionName, pin, sessionDbId, demoMode, tenant
             <div style={{ textAlign: "center", padding: 60, color: C.textMuted, fontSize: 14 }}>No responses submitted.</div>
           )}
           {openResponses.map((r, i) => {
-            const grade = openGrades[i];
+            const grade = openGrades[r.playerId];   // 084: keyed by stable player_id, never array index
             return (
-              <div key={i} style={{ padding: "14px 18px", borderRadius: 14, background: grade === "correct" ? "rgba(16,185,129,0.1)" : grade === "incorrect" ? "rgba(239,68,68,0.08)" : "#fff", border: `1px solid ${grade === "correct" ? "rgba(16,185,129,0.4)" : grade === "incorrect" ? "rgba(239,68,68,0.35)" : C.border}` }}>
+              <div key={r.playerId} style={{ padding: "14px 18px", borderRadius: 14, background: grade === "correct" ? "rgba(16,185,129,0.1)" : grade === "incorrect" ? "rgba(239,68,68,0.08)" : "#fff", border: `1px solid ${grade === "correct" ? "rgba(16,185,129,0.4)" : grade === "incorrect" ? "rgba(239,68,68,0.35)" : C.border}` }}>
                 <div style={{ display: "flex", alignItems: "flex-start", gap: 12 }}>
                   <div style={{ width: 28, height: 28, borderRadius: "50%", flexShrink: 0, background: "rgba(255,255,255,0.1)", display: "flex", alignItems: "center", justifyContent: "center", fontSize: 12, fontWeight: 700, color: C.textMuted, marginTop: 2 }}>{i + 1}</div>
                   <div style={{ flex: 1, minWidth: 0 }}>
@@ -3222,8 +3265,8 @@ function KahootHostView({ onNav, sessionName, pin, sessionDbId, demoMode, tenant
                     <p style={{ margin: 0, fontSize: 15, color: C.text, lineHeight: 1.45 }}>{r.text || <em style={{ opacity: 0.4 }}>No response</em>}</p>
                   </div>
                   <div style={{ display: "flex", gap: 6, flexShrink: 0 }}>
-                    <button onClick={() => setOpenGrades(g => ({ ...g, [i]: g[i] === "correct" ? undefined : "correct" }))} style={{ padding: "6px 14px", borderRadius: 8, border: "none", cursor: "pointer", fontSize: 13, fontWeight: 700, background: grade === "correct" ? C.green : "rgba(16,185,129,0.12)", color: grade === "correct" ? "#fff" : C.green, minHeight: 36 }}>✓</button>
-                    <button onClick={() => setOpenGrades(g => ({ ...g, [i]: g[i] === "incorrect" ? undefined : "incorrect" }))} style={{ padding: "6px 14px", borderRadius: 8, border: "none", cursor: "pointer", fontSize: 13, fontWeight: 700, background: grade === "incorrect" ? C.red : "rgba(239,68,68,0.1)", color: grade === "incorrect" ? "#fff" : C.red, minHeight: 36 }}>✗</button>
+                    <button onClick={() => setOpenGrades(g => ({ ...g, [r.playerId]: g[r.playerId] === "correct" ? undefined : "correct" }))} style={{ padding: "6px 14px", borderRadius: 8, border: "none", cursor: "pointer", fontSize: 13, fontWeight: 700, background: grade === "correct" ? C.green : "rgba(16,185,129,0.12)", color: grade === "correct" ? "#fff" : C.green, minHeight: 36 }}>✓</button>
+                    <button onClick={() => setOpenGrades(g => ({ ...g, [r.playerId]: g[r.playerId] === "incorrect" ? undefined : "incorrect" }))} style={{ padding: "6px 14px", borderRadius: 8, border: "none", cursor: "pointer", fontSize: 13, fontWeight: 700, background: grade === "incorrect" ? C.red : "rgba(239,68,68,0.1)", color: grade === "incorrect" ? "#fff" : C.red, minHeight: 36 }}>✗</button>
                   </div>
                 </div>
               </div>
@@ -26212,6 +26255,13 @@ export default function App() {
       clearActiveGameContext();
       toast.error("This quiz is no longer available. Create a new game with an active quiz.");
       setScreen("rankd-new");
+      return;
+    }
+    // 084: canonical roster requires ≥1 eligible authenticated learner. Fail-closed start returns a
+    // structured {ok:false} (never an exception) — keep the host in the waiting lobby with a clear
+    // message; no game started, no roster created. (Older cached clients hit the generic branch below.)
+    if (startData && startData.ok === false && startData.reason === "no_eligible_learners") {
+      toast.error("No learners have joined yet — wait for at least one learner, then start.");
       return;
     }
     // Any other non-start outcome (e.g. reason 'not_startable' — the session was concurrently
