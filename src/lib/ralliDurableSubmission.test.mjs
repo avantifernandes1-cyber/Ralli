@@ -66,8 +66,8 @@ ok("18 doReveal is async and invokes rpc_begin_question_reveal for the current q
 ok("19 reveal grades the CANONICAL roster's durable submissions via reconcileReveal (shared grader), not chAnswers",
    /reconcileReveal\(\{[\s\S]{0,160}submissions: rev\.data\.submissions[\s\S]{0,120}gradeAnswer/.test(host) && /import \{ reconcileReveal \} from "\.\/src\/lib\/revealReconcile\.js"/.test(app));
 ok("20 results are PERSISTED (recordQuestionResults) BEFORE publishReveal (broadcast)",
-   /const persist = await recordQuestionResults\(sessionDbId, qIdx, answerRows\)[\s\S]{0,1600}publishReveal\(payload, newScores\)/.test(host) &&
-   host.indexOf("recordQuestionResults(sessionDbId, qIdx, answerRows)") < host.indexOf("publishReveal(payload, newScores)"));
+   /const persist = await recordQuestionResults\(sessionDbId, qIdx, answerRows\)[\s\S]{0,1600}publishReveal084\(payload, newScores\)/.test(host) &&
+   host.indexOf("recordQuestionResults(sessionDbId, qIdx, answerRows)") < host.indexOf("publishReveal084(payload, newScores)"));
 ok("19b reveal grades gradedQuestion (host-local, never the learner-broadcast payload)", /question: gradedQuestion,/.test(host));
 ok("21 reveal/persist FAILURE blocks reveal + advance and is retryable (no broadcast)",
    /if \(persist\.error\) \{ hasRevealedRef\.current = false; setRevealErr\(true\); return; \}/.test(host) &&
@@ -79,7 +79,7 @@ ok("23 auto-reveal + answered count come from rpc_answer_progress (server), not 
    /const playerCount   = answerProgress \? Math\.max\(answerProgress\.active, 1\) : /.test(host) &&
    /getAnswerProgress\(sessionDbId, qIdx\)/.test(host));
 ok("24 server progress resets each question (no premature auto-reveal from a stale count)",
-   /useEffect\(\(\) => \{ setAnswerProgress\(null\); \}, \[qIdx\]\)/.test(host));
+   /useEffect\(\(\) => \{ setAnswerProgress\(null\); setRevealSubs\(null\); \}, \[qIdx\]\)/.test(host));
 ok("25 host surfaces a retryable reveal error (revealErr banner + Retry reveal → doReveal)",
    /\{revealErr && \(/.test(host) && /setRevealErr\(false\); doReveal\(\)/.test(host));
 

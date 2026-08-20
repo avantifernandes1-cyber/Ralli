@@ -1952,6 +1952,25 @@ const OPTION_COLORS = [
   { bg: "#EF4444", glow: "rgba(239,68,68,0.3)"   },  // D — red
 ];
 
+// Resolve the AUTHORITATIVE question deck for a REAL session from the durable
+// question_snapshot (written once at creation, migration 049; read via the host/manager
+// authorized rpc_manager_session_analytics, migration 075). This is the ONLY trustworthy
+// source of what a live game is actually playing — NEVER the client `quizzes` catalog,
+// whose list items can lack question bodies (learners load sanitized metadata; a manager's
+// catalog can be mid-load) so `quizzes.find(...)?.questions ?? GAME_QUESTIONS` silently
+// falls back to the hardcoded demo deck. That fallback is the root cause of a real game
+// rendering/broadcasting demo content while the durable snapshot holds the real quiz.
+// Returns the snapshot array, or null when it cannot be resolved — callers MUST fail
+// closed for a real game (never enter/broadcast the demo deck).
+async function resolveRealQuestionsFromSnapshot(sessionDbId) {
+  if (!sessionDbId) return null;
+  try {
+    const { data, error } = await getManagerSessionAnalytics(sessionDbId);
+    const snap = data?.snapshot;
+    return (!error && Array.isArray(snap) && snap.length > 0) ? snap : null;
+  } catch { return null; }
+}
+
 const SAMPLE_QUIZZES = [
   {
     id: "sq1",
@@ -2537,9 +2556,15 @@ function KahootHostView({ onNav, sessionName, pin, sessionDbId, demoMode, tenant
   // never leave the DB on `question` while players are told the answer, and a
   // delayed write can never attach an old reveal to a newer question. Retry reuses
   // the same frozen payload and never re-grades/re-inserts.
-  const revealPubRef = useRef(null);            // frozen { qIdx, liveQuestion, broadcastMsg }
+  const revealPubRef = useRef(null);            // frozen { mode?, qIdx, liveQuestion, broadcastMsg }
   const revealPublishingRef = useRef(false);    // concurrent / double-click guard
   const [revealPublishError, setRevealPublishError] = useState(false);
+  // 084: DURABLE per-player answers for the current reveal question, keyed by player_id
+  // (auth.uid), sourced from rpc_host_game_state. The reveal per-player panels used ONLY the
+  // ephemeral chAnswers realtime map, which is wiped on channel teardown / new question and is
+  // never repopulated for a reloaded learner — so after any reconnect the host showed every
+  // learner as "No answer" though durable submissions exist. This is the durable fallback.
+  const [revealSubs, setRevealSubs] = useState(null);
 
   const runRevealPublish = useCallback(async () => {
     const frozen = revealPubRef.current;
@@ -2548,15 +2573,29 @@ function KahootHostView({ onNav, sessionName, pin, sessionDbId, demoMode, tenant
     revealPublishingRef.current = true;
     try {
       if (sessionDbId) {
-        // Strict, state-guarded durable write bound to THIS exact session + question.
-        // Broadcast ONLY after it is confirmed (applied) or already durably present
-        // with the identical payload (idempotent — a lost response). A stale result
-        // (newer/older question, countdown/scoreboard/ended, terminal) is abandoned;
-        // a conflict (a DIFFERENT reveal already stored for this qIdx) is surfaced.
-        const res = await publishRevealDurable(sessionDbId, frozen.qIdx, frozen.liveQuestion);
-        if (res.outcome === "stale")    { revealPubRef.current = null; setRevealPublishError(false); return; } // superseded — abandon quietly
-        if (res.outcome === "conflict") { setRevealPublishError(true); return; }                                // integrity conflict → host Retry/End
-        if (!res.ok)                    { setRevealPublishError(true); return; }                                // error → host Retry; NO broadcast
+        if (frozen.mode === "durable084") {
+          // 084 path: rpc_begin_question_reveal already CLOSED submissions and moved the
+          // session to phase='reveal' under a row lock (bound to this exact session + qIdx),
+          // and results were already persisted via rpc_record_question_results. The pre-084
+          // rpc_host_publish_reveal REQUIRES a pre-reveal phase (question/open-review), so from
+          // phase='reveal' it 0-rows → classifies 'conflict' and the reveal is NEVER written or
+          // sent — the production "Couldn't publish the reveal" failure. Persist the reveal block
+          // into live_question at the SAME 'reveal' phase, then broadcast only after it confirms.
+          const { error } = await updateSessionPhase(sessionDbId, {
+            phase: "reveal", currentQuestionIndex: frozen.qIdx, liveQuestion: frozen.liveQuestion,
+          });
+          if (error) { setRevealPublishError(true); return; }   // error → host Retry; NO broadcast
+        } else {
+          // Pre-084 / legacy path. Strict, state-guarded durable write bound to THIS exact
+          // session + question. Broadcast ONLY after it is confirmed (applied) or already durably
+          // present with the identical payload (idempotent — a lost response). A stale result
+          // (newer/older question, countdown/scoreboard/ended, terminal) is abandoned;
+          // a conflict (a DIFFERENT reveal already stored for this qIdx) is surfaced.
+          const res = await publishRevealDurable(sessionDbId, frozen.qIdx, frozen.liveQuestion);
+          if (res.outcome === "stale")    { revealPubRef.current = null; setRevealPublishError(false); return; } // superseded — abandon quietly
+          if (res.outcome === "conflict") { setRevealPublishError(true); return; }                                // integrity conflict → host Retry/End
+          if (!res.ok)                    { setRevealPublishError(true); return; }                                // error → host Retry; NO broadcast
+        }
       }
       // applied OR idempotent (or demo / no-DB): broadcast EXACTLY once, show reveal.
       broadcast(frozen.broadcastMsg);
@@ -2578,6 +2617,23 @@ function KahootHostView({ onNav, sessionName, pin, sessionDbId, demoMode, tenant
   const publishReveal = useCallback((revealAnswer, scores) => {
     const broadcastMsg = { type: GM.REVEAL, correctIdx: revealAnswer.correctIdx ?? null, scores, ...revealAnswer };
     revealPubRef.current = {
+      qIdx,
+      liveQuestion: { ...(liveQuestionRef.current ?? {}), reveal: revealAnswer },
+      broadcastMsg,
+    };
+    setRevealPublishError(false);
+    runRevealPublish();
+  }, [qIdx, runRevealPublish]);
+
+  // 084 durable-reveal publish. Identical freeze/retry semantics as publishReveal, but tagged
+  // mode:"durable084" so runRevealPublish persists the reveal block via updateSessionPhase at
+  // the already-'reveal' phase (rpc_begin_question_reveal moved it there) instead of the pre-084
+  // rpc_host_publish_reveal, which requires a pre-reveal phase and would 0-row → 'conflict'.
+  // Retry (retryRevealPublish) replays this exact frozen payload — still idempotent, no re-grade.
+  const publishReveal084 = useCallback((revealAnswer, scores) => {
+    const broadcastMsg = { type: GM.REVEAL, correctIdx: revealAnswer.correctIdx ?? null, scores, ...revealAnswer };
+    revealPubRef.current = {
+      mode: "durable084",
       qIdx,
       liveQuestion: { ...(liveQuestionRef.current ?? {}), reveal: revealAnswer },
       broadcastMsg,
@@ -2617,8 +2673,31 @@ function KahootHostView({ onNav, sessionName, pin, sessionDbId, demoMode, tenant
   const timerColor    = timerPct > 50 ? C.green : timerPct > 25 ? C.orange : C.red;
 
   // 084: reset server progress on each new question so a prior question's "all answered" can never
-  // trigger a premature auto-reveal before the fresh count loads.
-  useEffect(() => { setAnswerProgress(null); }, [qIdx]);
+  // trigger a premature auto-reveal before the fresh count loads. Also drop the durable reveal
+  // answers so a prior question's responses can't render against the new one.
+  useEffect(() => { setAnswerProgress(null); setRevealSubs(null); }, [qIdx]);
+  // 084: on entering the reveal for THIS question, load the DURABLE per-player submissions
+  // (rpc_host_game_state → submissions for current_question_index) keyed by player_id, so the
+  // reveal per-player panels render each learner's actual answer from server truth — including
+  // after a host/learner reconnect wiped the ephemeral chAnswers map. Demo/no-DB keeps chAnswers.
+  useEffect(() => {
+    if (!sessionDbId || phase !== "reveal") return;
+    let stale = false;
+    getHostGameState(sessionDbId).then(({ data, error }) => {
+      if (stale || error || !data) return;
+      const map = {};
+      for (const s of (data.submissions ?? [])) {
+        map[s.player_id] = {
+          optionIdx:  s.option_idx,
+          sliderValue: s.numeric_value,
+          matchPairs: Array.isArray(s.answer_json) ? s.answer_json : null,
+          text:       s.text,
+        };
+      }
+      setRevealSubs(map);
+    }).catch(() => {});
+    return () => { stale = true; };
+  }, [sessionDbId, phase, qIdx]);
   // 084: refresh server progress on entering a question, on each realtime ANSWER notification (a
   // chAnswers-size change = a hint), and periodically. Graceful: errors (pre-084) leave it null.
   useEffect(() => {
@@ -2820,7 +2899,7 @@ function KahootHostView({ onNav, sessionName, pin, sessionDbId, demoMode, tenant
           : q.type === "slider" ? { sliderTarget: q.correct ?? 5, sliderTolerance: q.tolerance ?? 1 }
           : q.type === "match" ? { matchPairsCorrect: q.pairs ?? [], shuffledRight }
           : { correctIdx: q.correct };
-        publishReveal(payload, newScores);   // durable reveal publish + REVEAL broadcast — AFTER persistence
+        publishReveal084(payload, newScores);   // 084 durable reveal publish (phase already 'reveal') + REVEAL broadcast — AFTER persistence
         return;
       }
       if (rev.error && rev.error.code !== RPC_MISSING) { hasRevealedRef.current = false; setRevealErr(true); return; }  // 084 present but errored → retryable
@@ -3120,7 +3199,12 @@ function KahootHostView({ onNav, sessionName, pin, sessionDbId, demoMode, tenant
     doNext();
   };
 
-  const dist = (q?.options ?? []).map((_, i) => Object.values(chAnswers).filter(a => a.optionIdx === i).length);
+  // 084: during reveal, count the option distribution from the DURABLE submissions (revealSubs)
+  // so the bars are accurate even after a reconnect wiped chAnswers; live voting still uses chAnswers.
+  const dist = (q?.options ?? []).map((_, i) => {
+    const src = (phase === "reveal" && revealSubs) ? Object.values(revealSubs) : Object.values(chAnswers);
+    return src.filter(a => a.optionIdx === i).length;
+  });
   const openResponses = buildOpenResponses();   // 084: canonical roster + durable open text (never chAnswers keys)
   const rankBadges = ["1st","2nd","3rd","4th","5th"];
 
@@ -3566,7 +3650,7 @@ function KahootHostView({ onNav, sessionName, pin, sessionDbId, demoMode, tenant
               <div style={{ fontSize: 11, fontWeight: 700, color: C.textMuted, letterSpacing: "0.08em", marginBottom: 10 }}>PLAYER RESPONSES</div>
               <div style={{ display: "flex", flexDirection: "column", gap: 6, maxHeight: 220, overflowY: "auto" }}>
                 {scores.map(p => {
-                  const ans = chAnswers[p.id];
+                  const ans = revealSubs?.[p.id] ?? chAnswers[p.id];   // durable (084) → ephemeral fallback
                   const hasVal = ans?.sliderValue != null;
                   return (
                     <div key={p.id} style={{ display: "flex", alignItems: "center", gap: 10, padding: "8px 12px", borderRadius: 10, background: p.wasCorrect ? "#D1FAE5" : hasVal ? "#FEF2F2" : C.muted }}>
@@ -3616,7 +3700,7 @@ function KahootHostView({ onNav, sessionName, pin, sessionDbId, demoMode, tenant
               <div style={{ fontSize: 11, fontWeight: 700, color: C.textMuted, letterSpacing: "0.08em", marginBottom: 10 }}>PLAYER RESPONSES</div>
               <div style={{ display: "flex", flexDirection: "column", gap: 6, maxHeight: 220, overflowY: "auto" }}>
                 {scores.map(p => {
-                  const ans = chAnswers[p.id];
+                  const ans = revealSubs?.[p.id] ?? chAnswers[p.id];   // durable (084) → ephemeral fallback
                   const attempted = !!ans?.matchPairs?.length;
                   const total = q.pairs?.length ?? 0;
                   return (
@@ -3706,7 +3790,7 @@ function KahootHostView({ onNav, sessionName, pin, sessionDbId, demoMode, tenant
             <div style={{ fontSize: 11, fontWeight: 700, color: C.textMuted, letterSpacing: "0.08em", marginBottom: 10 }}>PLAYER RESPONSES</div>
             <div style={{ display: "flex", flexDirection: "column", gap: 6, maxHeight: 220, overflowY: "auto" }}>
               {scores.map(p => {
-                const ans = chAnswers[p.id];
+                const ans = revealSubs?.[p.id] ?? chAnswers[p.id];   // durable (084) → ephemeral fallback
                 const submittedLabel = ans && ans.optionIdx != null ? (q.options?.[ans.optionIdx] ?? `Option ${ans.optionIdx + 1}`) : null;
                 return (
                   <div key={p.id} style={{ display: "flex", alignItems: "center", gap: 10, padding: "8px 12px", borderRadius: 10, background: p.wasCorrect ? "#D1FAE5" : ans ? "#FEF2F2" : C.muted }}>
@@ -25005,16 +25089,25 @@ export default function App() {
                 const s = session?.data;
                 const terminal = !s || s.status === "completed" || s.status === "canceled" || s.phase === "ended";
                 if (s && !terminal) {
-                  setActiveGameSessionDbId(hostCtx.sessionDbId);
-                  setActiveGameIsDemo(false);
-                  setLobbyPin(s.pin ?? null);
-                  setLobbySessionName(s.name ?? null);
-                  setLobbyPlayerName(hostCtx.playerName ?? profile.name ?? null);
-                  setLobbyPlayerEmoji(hostCtx.playerEmoji ?? null);
-                  // Live (started or past waiting) → game view; still waiting → lobby.
-                  const live = s.status === "started" || (s.phase && s.phase !== "waiting");
-                  setScreen(live ? "rankd-game" : "rankd-lobby");
-                  hostReconnected = true;
+                  // Seed the host's live deck from the AUTHORITATIVE durable snapshot. Without
+                  // this, a host mid-game refresh leaves gameQuestions null → the render/broadcast
+                  // falls back to the demo GAME_QUESTIONS deck (the exact production failure). If it
+                  // can't be resolved, do NOT enter gameplay with demo content — leave the saved
+                  // context intact so a later retry/refresh can restore, and fall through to the hub.
+                  const realQs = await resolveRealQuestionsFromSnapshot(hostCtx.sessionDbId);
+                  if (Array.isArray(realQs) && realQs.length > 0) {
+                    setGameQuestions(realQs);
+                    setActiveGameSessionDbId(hostCtx.sessionDbId);
+                    setActiveGameIsDemo(false);
+                    setLobbyPin(s.pin ?? null);
+                    setLobbySessionName(s.name ?? null);
+                    setLobbyPlayerName(hostCtx.playerName ?? profile.name ?? null);
+                    setLobbyPlayerEmoji(hostCtx.playerEmoji ?? null);
+                    // Live (started or past waiting) → game view; still waiting → lobby.
+                    const live = s.status === "started" || (s.phase && s.phase !== "waiting");
+                    setScreen(live ? "rankd-game" : "rankd-lobby");
+                    hostReconnected = true;
+                  }
                 } else {
                   clearActiveGameContext(); // completed / canceled / ended → never restore
                 }
@@ -25954,8 +26047,19 @@ export default function App() {
     // cancel the just-created session (making it non-joinable) and let the host
     // retry — never leaving an orphaned joinable session without a snapshot.
     const quiz = quizzes.find(q => q.id === session.quizId);
-    const playedQuestions = quiz?.questions ?? GAME_QUESTIONS;
     const gameTenantId = currentOrg?.id ?? user?.orgId ?? null;
+    // Never snapshot the hardcoded demo GAME_QUESTIONS deck as a REAL game's authoritative
+    // question set: the durable question_snapshot written here is the single source of truth the
+    // host later renders from (via resolveRealQuestionsFromSnapshot). If a real quiz's questions
+    // aren't resolvable (catalog not loaded / wrong shape), fail closed — cancel the just-created
+    // session and let the host retry — rather than durably record the demo deck.
+    if (session.demoMode === false && (!quiz || !Array.isArray(quiz.questions) || quiz.questions.length === 0)) {
+      console.error("[ralli:game] createGameSession blocked: real quiz has no resolvable questions", session.quizId);
+      await cancelGameSession(data.id, gameTenantId).catch(e => console.error("[ralli:game] cancelGameSession failed:", e));
+      toast.error("Couldn't load this quiz's questions. Please reopen the quiz and try again.");
+      return;
+    }
+    const playedQuestions = quiz?.questions ?? GAME_QUESTIONS;
     if (data.id) {
       const { error: snapErr } = await saveSessionQuestionSnapshot(data.id, playedQuestions);
       if (snapErr) {
@@ -26162,7 +26266,7 @@ export default function App() {
   //   same way, but can't resume a genuinely in-flight question with the
   //   correct time remaining — see the comment on its restoration effect.
   const LOBBY_STATUSES = new Set(["waiting"]);
-  const handleLaunch = (session) => {
+  const handleLaunch = async (session) => {
     const isLobby = LOBBY_STATUSES.has(session.status);
     const isDemo  = session.demoMode !== false;
     const dbId    = session.dbId ?? null;
@@ -26176,8 +26280,20 @@ export default function App() {
       toast.error("Couldn't open this game — its session id is unavailable. Please refresh and try again.");
       return;
     }
-    const quiz = quizzes.find(q => q.id === session.quizId);
-    setGameQuestions(quiz?.questions ?? GAME_QUESTIONS);
+    // Seed the deck: a REAL session uses the AUTHORITATIVE durable snapshot (never the
+    // client quiz catalog, whose items can lack question bodies → silent demo fallback).
+    // Fail closed rather than re-enter a real game with the demo GAME_QUESTIONS deck.
+    if (isDemo) {
+      const quiz = quizzes.find(q => q.id === session.quizId);
+      setGameQuestions(quiz?.questions ?? GAME_QUESTIONS);
+    } else {
+      const realQs = await resolveRealQuestionsFromSnapshot(dbId);
+      if (!Array.isArray(realQs) || realQs.length === 0) {
+        toast.error("Couldn't load this game's questions. Please refresh and try again.");
+        return;
+      }
+      setGameQuestions(realQs);
+    }
     // Store the exact identity from the clicked session object.
     setActiveGameSessionDbId(dbId);
     setActiveGameIsDemo(isDemo);
@@ -26274,14 +26390,26 @@ export default function App() {
       return;
     }
 
-    // Started successfully — mark the exact active session started locally, broadcast
-    // GAME_START so all players navigate to the game, then navigate the host.
+    // Started successfully. Seed the host's live deck from the AUTHORITATIVE durable
+    // snapshot BEFORE entering gameplay — never `gameQuestions` (which can be null after a
+    // host refresh, or the demo GAME_QUESTIONS fallback) for a real game. This is the fix
+    // for a real session rendering/broadcasting the hardcoded demo deck while the durable
+    // snapshot holds the real quiz. Fail closed if it can't be resolved: stay in the lobby.
+    const realQs = await resolveRealQuestionsFromSnapshot(activeGameSessionDbId);
+    if (!Array.isArray(realQs) || realQs.length === 0) {
+      console.error("[ralli:game] handleGameStart blocked: could not resolve durable question snapshot");
+      toast.error("Couldn't load this game's questions. Please refresh and try again.");
+      return;
+    }
+    setGameQuestions(realQs);
+    // mark the exact active session started locally, broadcast GAME_START so all players
+    // navigate to the game, then navigate the host. GAME_START carries a PLAYER-SAFE deck
+    // (answer keys stripped) — learners only use it to start the countdown/navigate.
     setSessions(prev => prev.map(s =>
       (activeGameSessionDbId != null ? s.dbId === activeGameSessionDbId : s.code === lobbyPin)
         ? { ...s, status: "started" } : s
     ));
-    const qs = gameQuestions ?? GAME_QUESTIONS;
-    broadcast({ type: GM.GAME_START, questions: qs, totalQ: qs.length });
+    broadcast({ type: GM.GAME_START, questions: realQs.map(toPlayerSafeQuestion), totalQ: realQs.length });
     setScreen("rankd-game");
   };
 
