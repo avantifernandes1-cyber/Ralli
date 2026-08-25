@@ -2243,12 +2243,15 @@ function KahootHostView({ onNav, sessionName, pin, sessionDbId, demoMode, tenant
           if (!p.last_seen_at) return true;
           return (now - new Date(p.last_seen_at).getTime()) < HEARTBEAT_FRESH_MS;
         }).length;
-        // Halt fallback count: same status rule, but a null heartbeat does NOT
-        // count as active — a stale/heartbeat-less durable row must not keep a
-        // game alive when the host has lost Presence.
+        // Halt fallback count: a FRESH heartbeat is the ground truth of "connected now" and OVERRIDES
+        // a stale status flag. rpc_participant_heartbeat refreshes last_seen_at regardless of status,
+        // so a still-connected learner keeps beating even if a transient lobby-unmount/remount race
+        // spuriously wrote status='left'. Counting any fresh-heartbeat row (regardless of status) is
+        // what prevents a FALSE zero-player halt while learners are demonstrably connected, and lets a
+        // returned learner immediately cancel a pending halt. A genuinely departed player stops beating
+        // (their client unmounts and the heartbeat interval is cleared), so last_seen_at goes stale and
+        // they correctly drop within HEARTBEAT_FRESH_MS. A null heartbeat (no beat yet) never counts.
         const activeForHalt = data.filter(p => {
-          const statusOk = !p.status || p.status === "joined" || p.status === "active";
-          if (!statusOk) return false;
           if (!p.last_seen_at) return false;
           return (now - new Date(p.last_seen_at).getTime()) < HEARTBEAT_FRESH_MS;
         }).length;
@@ -7380,7 +7383,13 @@ function RankdLobbyScreen({ onNav, pin, sessionDbId: propSessionDbId = null, pla
         // the ended message rather than sitting in the lobby / "Hang tight".
         if (["canceled", "ended", "completed"].includes(data.status)) { setHostEnded(true); return; }
         const started = data.status === "started" || (data.phase && data.phase !== "waiting");
-        if (started) onNav("rankd-game");
+        // Navigating lobby→game is NOT a Leave. Set the SAME guard the broadcast nav path sets
+        // (advancingToGameRef) so the lobby's leave-on-unmount cleanup (markParticipantLeft →
+        // status='left') does not fire for a still-connected learner who advanced via this durable
+        // fallback. Without this, a learner who reaches the game through the poll (e.g. missing the
+        // GM.GAME_START frame) is wrongly marked 'left' on lobby unmount — which zeroes both halt
+        // sources and can falsely halt the game.
+        if (started) { advancingToGameRef.current = true; onNav("rankd-game"); }
       }).catch(() => {});
     };
     check(); // immediate on mount so a refresh after cancellation resolves at once
@@ -26402,6 +26411,15 @@ export default function App() {
       return;
     }
     setGameQuestions(realQs);
+    // Durable countdown recovery: persist phase='countdown' so a learner who reaches the game via
+    // the durable status poll (rpc_start_session sets status='started' but leaves phase='waiting'),
+    // or who misses the single transient GM.GAME_START frame, restores a countdown from server state
+    // (KahootPlayerView.reconcile's phase==='countdown' branch) instead of sitting on "Hang tight"
+    // and jumping straight to the question. The host's startQuestion flips durable phase to 'question'
+    // ~3s later, so a learner polling after the countdown correctly lands on the question. Best-effort:
+    // the GM.GAME_START broadcast remains the fast path; a failed persist must not block the game.
+    await updateSessionPhase(activeGameSessionDbId, { phase: "countdown", currentQuestionIndex: 0, paused: false })
+      .catch(e => console.error("[ralli:host] persist countdown phase failed:", e));
     // mark the exact active session started locally, broadcast GAME_START so all players
     // navigate to the game, then navigate the host. GAME_START carries a PLAYER-SAFE deck
     // (answer keys stripped) — learners only use it to start the countdown/navigate.

@@ -74,7 +74,7 @@ ok("does NOT map over the unfiltered quizzes prop for the picker list",
    !/\{quizzes\.map\(quiz => \(/.test(newSess));
 
 // ── (4) handleGameStart: await + quiz_unavailable branch ─────────────────────
-const hgs = app.slice(app.indexOf("const handleGameStart = async"), app.indexOf("const handleGameStart = async") + 6400);
+const hgs = app.slice(app.indexOf("const handleGameStart = async"), app.indexOf("const handleGameStart = async") + 7200);
 ok("handleGameStart is async", /const handleGameStart = async \(\) => \{/.test(app));
 ok("handleGameStart AWAITs startGameSession (result-driven, not fire-and-forget)",
    /startRes = await startGameSession\(activeGameSessionDbId\)/.test(hgs));
