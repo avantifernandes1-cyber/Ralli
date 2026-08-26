@@ -2264,7 +2264,10 @@ function KahootHostView({ onNav, sessionName, pin, sessionDbId, demoMode, tenant
     refreshRoster();
     const interval = setInterval(refreshRoster, 5000);
     return () => clearInterval(interval);
-  }, [sessionDbId]); // eslint-disable-line react-hooks/exhaustive-deps
+    // Re-poll immediately on a Presence change (a Leave/rejoin drops/adds a Presence entry) so the
+    // durable participant statuses — and thus the active-response denominator — update promptly rather
+    // than waiting up to 5s. The 5s interval remains the durable fallback.
+  }, [sessionDbId, chPlayers.length]); // eslint-disable-line react-hooks/exhaustive-deps
 
   // `scores` is initially seeded from Presence (chPlayers) so the scoreboard
   // isn't empty while the DB roster is still loading. But Presence identity
@@ -2701,16 +2704,36 @@ function KahootHostView({ onNav, sessionName, pin, sessionDbId, demoMode, tenant
     }).catch(() => {});
     return () => { stale = true; };
   }, [sessionDbId, phase, qIdx]);
-  // 084: refresh server progress on entering a question, on each realtime ANSWER notification (a
-  // chAnswers-size change = a hint), and periodically. Graceful: errors (pre-084) leave it null.
+  // Active-response progress. The auto-reveal denominator + the "answered" display use the
+  // server-authoritative ACTIVE RESPONSE SET — currently-active PARTICIPANTS (game_session_participants
+  // that are not 'left'/'completed' and whose heartbeat is fresh), NOT the immutable canonical roster
+  // (rpc_answer_progress.active counts the roster, which never changes on Leave, so it left the host
+  // waiting for a departed learner or the full timer). The numerator is the durable submissions BY
+  // those active participants (rpc_host_game_state), so a since-left player's earlier answer can never
+  // satisfy the remaining active learner's slot. This recomputes whenever the participant set changes
+  // (Leave/rejoin → dbParticipants dep) or a realtime ANSWER hint arrives, plus a 2s durable fallback —
+  // so an explicit Leave drops the denominator promptly and a rejoin restores it, with no stale cache.
   useEffect(() => {
     if (!sessionDbId || phase !== "question") return;
     let stale = false;
-    const refresh = () => { getAnswerProgress(sessionDbId, qIdx).then(({ data, error }) => { if (!stale && !error && data) setAnswerProgress(data); }).catch(() => {}); };
+    const refresh = () => {
+      getHostGameState(sessionDbId).then(({ data, error }) => {
+        if (stale || error || !data) return;
+        const now = Date.now();
+        const activeIds = (dbParticipants ?? []).filter(p => {
+          if (p.status === "left" || p.status === "completed") return false;   // explicit Leave / done → not eligible
+          if (!p.last_seen_at) return true;                                    // just joined, no beat yet → eligible
+          return (now - new Date(p.last_seen_at).getTime()) < HEARTBEAT_FRESH_MS; // fresh heartbeat → connected
+        }).map(p => p.player_id ?? p.id);
+        const answered = new Set((data.submissions ?? []).filter(s => s.question_idx === qIdx).map(s => s.player_id));
+        const answeredActive = activeIds.filter(id => answered.has(id)).length;
+        setAnswerProgress({ answered: answeredActive, active: activeIds.length });
+      }).catch(() => {});
+    };
     refresh();
     const iv = setInterval(refresh, 2000);
     return () => { stale = true; clearInterval(iv); };
-  }, [sessionDbId, phase, qIdx, Object.keys(chAnswers).length]); // eslint-disable-line react-hooks/exhaustive-deps
+  }, [sessionDbId, phase, qIdx, Object.keys(chAnswers).length, dbParticipants]); // eslint-disable-line react-hooks/exhaustive-deps
 
   // 084: host refresh/reconnect DURING open-review — rebuild the durable open-grading input (canonical
   // roster + durable open responses) from the server so manual grading is never lost or presence-based.
@@ -3139,13 +3162,14 @@ function KahootHostView({ onNav, sessionName, pin, sessionDbId, demoMode, tenant
     }
   };
 
-  const doNext = () => {
+  const doNext = async () => {
     if (isFinalQ) {
-      // ACCEPTANCE GATE FIRST. The parent validates identity; only on accept do
-      // we notify players (broadcast), write the terminal phase, and navigate.
-      // On reject: players are NOT told the game ended, phase stays intact, and
-      // the host stays put with the parent's retryable error.
-      const ok = onGameEnd ? onGameEnd({ scores, questions, questionHistory, sessionDbId, demoMode }) : true;
+      // ACCEPTANCE GATE FIRST. The parent validates identity AND (now) AWAITS the durable terminal
+      // persistence (status='completed' + ended_at + game_players) before we notify players. Only on
+      // accept do we broadcast GM.GAME_END — so terminal state is persisted BEFORE the terminal
+      // broadcast, and a learner who misses the broadcast still recovers it via the status reconcile.
+      // On reject: players are NOT told the game ended, phase stays intact, and the host stays put.
+      const ok = onGameEnd ? await onGameEnd({ scores, questions, questionHistory, sessionDbId, demoMode }) : true;
       if (ok === false) return;
       broadcast({ type: GM.GAME_END, scores });
       persistPhase("ended", qIdx, false);
@@ -4001,6 +4025,18 @@ function KahootPlayerView({ onNav, playerName, playerEmoji, playerId, pin, sessi
       const timingFresh = !lq || readSeq >= timingSeqRef.current;
       if (timingFresh) setGamePaused(!!s.paused);
 
+      // Terminal recovery keyed on the AUTHORITATIVE status. rpc_end_session sets status='completed'
+      // + ended_at atomically; phase='ended' is a SEPARATE fire-and-forget write that can race/not land,
+      // so an in-game learner must not depend on it (the lobby poll and boot restore already key on
+      // status). Populate the final board from the durable published scoreboard, then show the terminal
+      // results screen (which carries the exit action) — even if GM.GAME_END and phase='ended' were missed.
+      if (s.status === "completed" || s.status === "ended" || s.status === "canceled") {
+        const finalBoard = durableRestoreDecision(s);
+        if (finalBoard) setFinalScores(scoreboardRows(finalBoard.entries));
+        setPhase("ended");
+        return;
+      }
+
       if (s.phase === "waiting")    return;                       // still in lobby
       if (s.phase === "scoreboard") {
         // Durable recovery (081): apply the exact published board ONLY when it agrees with the
@@ -4406,8 +4442,12 @@ function KahootPlayerView({ onNav, playerName, playerEmoji, playerId, pin, sessi
         </div>
         <div style={{ padding: "14px 20px", borderTop: `1px solid ${C.border}` }}>
           {isFinalBoard
-            ? <button onClick={() => onNav("home")} style={{ width: "100%", padding: "13px", borderRadius: 14, border: "none", background: C.orange, color: "#fff", fontWeight: 900, fontSize: 15, cursor: "pointer", boxShadow: "0 0 32px rgba(253,191,36,0.3)" }}>Done</button>
-            : <p style={{ margin: 0, fontSize: 13, color: C.textSub, textAlign: "center" }}>Waiting for host to continue…</p>
+            ? <button onClick={() => onNav("rankd")} style={{ width: "100%", padding: "13px", borderRadius: 14, border: "none", background: C.orange, color: "#fff", fontWeight: 900, fontSize: 15, cursor: "pointer", boxShadow: "0 0 32px rgba(253,191,36,0.3)" }}>Back to Ralli Games</button>
+            : <>
+                <p style={{ margin: "0 0 10px", fontSize: 13, color: C.textSub, textAlign: "center" }}>Waiting for host to continue…</p>
+                {/* Defensive exit so an intermediate scoreboard is never a dead end (e.g. a missed terminal signal). */}
+                <button onClick={() => setShowLeaveConfirm(true)} style={{ display: "block", margin: "0 auto", padding: "8px 16px", borderRadius: 10, border: `1px solid ${C.border}`, background: "transparent", color: C.textMuted, fontWeight: 700, fontSize: 12, cursor: "pointer" }}>Leave game</button>
+              </>
           }
         </div>
       </div>
@@ -26439,7 +26479,7 @@ export default function App() {
   // id the child carries on `data.sessionDbId` must be non-null AND equal to
   // App state for a persisted game — otherwise we cannot know which session
   // this is and must not pick one speculatively.
-  const handleGameEnd = (data) => {
+  const handleGameEnd = async (data) => {
     const isDemoGame  = activeGameIsDemo;
     const appDbId     = activeGameSessionDbId;      // authoritative
     const carriedDbId = data?.sessionDbId ?? null;  // what the child held
@@ -26469,38 +26509,37 @@ export default function App() {
         ? { ...s, status: "completed" } : s
     ));
     const gameTenantId = currentOrg?.id ?? user?.orgId ?? null;
-    // Persist results + mark participants completed in Supabase (fire-and-forget).
-    // Pass the authoritative session id so endGameSession needs no read of the row it
-    // just updated (safe-read cutover — works after table SELECT is revoked).
-    endGameSession(lobbyPin, {
-      scores:   data?.scores ?? [],
-      tenantId: gameTenantId,
-      sessionId: endedDbId,
-    }).then(() => {
-      // Refresh Past Sessions from the DB now that this session's status/
-      // ended_at/game_players are actually persisted — without this, Past
-      // Sessions wouldn't show the just-finished game until the next login
-      // or the 10s poll on the games screen (see getGameHistory).
-      if (gameTenantId) {
-        getGameHistory(gameTenantId).then(({ data: history, error }) => {
-          if (error) console.error("[ralli] getGameHistory refresh failed:", error);
-          if (history) setPastSessions(history);
-        });
-      }
-      // Post-completion, request server-authoritative verification (migration 072
-      // + verify-game-session). Fire-and-forget and retryable/idempotent: it runs
-      // ONLY after durable completion, must never delay or strand the end screen,
-      // and a failure/unavailable Edge Function must never erase gameplay results
-      // — the session simply stays UNVERIFIED (and thus never leaderboard-eligible).
-      // endedDbId is null for demo games, so this is real-session-only.
-      if (endedDbId) {
-        requestSessionVerification(endedDbId)
-          .then(({ unavailable }) => {
-            if (unavailable) console.info("[ralli] session verification unavailable — session stays unverified until the verify service is deployed");
-          })
-          .catch(() => { /* never affects gameplay results */ });
-      }
-    }).catch(e => console.error("[ralli] endGameSession failed:", e));
+    // Persist terminal state (status='completed' + ended_at via rpc_end_session, and the final
+    // game_players rows) — AND AWAIT it, so the caller (doNext) broadcasts GM.GAME_END only AFTER the
+    // durable terminal state exists. This satisfies "terminal state persisted before terminal broadcast":
+    // a learner who receives the broadcast can always also recover the same state durably, and a learner
+    // who MISSES the broadcast recovers via the status-based reconcile. Pass the authoritative session id
+    // so endGameSession needs no read of the row it just updated (safe-read cutover).
+    try {
+      await endGameSession(lobbyPin, {
+        scores:   data?.scores ?? [],
+        tenantId: gameTenantId,
+        sessionId: endedDbId,
+      });
+    } catch (e) { console.error("[ralli] endGameSession failed:", e); }
+    // Post-persist follow-ups (fire-and-forget — must never delay or strand the end screen).
+    // Refresh Past Sessions now that status/ended_at/game_players are persisted.
+    if (gameTenantId) {
+      getGameHistory(gameTenantId).then(({ data: history, error }) => {
+        if (error) console.error("[ralli] getGameHistory refresh failed:", error);
+        if (history) setPastSessions(history);
+      }).catch(() => {});
+    }
+    // Post-completion, request server-authoritative verification (migration 072 + verify-game-session).
+    // Retryable/idempotent; a failure/unavailable Edge Function must never erase gameplay results —
+    // the session simply stays UNVERIFIED. endedDbId is null for demo games (real-session-only).
+    if (endedDbId) {
+      requestSessionVerification(endedDbId)
+        .then(({ unavailable }) => {
+          if (unavailable) console.info("[ralli] session verification unavailable — session stays unverified until the verify service is deployed");
+        })
+        .catch(() => { /* never affects gameplay results */ });
+    }
     // Award game points for all real participants, then trigger readiness for each.
     // awardGamePointsForSession returns the deduplicated list of authenticated user IDs
     // it awarded points to. Anonymous players have no player_id and are excluded.
