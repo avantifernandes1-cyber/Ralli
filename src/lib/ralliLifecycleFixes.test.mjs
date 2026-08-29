@@ -38,11 +38,12 @@ ok("6 lobby leave-on-unmount cleanup still bails when advancingToGameRef is set"
 // The halt fallback count must count a FRESH heartbeat regardless of status='left' (a spurious leave
 // must not zero a demonstrably-connected learner). The halt count block is the `activeForHalt` filter.
 const afhIdx = app.indexOf("const activeForHalt = data.filter");
-const afhBlock = app.slice(afhIdx, afhIdx + 260);
+const afhBlock = app.slice(afhIdx, afhIdx + 360);
 ok("7 activeForHalt counts by heartbeat freshness (HEARTBEAT_FRESH_MS), null beat excluded",
    /if \(!p\.last_seen_at\) return false;[\s\S]{0,120}HEARTBEAT_FRESH_MS/.test(afhBlock));
-ok("8 activeForHalt no longer gates on status (a fresh heartbeat overrides a stale 'left')",
-   !/statusOk/.test(afhBlock));
+ok("8 activeForHalt HONORS an explicit Leave (gates on status='left'); spurious-left is protected by raw Presence",
+   /if \(!statusOk\) return false/.test(afhBlock) &&
+   /const presenceActiveCount = chPlayers\.filter\(p => p\.id\)\.length/.test(app));
 // The DISPLAY roster count (`active`) is separate and may still consider status — unchanged.
 ok("9 the display roster count still exists (separate from the halt count)",
    /const active = data\.filter/.test(app));

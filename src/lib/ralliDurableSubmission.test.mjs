@@ -76,10 +76,10 @@ ok("22 graceful fallback to legacy realtime path ONLY when the 084 RPCs are abse
    /else: RPC_MISSING \(pre-084\)/.test(host));
 ok("23 auto-reveal + answered count come from the SERVER active-response set (active participants + durable submissions), not chAnswers/presence",
    /const answeredCount = answerProgress \? answerProgress\.answered : Object\.keys\(chAnswers\)\.length/.test(host) &&
-   /const playerCount   = answerProgress \? Math\.max\(answerProgress\.active, 1\) : /.test(host) &&
+   /const playerCount   = answerProgress \? answerProgress\.active : /.test(host) &&
    /getHostGameState\(sessionDbId\)/.test(host) &&
-   /const answeredActive = activeIds\.filter\(id => answered\.has\(id\)\)\.length/.test(host) &&
-   /setAnswerProgress\(\{ answered: answeredActive, active: activeIds\.length \}\)/.test(host));
+   /const answeredActive = activeIds\.filter\(id => submitters\.has\(id\)\)\.length/.test(host) &&
+   /setAnswerProgress\(\{ answered: answeredActive, active: activeIds\.length, qIdx: forQIdx \}\)/.test(host));
 ok("24 server progress resets each question (no premature auto-reveal from a stale count)",
    /useEffect\(\(\) => \{ setAnswerProgress\(null\); setRevealSubs\(null\); \}, \[qIdx\]\)/.test(host));
 ok("25 host surfaces a retryable reveal error (revealErr banner + Retry reveal → doReveal)",

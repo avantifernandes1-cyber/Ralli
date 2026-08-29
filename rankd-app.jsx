@@ -2034,7 +2034,8 @@ function KahootHostView({ onNav, sessionName, pin, sessionDbId, demoMode, tenant
     return chPlayers.map(p => ({ ...p, score: 0 }));   // graceful pre-084 fallback (presence)
   };
   const [revealErr, setRevealErr] = useState(false);   // 084: durable reveal/persist failed → block reveal, retryable
-  const [answerProgress, setAnswerProgress] = useState(null); // 084: {answered,active} from rpc_answer_progress (null = legacy)
+  const [answerProgress, setAnswerProgress] = useState(null); // active-response snapshot: {answered, active, qIdx}
+  const progressReqRef = useRef(0); // monotonic id so an out-of-order progress response never overwrites a newer one
   const [openReveal, setOpenReveal] = useState(null);  // 084: {roster,submissions,questionStartedAt} for durable open-ended manual grading (null = legacy)
   const [openGrades, setOpenGrades] = useState({});  // { idx: "correct"|"incorrect", __showNames: bool }
   // Matching questions: one shuffle computed by the host and broadcast to all
@@ -2243,15 +2244,16 @@ function KahootHostView({ onNav, sessionName, pin, sessionDbId, demoMode, tenant
           if (!p.last_seen_at) return true;
           return (now - new Date(p.last_seen_at).getTime()) < HEARTBEAT_FRESH_MS;
         }).length;
-        // Halt fallback count: a FRESH heartbeat is the ground truth of "connected now" and OVERRIDES
-        // a stale status flag. rpc_participant_heartbeat refreshes last_seen_at regardless of status,
-        // so a still-connected learner keeps beating even if a transient lobby-unmount/remount race
-        // spuriously wrote status='left'. Counting any fresh-heartbeat row (regardless of status) is
-        // what prevents a FALSE zero-player halt while learners are demonstrably connected, and lets a
-        // returned learner immediately cancel a pending halt. A genuinely departed player stops beating
-        // (their client unmounts and the heartbeat interval is cleared), so last_seen_at goes stale and
-        // they correctly drop within HEARTBEAT_FRESH_MS. A null heartbeat (no beat yet) never counts.
+        // Halt DURABLE count: honors an explicit Leave AT ONCE — a 'left'/'completed' row is excluded
+        // regardless of heartbeat freshness (rpc_participant_leave stamps last_seen_at=now(), so a
+        // heartbeat-only rule would keep an explicit leaver "fresh" for ~40s and delay/miss the halt —
+        // the observed failure). Protection against a SPURIOUS 'left' on a still-connected learner is
+        // provided by the Presence signal instead (see presenceActiveCount above), which counts them
+        // while they remain connected. A crashed client (row stays 'active') still uses the heartbeat
+        // grace: it drops once last_seen_at goes stale. A null heartbeat never counts for the halt.
         const activeForHalt = data.filter(p => {
+          const statusOk = !p.status || p.status === "joined" || p.status === "active";
+          if (!statusOk) return false;
           if (!p.last_seen_at) return false;
           return (now - new Date(p.last_seen_at).getTime()) < HEARTBEAT_FRESH_MS;
         }).length;
@@ -2326,15 +2328,16 @@ function KahootHostView({ onNav, sessionName, pin, sessionDbId, demoMode, tenant
   const haltActionedRef = useRef(false); // idempotent guard for the pause side effects (persist + broadcast)
   // Refs mirror the latest values into the watchdog interval below without
   // forcing the interval to be torn down and recreated on every tick.
-  // Durable 'left'/'completed' overrides a lingering ghost Presence entry in the zero-player
-  // calc (same authoritative rule as the lobby roster): an explicitly-left player must not keep
-  // the game alive via a Presence entry that hasn't hit the server timeout yet. dbParticipants
-  // now carries 'left' rows; a tab close leaves the row 'active' and still uses the heartbeat grace.
-  const leftIdsHost = useMemo(
-    () => new Set((dbParticipants || []).filter(p => p.status === "left" || p.status === "completed").map(p => p.player_id ?? p.id)),
-    [dbParticipants]
-  );
-  const presenceActiveCount = chPlayers.filter(p => p.id && !leftIdsHost.has(p.id)).length;
+  // Zero-player halt connectivity uses TWO independent signals (the watchdog takes the max):
+  //   • Presence = who is ACTUALLY connected right now (raw realtime entries). We deliberately do NOT
+  //     subtract 'left' rows here: a still-connected learner spuriously marked 'left' must stay
+  //     protected by Presence, and an EXPLICITLY-left learner drops out of Presence on their own
+  //     channel teardown (they untrack on Leave), so they stop counting here without over-filtering.
+  //   • The durable heartbeat count (dbActiveForHalt, below) is what honors an explicit Leave
+  //     immediately — it excludes 'left'/'completed' rows — while a crashed client (row stays 'active')
+  //     still gets the heartbeat grace before dropping. Together: explicit Leave halts promptly, a
+  //     spurious 'left' never halts a connected learner, and a genuine crash halts after the grace.
+  const presenceActiveCount = chPlayers.filter(p => p.id).length;
   const chPlayersLenRef = useRef(presenceActiveCount);
   chPlayersLenRef.current = presenceActiveCount;
   const chStatusRef = useRef(chStatus);
@@ -2673,7 +2676,10 @@ function KahootHostView({ onNav, sessionName, pin, sessionDbId, demoMode, tenant
   // ACTIVE canonical roster (rpc_answer_progress). Realtime ANSWER events only TRIGGER a refresh —
   // their payload never increments the count. Falls back to presence/chAnswers for demo or pre-084.
   const answeredCount = answerProgress ? answerProgress.answered : Object.keys(chAnswers).length;
-  const playerCount   = answerProgress ? Math.max(answerProgress.active, 1) : Math.max(chPlayers.length, 1);
+  // Denominator = the active-response count. When the snapshot is loaded, use it verbatim (a genuine 0
+  // active learners reads "0/0", not a floored "0/1"); only the pre-load fallback floors to avoid 0-of-0
+  // flicker before the first snapshot. (Percentage bars already guard playerCount > 0.)
+  const playerCount   = answerProgress ? answerProgress.active : Math.max(chPlayers.length, 1);
   const isFinalQ      = qIdx === total - 1;
   const timerPct      = q ? (timeLeft / q.timeLimit) * 100 : 0;
   const timerColor    = timerPct > 50 ? C.green : timerPct > 25 ? C.orange : C.red;
@@ -2717,17 +2723,28 @@ function KahootHostView({ onNav, sessionName, pin, sessionDbId, demoMode, tenant
     if (!sessionDbId || phase !== "question") return;
     let stale = false;
     const refresh = () => {
+      // Revision + identity guard: each request gets a monotonically increasing id; only the LATEST
+      // request's result is applied, so an OLDER async response (resolving out of order after a
+      // Leave/rejoin) can never overwrite a NEWER snapshot. The result is also discarded if it is for a
+      // different question than the one it was requested for (session is scoped by sessionDbId).
+      const reqId = ++progressReqRef.current;
+      const forQIdx = qIdx;
       getHostGameState(sessionDbId).then(({ data, error }) => {
         if (stale || error || !data) return;
+        if (reqId !== progressReqRef.current) return;                          // superseded by a newer request → discard
+        if ((data.current_question_index ?? forQIdx) !== forQIdx) return;      // identity guard: response for a different question
         const now = Date.now();
+        // Active-response set = currently-active PARTICIPANTS (not 'left'/'completed', fresh heartbeat).
         const activeIds = (dbParticipants ?? []).filter(p => {
           if (p.status === "left" || p.status === "completed") return false;   // explicit Leave / done → not eligible
           if (!p.last_seen_at) return true;                                    // just joined, no beat yet → eligible
           return (now - new Date(p.last_seen_at).getTime()) < HEARTBEAT_FRESH_MS; // fresh heartbeat → connected
-        }).map(p => p.player_id ?? p.id);
-        const answered = new Set((data.submissions ?? []).filter(s => s.question_idx === qIdx).map(s => s.player_id));
-        const answeredActive = activeIds.filter(id => answered.has(id)).length;
-        setAnswerProgress({ answered: answeredActive, active: activeIds.length });
+        }).map(p => p.player_id ?? p.id).sort();
+        // Numerator = durable submissions BY those active participants for THIS exact question.
+        const submitters = new Set((data.submissions ?? []).filter(s => s.question_idx === forQIdx).map(s => s.player_id));
+        const answeredActive = activeIds.filter(id => submitters.has(id)).length;
+        // One atomic snapshot (session/qIdx-scoped, revision-guarded): active ids + answered + active.
+        setAnswerProgress({ answered: answeredActive, active: activeIds.length, qIdx: forQIdx });
       }).catch(() => {});
     };
     refresh();
@@ -2866,7 +2883,11 @@ function KahootHostView({ onNav, sessionName, pin, sessionDbId, demoMode, tenant
     if (halted || paused) return; // no automatic reveal while paused/halted
     if (phase !== "question" || answeredCount < playerCount || answeredCount === 0) return;
     doReveal();
-  }, [answeredCount, phase, restoreState, halted, paused]); // eslint-disable-line react-hooks/exhaustive-deps
+    // playerCount MUST be a dep: when active eligibility drops (a learner Leaves) the DENOMINATOR
+    // changes while answeredCount stays the same, and without this the effect would not re-evaluate —
+    // so the current question would wait for the timer even though the remaining active learner has
+    // already answered. With it, active 2→1 immediately re-checks answeredCount >= playerCount.
+  }, [answeredCount, playerCount, phase, restoreState, halted, paused]); // eslint-disable-line react-hooks/exhaustive-deps
 
   const doReveal = async () => {
     // Reentrancy guard — see hasRevealedRef declaration above. Must be the
@@ -3475,7 +3496,13 @@ function KahootHostView({ onNav, sessionName, pin, sessionDbId, demoMode, tenant
             <div key={i} style={{ flex: 1, height: 4, borderRadius: 2, background: i < qIdx ? C.green : i === qIdx ? C.orange : "rgba(255,255,255,0.12)", transition: "background 0.3s" }} />
           ))}
         </div>
-        <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
+        <div style={{ display: "flex", alignItems: "center", gap: 14 }}>
+          {/* Presentational: the existing game PIN next to the player count, so the host can read it to a
+              rejoining learner without leaving gameplay. Uses the `pin` prop — no session/channel change. */}
+          <div style={{ textAlign: "right" }}>
+            <div style={{ fontSize: 15, fontWeight: 800, letterSpacing: "0.08em", color: C.dark }}>{pin}</div>
+            <div style={{ fontSize: 10, color: C.textMuted }}>Game PIN</div>
+          </div>
           <div style={{ textAlign: "right" }}>
             <div style={{ fontSize: 18, fontWeight: 900, color: answeredCount >= playerCount ? "#059669" : C.dark }}>{answeredCount}/{playerCount}</div>
             <div style={{ fontSize: 10, color: C.textMuted }}>players answered</div>
