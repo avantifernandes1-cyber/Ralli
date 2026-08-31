@@ -19,6 +19,13 @@ import {
   createGameSession,
   findJoinableSession,
   startGameSession,
+  submitGameAnswer,
+  getHostGameState,
+  beginQuestionReveal,
+  recordQuestionResults,
+  getAnswerProgress,
+  getMySubmission,
+  RPC_MISSING,
   publishScoreboard,
   endGameSession,
   getActiveSessions,
@@ -48,6 +55,7 @@ import {
 // exact same file (deploy bundles within supabase/functions); the browser imports
 // it here. One canonical grader, no copy. See supabase/functions/_shared/gameGrading.js.
 import { gradeAnswer } from "./supabase/functions/_shared/gameGrading.js";
+import { reconcileReveal } from "./src/lib/revealReconcile.js";
 // Canonical player-safe question serializer — the SINGLE place that strips
 // correct-answer/grading fields before a question is sent to or restored by a
 // player (SHOW_QUESTION broadcast + persisted live_question). The host keeps the
@@ -1944,6 +1952,25 @@ const OPTION_COLORS = [
   { bg: "#EF4444", glow: "rgba(239,68,68,0.3)"   },  // D — red
 ];
 
+// Resolve the AUTHORITATIVE question deck for a REAL session from the durable
+// question_snapshot (written once at creation, migration 049; read via the host/manager
+// authorized rpc_manager_session_analytics, migration 075). This is the ONLY trustworthy
+// source of what a live game is actually playing — NEVER the client `quizzes` catalog,
+// whose list items can lack question bodies (learners load sanitized metadata; a manager's
+// catalog can be mid-load) so `quizzes.find(...)?.questions ?? GAME_QUESTIONS` silently
+// falls back to the hardcoded demo deck. That fallback is the root cause of a real game
+// rendering/broadcasting demo content while the durable snapshot holds the real quiz.
+// Returns the snapshot array, or null when it cannot be resolved — callers MUST fail
+// closed for a real game (never enter/broadcast the demo deck).
+async function resolveRealQuestionsFromSnapshot(sessionDbId) {
+  if (!sessionDbId) return null;
+  try {
+    const { data, error } = await getManagerSessionAnalytics(sessionDbId);
+    const snap = data?.snapshot;
+    return (!error && Array.isArray(snap) && snap.length > 0) ? snap : null;
+  } catch { return null; }
+}
+
 const SAMPLE_QUIZZES = [
   {
     id: "sq1",
@@ -1998,6 +2025,18 @@ function KahootHostView({ onNav, sessionName, pin, sessionDbId, demoMode, tenant
   const [cdNum,      setCdNum]      = useState(3);
   const [timeLeft,   setTimeLeft]   = useState(0);
   const [scores,     setScores]     = useState(() => chPlayers.map(p => ({ ...p, score: 0 })));
+  // 084: immutable server-authoritative CANONICAL roster (eligible authenticated learners, resolved
+  // at game start). When present it is the membership truth for scoring — NEVER a Q0 presence snapshot.
+  const canonicalRosterRef = useRef([]);
+  const rosterScoreRows = () => {
+    const r = canonicalRosterRef.current;
+    if (r && r.length) return r.map(m => ({ id: m.id, name: m.name, emoji: m.emoji ?? null, color: null, score: 0 }));
+    return chPlayers.map(p => ({ ...p, score: 0 }));   // graceful pre-084 fallback (presence)
+  };
+  const [revealErr, setRevealErr] = useState(false);   // 084: durable reveal/persist failed → block reveal, retryable
+  const [answerProgress, setAnswerProgress] = useState(null); // active-response snapshot: {answered, active, qIdx}
+  const progressReqRef = useRef(0); // monotonic id so an out-of-order progress response never overwrites a newer one
+  const [openReveal, setOpenReveal] = useState(null);  // 084: {roster,submissions,questionStartedAt} for durable open-ended manual grading (null = legacy)
   const [openGrades, setOpenGrades] = useState({});  // { idx: "correct"|"incorrect", __showNames: bool }
   // Matching questions: one shuffle computed by the host and broadcast to all
   // players in SHOW_QUESTION, so every client renders the same right-column
@@ -2205,9 +2244,13 @@ function KahootHostView({ onNav, sessionName, pin, sessionDbId, demoMode, tenant
           if (!p.last_seen_at) return true;
           return (now - new Date(p.last_seen_at).getTime()) < HEARTBEAT_FRESH_MS;
         }).length;
-        // Halt fallback count: same status rule, but a null heartbeat does NOT
-        // count as active — a stale/heartbeat-less durable row must not keep a
-        // game alive when the host has lost Presence.
+        // Halt DURABLE count: honors an explicit Leave AT ONCE — a 'left'/'completed' row is excluded
+        // regardless of heartbeat freshness (rpc_participant_leave stamps last_seen_at=now(), so a
+        // heartbeat-only rule would keep an explicit leaver "fresh" for ~40s and delay/miss the halt —
+        // the observed failure). Protection against a SPURIOUS 'left' on a still-connected learner is
+        // provided by the Presence signal instead (see presenceActiveCount above), which counts them
+        // while they remain connected. A crashed client (row stays 'active') still uses the heartbeat
+        // grace: it drops once last_seen_at goes stale. A null heartbeat never counts for the halt.
         const activeForHalt = data.filter(p => {
           const statusOk = !p.status || p.status === "joined" || p.status === "active";
           if (!statusOk) return false;
@@ -2223,7 +2266,10 @@ function KahootHostView({ onNav, sessionName, pin, sessionDbId, demoMode, tenant
     refreshRoster();
     const interval = setInterval(refreshRoster, 5000);
     return () => clearInterval(interval);
-  }, [sessionDbId]); // eslint-disable-line react-hooks/exhaustive-deps
+    // Re-poll immediately on a Presence change (a Leave/rejoin drops/adds a Presence entry) so the
+    // durable participant statuses — and thus the active-response denominator — update promptly rather
+    // than waiting up to 5s. The 5s interval remains the durable fallback.
+  }, [sessionDbId, chPlayers.length]); // eslint-disable-line react-hooks/exhaustive-deps
 
   // `scores` is initially seeded from Presence (chPlayers) so the scoreboard
   // isn't empty while the DB roster is still loading. But Presence identity
@@ -2282,15 +2328,16 @@ function KahootHostView({ onNav, sessionName, pin, sessionDbId, demoMode, tenant
   const haltActionedRef = useRef(false); // idempotent guard for the pause side effects (persist + broadcast)
   // Refs mirror the latest values into the watchdog interval below without
   // forcing the interval to be torn down and recreated on every tick.
-  // Durable 'left'/'completed' overrides a lingering ghost Presence entry in the zero-player
-  // calc (same authoritative rule as the lobby roster): an explicitly-left player must not keep
-  // the game alive via a Presence entry that hasn't hit the server timeout yet. dbParticipants
-  // now carries 'left' rows; a tab close leaves the row 'active' and still uses the heartbeat grace.
-  const leftIdsHost = useMemo(
-    () => new Set((dbParticipants || []).filter(p => p.status === "left" || p.status === "completed").map(p => p.player_id ?? p.id)),
-    [dbParticipants]
-  );
-  const presenceActiveCount = chPlayers.filter(p => p.id && !leftIdsHost.has(p.id)).length;
+  // Zero-player halt connectivity uses TWO independent signals (the watchdog takes the max):
+  //   • Presence = who is ACTUALLY connected right now (raw realtime entries). We deliberately do NOT
+  //     subtract 'left' rows here: a still-connected learner spuriously marked 'left' must stay
+  //     protected by Presence, and an EXPLICITLY-left learner drops out of Presence on their own
+  //     channel teardown (they untrack on Leave), so they stop counting here without over-filtering.
+  //   • The durable heartbeat count (dbActiveForHalt, below) is what honors an explicit Leave
+  //     immediately — it excludes 'left'/'completed' rows — while a crashed client (row stays 'active')
+  //     still gets the heartbeat grace before dropping. Together: explicit Leave halts promptly, a
+  //     spurious 'left' never halts a connected learner, and a genuine crash halts after the grace.
+  const presenceActiveCount = chPlayers.filter(p => p.id).length;
   const chPlayersLenRef = useRef(presenceActiveCount);
   chPlayersLenRef.current = presenceActiveCount;
   const chStatusRef = useRef(chStatus);
@@ -2518,9 +2565,15 @@ function KahootHostView({ onNav, sessionName, pin, sessionDbId, demoMode, tenant
   // never leave the DB on `question` while players are told the answer, and a
   // delayed write can never attach an old reveal to a newer question. Retry reuses
   // the same frozen payload and never re-grades/re-inserts.
-  const revealPubRef = useRef(null);            // frozen { qIdx, liveQuestion, broadcastMsg }
+  const revealPubRef = useRef(null);            // frozen { mode?, qIdx, liveQuestion, broadcastMsg }
   const revealPublishingRef = useRef(false);    // concurrent / double-click guard
   const [revealPublishError, setRevealPublishError] = useState(false);
+  // 084: DURABLE per-player answers for the current reveal question, keyed by player_id
+  // (auth.uid), sourced from rpc_host_game_state. The reveal per-player panels used ONLY the
+  // ephemeral chAnswers realtime map, which is wiped on channel teardown / new question and is
+  // never repopulated for a reloaded learner — so after any reconnect the host showed every
+  // learner as "No answer" though durable submissions exist. This is the durable fallback.
+  const [revealSubs, setRevealSubs] = useState(null);
 
   const runRevealPublish = useCallback(async () => {
     const frozen = revealPubRef.current;
@@ -2529,15 +2582,29 @@ function KahootHostView({ onNav, sessionName, pin, sessionDbId, demoMode, tenant
     revealPublishingRef.current = true;
     try {
       if (sessionDbId) {
-        // Strict, state-guarded durable write bound to THIS exact session + question.
-        // Broadcast ONLY after it is confirmed (applied) or already durably present
-        // with the identical payload (idempotent — a lost response). A stale result
-        // (newer/older question, countdown/scoreboard/ended, terminal) is abandoned;
-        // a conflict (a DIFFERENT reveal already stored for this qIdx) is surfaced.
-        const res = await publishRevealDurable(sessionDbId, frozen.qIdx, frozen.liveQuestion);
-        if (res.outcome === "stale")    { revealPubRef.current = null; setRevealPublishError(false); return; } // superseded — abandon quietly
-        if (res.outcome === "conflict") { setRevealPublishError(true); return; }                                // integrity conflict → host Retry/End
-        if (!res.ok)                    { setRevealPublishError(true); return; }                                // error → host Retry; NO broadcast
+        if (frozen.mode === "durable084") {
+          // 084 path: rpc_begin_question_reveal already CLOSED submissions and moved the
+          // session to phase='reveal' under a row lock (bound to this exact session + qIdx),
+          // and results were already persisted via rpc_record_question_results. The pre-084
+          // rpc_host_publish_reveal REQUIRES a pre-reveal phase (question/open-review), so from
+          // phase='reveal' it 0-rows → classifies 'conflict' and the reveal is NEVER written or
+          // sent — the production "Couldn't publish the reveal" failure. Persist the reveal block
+          // into live_question at the SAME 'reveal' phase, then broadcast only after it confirms.
+          const { error } = await updateSessionPhase(sessionDbId, {
+            phase: "reveal", currentQuestionIndex: frozen.qIdx, liveQuestion: frozen.liveQuestion,
+          });
+          if (error) { setRevealPublishError(true); return; }   // error → host Retry; NO broadcast
+        } else {
+          // Pre-084 / legacy path. Strict, state-guarded durable write bound to THIS exact
+          // session + question. Broadcast ONLY after it is confirmed (applied) or already durably
+          // present with the identical payload (idempotent — a lost response). A stale result
+          // (newer/older question, countdown/scoreboard/ended, terminal) is abandoned;
+          // a conflict (a DIFFERENT reveal already stored for this qIdx) is surfaced.
+          const res = await publishRevealDurable(sessionDbId, frozen.qIdx, frozen.liveQuestion);
+          if (res.outcome === "stale")    { revealPubRef.current = null; setRevealPublishError(false); return; } // superseded — abandon quietly
+          if (res.outcome === "conflict") { setRevealPublishError(true); return; }                                // integrity conflict → host Retry/End
+          if (!res.ok)                    { setRevealPublishError(true); return; }                                // error → host Retry; NO broadcast
+        }
       }
       // applied OR idempotent (or demo / no-DB): broadcast EXACTLY once, show reveal.
       broadcast(frozen.broadcastMsg);
@@ -2567,6 +2634,23 @@ function KahootHostView({ onNav, sessionName, pin, sessionDbId, demoMode, tenant
     runRevealPublish();
   }, [qIdx, runRevealPublish]);
 
+  // 084 durable-reveal publish. Identical freeze/retry semantics as publishReveal, but tagged
+  // mode:"durable084" so runRevealPublish persists the reveal block via updateSessionPhase at
+  // the already-'reveal' phase (rpc_begin_question_reveal moved it there) instead of the pre-084
+  // rpc_host_publish_reveal, which requires a pre-reveal phase and would 0-row → 'conflict'.
+  // Retry (retryRevealPublish) replays this exact frozen payload — still idempotent, no re-grade.
+  const publishReveal084 = useCallback((revealAnswer, scores) => {
+    const broadcastMsg = { type: GM.REVEAL, correctIdx: revealAnswer.correctIdx ?? null, scores, ...revealAnswer };
+    revealPubRef.current = {
+      mode: "durable084",
+      qIdx,
+      liveQuestion: { ...(liveQuestionRef.current ?? {}), reveal: revealAnswer },
+      broadcastMsg,
+    };
+    setRevealPublishError(false);
+    runRevealPublish();
+  }, [qIdx, runRevealPublish]);
+
   const retryRevealPublish = useCallback(() => { runRevealPublish(); }, [runRevealPublish]);
 
   const persistPhase = useCallback((nextPhase, nextQIdx, nextPaused) => {
@@ -2588,11 +2672,97 @@ function KahootHostView({ onNav, sessionName, pin, sessionDbId, demoMode, tenant
 
   const q           = questions[qIdx];
   const total       = questions.length;
-  const answeredCount = Object.keys(chAnswers).length;
-  const playerCount   = Math.max(chPlayers.length, 1);
+  // 084: auto-reveal + the "answered" display use the SERVER-derived accepted-submission count vs the
+  // ACTIVE canonical roster (rpc_answer_progress). Realtime ANSWER events only TRIGGER a refresh —
+  // their payload never increments the count. Falls back to presence/chAnswers for demo or pre-084.
+  const answeredCount = answerProgress ? answerProgress.answered : Object.keys(chAnswers).length;
+  // Denominator = the active-response count. When the snapshot is loaded, use it verbatim (a genuine 0
+  // active learners reads "0/0", not a floored "0/1"); only the pre-load fallback floors to avoid 0-of-0
+  // flicker before the first snapshot. (Percentage bars already guard playerCount > 0.)
+  const playerCount   = answerProgress ? answerProgress.active : Math.max(chPlayers.length, 1);
   const isFinalQ      = qIdx === total - 1;
   const timerPct      = q ? (timeLeft / q.timeLimit) * 100 : 0;
   const timerColor    = timerPct > 50 ? C.green : timerPct > 25 ? C.orange : C.red;
+
+  // 084: reset server progress on each new question so a prior question's "all answered" can never
+  // trigger a premature auto-reveal before the fresh count loads. Also drop the durable reveal
+  // answers so a prior question's responses can't render against the new one.
+  useEffect(() => { setAnswerProgress(null); setRevealSubs(null); }, [qIdx]);
+  // 084: on entering the reveal for THIS question, load the DURABLE per-player submissions
+  // (rpc_host_game_state → submissions for current_question_index) keyed by player_id, so the
+  // reveal per-player panels render each learner's actual answer from server truth — including
+  // after a host/learner reconnect wiped the ephemeral chAnswers map. Demo/no-DB keeps chAnswers.
+  useEffect(() => {
+    if (!sessionDbId || phase !== "reveal") return;
+    let stale = false;
+    getHostGameState(sessionDbId).then(({ data, error }) => {
+      if (stale || error || !data) return;
+      const map = {};
+      for (const s of (data.submissions ?? [])) {
+        map[s.player_id] = {
+          optionIdx:  s.option_idx,
+          sliderValue: s.numeric_value,
+          matchPairs: Array.isArray(s.answer_json) ? s.answer_json : null,
+          text:       s.text,
+        };
+      }
+      setRevealSubs(map);
+    }).catch(() => {});
+    return () => { stale = true; };
+  }, [sessionDbId, phase, qIdx]);
+  // Active-response progress. The auto-reveal denominator + the "answered" display use the
+  // server-authoritative ACTIVE RESPONSE SET — currently-active PARTICIPANTS (game_session_participants
+  // that are not 'left'/'completed' and whose heartbeat is fresh), NOT the immutable canonical roster
+  // (rpc_answer_progress.active counts the roster, which never changes on Leave, so it left the host
+  // waiting for a departed learner or the full timer). The numerator is the durable submissions BY
+  // those active participants (rpc_host_game_state), so a since-left player's earlier answer can never
+  // satisfy the remaining active learner's slot. This recomputes whenever the participant set changes
+  // (Leave/rejoin → dbParticipants dep) or a realtime ANSWER hint arrives, plus a 2s durable fallback —
+  // so an explicit Leave drops the denominator promptly and a rejoin restores it, with no stale cache.
+  useEffect(() => {
+    if (!sessionDbId || phase !== "question") return;
+    let stale = false;
+    const refresh = () => {
+      // Revision + identity guard: each request gets a monotonically increasing id; only the LATEST
+      // request's result is applied, so an OLDER async response (resolving out of order after a
+      // Leave/rejoin) can never overwrite a NEWER snapshot. The result is also discarded if it is for a
+      // different question than the one it was requested for (session is scoped by sessionDbId).
+      const reqId = ++progressReqRef.current;
+      const forQIdx = qIdx;
+      getHostGameState(sessionDbId).then(({ data, error }) => {
+        if (stale || error || !data) return;
+        if (reqId !== progressReqRef.current) return;                          // superseded by a newer request → discard
+        if ((data.current_question_index ?? forQIdx) !== forQIdx) return;      // identity guard: response for a different question
+        const now = Date.now();
+        // Active-response set = currently-active PARTICIPANTS (not 'left'/'completed', fresh heartbeat).
+        const activeIds = (dbParticipants ?? []).filter(p => {
+          if (p.status === "left" || p.status === "completed") return false;   // explicit Leave / done → not eligible
+          if (!p.last_seen_at) return true;                                    // just joined, no beat yet → eligible
+          return (now - new Date(p.last_seen_at).getTime()) < HEARTBEAT_FRESH_MS; // fresh heartbeat → connected
+        }).map(p => p.player_id ?? p.id).sort();
+        // Numerator = durable submissions BY those active participants for THIS exact question.
+        const submitters = new Set((data.submissions ?? []).filter(s => s.question_idx === forQIdx).map(s => s.player_id));
+        const answeredActive = activeIds.filter(id => submitters.has(id)).length;
+        // One atomic snapshot (session/qIdx-scoped, revision-guarded): active ids + answered + active.
+        setAnswerProgress({ answered: answeredActive, active: activeIds.length, qIdx: forQIdx });
+      }).catch(() => {});
+    };
+    refresh();
+    const iv = setInterval(refresh, 2000);
+    return () => { stale = true; clearInterval(iv); };
+  }, [sessionDbId, phase, qIdx, Object.keys(chAnswers).length, dbParticipants]); // eslint-disable-line react-hooks/exhaustive-deps
+
+  // 084: host refresh/reconnect DURING open-review — rebuild the durable open-grading input (canonical
+  // roster + durable open responses) from the server so manual grading is never lost or presence-based.
+  useEffect(() => {
+    if (!sessionDbId || phase !== "open-review" || openReveal) return;
+    let stale = false;
+    getHostGameState(sessionDbId).then(({ data, error }) => {
+      if (stale || error || !data?.roster) return;
+      setOpenReveal({ roster: data.roster, submissions: data.submissions ?? [], questionStartedAt: null });
+    }).catch(() => {});
+    return () => { stale = true; };
+  }, [sessionDbId, phase, openReveal]); // eslint-disable-line react-hooks/exhaustive-deps
 
   // Shown on both pause overlays so the host can read the EXISTING game PIN to a
   // player who needs to rejoin (the overlay otherwise covers it). Purely
@@ -2613,8 +2783,28 @@ function KahootHostView({ onNav, sessionName, pin, sessionDbId, demoMode, tenant
 
   useEffect(() => {
     if (restoreState !== "done") return; // don't reset restored scores during restoration
-    if (phase === "countdown" && (qIdx === 0 || scores.length === 0)) setScores(chPlayers.map(p => ({ ...p, score: 0 })));
+    // 084: seed from the CANONICAL roster (server truth) when available, else presence (pre-084).
+    if (phase === "countdown" && (qIdx === 0 || scores.length === 0)) setScores(rosterScoreRows());
   }, [chPlayers.length, restoreState]); // eslint-disable-line react-hooks/exhaustive-deps
+
+  // 084: load the immutable canonical roster once per game (host start OR host refresh) and merge
+  // every eligible learner into `scores` — so a durably-joined learner who missed the Q0 realtime
+  // snapshot is NEVER dropped from scoring. Degrades gracefully (roster empty → prior presence
+  // behavior) until migration 084 is applied and rpc_host_game_state exists.
+  useEffect(() => {
+    if (!sessionDbId) return;
+    let cancelled = false;
+    getHostGameState(sessionDbId).then(({ data, error }) => {
+      if (cancelled || error || !data?.roster?.length) return;
+      canonicalRosterRef.current = data.roster;
+      setScores(prev => {
+        const byId = new Map((prev ?? []).map(p => [p.id, p]));
+        for (const m of data.roster) if (!byId.has(m.id)) byId.set(m.id, { id: m.id, name: m.name, emoji: m.emoji ?? null, color: null, score: 0 });
+        return Array.from(byId.values());
+      });
+    }).catch(() => {});
+    return () => { cancelled = true; };
+  }, [sessionDbId]); // eslint-disable-line react-hooks/exhaustive-deps
 
   // ── Start a question: persist durable state BEFORE broadcasting ─────────────
   // Ordering matters. The database write (phase + current_question_index +
@@ -2693,9 +2883,13 @@ function KahootHostView({ onNav, sessionName, pin, sessionDbId, demoMode, tenant
     if (halted || paused) return; // no automatic reveal while paused/halted
     if (phase !== "question" || answeredCount < playerCount || answeredCount === 0) return;
     doReveal();
-  }, [answeredCount, phase, restoreState, halted, paused]); // eslint-disable-line react-hooks/exhaustive-deps
+    // playerCount MUST be a dep: when active eligibility drops (a learner Leaves) the DENOMINATOR
+    // changes while answeredCount stays the same, and without this the effect would not re-evaluate —
+    // so the current question would wait for the timer even though the remaining active learner has
+    // already answered. With it, active 2→1 immediately re-checks answeredCount >= playerCount.
+  }, [answeredCount, playerCount, phase, restoreState, halted, paused]); // eslint-disable-line react-hooks/exhaustive-deps
 
-  const doReveal = () => {
+  const doReveal = async () => {
     // Reentrancy guard — see hasRevealedRef declaration above. Must be the
     // very first thing that runs (synchronous ref write) so a second call in
     // the same tick from either auto-trigger effect or the Reveal Now button
@@ -2703,13 +2897,62 @@ function KahootHostView({ onNav, sessionName, pin, sessionDbId, demoMode, tenant
     if (hasRevealedRef.current) return;
     hasRevealedRef.current = true;
     if (q.type === "open") {
-      // Collect open-ended responses and go to grading phase
+      // 084: DURABLE open-ended review. Fetch the canonical roster + durable open responses (never
+      // chAnswers) so manual grading is built only from server truth. beginQuestionReveal also closes
+      // submissions. On error (084 present) → block reveal (retryable); RPC_MISSING (pre-084) → legacy.
       setOpenGrades({});
+      if (sessionDbId) {
+        setRevealErr(false);
+        const rev = await beginQuestionReveal(sessionDbId, qIdx);
+        if (!rev.error && rev.data?.ok) {
+          setOpenReveal({ roster: rev.data.roster ?? [], submissions: rev.data.submissions ?? [], questionStartedAt: rev.data.question_started_at });
+        } else if (rev.error && rev.error.code !== RPC_MISSING) {
+          hasRevealedRef.current = false; setRevealErr(true); return;   // do not advance to review; retryable
+        } else {
+          setOpenReveal(null);   // pre-084 fallback → legacy chAnswers open path
+        }
+      }
       setPhase("open-review");
       persistPhase("open-review", qIdx, false);
       broadcast({ type: GM.OPEN_REVIEW, qText: q.q });
       return;
     }
+
+    // ── 084 DURABLE REVEAL ────────────────────────────────────────────────────
+    // Real game: grade ONLY the CANONICAL roster's DURABLE submissions (never chAnswers / ANSWER
+    // payloads / presence / client player ids). rpc_begin_question_reveal locks the session + closes
+    // submissions and returns the roster + durable answers; we grade with the shared grader, PERSIST
+    // idempotently (rpc_record_question_results), and ONLY THEN publish + broadcast REVEAL. On reveal
+    // or persistence failure we do NOT reveal or advance (retryable host error). Falls back to the
+    // legacy realtime path only when the 084 RPCs are absent (pre-apply preview) — never on a real error.
+    if (sessionDbId) {
+      setRevealErr(false);
+      const rev = await beginQuestionReveal(sessionDbId, qIdx);
+      if (!rev.error && rev.data?.ok) {
+        const roster = rev.data.roster?.length ? rev.data.roster : rosterScoreRows().map(r => ({ id: r.id, name: r.name, emoji: r.emoji }));
+        const gradedQuestion = q;   // host-local grading only (never broadcast; distinct from the learner-safe payload)
+        const { newScores, answerRows } = reconcileReveal({
+          roster, submissions: rev.data.submissions, question: gradedQuestion, prevScores: scores, gradeAnswer,
+          shuffledRight, questionStartedAt: rev.data.question_started_at, tenantId, qIdx });
+        const persist = await recordQuestionResults(sessionDbId, qIdx, answerRows);
+        if (persist.error) { hasRevealedRef.current = false; setRevealErr(true); return; }  // do NOT reveal/advance
+        setScores(newScores);
+        const answeredN = answerRows.filter(r => r.optionIdx != null || r.text != null || r.numericValue != null || r.answerJson != null).length;
+        const qDist = (q.type === "mc" || q.type === "tf") ? (q?.options ?? []).map((_, i) => answerRows.filter(r => r.optionIdx === i).length) : [];
+        setQuestionHistory(h => [...h, { qIdx, q: q?.q, options: q?.options ?? [],
+          correct: q.type === "slider" ? (q.correct ?? 5) : ((q.type === "mc" || q.type === "tf") ? q.correct : null),
+          distribution: qDist, correctCount: answerRows.filter(r => r.isCorrect).length, totalAnswers: answeredN, avgTimeMs: 0 }]);
+        const payload = q.type === "type" ? { acceptedAnswers: q.acceptedAnswers ?? [] }
+          : q.type === "slider" ? { sliderTarget: q.correct ?? 5, sliderTolerance: q.tolerance ?? 1 }
+          : q.type === "match" ? { matchPairsCorrect: q.pairs ?? [], shuffledRight }
+          : { correctIdx: q.correct };
+        publishReveal084(payload, newScores);   // 084 durable reveal publish (phase already 'reveal') + REVEAL broadcast — AFTER persistence
+        return;
+      }
+      if (rev.error && rev.error.code !== RPC_MISSING) { hasRevealedRef.current = false; setRevealErr(true); return; }  // 084 present but errored → retryable
+      // else: RPC_MISSING (pre-084) → fall through to the legacy realtime path below.
+    }
+
     if (q.type === "type") {
       // Auto-grade typed answers via the canonical shared grader (case-insensitive
       // acceptedAnswers match — identical rule, now single-sourced). See
@@ -2893,43 +3136,61 @@ function KahootHostView({ onNav, sessionName, pin, sessionDbId, demoMode, tenant
   };
 
   // Admin finishes grading open-ended responses
-  const doOpenGradeDone = () => {
-    const openResponses = Object.entries(chAnswers).map(([pid, ans], i) => ({ id: i, playerId: pid, text: ans.text, name: ans.name }));
-    const newScores = scores.map(p => {
-      const respIdx = openResponses.findIndex(r => r.playerId === p.id);
-      const grade   = openGrades[respIdx];
-      const delta   = grade === "correct" ? 100 : 0;
-      return { ...p, score: p.score + delta, delta, wasCorrect: grade === "correct" };
-    });
+  // 084: the manual open-review response list. Built from the CANONICAL roster + DURABLE open
+  // submissions (every member; submitted text or honestly unanswered) — never chAnswers keys/names.
+  // Falls back to chAnswers only for demo / pre-084. Keyed by stable player_id (never array index).
+  const buildOpenResponses = () => {
+    if (openReveal?.roster) {
+      const subByPlayer = new Map((openReveal.submissions ?? []).map(s => [String(s.player_id), s]));
+      return openReveal.roster.map(m => ({ playerId: m.id, name: m.name, text: subByPlayer.get(String(m.id))?.text ?? null }));
+    }
+    return Object.entries(chAnswers).map(([pid, ans]) => ({ playerId: pid, name: ans.name, text: ans.text ?? null }));
+  };
+
+  const doOpenGradeDone = async () => {
+    const responses = buildOpenResponses();
+    const textByPlayer = new Map(responses.map(r => [String(r.playerId), r.text]));
+    // Membership = canonical roster (durable) OR the seeded score set (legacy). openGrades is keyed by
+    // stable player_id, so a durably-submitted learner is graded even if they never broadcast/left.
+    const members = openReveal?.roster
+      ? openReveal.roster.map(m => ({ id: m.id, name: m.name, emoji: m.emoji ?? null }))
+      : scores.map(p => ({ id: p.id, name: p.name, emoji: p.emoji ?? null }));
+    const prevById = new Map(scores.map(p => [String(p.id), p]));
+    const newScores = []; const answerRows = [];
+    for (const m of members) {
+      const correct = openGrades[m.id] === "correct";
+      const delta = correct ? 100 : 0;
+      const prev = prevById.get(String(m.id));
+      newScores.push({ ...(prev ?? {}), id: m.id, name: m.name, emoji: m.emoji ?? (prev?.emoji ?? null), color: prev?.color ?? null, score: (prev?.score ?? 0) + delta, delta, wasCorrect: correct });
+      answerRows.push({ playerId: m.id, playerName: m.name, questionIdx: qIdx, optionIdx: null, text: textByPlayer.get(String(m.id)) ?? null, timeMs: null, isCorrect: correct, points: delta, tenantId, numericValue: null, answerJson: null });
+    }
     newScores.sort((a, b) => b.score - a.score);
+
+    if (sessionDbId && openReveal) {
+      // Durable: persist idempotently BEFORE reveal broadcast; on failure do not reveal or advance.
+      setRevealErr(false);
+      const persist = await recordQuestionResults(sessionDbId, qIdx, answerRows);
+      if (persist.error) { setRevealErr(true); return; }
+      setScores(newScores);
+      publishReveal({ isOpen: true }, newScores);
+      return;
+    }
+    // Legacy (demo / pre-084): fire-and-forget direct insert (unchanged behavior).
     setScores(newScores);
     publishReveal({ isOpen: true }, newScores);
-    // Persist open-ended answers (fire-and-forget)
     if (sessionDbId) {
-      const scoreMap = Object.fromEntries(newScores.map(p => [p.id, p]));
-      const answerRows = openResponses.map(r => ({
-        playerId:    r.playerId,
-        playerName:  r.name ?? r.playerId,
-        questionIdx: qIdx,
-        optionIdx:   null,
-        text:        r.text ?? null,
-        timeMs:      null,
-        isCorrect:   openGrades[r.id] === "correct",
-        points:      scoreMap[r.playerId]?.delta ?? 0,
-        tenantId,
-      }));
-      saveGameAnswers(sessionDbId, answerRows)
-        .then(({ error }) => { if (error) console.error("[ralli:host] saveGameAnswers (open) failed:", error); });
+      saveGameAnswers(sessionDbId, answerRows).then(({ error }) => { if (error) console.error("[ralli:host] saveGameAnswers (open) failed:", error); });
     }
   };
 
-  const doNext = () => {
+  const doNext = async () => {
     if (isFinalQ) {
-      // ACCEPTANCE GATE FIRST. The parent validates identity; only on accept do
-      // we notify players (broadcast), write the terminal phase, and navigate.
-      // On reject: players are NOT told the game ended, phase stays intact, and
-      // the host stays put with the parent's retryable error.
-      const ok = onGameEnd ? onGameEnd({ scores, questions, questionHistory, sessionDbId, demoMode }) : true;
+      // ACCEPTANCE GATE FIRST. The parent validates identity AND (now) AWAITS the durable terminal
+      // persistence (status='completed' + ended_at + game_players) before we notify players. Only on
+      // accept do we broadcast GM.GAME_END — so terminal state is persisted BEFORE the terminal
+      // broadcast, and a learner who misses the broadcast still recovers it via the status reconcile.
+      // On reject: players are NOT told the game ended, phase stays intact, and the host stays put.
+      const ok = onGameEnd ? await onGameEnd({ scores, questions, questionHistory, sessionDbId, demoMode }) : true;
       if (ok === false) return;
       broadcast({ type: GM.GAME_END, scores });
       persistPhase("ended", qIdx, false);
@@ -2986,8 +3247,13 @@ function KahootHostView({ onNav, sessionName, pin, sessionDbId, demoMode, tenant
     doNext();
   };
 
-  const dist = (q?.options ?? []).map((_, i) => Object.values(chAnswers).filter(a => a.optionIdx === i).length);
-  const openResponses = Object.entries(chAnswers).map(([pid, ans], i) => ({ id: i, playerId: pid, text: ans.text, name: ans.name }));
+  // 084: during reveal, count the option distribution from the DURABLE submissions (revealSubs)
+  // so the bars are accurate even after a reconnect wiped chAnswers; live voting still uses chAnswers.
+  const dist = (q?.options ?? []).map((_, i) => {
+    const src = (phase === "reveal" && revealSubs) ? Object.values(revealSubs) : Object.values(chAnswers);
+    return src.filter(a => a.optionIdx === i).length;
+  });
+  const openResponses = buildOpenResponses();   // 084: canonical roster + durable open text (never chAnswers keys)
   const rankBadges = ["1st","2nd","3rd","4th","5th"];
 
   // ── Loading / error states during session restoration ─────────────────────────
@@ -3121,9 +3387,9 @@ function KahootHostView({ onNav, sessionName, pin, sessionDbId, demoMode, tenant
             <div style={{ textAlign: "center", padding: 60, color: C.textMuted, fontSize: 14 }}>No responses submitted.</div>
           )}
           {openResponses.map((r, i) => {
-            const grade = openGrades[i];
+            const grade = openGrades[r.playerId];   // 084: keyed by stable player_id, never array index
             return (
-              <div key={i} style={{ padding: "14px 18px", borderRadius: 14, background: grade === "correct" ? "rgba(16,185,129,0.1)" : grade === "incorrect" ? "rgba(239,68,68,0.08)" : "#fff", border: `1px solid ${grade === "correct" ? "rgba(16,185,129,0.4)" : grade === "incorrect" ? "rgba(239,68,68,0.35)" : C.border}` }}>
+              <div key={r.playerId} style={{ padding: "14px 18px", borderRadius: 14, background: grade === "correct" ? "rgba(16,185,129,0.1)" : grade === "incorrect" ? "rgba(239,68,68,0.08)" : "#fff", border: `1px solid ${grade === "correct" ? "rgba(16,185,129,0.4)" : grade === "incorrect" ? "rgba(239,68,68,0.35)" : C.border}` }}>
                 <div style={{ display: "flex", alignItems: "flex-start", gap: 12 }}>
                   <div style={{ width: 28, height: 28, borderRadius: "50%", flexShrink: 0, background: "rgba(255,255,255,0.1)", display: "flex", alignItems: "center", justifyContent: "center", fontSize: 12, fontWeight: 700, color: C.textMuted, marginTop: 2 }}>{i + 1}</div>
                   <div style={{ flex: 1, minWidth: 0 }}>
@@ -3131,8 +3397,8 @@ function KahootHostView({ onNav, sessionName, pin, sessionDbId, demoMode, tenant
                     <p style={{ margin: 0, fontSize: 15, color: C.text, lineHeight: 1.45 }}>{r.text || <em style={{ opacity: 0.4 }}>No response</em>}</p>
                   </div>
                   <div style={{ display: "flex", gap: 6, flexShrink: 0 }}>
-                    <button onClick={() => setOpenGrades(g => ({ ...g, [i]: g[i] === "correct" ? undefined : "correct" }))} style={{ padding: "6px 14px", borderRadius: 8, border: "none", cursor: "pointer", fontSize: 13, fontWeight: 700, background: grade === "correct" ? C.green : "rgba(16,185,129,0.12)", color: grade === "correct" ? "#fff" : C.green, minHeight: 36 }}>✓</button>
-                    <button onClick={() => setOpenGrades(g => ({ ...g, [i]: g[i] === "incorrect" ? undefined : "incorrect" }))} style={{ padding: "6px 14px", borderRadius: 8, border: "none", cursor: "pointer", fontSize: 13, fontWeight: 700, background: grade === "incorrect" ? C.red : "rgba(239,68,68,0.1)", color: grade === "incorrect" ? "#fff" : C.red, minHeight: 36 }}>✗</button>
+                    <button onClick={() => setOpenGrades(g => ({ ...g, [r.playerId]: g[r.playerId] === "correct" ? undefined : "correct" }))} style={{ padding: "6px 14px", borderRadius: 8, border: "none", cursor: "pointer", fontSize: 13, fontWeight: 700, background: grade === "correct" ? C.green : "rgba(16,185,129,0.12)", color: grade === "correct" ? "#fff" : C.green, minHeight: 36 }}>✓</button>
+                    <button onClick={() => setOpenGrades(g => ({ ...g, [r.playerId]: g[r.playerId] === "incorrect" ? undefined : "incorrect" }))} style={{ padding: "6px 14px", borderRadius: 8, border: "none", cursor: "pointer", fontSize: 13, fontWeight: 700, background: grade === "incorrect" ? C.red : "rgba(239,68,68,0.1)", color: grade === "incorrect" ? "#fff" : C.red, minHeight: 36 }}>✗</button>
                   </div>
                 </div>
               </div>
@@ -3230,7 +3496,13 @@ function KahootHostView({ onNav, sessionName, pin, sessionDbId, demoMode, tenant
             <div key={i} style={{ flex: 1, height: 4, borderRadius: 2, background: i < qIdx ? C.green : i === qIdx ? C.orange : "rgba(255,255,255,0.12)", transition: "background 0.3s" }} />
           ))}
         </div>
-        <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
+        <div style={{ display: "flex", alignItems: "center", gap: 14 }}>
+          {/* Presentational: the existing game PIN next to the player count, so the host can read it to a
+              rejoining learner without leaving gameplay. Uses the `pin` prop — no session/channel change. */}
+          <div style={{ textAlign: "right" }}>
+            <div style={{ fontSize: 15, fontWeight: 800, letterSpacing: "0.08em", color: C.dark }}>{pin}</div>
+            <div style={{ fontSize: 10, color: C.textMuted }}>Game PIN</div>
+          </div>
           <div style={{ textAlign: "right" }}>
             <div style={{ fontSize: 18, fontWeight: 900, color: answeredCount >= playerCount ? "#059669" : C.dark }}>{answeredCount}/{playerCount}</div>
             <div style={{ fontSize: 10, color: C.textMuted }}>players answered</div>
@@ -3250,6 +3522,14 @@ function KahootHostView({ onNav, sessionName, pin, sessionDbId, demoMode, tenant
           </button>
         </div>
       </div>
+
+      {/* 084: durable reveal/persist failed — retryable. Nothing was revealed, scored, or advanced. */}
+      {revealErr && (
+        <div style={{ margin: "8px 16px", padding: "10px 14px", borderRadius: 10, background: "rgba(239,68,68,0.1)", border: "1px solid rgba(239,68,68,0.4)", display: "flex", alignItems: "center", justifyContent: "space-between", gap: 12 }}>
+          <span style={{ fontSize: 13, fontWeight: 700, color: "#ef4444" }}>Couldn't save results — the round was not revealed. No one was scored and the game did not advance.</span>
+          <button onClick={() => { setRevealErr(false); doReveal(); }} style={{ padding: "6px 14px", borderRadius: 8, border: "none", background: "#ef4444", color: "#fff", fontWeight: 800, fontSize: 13, cursor: "pointer" }}>Retry reveal</button>
+        </div>
+      )}
 
       {/* End confirm modal */}
       {showEndConfirm && (
@@ -3384,18 +3664,23 @@ function KahootHostView({ onNav, sessionName, pin, sessionDbId, demoMode, tenant
             <div style={{ padding: "14px 18px", borderRadius: 14, background: C.white, border: `1px solid ${C.border}` }}>
               <div style={{ fontSize: 11, fontWeight: 700, color: C.textMuted, letterSpacing: "0.08em", marginBottom: 10 }}>PLAYER RESPONSES</div>
               <div style={{ display: "flex", flexDirection: "column", gap: 6 }}>
-                {Object.entries(chAnswers).map(([pid, ans], i) => {
-                  const accepted = (q.acceptedAnswers ?? []).map(a => a.toLowerCase().trim());
-                  const correct  = accepted.length > 0 && accepted.some(a => (ans.text ?? "").toLowerCase().trim() === a);
+                {/* Iterate the canonical roster `scores` and read the AUTHORITATIVE durable correctness
+                    (p.wasCorrect from reconcileReveal), NOT a re-grade of ephemeral chAnswers text — the
+                    old code re-checked chAnswers against acceptedAnswers, so a learner whose answer never
+                    persisted (ephemeral-only) got a false green ✓ that disagreed with is_correct + the
+                    learner reveal. Display text is durable-first (revealSubs) → ephemeral fallback. */}
+                {scores.map(p => {
+                  const ans = revealSubs?.[p.id] ?? chAnswers[p.id];   // display only
+                  const hasText = ans?.text != null && ans.text !== "";
                   return (
-                    <div key={pid} style={{ display: "flex", alignItems: "center", gap: 10, padding: "8px 12px", borderRadius: 10, background: correct ? "#D1FAE5" : "#FEF2F2" }}>
-                      <span style={{ fontSize: 13, fontWeight: 700, color: correct ? "#059669" : C.red }}>{correct ? "✓" : "✗"}</span>
-                      <span style={{ fontSize: 13, color: C.text, flex: 1 }}>{ans.text ?? <em style={{ color: C.textMuted }}>No response</em>}</span>
-                      <span style={{ fontSize: 11, color: C.textSub }}>{ans.name}</span>
+                    <div key={p.id} style={{ display: "flex", alignItems: "center", gap: 10, padding: "8px 12px", borderRadius: 10, background: p.wasCorrect ? "#D1FAE5" : hasText ? "#FEF2F2" : C.muted }}>
+                      <span style={{ fontSize: 13, fontWeight: 700, color: p.wasCorrect ? "#059669" : hasText ? C.red : C.textMuted }}>{hasText ? (p.wasCorrect ? "✓" : "✗") : "—"}</span>
+                      <span style={{ fontSize: 13, color: C.text, flex: 1 }}>{hasText ? ans.text : <em style={{ color: C.textMuted }}>No response</em>}</span>
+                      <span style={{ fontSize: 11, color: C.textSub }}>{p.name}</span>
                     </div>
                   );
                 })}
-                {Object.keys(chAnswers).length === 0 && <span style={{ fontSize: 13, color: C.textMuted, fontStyle: "italic" }}>No responses received.</span>}
+                {scores.length === 0 && <span style={{ fontSize: 13, color: C.textMuted, fontStyle: "italic" }}>No players.</span>}
               </div>
             </div>
           )}
@@ -3424,7 +3709,7 @@ function KahootHostView({ onNav, sessionName, pin, sessionDbId, demoMode, tenant
               <div style={{ fontSize: 11, fontWeight: 700, color: C.textMuted, letterSpacing: "0.08em", marginBottom: 10 }}>PLAYER RESPONSES</div>
               <div style={{ display: "flex", flexDirection: "column", gap: 6, maxHeight: 220, overflowY: "auto" }}>
                 {scores.map(p => {
-                  const ans = chAnswers[p.id];
+                  const ans = revealSubs?.[p.id] ?? chAnswers[p.id];   // durable (084) → ephemeral fallback
                   const hasVal = ans?.sliderValue != null;
                   return (
                     <div key={p.id} style={{ display: "flex", alignItems: "center", gap: 10, padding: "8px 12px", borderRadius: 10, background: p.wasCorrect ? "#D1FAE5" : hasVal ? "#FEF2F2" : C.muted }}>
@@ -3474,7 +3759,7 @@ function KahootHostView({ onNav, sessionName, pin, sessionDbId, demoMode, tenant
               <div style={{ fontSize: 11, fontWeight: 700, color: C.textMuted, letterSpacing: "0.08em", marginBottom: 10 }}>PLAYER RESPONSES</div>
               <div style={{ display: "flex", flexDirection: "column", gap: 6, maxHeight: 220, overflowY: "auto" }}>
                 {scores.map(p => {
-                  const ans = chAnswers[p.id];
+                  const ans = revealSubs?.[p.id] ?? chAnswers[p.id];   // durable (084) → ephemeral fallback
                   const attempted = !!ans?.matchPairs?.length;
                   const total = q.pairs?.length ?? 0;
                   return (
@@ -3564,7 +3849,7 @@ function KahootHostView({ onNav, sessionName, pin, sessionDbId, demoMode, tenant
             <div style={{ fontSize: 11, fontWeight: 700, color: C.textMuted, letterSpacing: "0.08em", marginBottom: 10 }}>PLAYER RESPONSES</div>
             <div style={{ display: "flex", flexDirection: "column", gap: 6, maxHeight: 220, overflowY: "auto" }}>
               {scores.map(p => {
-                const ans = chAnswers[p.id];
+                const ans = revealSubs?.[p.id] ?? chAnswers[p.id];   // durable (084) → ephemeral fallback
                 const submittedLabel = ans && ans.optionIdx != null ? (q.options?.[ans.optionIdx] ?? `Option ${ans.optionIdx + 1}`) : null;
                 return (
                   <div key={p.id} style={{ display: "flex", alignItems: "center", gap: 10, padding: "8px 12px", borderRadius: 10, background: p.wasCorrect ? "#D1FAE5" : ans ? "#FEF2F2" : C.muted }}>
@@ -3724,7 +4009,7 @@ function KahootPlayerView({ onNav, playerName, playerEmoji, playerId, pin, sessi
     setQuestion(payload.question);
     setTimeLeft(remaining);
     setGamePaused(!!paused); // a recovered paused question stays visibly paused, no countdown
-    setSelectedIdx(null); setOpenText(""); setOpenSubmitted(false);
+    setSelectedIdx(null); setOpenText(""); setOpenSubmitted(false); setSubmitErr(false);
     setSliderValue(null); setSliderSubmitted(false);
     setShuffledRight(payload.shuffledRight ?? []); setMatchPairs([]); setMatchSelLeft(null); setMatchSubmitted(false);
     setQStartMs(payload.questionStartedAt ?? Date.now());
@@ -3771,6 +4056,18 @@ function KahootPlayerView({ onNav, playerName, playerEmoji, playerId, pin, sessi
       const readSeq = liveQuestionTimingSeq(lq);
       const timingFresh = !lq || readSeq >= timingSeqRef.current;
       if (timingFresh) setGamePaused(!!s.paused);
+
+      // Terminal recovery keyed on the AUTHORITATIVE status. rpc_end_session sets status='completed'
+      // + ended_at atomically; phase='ended' is a SEPARATE fire-and-forget write that can race/not land,
+      // so an in-game learner must not depend on it (the lobby poll and boot restore already key on
+      // status). Populate the final board from the durable published scoreboard, then show the terminal
+      // results screen (which carries the exit action) — even if GM.GAME_END and phase='ended' were missed.
+      if (s.status === "completed" || s.status === "ended" || s.status === "canceled") {
+        const finalBoard = durableRestoreDecision(s);
+        if (finalBoard) setFinalScores(scoreboardRows(finalBoard.entries));
+        setPhase("ended");
+        return;
+      }
 
       if (s.phase === "waiting")    return;                       // still in lobby
       if (s.phase === "scoreboard") {
@@ -3921,34 +4218,16 @@ function KahootPlayerView({ onNav, playerName, playerEmoji, playerId, pin, sessi
     if (chMsg.type === GM.OPEN_REVIEW) { setPhase("open-waiting"); }
     if (chMsg.type === GM.REVEAL) {
       setPhase("reveal");
-      let revealCorrect;
-      if (chMsg.isOpen) {
-        revealCorrect = null; // open-ended — host graded
-      } else if (Array.isArray(chMsg.acceptedAnswers)) {
-        // Type-answer: check typed text against accepted answers
-        const acc = chMsg.acceptedAnswers.map(a => a.toLowerCase().trim());
-        revealCorrect = acc.length > 0 && acc.some(a => openText.toLowerCase().trim() === a);
-      } else if (chMsg.sliderTarget != null) {
-        // Slider: within tolerance of the target, same rule the host used to score it
-        revealCorrect = sliderValue != null && Math.abs(sliderValue - chMsg.sliderTarget) <= (chMsg.sliderTolerance ?? 1);
-      } else if (Array.isArray(chMsg.matchPairsCorrect)) {
-        // Matching: all pairs must match — same all-or-nothing rule the host
-        // used to score it, checked against the SAME shuffledRight the host
-        // broadcast (chMsg.shuffledRight), not the local `shuffledRight`
-        // state, in case a message is processed before state settles.
-        const sr = chMsg.shuffledRight ?? shuffledRight;
-        revealCorrect = matchPairs.length > 0
-          && matchPairs.length === chMsg.matchPairsCorrect.length
-          && matchPairs.every(mp => sr[mp.rightIdx]?.right === chMsg.matchPairsCorrect[mp.leftIdx]?.right);
-      } else {
-        revealCorrect = selectedIdx === chMsg.correctIdx;
-      }
-      setIsCorrect(revealCorrect);
-      // Post-reveal ONLY: merge the correct-answer info the REVEAL broadcast carries
-      // back into the (sanitized) question so the reveal render can display it. The
-      // pre-reveal payload never contained it. Same helper as recovery below.
-      setQuestion(prev => (prev ? applyRevealToQuestion(prev, chMsg) : prev));
+      // Consume the AUTHORITATIVE durable correctness the host computed ONCE (reconcileReveal over the
+      // durable submissions) and carried in the REVEAL broadcast's per-player scores — NEVER re-grade
+      // locally. Local text/selection can diverge from the durable submission (e.g. an answer that failed
+      // to persist), and a local re-grade would then show a false ✓/✗ that disagrees with the stored
+      // is_correct, points, and the host panel. Open-ended stays null (host-graded manually).
       const me = chMsg.scores?.find(p => p.id === playerId) ?? chMsg.scores?.find(p => p.name === playerName);
+      setIsCorrect(chMsg.isOpen ? null : (me ? !!me.wasCorrect : null));
+      // Post-reveal ONLY: merge the correct-answer info the REVEAL broadcast carries back into the
+      // (sanitized) question so the reveal render can DISPLAY the accepted/correct answer (not to grade).
+      setQuestion(prev => (prev ? applyRevealToQuestion(prev, chMsg) : prev));
       if (me) { setMyScore(me.score); setMyDelta(me.delta); setMyRank(chMsg.scores.indexOf(me) + 1); }
     }
     if (chMsg.type === GM.NEXT_QUESTION) { setCdNum(3); setIsCorrect(null); setGamePaused(false); setPhase("countdown"); }
@@ -4003,26 +4282,82 @@ function KahootPlayerView({ onNav, playerName, playerEmoji, playerId, pin, sessi
     return () => clearTimeout(t);
   }, [phase, timeLeft, gamePaused]);
 
+  // 084 — DURABLE-FIRST submission. In a REAL game we persist the answer to the database
+  // (player_id = auth.uid(), server-authorized via rpc_submit_game_answer) BEFORE locking the UI
+  // or broadcasting. Only on durable acceptance do we lock + broadcast a realtime NOTIFICATION —
+  // the host reconciles scoring from durable submissions at reveal, so a missed/forged broadcast
+  // can never lose or forge an answer. On persistence failure we do NOT lock (learner may retry);
+  // identical retries are idempotent server-side. Demo mode (no sessionDbId) keeps the local path.
+  const submittingRef = useRef(false);
+  const [submitErr, setSubmitErr] = useState(false);
+  const persistThenLock = async (payload, lock, notify) => {
+    if (submittingRef.current) return;
+    submittingRef.current = true;
+    try {
+      // Durable-first, FAIL-CLOSED. The answer is shown as "Locked in" ONLY after the durable submission
+      // succeeds for the exact current session + canonical player (auth.uid) + question. KahootPlayerView
+      // is always a REAL game (never demo), so we must NEVER lock/broadcast optimistically: if
+      // sessionDbId/playerId is transiently absent (e.g. the pin-fallback realtime channel keeps a
+      // question answerable during a post-rejoin window before activeGameSessionDbId propagates), the old
+      // `if (sessionDbId && playerId)` guard skipped the submit and locked with NO durable row — silently
+      // dropping the answer while the host stayed at N-1/N. Now: no id ⇒ retryable error, no lock.
+      if (!sessionDbId || !playerId) { setSubmitErr(true); return; }
+      setSubmitErr(false);
+      const { ok } = await submitGameAnswer(sessionDbId, appliedQIdxRef.current, payload);
+      if (!ok) { setSubmitErr(true); return; }   // not saved (stale question / error) → keep phase 'question', allow retry
+      lock();
+      broadcast(notify);
+    } finally {
+      submittingRef.current = false;
+    }
+  };
+
+  // 084 — reconnect restore. On (re)entering a question, restore + re-lock the learner's OWN durable
+  // submission (rpc_my_submission, auth.uid-scoped) so a refresh never loses the locked answer and
+  // never permits a conflicting resubmit. Preserves MC/TF/Type/Slider 0/Matching/Open. Graceful
+  // pre-084 (errors → no-op → local state as before). Never reads another learner's answer.
+  useEffect(() => {
+    if (!sessionDbId || !playerId || phase !== "question") return;
+    const qi = appliedQIdxRef.current;
+    if (qi == null || qi < 0) return;
+    let stale = false;
+    getMySubmission(sessionDbId, qi).then(({ data, error }) => {
+      if (stale || error || !data?.found) return;
+      const t = data.q_type;
+      if ((t === "mc" || t === "tf") && data.option_idx != null) { setSelectedIdx(data.option_idx); setPhase("answered"); }
+      else if (t === "slider" && data.numeric_value != null) { setSliderValue(Number(data.numeric_value)); setSliderSubmitted(true); setPhase("answered"); }
+      else if (t === "match" && Array.isArray(data.answer_json)) { setMatchPairs(data.answer_json.map(p => ({ leftIdx: p.leftIdx, rightIdx: p.rightIdx }))); setMatchSubmitted(true); setPhase("answered"); }
+      else if ((t === "type" || t === "open") && data.text != null) { setOpenText(data.text); setOpenSubmitted(true); setPhase("answered"); }
+    }).catch(() => {});
+    return () => { stale = true; };
+  }, [sessionDbId, playerId, phase, question]); // eslint-disable-line react-hooks/exhaustive-deps
+
   const handleAnswer = (idx) => {
-    if (phase !== "question" || selectedIdx !== null) return;
+    if (phase !== "question" || selectedIdx !== null || submittingRef.current) return;
     const timeMs = Date.now() - (qStartMs ?? Date.now());
-    setSelectedIdx(idx); setPhase("answered");
-    broadcast({ type: GM.ANSWER, playerId, name: playerName, optionIdx: idx, timeMs });
+    persistThenLock({ option_idx: idx },
+      () => { setSelectedIdx(idx); setPhase("answered"); },
+      { type: GM.ANSWER, playerId, name: playerName, optionIdx: idx, timeMs });
   };
 
   const handleSliderSubmit = () => {
-    if (phase !== "question" || sliderSubmitted) return;
-    // sliderValue is null until the player drags. The input/display show the
-    // midpoint via `?? midpoint`, so a player who accepts the default without
-    // dragging sees a value (e.g. 5) while state is still null — submitting the
-    // raw null erased their answer everywhere downstream. Resolve to the exact
-    // value shown (same expression as the render), lock it into state so the
-    // reveal reads it, and broadcast that. `?? ` preserves a dragged 0.
+    if (phase !== "question" || sliderSubmitted || submittingRef.current) return;
+    // `?? ` preserves a dragged 0. Resolve to the exact value shown (same expression as render).
     const submitted = sliderValue ?? Math.round(((question?.min ?? 0) + (question?.max ?? 10)) / 2);
     const timeMs = Date.now() - (qStartMs ?? Date.now());
-    setSliderValue(submitted);
-    setSliderSubmitted(true); setPhase("answered");
-    broadcast({ type: GM.ANSWER, playerId, name: playerName, sliderValue: submitted, timeMs });
+    persistThenLock({ value: submitted },
+      () => { setSliderValue(submitted); setSliderSubmitted(true); setPhase("answered"); },
+      { type: GM.ANSWER, playerId, name: playerName, sliderValue: submitted, timeMs });
+  };
+
+  // Type/Open text submit (durable-first). Shared by the button + Enter key.
+  const handleTextSubmit = () => {
+    if (phase !== "question" || openSubmitted || !openText.trim() || submittingRef.current) return;
+    const text = openText.trim();
+    const timeMs = Date.now() - (qStartMs ?? Date.now());
+    persistThenLock({ text },
+      () => { setOpenSubmitted(true); setPhase("answered"); },
+      { type: GM.ANSWER, playerId, name: playerName, text, optionIdx: null, timeMs });
   };
 
   // Matching — tap-to-pair (chosen over drag-and-drop for the live, timed,
@@ -4043,10 +4378,11 @@ function KahootPlayerView({ onNav, playerName, playerEmoji, playerId, pin, sessi
   };
   const handleMatchSubmit = () => {
     const total = question?.pairs?.length ?? 0;
-    if (phase !== "question" || matchSubmitted || matchPairs.length < total) return;
+    if (phase !== "question" || matchSubmitted || matchPairs.length < total || submittingRef.current) return;
     const timeMs = Date.now() - (qStartMs ?? Date.now());
-    setMatchSubmitted(true); setPhase("answered");
-    broadcast({ type: GM.ANSWER, playerId, name: playerName, matchPairs, timeMs });
+    persistThenLock({ pairs: matchPairs.map(mp => ({ leftIdx: mp.leftIdx, rightIdx: mp.rightIdx })) },
+      () => { setMatchSubmitted(true); setPhase("answered"); },
+      { type: GM.ANSWER, playerId, name: playerName, matchPairs, timeMs });
   };
 
   const timerPct   = question ? (timeLeft / question.timeLimit) * 100 : 0;
@@ -4126,8 +4462,12 @@ function KahootPlayerView({ onNav, playerName, playerEmoji, playerId, pin, sessi
         </div>
         <div style={{ padding: "14px 20px", borderTop: `1px solid ${C.border}` }}>
           {isFinalBoard
-            ? <button onClick={() => onNav("home")} style={{ width: "100%", padding: "13px", borderRadius: 14, border: "none", background: C.orange, color: "#fff", fontWeight: 900, fontSize: 15, cursor: "pointer", boxShadow: "0 0 32px rgba(253,191,36,0.3)" }}>Done</button>
-            : <p style={{ margin: 0, fontSize: 13, color: C.textSub, textAlign: "center" }}>Waiting for host to continue…</p>
+            ? <button onClick={() => onNav("rankd")} style={{ width: "100%", padding: "13px", borderRadius: 14, border: "none", background: C.orange, color: "#fff", fontWeight: 900, fontSize: 15, cursor: "pointer", boxShadow: "0 0 32px rgba(253,191,36,0.3)" }}>Back to Ralli Games</button>
+            : <>
+                <p style={{ margin: "0 0 10px", fontSize: 13, color: C.textSub, textAlign: "center" }}>Waiting for host to continue…</p>
+                {/* Defensive exit so an intermediate scoreboard is never a dead end (e.g. a missed terminal signal). */}
+                <button onClick={() => setShowLeaveConfirm(true)} style={{ display: "block", margin: "0 auto", padding: "8px 16px", borderRadius: 10, border: `1px solid ${C.border}`, background: "transparent", color: C.textMuted, fontWeight: 700, fontSize: 12, cursor: "pointer" }}>Leave game</button>
+              </>
           }
         </div>
       </div>
@@ -4386,6 +4726,14 @@ function KahootPlayerView({ onNav, playerName, playerEmoji, playerId, pin, sessi
         <h2 style={{ margin: 0, fontSize: 18, fontWeight: 900, color: C.text, lineHeight: 1.3 }}>{question?.q}</h2>
       </div>
 
+      {/* Retryable submit error: a durable submission that did not confirm (identity still restoring right
+          after a rejoin, or a stale question) shows here — the answer is NOT locked; tap it again to retry. */}
+      {submitErr && phase === "question" && (
+        <div style={{ margin: "0 16px 8px", padding: "10px 14px", borderRadius: 12, background: "#FEF2F2", border: `1px solid ${C.red}` }}>
+          <span style={{ fontSize: 13, fontWeight: 700, color: C.red }}>Couldn't save your answer — tap your answer again to retry.</span>
+        </div>
+      )}
+
       {/* Answer input — varies by question type */}
       {isOpen ? (
         /* Open-ended — large textarea */
@@ -4404,12 +4752,7 @@ function KahootPlayerView({ onNav, playerName, playerEmoji, playerId, pin, sessi
             }}
           />
           {!openSubmitted ? (
-            <button onClick={() => {
-              if (!openText.trim()) return;
-              const timeMs = Date.now() - (qStartMs ?? Date.now());
-              setOpenSubmitted(true);
-              broadcast({ type: GM.ANSWER, playerId, name: playerName, text: openText.trim(), optionIdx: null, timeMs });
-            }} style={{ padding: "14px", borderRadius: 14, border: "none", background: openText.trim() ? C.orange : "rgba(255,255,255,0.08)", color: openText.trim() ? "#fff" : "rgba(255,255,255,0.3)", fontWeight: 900, fontSize: 15, cursor: openText.trim() ? "pointer" : "not-allowed", transition: "background 0.2s" }}>
+            <button onClick={handleTextSubmit} style={{ padding: "14px", borderRadius: 14, border: "none", background: openText.trim() ? C.orange : "rgba(255,255,255,0.08)", color: openText.trim() ? "#fff" : "rgba(255,255,255,0.3)", fontWeight: 900, fontSize: 15, cursor: openText.trim() ? "pointer" : "not-allowed", transition: "background 0.2s" }}>
               {openText.trim() ? "Submit Response →" : "Type something to submit"}
             </button>
           ) : (
@@ -4425,14 +4768,7 @@ function KahootPlayerView({ onNav, playerName, playerEmoji, playerId, pin, sessi
             type="text"
             value={openText}
             onChange={e => !openSubmitted && setOpenText(e.target.value)}
-            onKeyDown={e => {
-              if (e.key === "Enter" && openText.trim() && !openSubmitted) {
-                const timeMs = Date.now() - (qStartMs ?? Date.now());
-                setOpenSubmitted(true);
-                setPhase("answered");
-                broadcast({ type: GM.ANSWER, playerId, name: playerName, text: openText.trim(), optionIdx: null, timeMs });
-              }
-            }}
+            onKeyDown={e => { if (e.key === "Enter") handleTextSubmit(); }}
             placeholder="Type your answer…"
             readOnly={openSubmitted}
             style={{
@@ -4444,13 +4780,9 @@ function KahootPlayerView({ onNav, playerName, playerEmoji, playerId, pin, sessi
             }}
           />
           {!openSubmitted ? (
-            <button onClick={() => {
-              if (!openText.trim()) return;
-              const timeMs = Date.now() - (qStartMs ?? Date.now());
-              setOpenSubmitted(true);
-              setPhase("answered");
-              broadcast({ type: GM.ANSWER, playerId, name: playerName, text: openText.trim(), optionIdx: null, timeMs });
-            }} style={{ padding: "14px", borderRadius: 14, border: "none", background: openText.trim() ? C.orange : C.muted, color: openText.trim() ? "#fff" : C.textMuted, fontWeight: 900, fontSize: 15, cursor: openText.trim() ? "pointer" : "not-allowed", transition: "background 0.2s" }}>
+            /* Route through the DURABLE handleTextSubmit (same as the Enter key) — the previous inline
+               handler locked + broadcast with NO submitGameAnswer, silently dropping the answer. */
+            <button onClick={handleTextSubmit} style={{ padding: "14px", borderRadius: 14, border: "none", background: openText.trim() ? C.orange : C.muted, color: openText.trim() ? "#fff" : C.textMuted, fontWeight: 900, fontSize: 15, cursor: openText.trim() ? "pointer" : "not-allowed", transition: "background 0.2s" }}>
               {openText.trim() ? "Submit Answer →" : "Type something to submit"}
             </button>
           ) : (
@@ -7115,7 +7447,13 @@ function RankdLobbyScreen({ onNav, pin, sessionDbId: propSessionDbId = null, pla
         // the ended message rather than sitting in the lobby / "Hang tight".
         if (["canceled", "ended", "completed"].includes(data.status)) { setHostEnded(true); return; }
         const started = data.status === "started" || (data.phase && data.phase !== "waiting");
-        if (started) onNav("rankd-game");
+        // Navigating lobby→game is NOT a Leave. Set the SAME guard the broadcast nav path sets
+        // (advancingToGameRef) so the lobby's leave-on-unmount cleanup (markParticipantLeft →
+        // status='left') does not fire for a still-connected learner who advanced via this durable
+        // fallback. Without this, a learner who reaches the game through the poll (e.g. missing the
+        // GM.GAME_START frame) is wrongly marked 'left' on lobby unmount — which zeroes both halt
+        // sources and can falsely halt the game.
+        if (started) { advancingToGameRef.current = true; onNav("rankd-game"); }
       }).catch(() => {});
     };
     check(); // immediate on mount so a refresh after cancellation resolves at once
@@ -24824,16 +25162,25 @@ export default function App() {
                 const s = session?.data;
                 const terminal = !s || s.status === "completed" || s.status === "canceled" || s.phase === "ended";
                 if (s && !terminal) {
-                  setActiveGameSessionDbId(hostCtx.sessionDbId);
-                  setActiveGameIsDemo(false);
-                  setLobbyPin(s.pin ?? null);
-                  setLobbySessionName(s.name ?? null);
-                  setLobbyPlayerName(hostCtx.playerName ?? profile.name ?? null);
-                  setLobbyPlayerEmoji(hostCtx.playerEmoji ?? null);
-                  // Live (started or past waiting) → game view; still waiting → lobby.
-                  const live = s.status === "started" || (s.phase && s.phase !== "waiting");
-                  setScreen(live ? "rankd-game" : "rankd-lobby");
-                  hostReconnected = true;
+                  // Seed the host's live deck from the AUTHORITATIVE durable snapshot. Without
+                  // this, a host mid-game refresh leaves gameQuestions null → the render/broadcast
+                  // falls back to the demo GAME_QUESTIONS deck (the exact production failure). If it
+                  // can't be resolved, do NOT enter gameplay with demo content — leave the saved
+                  // context intact so a later retry/refresh can restore, and fall through to the hub.
+                  const realQs = await resolveRealQuestionsFromSnapshot(hostCtx.sessionDbId);
+                  if (Array.isArray(realQs) && realQs.length > 0) {
+                    setGameQuestions(realQs);
+                    setActiveGameSessionDbId(hostCtx.sessionDbId);
+                    setActiveGameIsDemo(false);
+                    setLobbyPin(s.pin ?? null);
+                    setLobbySessionName(s.name ?? null);
+                    setLobbyPlayerName(hostCtx.playerName ?? profile.name ?? null);
+                    setLobbyPlayerEmoji(hostCtx.playerEmoji ?? null);
+                    // Live (started or past waiting) → game view; still waiting → lobby.
+                    const live = s.status === "started" || (s.phase && s.phase !== "waiting");
+                    setScreen(live ? "rankd-game" : "rankd-lobby");
+                    hostReconnected = true;
+                  }
                 } else {
                   clearActiveGameContext(); // completed / canceled / ended → never restore
                 }
@@ -25773,8 +26120,19 @@ export default function App() {
     // cancel the just-created session (making it non-joinable) and let the host
     // retry — never leaving an orphaned joinable session without a snapshot.
     const quiz = quizzes.find(q => q.id === session.quizId);
-    const playedQuestions = quiz?.questions ?? GAME_QUESTIONS;
     const gameTenantId = currentOrg?.id ?? user?.orgId ?? null;
+    // Never snapshot the hardcoded demo GAME_QUESTIONS deck as a REAL game's authoritative
+    // question set: the durable question_snapshot written here is the single source of truth the
+    // host later renders from (via resolveRealQuestionsFromSnapshot). If a real quiz's questions
+    // aren't resolvable (catalog not loaded / wrong shape), fail closed — cancel the just-created
+    // session and let the host retry — rather than durably record the demo deck.
+    if (session.demoMode === false && (!quiz || !Array.isArray(quiz.questions) || quiz.questions.length === 0)) {
+      console.error("[ralli:game] createGameSession blocked: real quiz has no resolvable questions", session.quizId);
+      await cancelGameSession(data.id, gameTenantId).catch(e => console.error("[ralli:game] cancelGameSession failed:", e));
+      toast.error("Couldn't load this quiz's questions. Please reopen the quiz and try again.");
+      return;
+    }
+    const playedQuestions = quiz?.questions ?? GAME_QUESTIONS;
     if (data.id) {
       const { error: snapErr } = await saveSessionQuestionSnapshot(data.id, playedQuestions);
       if (snapErr) {
@@ -25981,7 +26339,7 @@ export default function App() {
   //   same way, but can't resume a genuinely in-flight question with the
   //   correct time remaining — see the comment on its restoration effect.
   const LOBBY_STATUSES = new Set(["waiting"]);
-  const handleLaunch = (session) => {
+  const handleLaunch = async (session) => {
     const isLobby = LOBBY_STATUSES.has(session.status);
     const isDemo  = session.demoMode !== false;
     const dbId    = session.dbId ?? null;
@@ -25995,8 +26353,20 @@ export default function App() {
       toast.error("Couldn't open this game — its session id is unavailable. Please refresh and try again.");
       return;
     }
-    const quiz = quizzes.find(q => q.id === session.quizId);
-    setGameQuestions(quiz?.questions ?? GAME_QUESTIONS);
+    // Seed the deck: a REAL session uses the AUTHORITATIVE durable snapshot (never the
+    // client quiz catalog, whose items can lack question bodies → silent demo fallback).
+    // Fail closed rather than re-enter a real game with the demo GAME_QUESTIONS deck.
+    if (isDemo) {
+      const quiz = quizzes.find(q => q.id === session.quizId);
+      setGameQuestions(quiz?.questions ?? GAME_QUESTIONS);
+    } else {
+      const realQs = await resolveRealQuestionsFromSnapshot(dbId);
+      if (!Array.isArray(realQs) || realQs.length === 0) {
+        toast.error("Couldn't load this game's questions. Please refresh and try again.");
+        return;
+      }
+      setGameQuestions(realQs);
+    }
     // Store the exact identity from the clicked session object.
     setActiveGameSessionDbId(dbId);
     setActiveGameIsDemo(isDemo);
@@ -26076,6 +26446,13 @@ export default function App() {
       setScreen("rankd-new");
       return;
     }
+    // 084: canonical roster requires ≥1 eligible authenticated learner. Fail-closed start returns a
+    // structured {ok:false} (never an exception) — keep the host in the waiting lobby with a clear
+    // message; no game started, no roster created. (Older cached clients hit the generic branch below.)
+    if (startData && startData.ok === false && startData.reason === "no_eligible_learners") {
+      toast.error("No learners have joined yet — wait for at least one learner, then start.");
+      return;
+    }
     // Any other non-start outcome (e.g. reason 'not_startable' — the session was concurrently
     // canceled / started / its quiz deleted between our read and the transition): do NOT broadcast
     // GAME_START or enter gameplay. Keep the host in the lobby to refresh/retry; if the session
@@ -26086,14 +26463,35 @@ export default function App() {
       return;
     }
 
-    // Started successfully — mark the exact active session started locally, broadcast
-    // GAME_START so all players navigate to the game, then navigate the host.
+    // Started successfully. Seed the host's live deck from the AUTHORITATIVE durable
+    // snapshot BEFORE entering gameplay — never `gameQuestions` (which can be null after a
+    // host refresh, or the demo GAME_QUESTIONS fallback) for a real game. This is the fix
+    // for a real session rendering/broadcasting the hardcoded demo deck while the durable
+    // snapshot holds the real quiz. Fail closed if it can't be resolved: stay in the lobby.
+    const realQs = await resolveRealQuestionsFromSnapshot(activeGameSessionDbId);
+    if (!Array.isArray(realQs) || realQs.length === 0) {
+      console.error("[ralli:game] handleGameStart blocked: could not resolve durable question snapshot");
+      toast.error("Couldn't load this game's questions. Please refresh and try again.");
+      return;
+    }
+    setGameQuestions(realQs);
+    // Durable countdown recovery: persist phase='countdown' so a learner who reaches the game via
+    // the durable status poll (rpc_start_session sets status='started' but leaves phase='waiting'),
+    // or who misses the single transient GM.GAME_START frame, restores a countdown from server state
+    // (KahootPlayerView.reconcile's phase==='countdown' branch) instead of sitting on "Hang tight"
+    // and jumping straight to the question. The host's startQuestion flips durable phase to 'question'
+    // ~3s later, so a learner polling after the countdown correctly lands on the question. Best-effort:
+    // the GM.GAME_START broadcast remains the fast path; a failed persist must not block the game.
+    await updateSessionPhase(activeGameSessionDbId, { phase: "countdown", currentQuestionIndex: 0, paused: false })
+      .catch(e => console.error("[ralli:host] persist countdown phase failed:", e));
+    // mark the exact active session started locally, broadcast GAME_START so all players
+    // navigate to the game, then navigate the host. GAME_START carries a PLAYER-SAFE deck
+    // (answer keys stripped) — learners only use it to start the countdown/navigate.
     setSessions(prev => prev.map(s =>
       (activeGameSessionDbId != null ? s.dbId === activeGameSessionDbId : s.code === lobbyPin)
         ? { ...s, status: "started" } : s
     ));
-    const qs = gameQuestions ?? GAME_QUESTIONS;
-    broadcast({ type: GM.GAME_START, questions: qs, totalQ: qs.length });
+    broadcast({ type: GM.GAME_START, questions: realQs.map(toPlayerSafeQuestion), totalQ: realQs.length });
     setScreen("rankd-game");
   };
 
@@ -26105,7 +26503,7 @@ export default function App() {
   // id the child carries on `data.sessionDbId` must be non-null AND equal to
   // App state for a persisted game — otherwise we cannot know which session
   // this is and must not pick one speculatively.
-  const handleGameEnd = (data) => {
+  const handleGameEnd = async (data) => {
     const isDemoGame  = activeGameIsDemo;
     const appDbId     = activeGameSessionDbId;      // authoritative
     const carriedDbId = data?.sessionDbId ?? null;  // what the child held
@@ -26135,38 +26533,37 @@ export default function App() {
         ? { ...s, status: "completed" } : s
     ));
     const gameTenantId = currentOrg?.id ?? user?.orgId ?? null;
-    // Persist results + mark participants completed in Supabase (fire-and-forget).
-    // Pass the authoritative session id so endGameSession needs no read of the row it
-    // just updated (safe-read cutover — works after table SELECT is revoked).
-    endGameSession(lobbyPin, {
-      scores:   data?.scores ?? [],
-      tenantId: gameTenantId,
-      sessionId: endedDbId,
-    }).then(() => {
-      // Refresh Past Sessions from the DB now that this session's status/
-      // ended_at/game_players are actually persisted — without this, Past
-      // Sessions wouldn't show the just-finished game until the next login
-      // or the 10s poll on the games screen (see getGameHistory).
-      if (gameTenantId) {
-        getGameHistory(gameTenantId).then(({ data: history, error }) => {
-          if (error) console.error("[ralli] getGameHistory refresh failed:", error);
-          if (history) setPastSessions(history);
-        });
-      }
-      // Post-completion, request server-authoritative verification (migration 072
-      // + verify-game-session). Fire-and-forget and retryable/idempotent: it runs
-      // ONLY after durable completion, must never delay or strand the end screen,
-      // and a failure/unavailable Edge Function must never erase gameplay results
-      // — the session simply stays UNVERIFIED (and thus never leaderboard-eligible).
-      // endedDbId is null for demo games, so this is real-session-only.
-      if (endedDbId) {
-        requestSessionVerification(endedDbId)
-          .then(({ unavailable }) => {
-            if (unavailable) console.info("[ralli] session verification unavailable — session stays unverified until the verify service is deployed");
-          })
-          .catch(() => { /* never affects gameplay results */ });
-      }
-    }).catch(e => console.error("[ralli] endGameSession failed:", e));
+    // Persist terminal state (status='completed' + ended_at via rpc_end_session, and the final
+    // game_players rows) — AND AWAIT it, so the caller (doNext) broadcasts GM.GAME_END only AFTER the
+    // durable terminal state exists. This satisfies "terminal state persisted before terminal broadcast":
+    // a learner who receives the broadcast can always also recover the same state durably, and a learner
+    // who MISSES the broadcast recovers via the status-based reconcile. Pass the authoritative session id
+    // so endGameSession needs no read of the row it just updated (safe-read cutover).
+    try {
+      await endGameSession(lobbyPin, {
+        scores:   data?.scores ?? [],
+        tenantId: gameTenantId,
+        sessionId: endedDbId,
+      });
+    } catch (e) { console.error("[ralli] endGameSession failed:", e); }
+    // Post-persist follow-ups (fire-and-forget — must never delay or strand the end screen).
+    // Refresh Past Sessions now that status/ended_at/game_players are persisted.
+    if (gameTenantId) {
+      getGameHistory(gameTenantId).then(({ data: history, error }) => {
+        if (error) console.error("[ralli] getGameHistory refresh failed:", error);
+        if (history) setPastSessions(history);
+      }).catch(() => {});
+    }
+    // Post-completion, request server-authoritative verification (migration 072 + verify-game-session).
+    // Retryable/idempotent; a failure/unavailable Edge Function must never erase gameplay results —
+    // the session simply stays UNVERIFIED. endedDbId is null for demo games (real-session-only).
+    if (endedDbId) {
+      requestSessionVerification(endedDbId)
+        .then(({ unavailable }) => {
+          if (unavailable) console.info("[ralli] session verification unavailable — session stays unverified until the verify service is deployed");
+        })
+        .catch(() => { /* never affects gameplay results */ });
+    }
     // Award game points for all real participants, then trigger readiness for each.
     // awardGamePointsForSession returns the deduplicated list of authenticated user IDs
     // it awarded points to. Anonymous players have no player_id and are excluded.

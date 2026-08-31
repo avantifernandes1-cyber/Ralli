@@ -33,7 +33,7 @@ ok("2. persisted context records role: gameRole (selects restore RPC on boot)",
 // ── READ/ROUTE side: admin boot branches reconnect the host via the host-safe RPC ──
 const hostReconnIdx = src.indexOf("Host active-game refresh reconnect");
 ok("3. host reconnect block exists in the boot path", hostReconnIdx >= 0);
-const boot = src.slice(hostReconnIdx, hostReconnIdx + 2600);
+const boot = src.slice(hostReconnIdx, hostReconnIdx + 3400);
 ok("4. host reconnect is gated to admin-type profiles",
    /isRalliAdmin\(profile\.role\) \|\| profile\.role === "orgAdmin"/.test(boot));
 ok("5. host reconnect only fires for an admin-role context (hostCtx.role === \"admin\")",

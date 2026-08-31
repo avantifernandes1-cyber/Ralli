@@ -1355,3 +1355,97 @@ refresh landed on the Ralli Live hub / Active Sessions list; corrected in commit
 (`rpc_host_session_restore`-based host reconnect on boot). Migration 081 itself is unchanged and
 remains applied exactly once. This applied-migration record is now committed to the branch (docs only;
 no merge). Migrations 072 and 082 remain unapplied.
+
+## 2026-08-02 — Verification foundation applied + Edge Function deployed (072 + verify-game-session)
+
+Branch `feature/ralli-live-leaderboard-view` @ HEAD `844b2289ad6ab991bc5e0f59a732b66a390cf5d7`.
+Two-stage controlled execution under explicit product approval; nothing merged; no leaderboard UI.
+
+**Stage 1 — migration 072 (one controlled `apply_migration`, exact committed bytes).**
+
+| Order | Prod version (ledger) | Prod name | Git file | Commit | SQL SHA-256 | Applied (UTC) | Verification |
+|---|---|---|---|---|---|---|---|
+| 46 | `20260802180613` | 072_game_verification_foundation | supabase/migrations/072_game_verification_foundation.sql | 844b228 (authored d208a89) | b27a557cf6280f6e49ecf1a39a3f3a744f4455202a648fd69f03360204795147 | 2026-08-02 18:06:13 | PASS |
+
+- **Approved backfill executed exactly as scoped:** **36** existing sessions with a non-null
+  `question_snapshot` received `question_snapshot_hash` + `question_snapshot_frozen_at`; all 36 hashes
+  equal `md5(question_snapshot::text)` (0 wrong); 0 demo rows. **No** answers/scores/points/XP/
+  analytics/participants/session-lifecycle changed (sessions=86, answers=162, players=38 unchanged).
+- **Zero automatic verification rows:** `game_session_verifications`=0, `game_answer_verifications`=0
+  immediately after apply.
+- Structural: 2 additive columns; 2 append-only tables + 4 indexes; 3 functions
+  (`record_game_verification` secdef/`search_path=''`/EXECUTE=service_role only — anon+authenticated
+  denied; `game_sessions_freeze_snapshot`; `game_verifications_block_update`); 3 triggers; RLS on both
+  tables; 2 same-tenant read policies. Migrations 073–081/083 intact; 084/085 do not exist. Isolated
+  harness 19/19; re-apply idempotent.
+
+**Stage 2 — Edge Function `verify-game-session` deployed (exact committed bundle).**
+- Deployment: id `a2b745d8-306c-4fc4-8b52-0e4d6dfa552a`, **version 1, status ACTIVE**, bundle
+  `ezbr_sha256 7c680150b7180703683eef9ccf3ead4ba74daa122aec920d53492cb1fd3bf163`.
+- Bundle file SHA-256 (working tree == committed at 844b228):
+  `verify-game-session/index.ts` = `96650b424b62c2f259a562425b207aaeb07362ea1a6b60d4f4333c3b0eb03e56`;
+  `_shared/cors.js` = `26cbb30d1a20514f14ae5b1f7f6f7a343e5b2a3f12ab97c3c0a5187791f29d32`;
+  `_shared/gameGrading.js` = `c88dcbb2b2f47e2d304cc801d0ccee3e7180e838588ab662a8144b6a7a22a6f3`;
+  `verify-game-session/import_map.json` = `74556822affb033f13dd86b8830fba80eed8024eccaf66b7bc95b66bc4194081`.
+- **JWT verification: `verify_jwt = true`** (explicit; the function also self-verifies via
+  `auth.getUser()`). Platform secrets `SUPABASE_URL` / `SUPABASE_ANON_KEY` /
+  `SUPABASE_SERVICE_ROLE_KEY` are platform-injected defaults (not printed).
+- **CORS runtime (live):** OPTIONS from `https://runralli.com` → **204** with
+  `Access-Control-Allow-Origin: https://runralli.com`, `Access-Control-Allow-Methods: POST, OPTIONS`,
+  `Access-Control-Allow-Headers: authorization, apikey, content-type, x-client-info`; approved preview
+  branch alias + `http://localhost:5173` echoed; unapproved `https://evil.com` → 204 with **no** ACAO;
+  anonymous POST → **401** (gateway); GET → **401**. The `verify_jwt`+OPTIONS preflight concern did not
+  materialize (OPTIONS reaches the function).
+- **No historical verification performed:** verification-row counts remained 0 before and after
+  deployment; no verification was invoked against any historical session. Frontend game-end
+  invocation remains non-blocking / safe-by-default.
+
+**Post-deploy tests:** canonical grader 15/15; CORS policy 32/32; CORS wiring 22/22; full JS suite
+22/22; 072 SQL harness 19/19 (isolated); esbuild TS parse + Vite build OK; trace scan clean.
+
+**Reliability (documented, NOT implemented):** migration **084** reserved for the durable verification
+queue/retry/reconciliation; migration **085** for the leaderboard read RPC; the leaderboard UI stays
+blocked until durable retry exists; missing verification must read as "pending/unverified," never
+failed or zero-scoring.
+
+Operator: applied + deployed by Claude Code under explicit user approval. Ledger row 46. Nothing
+merged to main; migration 082 remains unwritten/unapplied; leaderboard UI remains unbuilt.
+
+---
+
+## Row 47 — Migration 084 applied + Ralli Live multi-player durability (beta complete)
+
+**Date:** 2026-08-04 (084 apply) → 2026-08-31 (frontend live-QA closeout). **Operator:** Claude Code under
+explicit per-step user approval. Nothing merged to `main`; work lives on `feature/ralli-live-leaderboard-view`.
+
+**Migration `084_ralli_canonical_roster_durable_answers`**
+- Production version **`20260804003242`**, recorded **exactly once** in `supabase_migrations.schema_migrations`.
+- Committed artifact `d85c5a8:supabase/migrations/084_ralli_canonical_roster_durable_answers.sql`
+  SHA-256 = `be38e67643aeee705e525e835c3d27a7d18652ddfb771ca0aaf8dab177e7f40b` (working tree == committed).
+- Supersedes the earlier "084 reserved for verification queue" note above: 084 is the **canonical
+  immutable roster + durable answer-submission** foundation. Adds `game_sessions.current_question_started_at`,
+  tables `game_roster_members` (immutable canonical roster, built atomically in `rpc_start_session`) and
+  `game_answer_submissions` (durable, first-write-locked, idempotent, `player_id = auth.uid()`), RLS +
+  immutability triggers, and RPCs `rpc_submit_game_answer`, `rpc_begin_question_reveal`, `rpc_host_game_state`,
+  `rpc_answer_progress`, `rpc_record_question_results`, `rpc_my_submission`; supersedes `rpc_start_session`
+  (+ canonical roster, fail-closed structured no-start) and `rpc_set_session_phase` (+ server question-start
+  stamp). Additive/forward-only; **no DML/backfill**. **No migration 085 exists or is applied.**
+
+**Frontend (commits `18c42d4..340f303` on the feature branch)** — made 084 the sole gameplay authority and
+fixed the multi-player lifecycle: real-quiz snapshot rendering, durable reveal publication, durable answer
+display, durable countdown recovery, no-false zero-player halt, active-response denominator (Leave/rejoin),
+revision-guarded progress snapshot, durable terminal recovery + exit, fail-closed learner submit (never
+"Locked in" without a durable row; Type Submit + Enter share the durable path), and single-source Type
+correctness (host + learner read durable `p.wasCorrect`; no independent re-grade). Manager PIN shown in the
+host gameplay header.
+
+**Verification (this closeout, all PASS):** Vite build OK; full JS suite 27/27; 084 real-JWT SQL harness
+12/12 (isolated); 084 concurrency 9/9; trace/instrumentation scan clean (no runtime markers). Read-only
+production reconciliation: 084 recorded once (version above); 2 durable tables + 8 RPCs live; **no 085**;
+final live-QA session `ec811d44` has 2 distinct canonical players, 2 final `game_players`, 11 durable
+submissions, **0 duplicate answer rows, 0 duplicate roster entries, 0 cross-tenant submissions** (tenant
+isolation intact).
+
+**Status:** Ralli Live gameplay, recovery, scoring, and historical analytics — **live-QA passed, beta
+complete.** The future organization/team/individual **leaderboard remains separate and unimplemented**; no
+leaderboard UI is exposed. Ledger row 47.

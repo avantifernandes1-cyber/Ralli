@@ -97,8 +97,82 @@ export async function startGameSession(sessionId) {
   // { ok: false, reason: 'quiz_unavailable' } (migration 083) the session was durably canceled
   // server-side because its quiz was archived before start; the host must NOT enter the game.
   const { data, error } = await supabase.rpc("rpc_start_session", { p_session_id: sessionId });
+  // 084: on success, `data.roster` is the immutable canonical roster (eligible authenticated
+  // same-tenant learners) resolved atomically in the start transaction — the server-authoritative
+  // membership the host must use for scoring (never Q0 presence). Additive; old callers read ok/reason.
   return { data, error };
 }
+
+// ── 084: CANONICAL ROSTER + DURABLE ANSWER SUBMISSION ────────────────────────────
+
+/**
+ * Durable, server-authoritative answer submission (migration 084). The player is derived
+ * from auth.uid() server-side (a client-supplied id is impossible); membership in the canonical
+ * roster + started session + answerable phase + exact current question + per-type shape are all
+ * enforced server-side. First write locks; identical retry is idempotent; a conflicting change is
+ * rejected. Correctness is NEVER computed or returned. Returns { ok, idempotent, error }.
+ *
+ * @param {string} sessionId - game_sessions.id
+ * @param {number} questionIdx - the current question index the learner is answering
+ * @param {object} answer - typed payload: {option_idx}|{value}|{text}|{pairs:[{leftIdx,rightIdx}]}
+ */
+export async function submitGameAnswer(sessionId, questionIdx, answer) {
+  const { data, error } = await supabase.rpc("rpc_submit_game_answer", {
+    p_session_id: sessionId, p_question_idx: questionIdx, p_answer: answer,
+  });
+  return { ok: !error && data?.ok === true, idempotent: data?.idempotent === true, data, error };
+}
+
+/**
+ * Atomic reveal boundary (migration 084). Host-authorized; in one locked transaction it closes
+ * submissions for the current question and returns the canonical roster + durable submissions +
+ * server question-start so the host grades with the ONE shared grader. Deterministic race: a
+ * submission committing before this call is included; one after is rejected as stale.
+ */
+export async function beginQuestionReveal(sessionId, questionIdx) {
+  const { data, error } = await supabase.rpc("rpc_begin_question_reveal", {
+    p_session_id: sessionId, p_question_idx: questionIdx,
+  });
+  return { data, error };
+}
+
+/** Host game-state read (084): canonical roster + current-question durable submissions (for host refresh). */
+export async function getHostGameState(sessionId) {
+  const { data, error } = await supabase.rpc("rpc_host_game_state", { p_session_id: sessionId });
+  return { data, error };
+}
+
+/** Server-derived accepted-submission progress vs active roster (084) — the auto-reveal count source. */
+export async function getAnswerProgress(sessionId, questionIdx) {
+  const { data, error } = await supabase.rpc("rpc_answer_progress", {
+    p_session_id: sessionId, p_question_idx: questionIdx,
+  });
+  return { data, error };
+}
+
+/**
+ * Idempotent host result persistence (084): under the session lock, replaces game_answers for
+ * (session, question) with exactly the supplied canonical roster rows (re-reveal/reconnect safe).
+ * Outside-roster rows are rejected server-side. Returns { data, error }.
+ */
+export async function recordQuestionResults(sessionId, questionIdx, rows) {
+  const { data, error } = await supabase.rpc("rpc_record_question_results", {
+    p_session_id: sessionId, p_question_idx: questionIdx, p_rows: rows,
+  });
+  return { data, error };
+}
+
+/** Learner reconnect restore (084): the caller's OWN durable submission for a question, or {found:false}. */
+export async function getMySubmission(sessionId, questionIdx) {
+  const { data, error } = await supabase.rpc("rpc_my_submission", {
+    p_session_id: sessionId, p_question_idx: questionIdx,
+  });
+  return { data, error };
+}
+
+// Supabase error code for "function not found" (RPC absent because 084 is not applied yet) — the
+// signal the frontend uses to degrade gracefully to the legacy realtime path during pre-084 preview.
+export const RPC_MISSING = "PGRST202";
 
 /**
  * Durably publish the scoreboard the host already computed (migration 081), so a learner who
