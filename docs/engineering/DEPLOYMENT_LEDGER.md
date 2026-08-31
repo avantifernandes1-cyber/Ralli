@@ -1410,3 +1410,42 @@ failed or zero-scoring.
 
 Operator: applied + deployed by Claude Code under explicit user approval. Ledger row 46. Nothing
 merged to main; migration 082 remains unwritten/unapplied; leaderboard UI remains unbuilt.
+
+---
+
+## Row 47 — Migration 084 applied + Ralli Live multi-player durability (beta complete)
+
+**Date:** 2026-08-04 (084 apply) → 2026-08-31 (frontend live-QA closeout). **Operator:** Claude Code under
+explicit per-step user approval. Nothing merged to `main`; work lives on `feature/ralli-live-leaderboard-view`.
+
+**Migration `084_ralli_canonical_roster_durable_answers`**
+- Production version **`20260804003242`**, recorded **exactly once** in `supabase_migrations.schema_migrations`.
+- Committed artifact `d85c5a8:supabase/migrations/084_ralli_canonical_roster_durable_answers.sql`
+  SHA-256 = `be38e67643aeee705e525e835c3d27a7d18652ddfb771ca0aaf8dab177e7f40b` (working tree == committed).
+- Supersedes the earlier "084 reserved for verification queue" note above: 084 is the **canonical
+  immutable roster + durable answer-submission** foundation. Adds `game_sessions.current_question_started_at`,
+  tables `game_roster_members` (immutable canonical roster, built atomically in `rpc_start_session`) and
+  `game_answer_submissions` (durable, first-write-locked, idempotent, `player_id = auth.uid()`), RLS +
+  immutability triggers, and RPCs `rpc_submit_game_answer`, `rpc_begin_question_reveal`, `rpc_host_game_state`,
+  `rpc_answer_progress`, `rpc_record_question_results`, `rpc_my_submission`; supersedes `rpc_start_session`
+  (+ canonical roster, fail-closed structured no-start) and `rpc_set_session_phase` (+ server question-start
+  stamp). Additive/forward-only; **no DML/backfill**. **No migration 085 exists or is applied.**
+
+**Frontend (commits `18c42d4..340f303` on the feature branch)** — made 084 the sole gameplay authority and
+fixed the multi-player lifecycle: real-quiz snapshot rendering, durable reveal publication, durable answer
+display, durable countdown recovery, no-false zero-player halt, active-response denominator (Leave/rejoin),
+revision-guarded progress snapshot, durable terminal recovery + exit, fail-closed learner submit (never
+"Locked in" without a durable row; Type Submit + Enter share the durable path), and single-source Type
+correctness (host + learner read durable `p.wasCorrect`; no independent re-grade). Manager PIN shown in the
+host gameplay header.
+
+**Verification (this closeout, all PASS):** Vite build OK; full JS suite 27/27; 084 real-JWT SQL harness
+12/12 (isolated); 084 concurrency 9/9; trace/instrumentation scan clean (no runtime markers). Read-only
+production reconciliation: 084 recorded once (version above); 2 durable tables + 8 RPCs live; **no 085**;
+final live-QA session `ec811d44` has 2 distinct canonical players, 2 final `game_players`, 11 durable
+submissions, **0 duplicate answer rows, 0 duplicate roster entries, 0 cross-tenant submissions** (tenant
+isolation intact).
+
+**Status:** Ralli Live gameplay, recovery, scoring, and historical analytics — **live-QA passed, beta
+complete.** The future organization/team/individual **leaderboard remains separate and unimplemented**; no
+leaderboard UI is exposed. Ledger row 47.

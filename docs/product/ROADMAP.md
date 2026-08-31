@@ -94,13 +94,23 @@ Readiness / analytics boundary (for the later Leadership Dashboard overhaul — 
 
 ### Ralli Live
 
-Status: Beta Complete
+Status: Gameplay / recovery / scoring / historical-analytics foundation — Beta Complete (live-QA passed)
 
 Completed:
 
+- Multi-player durability foundation (migration 084): canonical immutable roster + durable, auth.uid-derived,
+  idempotent per-learner answer submissions; the database is the source of truth for both membership and answers
+- Durable reveal + deterministic scoring from the canonical reconciliation (single grader; no independent re-grade)
+- Repeated Leave / Rejoin (same canonical identity, no duplicates); active-response denominator + immediate reveal
+- Countdown recovery, zero-player halt (pause, not auto-end) + manual resume, refresh/reconnect recovery, completion + exit
+- Type grading correctness (snapshot-driven; host/learner/persisted/points agree)
 - Slider tolerance consistency
 - Player reveal parity
 - Past Sessions
+- Historical analytics remain snapshot-based and immutable
+
+Not in scope / separate: the organization / team / individual **leaderboard** (view + read RPCs) is a distinct,
+**unimplemented** feature and is NOT part of this beta-complete foundation.
 
 ---
 
@@ -117,6 +127,15 @@ Status: Beta Ready
 ---
 
 ## Future
+
+Guided Onboarding Builder
+
+Help leaders create effective onboarding — not merely arrange content — using this sequence:
+
+1. Teach the why and underlying methodology.
+2. Teach the workflow and how to reason through the task.
+3. Teach the tools used to execute it, such as HubSpot, Orum, Gong, and related systems.
+4. Reinforce it with real examples from the organization's existing content.
 
 Continuous Learning Programs
 

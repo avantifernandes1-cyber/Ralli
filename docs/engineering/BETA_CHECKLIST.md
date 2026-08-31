@@ -98,7 +98,23 @@ Beta Complete — migrations 068–070 applied and verified in production; live 
 
 ## Ralli Live
 
-- [x] Analytics
+Multi-player gameplay, recovery, scoring, and historical analytics — **live-QA passed** on preview
+`340f303` (migration 084 durable roster/submission foundation; frontend on
+`feature/ralli-live-leaderboard-view`, not merged).
+
+- [x] Multi-player durability — canonical immutable roster + durable per-learner submissions (084); the
+      learner UI locks only after the exact current answer is durably accepted; missing session/player/
+      question identity fails closed (no optimistic lock, retryable error)
+- [x] Repeated Leave / Rejoin — verified across ≥5 cycles; rejoin restores the same canonical player (no
+      duplicate roster/answer rows); active-response denominator drops on Leave and immediate auto-reveal
+      once all active learners answer; no stale progress state
+- [x] Type grading — snapshot-driven; host response display, learner reveal, persisted correctness, and
+      points all come from the one durable reconciliation (no independent re-grade); accepted answers
+      grade correct, clearly-wrong answers fail
+- [x] Scoring / leaderboard / recap / Player Breakdown include both learners
+- [x] Zero-player halt (pauses, does not auto-end) + manual host resume; rejoin does not auto-resume
+- [x] Countdown synchronization, pause/resume, refresh/reconnect recovery, completion + clean exit
+- [x] Analytics — historical analytics remain snapshot-based and immutable
 
 - [x] Tenant isolation
 
