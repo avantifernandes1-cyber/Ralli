@@ -36,7 +36,7 @@ ok("6 persistThenLock awaits submitGameAnswer and does NOT lock on failure",
    /if \(!ok\) \{ setSubmitErr\(true\); return; \}/.test(player) &&
    /persistThenLock = async \(payload, lock, notify\)/.test(player));
 ok("7 lock + broadcast happen ONLY after durable acceptance (in persistThenLock, after the ok gate)",
-   /if \(!ok\) \{ setSubmitErr\(true\); return; \}[\s\S]{0,80}lock\(\);[\s\S]{0,40}broadcast\(notify\)/.test(player));
+   /if \(!ok\) \{ setSubmitErr\(true\); return; \}[\s\S]{0,180}lock\(\);[\s\S]{0,40}broadcast\(notify\)/.test(player));
 ok("8 MC/TF handler is durable-first ({option_idx})", /persistThenLock\(\{ option_idx: idx \}/.test(player));
 ok("9 Slider handler is durable-first and preserves the value ({value: submitted})", /persistThenLock\(\{ value: submitted \}/.test(player));
 ok("10 Matching handler is durable-first ({pairs:[{leftIdx,rightIdx}]})", /persistThenLock\(\{ pairs: matchPairs\.map\(mp => \(\{ leftIdx: mp\.leftIdx, rightIdx: mp\.rightIdx \}\)\) \}/.test(player));

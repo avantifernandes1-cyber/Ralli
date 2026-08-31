@@ -3664,18 +3664,23 @@ function KahootHostView({ onNav, sessionName, pin, sessionDbId, demoMode, tenant
             <div style={{ padding: "14px 18px", borderRadius: 14, background: C.white, border: `1px solid ${C.border}` }}>
               <div style={{ fontSize: 11, fontWeight: 700, color: C.textMuted, letterSpacing: "0.08em", marginBottom: 10 }}>PLAYER RESPONSES</div>
               <div style={{ display: "flex", flexDirection: "column", gap: 6 }}>
-                {Object.entries(chAnswers).map(([pid, ans], i) => {
-                  const accepted = (q.acceptedAnswers ?? []).map(a => a.toLowerCase().trim());
-                  const correct  = accepted.length > 0 && accepted.some(a => (ans.text ?? "").toLowerCase().trim() === a);
+                {/* Iterate the canonical roster `scores` and read the AUTHORITATIVE durable correctness
+                    (p.wasCorrect from reconcileReveal), NOT a re-grade of ephemeral chAnswers text — the
+                    old code re-checked chAnswers against acceptedAnswers, so a learner whose answer never
+                    persisted (ephemeral-only) got a false green ✓ that disagreed with is_correct + the
+                    learner reveal. Display text is durable-first (revealSubs) → ephemeral fallback. */}
+                {scores.map(p => {
+                  const ans = revealSubs?.[p.id] ?? chAnswers[p.id];   // display only
+                  const hasText = ans?.text != null && ans.text !== "";
                   return (
-                    <div key={pid} style={{ display: "flex", alignItems: "center", gap: 10, padding: "8px 12px", borderRadius: 10, background: correct ? "#D1FAE5" : "#FEF2F2" }}>
-                      <span style={{ fontSize: 13, fontWeight: 700, color: correct ? "#059669" : C.red }}>{correct ? "✓" : "✗"}</span>
-                      <span style={{ fontSize: 13, color: C.text, flex: 1 }}>{ans.text ?? <em style={{ color: C.textMuted }}>No response</em>}</span>
-                      <span style={{ fontSize: 11, color: C.textSub }}>{ans.name}</span>
+                    <div key={p.id} style={{ display: "flex", alignItems: "center", gap: 10, padding: "8px 12px", borderRadius: 10, background: p.wasCorrect ? "#D1FAE5" : hasText ? "#FEF2F2" : C.muted }}>
+                      <span style={{ fontSize: 13, fontWeight: 700, color: p.wasCorrect ? "#059669" : hasText ? C.red : C.textMuted }}>{hasText ? (p.wasCorrect ? "✓" : "✗") : "—"}</span>
+                      <span style={{ fontSize: 13, color: C.text, flex: 1 }}>{hasText ? ans.text : <em style={{ color: C.textMuted }}>No response</em>}</span>
+                      <span style={{ fontSize: 11, color: C.textSub }}>{p.name}</span>
                     </div>
                   );
                 })}
-                {Object.keys(chAnswers).length === 0 && <span style={{ fontSize: 13, color: C.textMuted, fontStyle: "italic" }}>No responses received.</span>}
+                {scores.length === 0 && <span style={{ fontSize: 13, color: C.textMuted, fontStyle: "italic" }}>No players.</span>}
               </div>
             </div>
           )}
@@ -4004,7 +4009,7 @@ function KahootPlayerView({ onNav, playerName, playerEmoji, playerId, pin, sessi
     setQuestion(payload.question);
     setTimeLeft(remaining);
     setGamePaused(!!paused); // a recovered paused question stays visibly paused, no countdown
-    setSelectedIdx(null); setOpenText(""); setOpenSubmitted(false);
+    setSelectedIdx(null); setOpenText(""); setOpenSubmitted(false); setSubmitErr(false);
     setSliderValue(null); setSliderSubmitted(false);
     setShuffledRight(payload.shuffledRight ?? []); setMatchPairs([]); setMatchSelLeft(null); setMatchSubmitted(false);
     setQStartMs(payload.questionStartedAt ?? Date.now());
@@ -4213,34 +4218,16 @@ function KahootPlayerView({ onNav, playerName, playerEmoji, playerId, pin, sessi
     if (chMsg.type === GM.OPEN_REVIEW) { setPhase("open-waiting"); }
     if (chMsg.type === GM.REVEAL) {
       setPhase("reveal");
-      let revealCorrect;
-      if (chMsg.isOpen) {
-        revealCorrect = null; // open-ended — host graded
-      } else if (Array.isArray(chMsg.acceptedAnswers)) {
-        // Type-answer: check typed text against accepted answers
-        const acc = chMsg.acceptedAnswers.map(a => a.toLowerCase().trim());
-        revealCorrect = acc.length > 0 && acc.some(a => openText.toLowerCase().trim() === a);
-      } else if (chMsg.sliderTarget != null) {
-        // Slider: within tolerance of the target, same rule the host used to score it
-        revealCorrect = sliderValue != null && Math.abs(sliderValue - chMsg.sliderTarget) <= (chMsg.sliderTolerance ?? 1);
-      } else if (Array.isArray(chMsg.matchPairsCorrect)) {
-        // Matching: all pairs must match — same all-or-nothing rule the host
-        // used to score it, checked against the SAME shuffledRight the host
-        // broadcast (chMsg.shuffledRight), not the local `shuffledRight`
-        // state, in case a message is processed before state settles.
-        const sr = chMsg.shuffledRight ?? shuffledRight;
-        revealCorrect = matchPairs.length > 0
-          && matchPairs.length === chMsg.matchPairsCorrect.length
-          && matchPairs.every(mp => sr[mp.rightIdx]?.right === chMsg.matchPairsCorrect[mp.leftIdx]?.right);
-      } else {
-        revealCorrect = selectedIdx === chMsg.correctIdx;
-      }
-      setIsCorrect(revealCorrect);
-      // Post-reveal ONLY: merge the correct-answer info the REVEAL broadcast carries
-      // back into the (sanitized) question so the reveal render can display it. The
-      // pre-reveal payload never contained it. Same helper as recovery below.
-      setQuestion(prev => (prev ? applyRevealToQuestion(prev, chMsg) : prev));
+      // Consume the AUTHORITATIVE durable correctness the host computed ONCE (reconcileReveal over the
+      // durable submissions) and carried in the REVEAL broadcast's per-player scores — NEVER re-grade
+      // locally. Local text/selection can diverge from the durable submission (e.g. an answer that failed
+      // to persist), and a local re-grade would then show a false ✓/✗ that disagrees with the stored
+      // is_correct, points, and the host panel. Open-ended stays null (host-graded manually).
       const me = chMsg.scores?.find(p => p.id === playerId) ?? chMsg.scores?.find(p => p.name === playerName);
+      setIsCorrect(chMsg.isOpen ? null : (me ? !!me.wasCorrect : null));
+      // Post-reveal ONLY: merge the correct-answer info the REVEAL broadcast carries back into the
+      // (sanitized) question so the reveal render can DISPLAY the accepted/correct answer (not to grade).
+      setQuestion(prev => (prev ? applyRevealToQuestion(prev, chMsg) : prev));
       if (me) { setMyScore(me.score); setMyDelta(me.delta); setMyRank(chMsg.scores.indexOf(me) + 1); }
     }
     if (chMsg.type === GM.NEXT_QUESTION) { setCdNum(3); setIsCorrect(null); setGamePaused(false); setPhase("countdown"); }
@@ -4307,11 +4294,17 @@ function KahootPlayerView({ onNav, playerName, playerEmoji, playerId, pin, sessi
     if (submittingRef.current) return;
     submittingRef.current = true;
     try {
-      if (sessionDbId && playerId) {
-        setSubmitErr(false);
-        const { ok } = await submitGameAnswer(sessionDbId, appliedQIdxRef.current, payload);
-        if (!ok) { setSubmitErr(true); return; }   // not saved → keep phase 'question'; allow retry
-      }
+      // Durable-first, FAIL-CLOSED. The answer is shown as "Locked in" ONLY after the durable submission
+      // succeeds for the exact current session + canonical player (auth.uid) + question. KahootPlayerView
+      // is always a REAL game (never demo), so we must NEVER lock/broadcast optimistically: if
+      // sessionDbId/playerId is transiently absent (e.g. the pin-fallback realtime channel keeps a
+      // question answerable during a post-rejoin window before activeGameSessionDbId propagates), the old
+      // `if (sessionDbId && playerId)` guard skipped the submit and locked with NO durable row — silently
+      // dropping the answer while the host stayed at N-1/N. Now: no id ⇒ retryable error, no lock.
+      if (!sessionDbId || !playerId) { setSubmitErr(true); return; }
+      setSubmitErr(false);
+      const { ok } = await submitGameAnswer(sessionDbId, appliedQIdxRef.current, payload);
+      if (!ok) { setSubmitErr(true); return; }   // not saved (stale question / error) → keep phase 'question', allow retry
       lock();
       broadcast(notify);
     } finally {
@@ -4733,6 +4726,14 @@ function KahootPlayerView({ onNav, playerName, playerEmoji, playerId, pin, sessi
         <h2 style={{ margin: 0, fontSize: 18, fontWeight: 900, color: C.text, lineHeight: 1.3 }}>{question?.q}</h2>
       </div>
 
+      {/* Retryable submit error: a durable submission that did not confirm (identity still restoring right
+          after a rejoin, or a stale question) shows here — the answer is NOT locked; tap it again to retry. */}
+      {submitErr && phase === "question" && (
+        <div style={{ margin: "0 16px 8px", padding: "10px 14px", borderRadius: 12, background: "#FEF2F2", border: `1px solid ${C.red}` }}>
+          <span style={{ fontSize: 13, fontWeight: 700, color: C.red }}>Couldn't save your answer — tap your answer again to retry.</span>
+        </div>
+      )}
+
       {/* Answer input — varies by question type */}
       {isOpen ? (
         /* Open-ended — large textarea */
@@ -4779,13 +4780,9 @@ function KahootPlayerView({ onNav, playerName, playerEmoji, playerId, pin, sessi
             }}
           />
           {!openSubmitted ? (
-            <button onClick={() => {
-              if (!openText.trim()) return;
-              const timeMs = Date.now() - (qStartMs ?? Date.now());
-              setOpenSubmitted(true);
-              setPhase("answered");
-              broadcast({ type: GM.ANSWER, playerId, name: playerName, text: openText.trim(), optionIdx: null, timeMs });
-            }} style={{ padding: "14px", borderRadius: 14, border: "none", background: openText.trim() ? C.orange : C.muted, color: openText.trim() ? "#fff" : C.textMuted, fontWeight: 900, fontSize: 15, cursor: openText.trim() ? "pointer" : "not-allowed", transition: "background 0.2s" }}>
+            /* Route through the DURABLE handleTextSubmit (same as the Enter key) — the previous inline
+               handler locked + broadcast with NO submitGameAnswer, silently dropping the answer. */
+            <button onClick={handleTextSubmit} style={{ padding: "14px", borderRadius: 14, border: "none", background: openText.trim() ? C.orange : C.muted, color: openText.trim() ? "#fff" : C.textMuted, fontWeight: 900, fontSize: 15, cursor: openText.trim() ? "pointer" : "not-allowed", transition: "background 0.2s" }}>
               {openText.trim() ? "Submit Answer →" : "Type something to submit"}
             </button>
           ) : (
