@@ -109,8 +109,17 @@ Completed:
 - Past Sessions
 - Historical analytics remain snapshot-based and immutable
 
-Not in scope / separate: the organization / team / individual **leaderboard** (view + read RPCs) is a distinct,
-**unimplemented** feature and is NOT part of this beta-complete foundation.
+The organization / team / individual **leaderboard** foundation is now implemented locally on
+`feature/ralli-live-leaderboard-085` (migration 085) but is **NOT applied to production, not deployed,
+not backfilled, and not merged.** It is prospective and server-authoritative: a durable per-question
+**exposure** denominator, verified-accuracy-only individual scoring with a tenant-mean shrinkage prior,
+median-based team scoring with eligibility/participation gates, an org IANA timezone with half-open
+timeframe windows, and a durable verification queue/outbox. The leaderboard lives inside Ralli Live
+(Individuals / Teams / team drill-down); the global Leaderboard nav item and the lifetime-XP Home
+"Team Leaderboard" widget were removed. Sessions predating 085 stay in Past Sessions/analytics but are
+excluded from ranking ("Pre-leaderboard tracking"). Until 085 is applied, the in-app leaderboard shows
+its backend-unavailable / retry states. Fully validated locally (SQL harness + concurrency + JS suite +
+build + scans); awaiting separate approval to apply/deploy.
 
 ---
 

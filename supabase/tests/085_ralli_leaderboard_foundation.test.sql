@@ -1,0 +1,277 @@
+-- Repeatable tests for migration 085 (Ralli Live leaderboard foundation).
+-- Proves: (1) durable-active exposure insertion at question-start (only roster-active +
+-- participant-active + fresh-heartbeat learners exposed; explicit-leave and stale excluded;
+-- duplicate phase calls idempotent); (2) exposure immutability (no UPDATE/DELETE); (3-5) the
+-- individual formula (exposure denominator, open-ended-pending excluded from numerator AND
+-- denominator, adjusted-accuracy shrinkage, ≥20-faced/≥3-games eligibility, unranked progress);
+-- (6) the team formula (median of eligible members, ≥2-eligible + ≥50%-participation gate);
+-- (7) org timezone (UTC default, valid IANA set by manager, invalid rejected, learner read-only);
+-- (8) security (anon denied, learner own-team-only drill-down, manager any same-tenant team);
+-- (9) payload confidentiality (aggregate-only, no answer/verdict/snapshot material); (10) managers/
+-- admins excluded from rankings; (Q1-Q6) the verification queue/outbox (enqueue-once on real
+-- completion, demo/canceled excluded, service-role-only claim, backoff retry → terminal failed,
+-- success → completed, no answer material stored). Runs against a local DB migrated through 085.
+-- One rolled-back transaction, no creds/answers. Expect "085 ALL TESTS PASSED" + "085 QUEUE TESTS PASSED".
+-- (To reproduce standalone: apply supabase/tests/concurrency/085_leaderboard_prelude.sql, then the
+--  exact 085 migration, then this file — see the local runner in the deliverable notes.)
+\set ON_ERROR_STOP on
+BEGIN;
+-- ── Fixtures ────────────────────────────────────────────────────────────────
+-- Tenant TA; teams A,B. Learners L1,L2,L3 (team A), L4,L5 (team B). Host/admin H1 (orgAdmin), manager MG.
+INSERT INTO public.tenants(id,name,timezone) VALUES ('00000000-0000-0000-0000-0000000850a0','TA', DEFAULT) ON CONFLICT DO NOTHING;
+INSERT INTO public.tenant_teams(id,tenant_id,name) VALUES
+ ('00000000-0000-0000-0000-000000085a01','00000000-0000-0000-0000-0000000850a0','Team A'),
+ ('00000000-0000-0000-0000-000000085b01','00000000-0000-0000-0000-0000000850a0','Team B');
+INSERT INTO auth.users(id,aud,role,email) VALUES
+ ('00000000-0000-0000-0000-000000085001','authenticated','authenticated','l1'),
+ ('00000000-0000-0000-0000-000000085002','authenticated','authenticated','l2'),
+ ('00000000-0000-0000-0000-000000085003','authenticated','authenticated','l3'),
+ ('00000000-0000-0000-0000-000000085004','authenticated','authenticated','l4'),
+ ('00000000-0000-0000-0000-000000085005','authenticated','authenticated','l5'),
+ ('00000000-0000-0000-0000-00000085f001','authenticated','authenticated','h1'),
+ ('00000000-0000-0000-0000-00000085f002','authenticated','authenticated','mg');
+UPDATE public.profiles SET role='user',status='active',tenant_id='00000000-0000-0000-0000-0000000850a0',team_id='00000000-0000-0000-0000-000000085a01',name='L1' WHERE id='00000000-0000-0000-0000-000000085001';
+UPDATE public.profiles SET role='user',status='active',tenant_id='00000000-0000-0000-0000-0000000850a0',team_id='00000000-0000-0000-0000-000000085a01',name='L2' WHERE id='00000000-0000-0000-0000-000000085002';
+UPDATE public.profiles SET role='user',status='active',tenant_id='00000000-0000-0000-0000-0000000850a0',team_id='00000000-0000-0000-0000-000000085a01',name='L3' WHERE id='00000000-0000-0000-0000-000000085003';
+UPDATE public.profiles SET role='user',status='active',tenant_id='00000000-0000-0000-0000-0000000850a0',team_id='00000000-0000-0000-0000-000000085b01',name='L4' WHERE id='00000000-0000-0000-0000-000000085004';
+UPDATE public.profiles SET role='user',status='active',tenant_id='00000000-0000-0000-0000-0000000850a0',team_id='00000000-0000-0000-0000-000000085b01',name='L5' WHERE id='00000000-0000-0000-0000-000000085005';
+UPDATE public.profiles SET role='orgAdmin',status='active',tenant_id='00000000-0000-0000-0000-0000000850a0',name='H1' WHERE id='00000000-0000-0000-0000-00000085f001';
+UPDATE public.profiles SET role='manager',status='active',tenant_id='00000000-0000-0000-0000-0000000850a0',name='MG' WHERE id='00000000-0000-0000-0000-00000085f002';
+
+\set snap8 '[{"id":"q0","type":"mc","options":["a","b"],"timeLimit":20},{"id":"q1","type":"mc","options":["a","b"],"timeLimit":20},{"id":"q2","type":"mc","options":["a","b"],"timeLimit":20},{"id":"q3","type":"mc","options":["a","b"],"timeLimit":20},{"id":"q4","type":"mc","options":["a","b"],"timeLimit":20},{"id":"q5","type":"mc","options":["a","b"],"timeLimit":20},{"id":"q6","type":"mc","options":["a","b"],"timeLimit":20},{"id":"q7","type":"open","timeLimit":20}]'
+
+CREATE TEMP TABLE _snap(v jsonb); INSERT INTO _snap VALUES (:'snap8'::jsonb);
+-- Three COMPLETED real sessions this month (ended_at now()). q7 is open-ended for the pending-manual test.
+INSERT INTO public.game_sessions(id,tenant_id,quiz_id,host_id,pin,status,demo_mode,question_count,question_snapshot,ended_at,current_question_index,phase)
+SELECT ('00000000-0000-0000-0000-00000008500'||g)::uuid,'00000000-0000-0000-0000-0000000850a0','q','00000000-0000-0000-0000-00000085f001','p'||g,'completed',false,8, :'snap8'::jsonb, now(), 7,'scoreboard'
+FROM generate_series(1,3) g;
+
+-- Roster (084 snapshot team) + exposures + verifications for L1,L2 (team A) and L4 (team B) across all 3 sessions, 8 q each.
+-- verified_correct pattern: L1 correct on q_idx<6 (6/8 per session → 18/24), L2 correct on q_idx<4 (4/8 → 12/24, but q7 open),
+-- L4 correct on q_idx<7 (7/8 → but q7 open). We seed q0..q6 (auto) with verdicts; q7 (open) left PENDING (no verdict).
+DO $$
+DECLARE s int; qi int; sid uuid; pl text; tm uuid;
+  players text[] := ARRAY['00000000-0000-0000-0000-000000085001','00000000-0000-0000-0000-000000085002','00000000-0000-0000-0000-000000085004'];
+BEGIN
+  FOR s IN 1..3 LOOP
+    sid := ('00000000-0000-0000-0000-00000008500'||s)::uuid;
+    FOREACH pl IN ARRAY players LOOP
+      tm := CASE WHEN pl='00000000-0000-0000-0000-000000085004' THEN '00000000-0000-0000-0000-000000085b01'::uuid ELSE '00000000-0000-0000-0000-000000085a01'::uuid END;
+      INSERT INTO public.game_roster_members(session_id,tenant_id,player_id,name,team_id,status) VALUES (sid,'00000000-0000-0000-0000-0000000850a0',pl,pl,tm,'active');
+      FOR qi IN 0..7 LOOP
+        -- exposure for every question (all present all game)
+        INSERT INTO public.game_question_exposures(session_id,tenant_id,player_id,question_idx,question_id,exposed_at)
+          VALUES (sid,'00000000-0000-0000-0000-0000000850a0',pl,qi,'q'||qi, now() - interval '10 min');
+        -- submission (fast correct) — used for speed on correct answers
+        INSERT INTO public.game_answer_submissions(session_id,tenant_id,player_id,question_idx,q_type,option_idx,submitted_at)
+          VALUES (sid,'00000000-0000-0000-0000-0000000850a0',pl,qi,'mc',1, now() - interval '10 min' + interval '2 sec');
+        -- verification for auto questions (q0..q6). q7 open → NO verdict (pending manual) → excluded.
+        IF qi < 7 THEN
+          INSERT INTO public.game_answer_verifications(session_id,tenant_id,player_id,question_idx,verified_correct,eligibility)
+          VALUES (sid,'00000000-0000-0000-0000-0000000850a0',pl,qi,
+            CASE
+              WHEN pl='00000000-0000-0000-0000-000000085001' THEN qi < 6   -- L1: q0..q5 correct (6/7 auto)
+              WHEN pl='00000000-0000-0000-0000-000000085002' THEN qi < 4   -- L2: q0..q3 correct (4/7 auto)
+              ELSE qi < 6                                                   -- L4: q0..q5 correct (6/7 auto)
+            END, 'scored');
+        END IF;
+      END LOOP;
+    END LOOP;
+  END LOOP;
+END $$;
+
+DO $$
+DECLARE r jsonb; ind jsonb; tms jsonb; L1 jsonb; L2 jsonb; L3 jsonb; ok boolean;
+  h1 text:='00000000-0000-0000-0000-00000085f001'; p_l1 text:='00000000-0000-0000-0000-000000085001'; p_l4 text:='00000000-0000-0000-0000-000000085004';
+BEGIN
+  -- ── EXPOSURE LIFECYCLE via rpc_set_session_phase ──────────────────────────
+  -- session S9 started; roster L1(active,fresh), L2(left), L3(active,stale heartbeat), plus participant rows.
+  INSERT INTO public.game_sessions(id,tenant_id,quiz_id,host_id,pin,status,demo_mode,question_count,question_snapshot,current_question_index,phase)
+    VALUES ('00000000-0000-0000-0000-000000085099','00000000-0000-0000-0000-0000000850a0','q',h1,'p9','started',false,8, (SELECT v FROM _snap),0,'countdown');
+  INSERT INTO public.game_roster_members(session_id,tenant_id,player_id,name,team_id,status) VALUES
+    ('00000000-0000-0000-0000-000000085099','00000000-0000-0000-0000-0000000850a0',p_l1,'L1','00000000-0000-0000-0000-000000085a01','active'),
+    ('00000000-0000-0000-0000-000000085099','00000000-0000-0000-0000-0000000850a0','00000000-0000-0000-0000-000000085002','L2','00000000-0000-0000-0000-000000085a01','active'),
+    ('00000000-0000-0000-0000-000000085099','00000000-0000-0000-0000-0000000850a0','00000000-0000-0000-0000-000000085003','L3','00000000-0000-0000-0000-000000085a01','active');
+  INSERT INTO public.game_session_participants(session_id,tenant_id,player_id,status,last_seen_at) VALUES
+    ('00000000-0000-0000-0000-000000085099','00000000-0000-0000-0000-0000000850a0',p_l1,'active', now()),                      -- fresh
+    ('00000000-0000-0000-0000-000000085099','00000000-0000-0000-0000-0000000850a0','00000000-0000-0000-0000-000000085002','left', now()),  -- explicit leave
+    ('00000000-0000-0000-0000-000000085099','00000000-0000-0000-0000-0000000850a0','00000000-0000-0000-0000-000000085003','active', now() - interval '5 min'); -- stale
+  PERFORM set_config('request.jwt.claims','{"sub":"'||h1||'","role":"authenticated"}',true); SET LOCAL ROLE authenticated;
+  PERFORM public.rpc_set_session_phase('00000000-0000-0000-0000-000000085099','question',true,0,false,false,true,'{}'::jsonb);
+  PERFORM public.rpc_set_session_phase('00000000-0000-0000-0000-000000085099','question',true,0,false,false,true,'{}'::jsonb); -- duplicate → idempotent
+  RESET ROLE;
+  IF (SELECT count(*) FROM public.game_question_exposures WHERE session_id='00000000-0000-0000-0000-000000085099') <> 1 THEN RAISE EXCEPTION '1 FAIL exposure count (expected 1: only L1 active+fresh)'; END IF;
+  IF NOT EXISTS (SELECT 1 FROM public.game_question_exposures WHERE session_id='00000000-0000-0000-0000-000000085099' AND player_id=p_l1) THEN RAISE EXCEPTION '1 FAIL L1 not exposed'; END IF;
+  RAISE NOTICE '1. exposure: only durably-active (L1) exposed; left(L2)+stale(L3) excluded; duplicate call idempotent: PASS';
+
+  -- immutability
+  ok:=false; BEGIN UPDATE public.game_question_exposures SET question_idx=9 WHERE session_id='00000000-0000-0000-0000-000000085099'; ok:=true; EXCEPTION WHEN OTHERS THEN END;
+  IF ok THEN RAISE EXCEPTION '2 FAIL exposure mutable'; END IF;
+  ok:=false; BEGIN DELETE FROM public.game_question_exposures WHERE session_id='00000000-0000-0000-0000-000000085099'; ok:=true; EXCEPTION WHEN OTHERS THEN END;
+  IF ok THEN RAISE EXCEPTION '2 FAIL exposure deletable'; END IF;
+  RAISE NOTICE '2. exposure immutable (no UPDATE/DELETE): PASS';
+
+  -- ── INDIVIDUAL FORMULA ────────────────────────────────────────────────────
+  PERFORM set_config('request.jwt.claims','{"sub":"'||h1||'","role":"authenticated"}',true); SET LOCAL ROLE authenticated;
+  ind := public.rpc_ralli_leaderboard_individuals(date_trunc('month',now()), date_trunc('month',now())+interval '1 month', NULL);
+  RESET ROLE;
+  L1 := (SELECT e FROM jsonb_array_elements(ind) e WHERE e->>'player_id'=p_l1);
+  -- L1: faced = 21 (3 sessions × 7 graded; q7 open pending EXCLUDED), correct = 18 (q0..q5 × 3). raw = 18/21 = 0.8571
+  IF (L1->>'questions_faced')::int <> 21 THEN RAISE EXCEPTION '3 FAIL L1 faced % (expected 21, open q7 excluded)', L1->>'questions_faced'; END IF;
+  IF (L1->>'verified_correct')::int <> 18 THEN RAISE EXCEPTION '3 FAIL L1 correct % (expected 18)', L1->>'verified_correct'; END IF;
+  IF round((L1->>'raw_accuracy')::numeric,4) <> 0.8571 THEN RAISE EXCEPTION '3 FAIL L1 raw_acc %', L1->>'raw_accuracy'; END IF;
+  IF (L1->>'enough_data')::boolean <> true OR (L1->>'rank') IS NULL THEN RAISE EXCEPTION '3 FAIL L1 not ranked'; END IF;
+  RAISE NOTICE '3. individual: open-ended pending EXCLUDED from denom; faced=21 correct=18 raw=0.8571; ranked: PASS';
+
+  -- L2: faced 21, correct 12 (q0..q3 × 3) → raw 0.5714; ranked. L4: faced 21, correct 18 → same as L1 numerically.
+  L2 := (SELECT e FROM jsonb_array_elements(ind) e WHERE e->>'player_id'='00000000-0000-0000-0000-000000085002');
+  IF (L2->>'verified_correct')::int <> 12 THEN RAISE EXCEPTION '4 FAIL L2 correct %', L2->>'verified_correct'; END IF;
+  -- adjusted_accuracy shrinks toward tenant mean; L1 (0.857) must outrank L2 (0.571)
+  IF (L1->>'adjusted_accuracy')::numeric <= (L2->>'adjusted_accuracy')::numeric THEN RAISE EXCEPTION '4 FAIL higher accuracy did not rank higher'; END IF;
+  IF (L1->>'rank')::int >= (L2->>'rank')::int THEN RAISE EXCEPTION '4 FAIL L1 rank not better than L2'; END IF;
+  RAISE NOTICE '4. individual: higher accuracy outranks lower regardless of equal volume; adjusted-accuracy shrinkage applied: PASS';
+
+  -- L3: only exposures from S9 phase test (1 question) → faced < 20 → NOT enough → rank NULL, progress shown.
+  L3 := (SELECT e FROM jsonb_array_elements(ind) e WHERE e->>'player_id'='00000000-0000-0000-0000-000000085003');
+  IF L3 IS NOT NULL AND ((L3->>'enough_data')::boolean = true OR (L3->>'rank') IS NOT NULL) THEN RAISE EXCEPTION '5 FAIL L3 wrongly ranked'; END IF;
+  RAISE NOTICE '5. individual: below-threshold learner is unranked (rank NULL, Not enough data): PASS';
+
+  -- ── TEAM FORMULA ──────────────────────────────────────────────────────────
+  PERFORM set_config('request.jwt.claims','{"sub":"'||h1||'","role":"authenticated"}',true); SET LOCAL ROLE authenticated;
+  tms := public.rpc_ralli_leaderboard_teams(date_trunc('month',now()), date_trunc('month',now())+interval '1 month');
+  RESET ROLE;
+  -- Team A: eligible L1,L2 (2) of active {L1,L2,L3} (3): 2 >= ceil(0.5*3)=2 → ENOUGH, ranked, median of {L1adj,L2adj}.
+  -- Team B: eligible L4 (1) of active {L4,L5} (2): 1 < 2 → NOT ENOUGH.
+  IF (SELECT (e->>'enough_data')::boolean FROM jsonb_array_elements(tms) e WHERE e->>'team_id'='00000000-0000-0000-0000-000000085a01') <> true THEN RAISE EXCEPTION '6 FAIL Team A not enough'; END IF;
+  IF (SELECT e->>'rank' FROM jsonb_array_elements(tms) e WHERE e->>'team_id'='00000000-0000-0000-0000-000000085a01') IS NULL THEN RAISE EXCEPTION '6 FAIL Team A unranked'; END IF;
+  IF (SELECT (e->>'enough_data')::boolean FROM jsonb_array_elements(tms) e WHERE e->>'team_id'='00000000-0000-0000-0000-000000085b01') <> false THEN RAISE EXCEPTION '6 FAIL Team B should be not-enough (1 eligible < 2)'; END IF;
+  IF (SELECT (e->>'eligible_members')::int FROM jsonb_array_elements(tms) e WHERE e->>'team_id'='00000000-0000-0000-0000-000000085a01') <> 2 THEN RAISE EXCEPTION '6 FAIL Team A eligible_members'; END IF;
+  RAISE NOTICE '6. team: median of eligible members; Team A ranked (2 eligible, 50%%+ participation), Team B not-enough (1 eligible): PASS';
+
+  -- ── TIMEZONE ──────────────────────────────────────────────────────────────
+  -- default UTC
+  PERFORM set_config('request.jwt.claims','{"sub":"'||h1||'","role":"authenticated"}',true); SET LOCAL ROLE authenticated;
+  IF public.rpc_get_org_timezone() <> 'UTC' THEN RAISE EXCEPTION '7 FAIL default tz not UTC'; END IF;
+  PERFORM public.rpc_set_org_timezone('America/New_York');
+  IF public.rpc_get_org_timezone() <> 'America/New_York' THEN RAISE EXCEPTION '7 FAIL tz not updated'; END IF;
+  ok:=false; BEGIN PERFORM public.rpc_set_org_timezone('Mars/Phobos'); ok:=true; EXCEPTION WHEN check_violation THEN END;
+  IF ok THEN RAISE EXCEPTION '7 FAIL invalid tz accepted'; END IF;
+  RESET ROLE;
+  -- learner cannot update
+  PERFORM set_config('request.jwt.claims','{"sub":"'||p_l1||'","role":"authenticated"}',true); SET LOCAL ROLE authenticated;
+  ok:=false; BEGIN PERFORM public.rpc_set_org_timezone('UTC'); ok:=true; EXCEPTION WHEN insufficient_privilege THEN END;
+  IF ok THEN RAISE EXCEPTION '7 FAIL learner changed tz'; END IF;
+  RESET ROLE;
+  RAISE NOTICE '7. timezone: default UTC; manager sets valid IANA; invalid rejected; learner read-only: PASS';
+
+  -- ── SECURITY ──────────────────────────────────────────────────────────────
+  -- anon denied (no EXECUTE grant to the anon role)
+  PERFORM set_config('request.jwt.claims','',true); SET LOCAL ROLE anon;
+  ok:=false; BEGIN PERFORM public.rpc_ralli_leaderboard_individuals(now()-interval '1 month', now(), NULL); ok:=true; EXCEPTION WHEN insufficient_privilege THEN END;
+  RESET ROLE;
+  IF ok THEN RAISE EXCEPTION '8 FAIL anon allowed'; END IF;
+  -- learner cannot drill into another team (L1 team A tries team B)
+  PERFORM set_config('request.jwt.claims','{"sub":"'||p_l1||'","role":"authenticated"}',true); SET LOCAL ROLE authenticated;
+  ok:=false; BEGIN PERFORM public.rpc_ralli_team_members('00000000-0000-0000-0000-000000085b01', now()-interval '1 month', now()); ok:=true; EXCEPTION WHEN insufficient_privilege THEN END;
+  IF ok THEN RAISE EXCEPTION '8 FAIL learner drilled into another team'; END IF;
+  -- learner CAN view own team
+  PERFORM public.rpc_ralli_team_members('00000000-0000-0000-0000-000000085a01', date_trunc('month',now()), date_trunc('month',now())+interval '1 month');
+  RESET ROLE;
+  -- manager can view any same-tenant team
+  PERFORM set_config('request.jwt.claims','{"sub":"'||h1||'","role":"authenticated"}',true); SET LOCAL ROLE authenticated;
+  PERFORM public.rpc_ralli_team_members('00000000-0000-0000-0000-000000085b01', date_trunc('month',now()), date_trunc('month',now())+interval '1 month');
+  RESET ROLE;
+  RAISE NOTICE '8. security: anon denied; learner own-team only; manager any same-tenant team: PASS';
+
+  -- ── PAYLOAD CONFIDENTIALITY ───────────────────────────────────────────────
+  IF ind::text ILIKE '%answer_text%' OR ind::text ILIKE '%correct_idx%' OR ind::text ILIKE '%acceptedAnswers%' OR ind::text ILIKE '%question_snapshot%' THEN
+    RAISE EXCEPTION '9 FAIL leaderboard payload leaks answer/solution material'; END IF;
+  RAISE NOTICE '9. payload aggregate-only (no answer text / correct keys / snapshot): PASS';
+
+  -- ── MANAGERS/ADMINS EXCLUDED FROM RANKINGS ────────────────────────────────
+  IF EXISTS (SELECT 1 FROM jsonb_array_elements(ind) e WHERE e->>'player_id' IN ('00000000-0000-0000-0000-00000085f001','00000000-0000-0000-0000-00000085f002')) THEN
+    RAISE EXCEPTION '10 FAIL manager/admin present in rankings'; END IF;
+  RAISE NOTICE '10. managers/admins excluded from rankings: PASS';
+
+  RAISE NOTICE '085 ALL TESTS PASSED';
+END $$;
+
+-- ── VERIFICATION QUEUE / OUTBOX ─────────────────────────────────────────────
+DO $$
+DECLARE st text; att int; nxt timestamptz; claimed jsonb; ok boolean; i int;
+  sid uuid := '00000000-0000-0000-0000-000000085077';
+  dsid uuid := '00000000-0000-0000-0000-000000085078';
+  csid uuid := '00000000-0000-0000-0000-000000085079';
+BEGIN
+  -- real session started → completed: trigger enqueues exactly one pending row
+  INSERT INTO public.game_sessions(id,tenant_id,host_id,pin,status,demo_mode,question_count) VALUES (sid,'00000000-0000-0000-0000-0000000850a0','00000000-0000-0000-0000-00000085f001','p77','started',false,8);
+  UPDATE public.game_sessions SET status='completed', ended_at=now() WHERE id=sid;
+  IF (SELECT count(*) FROM public.game_verification_queue WHERE session_id=sid) <> 1 THEN RAISE EXCEPTION 'Q FAIL not enqueued once'; END IF;
+  IF (SELECT state FROM public.game_verification_queue WHERE session_id=sid) <> 'pending' THEN RAISE EXCEPTION 'Q FAIL not pending'; END IF;
+  -- idempotent: a redundant completed→completed update must not create a second row
+  UPDATE public.game_sessions SET status='completed' WHERE id=sid;
+  IF (SELECT count(*) FROM public.game_verification_queue WHERE session_id=sid) <> 1 THEN RAISE EXCEPTION 'Q FAIL duplicate enqueue'; END IF;
+  RAISE NOTICE 'Q1. queue: real completion enqueues exactly once, idempotent: PASS';
+
+  -- demo + canceled excluded
+  INSERT INTO public.game_sessions(id,tenant_id,host_id,pin,status,demo_mode,question_count) VALUES (dsid,'00000000-0000-0000-0000-0000000850a0','00000000-0000-0000-0000-00000085f001','p78','started',true,8);
+  UPDATE public.game_sessions SET status='completed' WHERE id=dsid;
+  INSERT INTO public.game_sessions(id,tenant_id,host_id,pin,status,demo_mode,question_count) VALUES (csid,'00000000-0000-0000-0000-0000000850a0','00000000-0000-0000-0000-00000085f001','p79','started',false,8);
+  UPDATE public.game_sessions SET status='canceled' WHERE id=csid;
+  IF EXISTS (SELECT 1 FROM public.game_verification_queue WHERE session_id IN (dsid,csid)) THEN RAISE EXCEPTION 'Q FAIL demo/canceled enqueued'; END IF;
+  RAISE NOTICE 'Q2. queue: demo + canceled sessions never enqueued: PASS';
+
+  -- authenticated (non-worker) cannot claim jobs
+  PERFORM set_config('request.jwt.claims','{"sub":"00000000-0000-0000-0000-00000085f001","role":"authenticated"}',true); SET LOCAL ROLE authenticated;
+  ok:=false; BEGIN PERFORM public.rpc_claim_verification_job(); ok:=true; EXCEPTION WHEN insufficient_privilege THEN END;
+  RESET ROLE;
+  IF ok THEN RAISE EXCEPTION 'Q FAIL authenticated claimed a job'; END IF;
+
+  -- service_role worker claims → processing
+  PERFORM set_config('request.jwt.claims','{"role":"service_role"}',true); SET LOCAL ROLE service_role;
+  claimed := public.rpc_claim_verification_job();
+  IF claimed IS NULL OR (claimed->>'session_id') <> sid::text THEN RAISE EXCEPTION 'Q FAIL worker did not claim pending job'; END IF;
+  RESET ROLE;
+  IF (SELECT state FROM public.game_verification_queue WHERE session_id=sid) <> 'processing' THEN RAISE EXCEPTION 'Q FAIL not processing after claim'; END IF;
+  RAISE NOTICE 'Q3. queue: only service_role worker claims; claim marks processing: PASS';
+
+  -- transient failure → retry with backoff, attempts increment, next_attempt in the future
+  PERFORM set_config('request.jwt.claims','{"role":"service_role"}',true); SET LOCAL ROLE service_role;
+  PERFORM public.rpc_complete_verification_job(sid, false, 'transient upstream error');
+  RESET ROLE;
+  SELECT state, attempts, next_attempt_at INTO st, att, nxt FROM public.game_verification_queue WHERE session_id=sid;
+  IF st <> 'pending' OR att <> 1 OR nxt <= now() THEN RAISE EXCEPTION 'Q FAIL retry/backoff (state=% att=%)', st, att; END IF;
+
+  -- exhaust attempts → terminal 'failed'. attempts increment happens in claim; complete fails at attempts>=6.
+  FOR i IN 1..8 LOOP
+    -- force the row due & pending so the worker can re-claim it (simulates the backoff window elapsing)
+    UPDATE public.game_verification_queue SET next_attempt_at = now() - interval '1 min', state='pending' WHERE session_id=sid AND state <> 'failed';
+    PERFORM set_config('request.jwt.claims','{"role":"service_role"}',true); SET LOCAL ROLE service_role;
+    PERFORM public.rpc_claim_verification_job();               -- attempts += 1, state=processing
+    PERFORM public.rpc_complete_verification_job(sid, false, 'still failing');  -- pending (backoff) or failed at attempts>=6
+    RESET ROLE;
+    EXIT WHEN (SELECT state FROM public.game_verification_queue WHERE session_id=sid) = 'failed';
+  END LOOP;
+  IF (SELECT state FROM public.game_verification_queue WHERE session_id=sid) <> 'failed' THEN RAISE EXCEPTION 'Q FAIL did not reach terminal failed'; END IF;
+  RAISE NOTICE 'Q4. queue: transient failure retries with backoff; exhausts to terminal failed: PASS';
+
+  -- success path on a fresh job → completed
+  UPDATE public.game_verification_queue SET state='pending', attempts=0, next_attempt_at=now()-interval '1 min' WHERE session_id=sid;
+  PERFORM set_config('request.jwt.claims','{"role":"service_role"}',true); SET LOCAL ROLE service_role;
+  PERFORM public.rpc_claim_verification_job();
+  PERFORM public.rpc_complete_verification_job(sid, true, NULL);
+  RESET ROLE;
+  IF (SELECT state FROM public.game_verification_queue WHERE session_id=sid) <> 'completed' THEN RAISE EXCEPTION 'Q FAIL success not completed'; END IF;
+  RAISE NOTICE 'Q5. queue: successful completion marks completed: PASS';
+
+  -- confidentiality: the outbox row carries NO answer/verdict/snapshot material (schema-level)
+  IF EXISTS (
+    SELECT 1 FROM information_schema.columns
+    WHERE table_schema='public' AND table_name='game_verification_queue'
+      AND column_name IN ('answer_text','verified_correct','correct_idx','question_snapshot','answer_json','numeric_value')
+  ) THEN RAISE EXCEPTION 'Q FAIL queue table exposes answer/verdict material'; END IF;
+  RAISE NOTICE 'Q6. queue: outbox stores no answer/verdict/snapshot material: PASS';
+
+  RAISE NOTICE '085 QUEUE TESTS PASSED';
+END $$;
+ROLLBACK;

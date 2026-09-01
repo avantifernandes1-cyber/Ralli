@@ -1,5 +1,66 @@
 # Changelog
 
+## September 2026
+
+Ralli Live Leaderboard — Denominator Foundation (implemented locally, NOT applied/deployed/merged)
+
+On `feature/ralli-live-leaderboard-085` (branched from `origin/main`). Migration 085 is written and
+fully validated locally but is **NOT applied to production, no Edge Function deployed, no historical
+backfill, and the branch is not merged.** Until 085 is applied, the in-app leaderboard honestly shows
+its backend-unavailable / error+retry states.
+
+Foundation (migration 085, local only):
+
+- **Exposure denominator** (`game_question_exposures`): a durable, immutable, append-only row per
+  `(session_id, player_id, question_idx)` proving a canonical player was durably active when a
+  question began. Inserted idempotently inside the authoritative question-start transition of
+  `rpc_set_session_phase` (a faithful superset of the 084 version) for roster-active + participant-
+  active + fresh-heartbeat (≤40s) members only. Explicit-leave and stale members are never exposed;
+  disconnect-after-start keeps the exposure; demo/canceled/completed never expose. Blocked from
+  UPDATE/DELETE by trigger; tenant-scoped RLS; no client writes.
+- **Individual formula** (`rpc_ralli_leaderboard_individuals`): `adjusted_accuracy =
+  (verified_correct + 20·tenant_mean) / (eligible_questions_faced + 20)`, verified_correct from
+  authoritative 072 verifications only, denominator from exposure rows only, open-ended-pending
+  (no verdict) excluded from BOTH numerator and denominator, neutral prior 0.5 when no tenant
+  baseline. Eligibility ≥20 faced AND ≥3 games; otherwise unranked with progress. Dense ranking;
+  speed is a tie-break only (server-derived median normalized correct-response time). No XP / lifetime
+  / volume / client correctness anywhere.
+- **Team formula** (`rpc_ralli_leaderboard_teams`, `rpc_ralli_team_members`): median of eligible
+  members' adjusted accuracy from the 084 roster-snapshot team; ranked only with ≥2 eligible AND ≥50%
+  of active learners eligible. Learners may drill into their own team only; managers any same-tenant.
+- **Org timezone** (`tenants.timezone`, `rpc_get_org_timezone` / `rpc_set_org_timezone`): IANA,
+  default UTC, validated against `pg_timezone_names`, manager/orgAdmin write-only, learner read-only.
+  Half-open `[from, to)` timeframe boundaries computed client-side in the org tz.
+- **Durable verification queue/outbox** (`game_verification_queue` + completion trigger +
+  service-role-only `rpc_claim_verification_job` / `rpc_complete_verification_job`): a real session
+  reaching `completed` enqueues exactly once; demo/canceled excluded; exponential-backoff retries to a
+  terminal `failed`; stores no answer/verdict/snapshot material. No outbound HTTP from a trigger.
+- All privileged functions SECURITY DEFINER with `SET search_path=''`, tenant/caller server-derived,
+  anon/Public denied, aggregate-only returns (no answer text / correct-answer keys / snapshots).
+
+Frontend (feature branch only):
+
+- Leaderboard moved **into Ralli Live**: managers get Active / Past Sessions / Leaderboard; learners
+  get Join a Game / My Scores / Leaderboard. Leaderboard = Individuals (default) / Teams / team
+  drill-down, with a timeframe filter (Current month default, Last 2/3/4 months, Current calendar
+  year) and the active org timezone shown beside it. New `ralliLeaderboardService` + pure, unit-tested
+  `ralliLeaderboardTimeframe` (tz/DST-correct half-open ranges) and `ralliLeaderboardView`
+  (recognitions + formatting) helpers. All states implemented: loading / error+retry / no-verified-
+  games / not-enough-individual / not-enough-team / valid — service errors are never converted to
+  empty results.
+- Removed the global **Leaderboard** nav item and the old Home "Team Leaderboard" widget, which ranked
+  blended lifetime XP from `user_point_events` (not a valid readiness ranking). Scoring services kept
+  for their remaining consumers.
+
+Historical Ralli Live sessions predating 085 remain visible in Past Sessions/analytics but are
+excluded from ranking (no backfill/inference) — "Pre-leaderboard tracking."
+
+Validation (all local, green): 085 SQL harness (exposure lifecycle, individual/team formula, timezone,
+security, confidentiality, verification queue) + 085 two-connection concurrency (exposure idempotency,
+enqueue-once); 084 unchanged (byte-identical) and its concurrency still passes; full JS suite incl. new
+timeframe/view tests; esbuild parse; Vite build; trace/secret/payload-leak scans; migration-integrity
+scan (no prior migration edited).
+
 ## July 2026
 
 Ralli Live — Lifecycle & Confidentiality Foundation (in progress, not beta-complete)

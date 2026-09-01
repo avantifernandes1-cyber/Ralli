@@ -119,3 +119,10 @@ Multi-player gameplay, recovery, scoring, and historical analytics — **live-QA
 - [x] Tenant isolation
 
 - [x] Past Sessions
+
+- [ ] Leaderboard (migration 085) — exposure denominator, verified-accuracy individual + median team
+      scoring, org timezone, durable verification queue; frontend moved into Ralli Live (Individuals /
+      Teams / drill-down, timeframe filter). Implemented + fully validated locally on
+      `feature/ralli-live-leaderboard-085`; **not applied / not deployed / not backfilled / not merged**
+      (awaiting separate approval). Sessions predating 085 excluded from ranking ("Pre-leaderboard
+      tracking").
