@@ -23,7 +23,7 @@ until docker exec -e PGPASSWORD=postgres "$CN" pg_isready -U postgres -d test >/
 docker cp "$PRELUDE" "$CN":/p.sql >/dev/null; docker cp "$MIG" "$CN":/m.sql >/dev/null
 q -f /p.sql >/dev/null 2>&1; q -f /m.sql >/tmp/m085.out 2>&1
 ok "085 applied (exposure table present)" "$(q -tAc "SELECT to_regclass('public.game_question_exposures') IS NOT NULL;")" "t"
-ok "085 applied (individuals RPC present)" "$(q -tAc "SELECT to_regprocedure('public.rpc_ralli_leaderboard_individuals(timestamptz,timestamptz,uuid)') IS NOT NULL;")" "t"
+ok "085 applied (individuals RPC present)" "$(q -tAc "SELECT to_regprocedure('public.rpc_ralli_leaderboard_individuals(text,uuid)') IS NOT NULL;")" "t"
 
 seedq(){ q -c "
   TRUNCATE public.game_question_exposures; DELETE FROM public.game_verification_queue;

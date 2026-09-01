@@ -2,24 +2,30 @@
  * Ralli Live Leaderboard Service
  *
  * The single client entry point for the prospective, server-authoritative Ralli Live
- * leaderboard (migration 085). Every ranking number comes from the SECURITY DEFINER
- * RPCs — this module NEVER computes accuracy, denominators, eligibility, or ranks on the
- * client. It only:
- *   - computes the timeframe boundaries (half-open [from, to) in the org timezone), and
- *   - forwards those to the aggregate-only RPCs, returning { data, error } verbatim.
+ * leaderboard (migration 085). Every ranking number AND every timeframe boundary comes from
+ * the SECURITY DEFINER RPCs — this module NEVER computes accuracy, denominators, eligibility,
+ * ranks, or query windows on the client. It only:
+ *   - sends the SELECTED TIMEFRAME ENUM (never arbitrary dates), and
+ *   - returns the aggregate-only RPC payload verbatim.
+ * The server derives the tenant + its timezone, computes the exact half-open [from, to) window,
+ * rejects unsupported enums, and returns { timeframe, from, to, timezone, rows } so the UI can
+ * show the resolved window honestly. A client cannot widen or manipulate the period.
+ *
+ * The pure timeframe model (TIMEFRAMES / computeTimeframeRange) is re-exported for LABELS and
+ * tests only — it is NOT the authority for production queries (the server is).
  *
  * Confidentiality: the RPCs return aggregates only (no answer text, correct-answer keys,
  * snapshots, or grading material). This module adds nothing and strips nothing.
  *
  * Error handling contract (see leaderboard UI states): a service/RPC error is returned as
  * { data: null, error } — it is NEVER swallowed into an empty result. "No rankable data"
- * is a legitimate success ([] / enough_data:false rows), distinct from an error.
+ * is a legitimate success (rows: [] / enough_data:false), distinct from an error.
  */
 
 import { supabase } from "./supabase.js";
 import { TIMEFRAMES, DEFAULT_TIMEFRAME, computeTimeframeRange } from "./ralliLeaderboardTimeframe.js";
 
-// Re-export the pure timeframe model so callers have one leaderboard import surface.
+// Re-export the pure timeframe model (labels/tests only — the server owns production windows).
 export { TIMEFRAMES, DEFAULT_TIMEFRAME, computeTimeframeRange };
 
 // ── Organization timezone ────────────────────────────────────────────────────
@@ -34,41 +40,27 @@ export async function setOrgTimezone(tz) {
   return { data: data ?? null, error };
 }
 
-// ── Leaderboard reads ────────────────────────────────────────────────────────
-// Individuals across the org (teamId optional: scope to one team for a drill-down list).
-export async function getIndividualLeaderboard({ from, to, teamId = null }) {
+// ── Leaderboard reads (server sends back { timeframe, from, to, timezone, rows }) ─────
+// The client passes ONLY the approved timeframe enum. Team id (optional) scopes individuals to a
+// team; the server enforces that a learner may only pass their own team.
+export async function loadIndividuals(timeframe, { teamId = null } = {}) {
   const { data, error } = await supabase.rpc("rpc_ralli_leaderboard_individuals", {
-    p_from: from, p_to: to, p_team_id: teamId,
+    p_timeframe: timeframe, p_team_id: teamId,
   });
   return { data: data ?? null, error };
 }
 
-// Aggregated team standings across the org.
-export async function getTeamLeaderboard({ from, to }) {
+export async function loadTeams(timeframe) {
   const { data, error } = await supabase.rpc("rpc_ralli_leaderboard_teams", {
-    p_from: from, p_to: to,
+    p_timeframe: timeframe,
   });
   return { data: data ?? null, error };
 }
 
 // Members of one team (learners: own team only; managers: any same-tenant team).
-export async function getTeamMembers({ teamId, from, to }) {
+export async function loadTeamMembers(timeframe, teamId) {
   const { data, error } = await supabase.rpc("rpc_ralli_team_members", {
-    p_team_id: teamId, p_from: from, p_to: to,
+    p_team_id: teamId, p_timeframe: timeframe,
   });
   return { data: data ?? null, error };
-}
-
-// Convenience: resolve a timeframe id against the org tz, then fetch individuals.
-export async function loadIndividuals(timeframeId, tz, { teamId = null, now } = {}) {
-  const { fromISO, toISO } = computeTimeframeRange(timeframeId, tz, now);
-  return getIndividualLeaderboard({ from: fromISO, to: toISO, teamId });
-}
-export async function loadTeams(timeframeId, tz, { now } = {}) {
-  const { fromISO, toISO } = computeTimeframeRange(timeframeId, tz, now);
-  return getTeamLeaderboard({ from: fromISO, to: toISO });
-}
-export async function loadTeamMembers(timeframeId, tz, teamId, { now } = {}) {
-  const { fromISO, toISO } = computeTimeframeRange(timeframeId, tz, now);
-  return getTeamMembers({ teamId, from: fromISO, to: toISO });
 }

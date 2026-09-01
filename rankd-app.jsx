@@ -120,7 +120,7 @@ import { getProfile, createMissingProfile, getTenantProfiles } from "./src/lib/p
 import { sendInviteEmail } from "./src/lib/emailService.js";
 import { provisionTenant, buildInviteUrl, normalizeProvisionedOrg, createMemberInvite } from "./src/lib/provisioningService.js";
 import { awardLessonPoints, awardCoursePoints, awardGamePointsForSession, getLeaderboard, computeUserMeta, getUserStreak } from "./src/lib/scoringService.js";
-import { TIMEFRAMES, DEFAULT_TIMEFRAME, getOrgTimezone, loadIndividuals, loadTeams, loadTeamMembers } from "./src/lib/ralliLeaderboardService.js";
+import { TIMEFRAMES, DEFAULT_TIMEFRAME, loadIndividuals, loadTeams, loadTeamMembers } from "./src/lib/ralliLeaderboardService.js";
 import { computeRecognitions, partitionIndividuals, partitionTeams, formatAccuracyPct } from "./src/lib/ralliLeaderboardView.js";
 import { triggerReadinessUpdate, getTopicHeatmap, getOrgMetrics, getRepTopicScores, getUserPerformance, getRecommendations } from "./src/lib/insightsService.js";
 import { cellScore as heatmapCellScore, coverageLine as heatmapCoverageLine, thresholdNote as heatmapThresholdNote, hasVerifiedEvidence as heatmapHasEvidence } from "./src/lib/heatmapModel.js";
@@ -7096,61 +7096,54 @@ function LbBadge({ kind }) {
 }
 
 function RalliLeaderboard({ currentUser, isManager }) {
-  const [tz, setTz] = useState(null);            // org IANA timezone (null until loaded)
   const [timeframe, setTimeframe] = useState(DEFAULT_TIMEFRAME);
   const [view, setView] = useState("individuals"); // "individuals" | "teams"
   const [drill, setDrill] = useState(null);        // { teamId, teamName } | null
   const [reloadKey, setReloadKey] = useState(0);
 
-  const [ind, setInd] = useState({ loading: true, error: null, rows: null });
-  const [teams, setTeams] = useState({ loading: true, error: null, rows: null });
-  const [members, setMembers] = useState({ loading: false, error: null, rows: null });
+  // Each holds the server payload verbatim: data = { timeframe, from, to, timezone, rows }.
+  // The server owns the window + timezone; the client only sends the selected enum.
+  const [ind, setInd] = useState({ loading: true, error: null, data: null });
+  const [teams, setTeams] = useState({ loading: true, error: null, data: null });
+  const [members, setMembers] = useState({ loading: false, error: null, data: null });
 
-  // Org timezone (drives the half-open timeframe boundaries + the "times shown in …" label).
+  // Individuals + Teams reload together whenever the timeframe / retry changes.
   useEffect(() => {
-    let cancelled = false;
-    getOrgTimezone().then(({ data, error }) => {
-      if (cancelled) return;
-      setTz(error || !data ? "UTC" : data);
-    });
-    return () => { cancelled = true; };
-  }, []);
-
-  // Individuals + Teams reload together whenever the timeframe / tz / retry changes.
-  useEffect(() => {
-    if (!tz) return;
     let cancelled = false;
     setInd((s) => ({ ...s, loading: true, error: null }));
     setTeams((s) => ({ ...s, loading: true, error: null }));
-    loadIndividuals(timeframe, tz).then(({ data, error }) => {
+    loadIndividuals(timeframe).then(({ data, error }) => {
       if (cancelled) return;
-      setInd({ loading: false, error: error || null, rows: error ? null : (data || []) });
+      setInd({ loading: false, error: error || null, data: error ? null : (data || null) });
     });
-    loadTeams(timeframe, tz).then(({ data, error }) => {
+    loadTeams(timeframe).then(({ data, error }) => {
       if (cancelled) return;
-      setTeams({ loading: false, error: error || null, rows: error ? null : (data || []) });
+      setTeams({ loading: false, error: error || null, data: error ? null : (data || null) });
     });
     return () => { cancelled = true; };
-  }, [tz, timeframe, reloadKey]);
+  }, [timeframe, reloadKey]);
 
   // Team drill-down members.
   useEffect(() => {
-    if (!tz || !drill) { setMembers({ loading: false, error: null, rows: null }); return; }
+    if (!drill) { setMembers({ loading: false, error: null, data: null }); return; }
     let cancelled = false;
-    setMembers({ loading: true, error: null, rows: null });
-    loadTeamMembers(timeframe, tz, drill.teamId).then(({ data, error }) => {
+    setMembers({ loading: true, error: null, data: null });
+    loadTeamMembers(timeframe, drill.teamId).then(({ data, error }) => {
       if (cancelled) return;
-      setMembers({ loading: false, error: error || null, rows: error ? null : (data || []) });
+      setMembers({ loading: false, error: error || null, data: error ? null : (data || null) });
     });
     return () => { cancelled = true; };
-  }, [tz, timeframe, drill, reloadKey]);
+  }, [timeframe, drill, reloadKey]);
 
+  const indRows = ind.data?.rows || [];
   const myTeamId = useMemo(() => {
-    const me = (ind.rows || []).find((r) => r.player_id === currentUser?.id);
+    const me = indRows.find((r) => r.player_id === currentUser?.id);
     return me ? me.team_id : null;
-  }, [ind.rows, currentUser]);
+  }, [ind.data, currentUser]);   // eslint-disable-line react-hooks/exhaustive-deps
 
-  const recognitions = useMemo(() => computeRecognitions(ind.rows || []), [ind.rows]);
+  const recognitions = useMemo(() => computeRecognitions(indRows), [ind.data]); // eslint-disable-line react-hooks/exhaustive-deps
+  // The active org timezone comes from the server response (whichever view has loaded), for honest display.
+  const resolvedTz = ind.data?.timezone || teams.data?.timezone || members.data?.timezone || null;
   const retry = () => setReloadKey((k) => k + 1);
 
   const retryBtn = (
@@ -7238,7 +7231,7 @@ function RalliLeaderboard({ currentUser, isManager }) {
   const TeamsTable = () => {
     if (teams.loading) return <LbStateCard title="Loading team standings…" />;
     if (teams.error) return <LbStateCard icon="⚠️" title="Couldn't load team standings" body="The leaderboard service returned an error." action={retryBtn} />;
-    const { ranked, pending } = partitionTeams(teams.rows);
+    const { ranked, pending } = partitionTeams(teams.data?.rows || []);
     if (ranked.length === 0 && pending.length === 0) {
       return <LbStateCard icon="🏁" title="No verified games yet" body="Team standings appear once completed Ralli Live sessions finish server verification." />;
     }
@@ -7298,7 +7291,7 @@ function RalliLeaderboard({ currentUser, isManager }) {
         <h3 style={{ margin: 0, fontSize: 18, fontWeight: 900, color: C.text }}>{drill.teamName || "Team"}</h3>
         {members.loading ? <LbStateCard title="Loading team members…" />
           : members.error ? <LbStateCard icon="⚠️" title="Couldn't load this team" body="You may only view your own team, or the service returned an error." action={retryBtn} />
-          : <IndividualsTable rows={members.rows || []} scopedToTeam />}
+          : <IndividualsTable rows={members.data?.rows || []} scopedToTeam />}
       </div>
     );
   };
@@ -7327,16 +7320,15 @@ function RalliLeaderboard({ currentUser, isManager }) {
         </select>
       </div>
       <p style={{ margin: "0 0 20px", fontSize: 11, color: C.textMuted }}>
-        {tfActive ? tfActive.label : ""} · times shown in {tz || "…"}
+        {tfActive ? tfActive.label : ""} · times shown in {resolvedTz || "org timezone"}
       </p>
 
       {/* Body */}
-      {!tz ? <LbStateCard title="Loading leaderboard…" />
-        : drill ? <DrillDown />
+      {drill ? <DrillDown />
         : view === "individuals"
           ? (ind.loading ? <LbStateCard title="Loading individuals…" />
              : ind.error ? <LbStateCard icon="⚠️" title="Couldn't load the leaderboard" body="The leaderboard service returned an error." action={retryBtn} />
-             : <IndividualsTable rows={ind.rows || []} />)
+             : <IndividualsTable rows={ind.data?.rows || []} />)
           : <TeamsTable />}
     </div>
   );

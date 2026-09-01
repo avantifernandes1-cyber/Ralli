@@ -55,6 +55,34 @@ Frontend (feature branch only):
 Historical Ralli Live sessions predating 085 remain visible in Past Sessions/analytics but are
 excluded from ranking (no backfill/inference) — "Pre-leaderboard tracking."
 
+Pre-production corrections (still local only; 085 unapplied, worker not deployed/scheduled):
+
+- **Exposure freshness reuses the canonical durable-active definition.** Audit found the established
+  Ralli Live lifecycle uses a 15s participant heartbeat and a single 40s freshness window
+  (`HEARTBEAT_FRESH_MS`) shared by lobby visibility, in-game active count, and the zero-player halt;
+  the "~25s stale" figure survives only as a stale code comment, not in code. 085 already used that 40s
+  window via one helper; the only divergence was an inclusive `<=` vs the frontend's strict `<`. Fixed to
+  strict `<` so a heartbeat exactly at the edge is stale in the DB and client identically — no new,
+  more-permissive rule. Boundary tests added (39.5s in; exactly 40s + 41s out; Leave-over-fresh,
+  active-without-heartbeat, fresh-without-active-roster all excluded; rejoin re-qualifies at a later
+  question).
+- **Durable verification worker.** Added the server-owned worker the outbox needed (no worker existed;
+  the frontend fire-and-forget was not one): `verify-queue-worker` (Deno, service-role-only, bounded
+  batch + runtime budget) reusing the canonical verify path (`_shared/verifySession.js` → shared grader
+  + `record_game_verification`) via a pure, unit-tested orchestrator (`_shared/verifyQueueWorker.js`).
+  Added a **processing lease** to migration 085 (`lease_expires_at` + reclaim-expired-on-claim +
+  release-on-complete) so a crashed worker's job is never permanently stuck. Implemented + tested; NOT
+  deployed or scheduled (see docs/engineering/085_VERIFICATION_WORKER.md).
+- **Server-authoritative timeframes.** The leaderboard RPCs no longer accept client `from`/`to` dates;
+  they take an approved enum (`current_month`, `last_2_months`, `last_3_months`, `last_4_months`,
+  `current_year`) and a single server resolver (`ralli_resolve_timeframe`) derives the tenant, reads the
+  tenant IANA timezone (fallback UTC), computes the exact half-open `[from, to)` window, rejects
+  unsupported enums, and returns the resolved `{ timeframe, from, to, timezone, rows }`. Individuals,
+  Teams, and Team Members share the one resolver so their windows cannot disagree, and a client can no
+  longer widen the period. The frontend pure timeframe util is retained for labels/tests only. Server
+  timeframe tests added (UTC + America/New_York + year/last_N boundaries, invalid enum rejected,
+  all-three-RPCs-agree, arbitrary-date signature uncallable, invalid stored tz → UTC, tenant isolation).
+
 Validation (all local, green): 085 SQL harness (exposure lifecycle, individual/team formula, timezone,
 security, confidentiality, verification queue) + 085 two-connection concurrency (exposure idempotency,
 enqueue-once); 084 unchanged (byte-identical) and its concurrency still passes; full JS suite incl. new
