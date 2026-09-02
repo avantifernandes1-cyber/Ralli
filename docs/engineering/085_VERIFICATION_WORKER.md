@@ -29,20 +29,75 @@ approval (it is a production mutation).
 
 ## Environment (function secrets)
 
+Set as **protected Edge Function secrets** (never in committed files, client env, or Vercel public vars):
+
 - `SUPABASE_URL`
 - `SUPABASE_SERVICE_ROLE_KEY`
+
+The worker reads both from `Deno.env` at runtime (protected runtime configuration). The service-role key
+is never returned, never logged, and never placed in SQL, migrations, docs, source, or browser requests.
 
 ## Deploy (requires separate approval — do NOT run as part of the leaderboard slice)
 
 ```
+supabase secrets set SUPABASE_SERVICE_ROLE_KEY=<paste-in-a-secure-shell-not-committed>
 supabase functions deploy verify-queue-worker
 ```
 
-## Schedule (requires separate approval)
+Use placeholders only in docs. `<...>` above is a placeholder; never commit a real token-like value.
 
-Invoke roughly once per minute via an approved Supabase mechanism (pg_cron + pg_net, or the dashboard
-Scheduled Functions), as `POST` with header `Authorization: Bearer <SERVICE_ROLE_KEY>`. Each invocation
-processes a bounded batch and returns quickly; a missed tick is harmless (the next tick drains the backlog).
+## Secure scheduling & secret handling (requires separate approval)
+
+Invoke roughly once per minute; each invocation drains a bounded batch and a missed tick is harmless
+(the next tick catches up). The scheduled caller must present `Authorization: Bearer <service-role-key>`,
+and **that credential must come from protected secret storage — never hardcoded in the schedule SQL.**
+
+Approved approach — Supabase Vault (encrypted project secret) + `pg_cron` + `pg_net`:
+
+1. Store the key once in Vault (encrypted at rest), e.g. as a secret named `verify_worker_bearer`. Do
+   this via the dashboard or a secure shell — **not** in a committed migration.
+2. Schedule with `pg_cron`, reading the secret from Vault at call time so the raw token never appears in
+   the job definition or `cron.job` catalog:
+
+```sql
+-- Placeholders only. The Authorization value is pulled from Vault at runtime; no token in this SQL.
+select cron.schedule(
+  'ralli-verify-queue',            -- job name
+  '* * * * *',                     -- every minute
+  $cron$
+    select net.http_post(
+      url    := '<project-functions-url>/verify-queue-worker',
+      headers:= jsonb_build_object(
+        'Content-Type',  'application/json',
+        'Authorization', 'Bearer ' || (select decrypted_secret
+                                        from vault.decrypted_secrets
+                                        where name = 'verify_worker_bearer')
+      ),
+      body   := '{}'::jsonb
+    );
+  $cron$
+);
+```
+
+Alternatively, use the platform's protected **Scheduled Functions** mechanism, which stores the invocation
+secret in the same protected secret store and never exposes it to the repo or the client.
+
+### Rotation
+
+1. Set the new service-role key as the Edge Function secret (`supabase secrets set ...`) and update the
+   Vault secret `verify_worker_bearer` to match.
+2. Redeploy the function (picks up the new env secret).
+3. Revoke the old key in the Supabase dashboard.
+   The worker's `safeEqual` gate compares the presented bearer to the current env key, so a stale token
+   stops working the moment the env secret is rotated — no code change required.
+
+### Log redaction & local development
+
+- Never log `Authorization` headers, bearer tokens, or the service-role key. The worker emits **no**
+  `console.*` output; any future logging must redact these. `last_error` in the queue stores only short
+  whitelisted codes (no secrets/answers/snapshots).
+- Local development uses an **uncommitted** `supabase/functions/.env` (git-ignored) or the local
+  `supabase start` secret store — never a committed `.env` and never the client `.env.local`.
 
 ## Batch / concurrency / lease
 

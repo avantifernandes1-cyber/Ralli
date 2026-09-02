@@ -409,6 +409,21 @@ BEGIN
   IF (SELECT lease_expires_at FROM public.game_verification_queue WHERE session_id=lsid) IS NOT NULL THEN RAISE EXCEPTION 'Q7 FAIL completion did not release lease'; END IF;
   RAISE NOTICE 'Q7. queue: processing lease held on claim; live lease not stealable; expired lease reclaimed (attempts bumped); completion releases lease: PASS';
 
+  -- ── TERMINAL FAIL-FAST (p_terminal) ────────────────────────────────────────
+  -- A permanent error (e.g. snapshot-hash integrity mismatch) fails the job immediately, without
+  -- burning through the 6-attempt backoff. Lease released; state terminal 'failed'.
+  INSERT INTO public.game_sessions(id,tenant_id,host_id,pin,status,demo_mode,question_count) VALUES ('00000000-0000-0000-0000-000000085075','00000000-0000-0000-0000-0000000850a0','00000000-0000-0000-0000-00000085f001','p75','started',false,8);
+  UPDATE public.game_sessions SET status='completed', ended_at=now() WHERE id='00000000-0000-0000-0000-000000085075';
+  PERFORM set_config('request.jwt.claims','{"role":"service_role"}',true); SET LOCAL ROLE service_role;
+  claimed := public.rpc_claim_verification_job();   -- claims 085075 (attempts=1)
+  PERFORM public.rpc_complete_verification_job('00000000-0000-0000-0000-000000085075', false, 'snapshot_hash_mismatch', true);  -- terminal
+  RESET ROLE;
+  SELECT state, attempts, lease_expires_at INTO st, att, lease FROM public.game_verification_queue WHERE session_id='00000000-0000-0000-0000-000000085075';
+  IF st <> 'failed' THEN RAISE EXCEPTION 'Q8 FAIL terminal not reached (state=%)', st; END IF;
+  IF att >= 6 THEN RAISE EXCEPTION 'Q8 FAIL terminal should not require 6 attempts (att=%)', att; END IF;
+  IF lease IS NOT NULL THEN RAISE EXCEPTION 'Q8 FAIL terminal did not release lease'; END IF;
+  RAISE NOTICE 'Q8. queue: p_terminal fails a permanent error immediately (no 6-attempt burn), lease released: PASS';
+
   RAISE NOTICE '085 QUEUE TESTS PASSED';
 END $$;
 ROLLBACK;

@@ -53,8 +53,19 @@ ok("11 tenant derived server-side from the session (not the body)",
 ok("12 service-role key stays server-side (env secret, never in a response)",
    /SERVICE_ROLE_KEY = Deno\.env\.get\("SUPABASE_SERVICE_ROLE_KEY"\)/.test(src) && !/SERVICE_ROLE_KEY[\s\S]{0,40}json\(/.test(src));
 ok("13 demo/incomplete handling preserved", /demo_mode === true.*ineligible/.test(src) && /session not completed", retryable: true \}, 409/.test(src));
-ok("14 canonical grader + writer RPC calls unchanged",
-   /buildSessionVerdicts\(snapshot, answers \?\? \[\]\)/.test(src) && /admin\.rpc\("record_game_verification"/.test(src));
+// 14 — grading + the writer RPC now live in the ONE shared canonical verifier; the entrypoint
+//      delegates to it and must NOT re-implement the grader or the record RPC itself (single source
+//      of truth shared with verify-queue-worker). Stronger than the old copy-in-entrypoint assertion.
+ok("14a entrypoint imports + calls the shared canonical verifier",
+   /import \{ verifyLoadedSession, VERIFICATION_SOURCE_EDGE \} from "\.\.\/_shared\/verifySession\.js"/.test(src) &&
+   /verifyLoadedSession\(admin, session, \{ source: VERIFICATION_SOURCE_EDGE \}\)/.test(src));
+ok("14b entrypoint no longer re-implements the grader or the record RPC call (no drift)",
+   !/buildSessionVerdicts\(/.test(src) && !/\.rpc\("record_game_verification"/.test(src));
+{
+  const vsrc = readFileSync(join(here, "..", "_shared", "verifySession.js"), "utf8");
+  ok("14c grader + writer RPC live ONCE in the shared verifier",
+     /buildSessionVerdicts\(/.test(vsrc) && /record_game_verification/.test(vsrc));
+}
 ok("15 response payload fields unchanged (ok + spread result)", /return json\(\{ ok: true, \.\.\.\(result as object\) \}, 200, cors\)/.test(src));
 ok("16 logging policy unchanged (no console.* in the function)", !/console\./.test(src));
 

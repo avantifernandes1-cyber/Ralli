@@ -83,6 +83,29 @@ Pre-production corrections (still local only; 085 unapplied, worker not deployed
   timeframe tests added (UTC + America/New_York + year/last_N boundaries, invalid enum rejected,
   all-three-RPCs-agree, arbitrary-date signature uncallable, invalid stored tz → UTC, tenant isolation).
 
+Canonical-verifier correction (still local only):
+
+- **One session-verification implementation.** Extracted the grade+record core into
+  `_shared/verifySession.js` (`verifyLoadedSession` + `verifyCompletedSession`) with a typed result
+  contract (verified/idempotent, ineligible, not_ready, integrity, transient, unauthorized,
+  bad_request). BOTH `verify-game-session` (on-demand) and `verify-queue-worker` now call it — the
+  grader (`buildSessionVerdicts`) and the writer RPC (`record_game_verification`) have exactly one call
+  site, so the two paths cannot drift. The Edge Function keeps only transport/auth/authz/CORS and its
+  existing HTTP mappings (external behavior preserved); authorization is entrypoint-owned (edge:
+  host/manager/admin; worker: service-role) and passed to the shared loader as a policy, never decided
+  from request fields. The worker maps the typed contract to the queue: verified/ineligible → done;
+  not_ready/transient → backoff retry; integrity/bad_request → terminal fail-fast (new `p_terminal` on
+  `rpc_complete_verification_job`). CORS/wiring tests updated to assert the shared implementation (and
+  that the entrypoint no longer re-implements the grader/RPC) without weakening security assertions.
+- **Stale heartbeat comment removed.** The lingering "~25s freshness" comment in `rankd-app.jsx` was
+  corrected to the exact contract (15s heartbeat write; fresh while age is STRICTLY < 40s; zero-player
+  halt adds its own 5s grace); a guard test (`ralliHeartbeatThreshold.test.mjs`) now fails if the
+  frontend `HEARTBEAT_FRESH_MS` and the DB `ralli_heartbeat_fresh_window()` ever diverge or go inclusive.
+- **Secure scheduler-secret docs.** `085_VERIFICATION_WORKER.md` now documents Vault-based secret
+  storage (pg_cron + pg_net pulling the bearer from `vault.decrypted_secrets`, or protected Scheduled
+  Functions), rotation, log redaction, and uncommitted local-dev env — placeholders only, no token-like
+  examples, service-role key never in SQL/docs/source/client vars.
+
 Validation (all local, green): 085 SQL harness (exposure lifecycle, individual/team formula, timezone,
 security, confidentiality, verification queue) + 085 two-connection concurrency (exposure idempotency,
 enqueue-once); 084 unchanged (byte-identical) and its concurrency still passes; full JS suite incl. new

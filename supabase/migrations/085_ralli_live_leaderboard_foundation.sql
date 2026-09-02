@@ -228,8 +228,10 @@ BEGIN
   RETURN jsonb_build_object('claimed', true, 'session_id', v_sid, 'tenant_id', v_tid, 'attempt', v_att + 1);
 END; $function$;
 
--- Worker complete: mark terminal success or schedule an exponential-backoff retry (fail after 6 attempts).
-CREATE OR REPLACE FUNCTION public.rpc_complete_verification_job(p_session_id uuid, p_ok boolean, p_error text DEFAULT NULL)
+-- Worker complete: terminal success (p_ok), immediate terminal failure (p_terminal — a permanent error
+-- that retrying cannot fix, e.g. a snapshot-hash integrity mismatch), or an exponential-backoff retry
+-- that becomes terminal 'failed' after 6 attempts.
+CREATE OR REPLACE FUNCTION public.rpc_complete_verification_job(p_session_id uuid, p_ok boolean, p_error text DEFAULT NULL, p_terminal boolean DEFAULT false)
 RETURNS jsonb LANGUAGE plpgsql VOLATILE SECURITY DEFINER SET search_path = '' AS $function$
 DECLARE v_att int;
 BEGIN
@@ -243,7 +245,7 @@ BEGIN
   ELSE
     SELECT attempts INTO v_att FROM public.game_verification_queue WHERE session_id = p_session_id;
     UPDATE public.game_verification_queue
-       SET state = CASE WHEN v_att >= 6 THEN 'failed' ELSE 'pending' END,
+       SET state = CASE WHEN p_terminal OR v_att >= 6 THEN 'failed' ELSE 'pending' END,
            next_attempt_at = now() + make_interval(secs => LEAST(3600, power(2, v_att)::int * 30)),
            lease_expires_at = NULL,                         -- release the lease on retry/terminal
            last_error = left(coalesce(p_error,''), 500),   -- short, no answer/snapshot material
@@ -516,8 +518,8 @@ REVOKE EXECUTE ON FUNCTION public.rpc_ralli_team_members(uuid, text)            
 GRANT  EXECUTE ON FUNCTION public.rpc_ralli_team_members(uuid, text)            TO authenticated, service_role;
 REVOKE EXECUTE ON FUNCTION public.rpc_claim_verification_job()                   FROM PUBLIC, anon, authenticated;
 GRANT  EXECUTE ON FUNCTION public.rpc_claim_verification_job()                   TO service_role;
-REVOKE EXECUTE ON FUNCTION public.rpc_complete_verification_job(uuid, boolean, text) FROM PUBLIC, anon, authenticated;
-GRANT  EXECUTE ON FUNCTION public.rpc_complete_verification_job(uuid, boolean, text) TO service_role;
+REVOKE EXECUTE ON FUNCTION public.rpc_complete_verification_job(uuid, boolean, text, boolean) FROM PUBLIC, anon, authenticated;
+GRANT  EXECUTE ON FUNCTION public.rpc_complete_verification_job(uuid, boolean, text, boolean) TO service_role;
 
 -- No DML/backfill: existing sessions get NO exposure rows retroactively (they are "pre-leaderboard tracking"
 -- and excluded from ranking). Rankings begin with games played after 085 is applied.

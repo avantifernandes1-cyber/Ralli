@@ -4141,10 +4141,15 @@ function KahootPlayerView({ onNav, playerName, playerEmoji, playerId, pin, sessi
   }, [sessionDbId, playerId, reconcile]);
 
   // Heartbeat: keep last_seen_at fresh while in-game so the host can detect
-  // stale connections. 15s interval pairs with the host's 25s freshness window
-  // (see the roster poll) so a present player is never dropped, but a gone
-  // player is detected within ~25s. Fire one immediately so a just-joined
-  // player has a fresh timestamp right away, not only after the first interval.
+  // stale connections. The 15s write interval pairs with the canonical freshness
+  // window HEARTBEAT_FRESH_MS = 40000 (see the top-of-file constant and the roster
+  // poll): a participant is "fresh" while (now - last_seen_at) is STRICTLY under 40s,
+  // so a present player (heartbeat every 15s) is never dropped, and a gone player is
+  // detected once its heartbeat crosses 40s (the zero-player halt then adds its own
+  // separate 5s grace). Migration 085 exposure eligibility uses this exact same
+  // definition (ralli_heartbeat_fresh_window() = 40s, strict "<"), so the database and
+  // the frontend agree. Fire one beat immediately so a just-joined player has a fresh
+  // timestamp right away, not only after the first interval.
   useEffect(() => {
     if (!sessionDbId || !playerId) return;
     const beat = () => updateParticipantHeartbeat(sessionDbId, playerId)

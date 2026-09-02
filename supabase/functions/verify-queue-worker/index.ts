@@ -53,9 +53,9 @@ Deno.serve(async (req) => {
       return data; // { claimed, session_id?, ... }
     },
     verifyOne: (sessionId: string) => verifyCompletedSession(admin, sessionId, { source: VERIFICATION_SOURCE_WORKER }),
-    completeJob: async (sessionId: string, ok: boolean, err: string | null) => {
+    completeJob: async (sessionId: string, ok: boolean, terminal: boolean, err: string | null) => {
       // Best-effort: if this write fails, the processing lease expires and the job is reclaimed later.
-      await admin.rpc("rpc_complete_verification_job", { p_session_id: sessionId, p_ok: ok, p_error: err });
+      await admin.rpc("rpc_complete_verification_job", { p_session_id: sessionId, p_ok: ok, p_error: err, p_terminal: terminal });
     },
     now: () => Date.now(),
   };
