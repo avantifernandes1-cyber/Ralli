@@ -68,6 +68,18 @@ GRANT  SELECT, INSERT, UPDATE, DELETE ON public.game_question_exposures TO servi
 CREATE OR REPLACE FUNCTION public.ralli_heartbeat_fresh_window()
 RETURNS interval LANGUAGE sql IMMUTABLE SET search_path = '' AS $$ SELECT interval '40 seconds' $$;
 
+-- Session-level FULL-COVERAGE admission marker for the leaderboard. false = the session may have
+-- incomplete or legacy (pre-085) exposure data; true = exposure tracking began authoritatively with
+-- QUESTION 1 (index 0) under this migration's phase RPC, so EVERY question of the game was exposure-
+-- tracked. This is the leaderboard admission gate — the existence of a few exposure rows is NOT proof
+-- of complete coverage (a session mid-flight when 085 is applied could accrue partial exposures). Only
+-- rpc_set_session_phase sets it (at the q0 transition, in the same transaction as the exposure insert);
+-- it is never set by the frontend, session creation, later questions, verification, the worker, or any
+-- backfill, and it is never reset to false. Existing rows default false (excluded; no backfill).
+ALTER TABLE public.game_sessions ADD COLUMN IF NOT EXISTS exposure_fully_tracked boolean NOT NULL DEFAULT false;
+COMMENT ON COLUMN public.game_sessions.exposure_fully_tracked IS
+  'Leaderboard admission gate (085): true only when exposure tracking began at question 1 (idx 0) under the 085 phase RPC — proof of complete per-question exposure coverage. Legacy/partial/mid-flight sessions stay false and are excluded from ranking. Never backfilled; never reset.';
+
 -- ══ PART 2 — SUPERSEDE rpc_set_session_phase: record exposure at question start ═══
 -- Faithful superset of the 084 body. ADDITIONALLY, on the authoritative transition INTO a
 -- 'question' phase, insert one exposure row per DURABLY-ACTIVE canonical roster member for the
@@ -120,6 +132,15 @@ BEGIN
       AND gsp.last_seen_at IS NOT NULL
       AND (now() - gsp.last_seen_at) < public.ralli_heartbeat_fresh_window()  -- STRICT: matches frontend `< HEARTBEAT_FRESH_MS`
     ON CONFLICT (session_id, player_id, question_idx) DO NOTHING;             -- idempotent, immutable
+
+    -- Full-coverage admission: mark the session leaderboard-eligible ONLY when tracking begins at the
+    -- FIRST question (idx 0) under this RPC, in the SAME transaction as the exposure insert above. A
+    -- session mid-flight when 085 was applied reaches its next question at idx > 0 and is never marked,
+    -- so its partial exposures can never admit it. If this transaction rolls back (guard/error), the
+    -- marker stays false. Idempotent + never reset (advancing to later questions leaves it true).
+    IF v_qidx = 0 THEN
+      UPDATE public.game_sessions SET exposure_fully_tracked = true WHERE id = v_s.id;
+    END IF;
   END IF;
 
   RETURN jsonb_build_object('ok', true);
@@ -321,7 +342,7 @@ BEGIN
     SELECT s.id FROM public.game_sessions s
     WHERE s.tenant_id = v_tid::text AND s.demo_mode = false AND s.status = 'completed'
       AND s.ended_at >= v_start AND s.ended_at < v_end
-      AND EXISTS (SELECT 1 FROM public.game_question_exposures e WHERE e.session_id = s.id)
+      AND s.exposure_fully_tracked = true   -- full-coverage admission gate (q0-tracked under 085); legacy/partial excluded
   ),
   faced_raw AS (
     SELECT e.player_id, e.session_id, e.question_idx, e.exposed_at,
@@ -408,11 +429,11 @@ BEGIN
   IF v_uid IS NULL OR v_tid IS NULL THEN RAISE EXCEPTION 'authentication required' USING ERRCODE='insufficient_privilege'; END IF;
   SELECT t_start, t_end, tz INTO v_start, v_end, v_tz FROM public.ralli_resolve_timeframe(p_timeframe);  -- server-authoritative window
   RETURN jsonb_build_object('timeframe', p_timeframe, 'from', v_start, 'to', v_end, 'timezone', v_tz, 'rows', (
-  WITH elig_sessions AS (  -- teams use ONLY 084-roster sessions (immutable session-time team) with exposures
+  WITH elig_sessions AS (  -- teams use ONLY 084-roster sessions (immutable session-time team), fully tracked
     SELECT s.id FROM public.game_sessions s
     WHERE s.tenant_id = v_tid::text AND s.demo_mode=false AND s.status='completed'
       AND s.ended_at >= v_start AND s.ended_at < v_end
-      AND EXISTS (SELECT 1 FROM public.game_question_exposures e WHERE e.session_id = s.id)
+      AND s.exposure_fully_tracked = true   -- full-coverage admission gate (q0-tracked under 085); legacy/partial excluded
       AND EXISTS (SELECT 1 FROM public.game_roster_members r WHERE r.session_id = s.id)
   ),
   faced_raw AS (

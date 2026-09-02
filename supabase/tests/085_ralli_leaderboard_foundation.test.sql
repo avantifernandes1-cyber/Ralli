@@ -43,9 +43,10 @@ UPDATE public.profiles SET role='manager',status='active',tenant_id='00000000-00
 \set snap8 '[{"id":"q0","type":"mc","options":["a","b"],"timeLimit":20},{"id":"q1","type":"mc","options":["a","b"],"timeLimit":20},{"id":"q2","type":"mc","options":["a","b"],"timeLimit":20},{"id":"q3","type":"mc","options":["a","b"],"timeLimit":20},{"id":"q4","type":"mc","options":["a","b"],"timeLimit":20},{"id":"q5","type":"mc","options":["a","b"],"timeLimit":20},{"id":"q6","type":"mc","options":["a","b"],"timeLimit":20},{"id":"q7","type":"open","timeLimit":20}]'
 
 CREATE TEMP TABLE _snap(v jsonb); INSERT INTO _snap VALUES (:'snap8'::jsonb);
--- Three COMPLETED real sessions this month (ended_at now()). q7 is open-ended for the pending-manual test.
-INSERT INTO public.game_sessions(id,tenant_id,quiz_id,host_id,pin,status,demo_mode,question_count,question_snapshot,ended_at,current_question_index,phase)
-SELECT ('00000000-0000-0000-0000-00000008500'||g)::uuid,'00000000-0000-0000-0000-0000000850a0','q','00000000-0000-0000-0000-00000085f001','p'||g,'completed',false,8, :'snap8'::jsonb, date_trunc('month', now()) + interval '10 days', 7,'scoreboard'
+-- Three COMPLETED real sessions this month. exposure_fully_tracked=true (they represent games whose
+-- q0 transition ran under 085 → full per-question coverage). q7 is open-ended for the pending-manual test.
+INSERT INTO public.game_sessions(id,tenant_id,quiz_id,host_id,pin,status,demo_mode,question_count,question_snapshot,ended_at,current_question_index,phase,exposure_fully_tracked)
+SELECT ('00000000-0000-0000-0000-00000008500'||g)::uuid,'00000000-0000-0000-0000-0000000850a0','q','00000000-0000-0000-0000-00000085f001','p'||g,'completed',false,8, :'snap8'::jsonb, date_trunc('month', now()) + interval '10 days', 7,'scoreboard', true
 FROM generate_series(1,3) g;
 
 -- Roster (084 snapshot team) + exposures + verifications for L1,L2 (team A) and L4 (team B) across all 3 sessions, 8 q each.
@@ -144,7 +145,10 @@ BEGIN
   IF (SELECT count(*) FROM public.game_question_exposures WHERE session_id='00000000-0000-0000-0000-000000085098' AND question_idx=0) <> 1
      OR NOT EXISTS (SELECT 1 FROM public.game_question_exposures WHERE session_id='00000000-0000-0000-0000-000000085098' AND question_idx=0 AND player_id=p_l1) THEN
     RAISE EXCEPTION '2b FAIL boundary q0: expected only L1 (fresh <40s) exposed'; END IF;
-  RAISE NOTICE '2b. exposure boundary: 39.5s included; exactly 40s + 41s excluded (strict); Leave-over-fresh, active-without-heartbeat, fresh-without-active-roster all excluded: PASS';
+  -- full-coverage marker: the q0 transition under 085 marks the session fully tracked (req #1)
+  IF (SELECT exposure_fully_tracked FROM public.game_sessions WHERE id='00000000-0000-0000-0000-000000085098') <> true THEN
+    RAISE EXCEPTION '2b FAIL q0 transition did not set exposure_fully_tracked'; END IF;
+  RAISE NOTICE '2b. exposure boundary: 39.5s included; exactly 40s + 41s excluded (strict); Leave-over-fresh, active-without-heartbeat, fresh-without-active-roster all excluded; q0 marks full coverage: PASS';
 
   -- Rejoin refreshes eligibility at a LATER question. L2 rejoins (participant active + fresh);
   -- refresh L1 too so it stays fresh; L3/L4/L5/L6 unchanged (still ineligible). Advance to q1.
@@ -161,6 +165,23 @@ BEGIN
   IF (SELECT count(*) FROM public.game_question_exposures WHERE session_id='00000000-0000-0000-0000-000000085098' AND question_idx=0) <> 1 THEN
     RAISE EXCEPTION '2c FAIL q0 exposures changed retroactively'; END IF;
   RAISE NOTICE '2c. exposure: rejoin-before-a-later-question re-qualifies for THAT question; earlier question unchanged; duplicate phase idempotent: PASS';
+
+  -- 2d. A session whose exposure tracking begins at a LATER question (never q0 under 085) is NEVER
+  -- marked fully tracked, even though it accrues exposure rows — this is the mid-flight-at-apply case.
+  INSERT INTO public.game_sessions(id,tenant_id,quiz_id,host_id,pin,status,demo_mode,question_count,question_snapshot,current_question_index,phase)
+    VALUES ('00000000-0000-0000-0000-000000085097','00000000-0000-0000-0000-0000000850a0','q',h1,'p97','started',false,8,(SELECT v FROM _snap),0,'countdown');
+  INSERT INTO public.game_roster_members(session_id,tenant_id,player_id,name,team_id,status) VALUES
+    ('00000000-0000-0000-0000-000000085097','00000000-0000-0000-0000-0000000850a0',p_l1,'L1','00000000-0000-0000-0000-000000085a01','active');
+  INSERT INTO public.game_session_participants(session_id,tenant_id,player_id,status,last_seen_at) VALUES
+    ('00000000-0000-0000-0000-000000085097','00000000-0000-0000-0000-0000000850a0',p_l1,'active', now());
+  PERFORM set_config('request.jwt.claims','{"sub":"'||h1||'","role":"authenticated"}',true); SET LOCAL ROLE authenticated;
+  PERFORM public.rpc_set_session_phase('00000000-0000-0000-0000-000000085097','question',true,2,false,false,true,'{}'::jsonb); -- starts at q2, never q0
+  RESET ROLE;
+  IF (SELECT count(*) FROM public.game_question_exposures WHERE session_id='00000000-0000-0000-0000-000000085097' AND question_idx=2) <> 1 THEN
+    RAISE EXCEPTION '2d FAIL q2 exposure not recorded'; END IF;
+  IF (SELECT exposure_fully_tracked FROM public.game_sessions WHERE id='00000000-0000-0000-0000-000000085097') <> false THEN
+    RAISE EXCEPTION '2d FAIL session tracked despite never transitioning q0 under 085'; END IF;
+  RAISE NOTICE '2d. exposure: a session first tracked at q2 (mid-flight-at-apply) accrues exposures but is NEVER marked fully tracked: PASS';
 
   -- ── INDIVIDUAL FORMULA ────────────────────────────────────────────────────
   PERFORM set_config('request.jwt.claims','{"sub":"'||h1||'","role":"authenticated"}',true); SET LOCAL ROLE authenticated;
@@ -297,6 +318,55 @@ BEGIN
   IF obj->>'timezone' <> 'America/New_York' THEN RAISE EXCEPTION '11 FAIL caller got another tenant''s tz'; END IF;
   RESET ROLE;
   RAISE NOTICE '11. server timeframes: enum-only; UTC + NY + year + last_N boundaries exact; invalid enum rejected; all 3 RPCs agree; arbitrary dates uncallable; invalid stored tz → UTC; tenant-isolated: PASS';
+
+  -- ── FULL-COVERAGE ADMISSION GATE (exposure_fully_tracked) across all scopes ─
+  -- Seed L6 (team A) with 3 completed in-window sessions, 21 exposures + all-correct verifications,
+  -- but exposure_fully_tracked=FALSE (partial/untracked). Same exposure rows, only the marker differs.
+  PERFORM set_config('request.jwt.claims','{"sub":"'||h1||'","role":"authenticated"}',true); SET LOCAL ROLE authenticated;
+  PERFORM public.rpc_set_org_timezone('UTC');  -- deterministic window for this block
+  RESET ROLE;
+  INSERT INTO public.game_sessions(id,tenant_id,quiz_id,host_id,pin,status,demo_mode,question_count,question_snapshot,ended_at,current_question_index,phase,exposure_fully_tracked)
+  SELECT ('00000000-0000-0000-0000-00000008507'||g)::uuid,'00000000-0000-0000-0000-0000000850a0','q',h1,'g'||g,'completed',false,8,(SELECT v FROM _snap), date_trunc('month',now())+interval '12 days',7,'scoreboard', false
+  FROM generate_series(1,3) g;
+  INSERT INTO public.game_roster_members(session_id,tenant_id,player_id,name,team_id,status)
+  SELECT ('00000000-0000-0000-0000-00000008507'||g)::uuid,'00000000-0000-0000-0000-0000000850a0','00000000-0000-0000-0000-000000085006','L6','00000000-0000-0000-0000-000000085a01','active'
+  FROM generate_series(1,3) g;
+  INSERT INTO public.game_question_exposures(session_id,tenant_id,player_id,question_idx,question_id,exposed_at)
+  SELECT ('00000000-0000-0000-0000-00000008507'||g)::uuid,'00000000-0000-0000-0000-0000000850a0','00000000-0000-0000-0000-000000085006',qi,'q'||qi, date_trunc('month',now())+interval '12 days'
+  FROM generate_series(1,3) g, generate_series(0,6) qi;
+  INSERT INTO public.game_answer_verifications(session_id,tenant_id,player_id,question_idx,verified_correct,eligibility)
+  SELECT ('00000000-0000-0000-0000-00000008507'||g)::uuid,'00000000-0000-0000-0000-0000000850a0','00000000-0000-0000-0000-000000085006',qi,true,'scored'
+  FROM generate_series(1,3) g, generate_series(0,6) qi;
+
+  PERFORM set_config('request.jwt.claims','{"sub":"'||h1||'","role":"authenticated"}',true); SET LOCAL ROLE authenticated;
+  -- (a) marker FALSE → excluded from ALL scopes despite 21 exposures + 3 games of correct verifications
+  obj  := public.rpc_ralli_leaderboard_individuals('current_month', NULL);
+  L3 := (SELECT e FROM jsonb_array_elements(obj->'rows') e WHERE e->>'player_id'='00000000-0000-0000-0000-000000085006');
+  IF L3 IS NOT NULL AND ((L3->>'questions_faced')::int <> 0 OR (L3->>'enough_data')::boolean = true OR (L3->>'rank') IS NOT NULL) THEN
+    RAISE EXCEPTION '12 FAIL untracked session admitted to individuals (faced=%, enough=%)', L3->>'questions_faced', L3->>'enough_data'; END IF;
+  obj3 := public.rpc_ralli_team_members('00000000-0000-0000-0000-000000085a01','current_month');
+  L3 := (SELECT e FROM jsonb_array_elements(obj3->'rows') e WHERE e->>'player_id'='00000000-0000-0000-0000-000000085006');
+  IF L3 IS NOT NULL AND ((L3->>'questions_faced')::int <> 0 OR (L3->>'rank') IS NOT NULL) THEN
+    RAISE EXCEPTION '12 FAIL untracked session admitted to team drill-down'; END IF;
+
+  -- (b) flip marker TRUE (same exposures) → included in all scopes; denominator uses every exposure
+  RESET ROLE;
+  UPDATE public.game_sessions SET exposure_fully_tracked = true WHERE id IN
+    ('00000000-0000-0000-0000-000000085071','00000000-0000-0000-0000-000000085072','00000000-0000-0000-0000-000000085073');
+  PERFORM set_config('request.jwt.claims','{"sub":"'||h1||'","role":"authenticated"}',true); SET LOCAL ROLE authenticated;
+  obj  := public.rpc_ralli_leaderboard_individuals('current_month', NULL);
+  L3 := (SELECT e FROM jsonb_array_elements(obj->'rows') e WHERE e->>'player_id'='00000000-0000-0000-0000-000000085006');
+  IF L3 IS NULL OR (L3->>'questions_faced')::int <> 21 OR (L3->>'verified_correct')::int <> 21
+     OR (L3->>'games')::int <> 3 OR (L3->>'enough_data')::boolean <> true OR (L3->>'rank') IS NULL THEN
+    RAISE EXCEPTION '12 FAIL tracked session not admitted/used (faced=%, correct=%, games=%)', L3->>'questions_faced', L3->>'verified_correct', L3->>'games'; END IF;
+  obj3 := public.rpc_ralli_team_members('00000000-0000-0000-0000-000000085a01','current_month');
+  IF NOT EXISTS (SELECT 1 FROM jsonb_array_elements(obj3->'rows') e WHERE e->>'player_id'='00000000-0000-0000-0000-000000085006' AND (e->>'questions_faced')::int=21) THEN
+    RAISE EXCEPTION '12 FAIL tracked session not admitted to team drill-down'; END IF;
+  obj2 := public.rpc_ralli_leaderboard_teams('current_month');
+  IF (SELECT (e->>'eligible_members')::int FROM jsonb_array_elements(obj2->'rows') e WHERE e->>'team_id'='00000000-0000-0000-0000-000000085a01') < 3 THEN
+    RAISE EXCEPTION '12 FAIL team scope did not admit the now-tracked learner'; END IF;
+  RESET ROLE;
+  RAISE NOTICE '12. admission gate: identical exposures excluded when marker FALSE and included when TRUE, across individuals + team drill-down + teams; denominator uses every exposure once admitted: PASS';
 
   RAISE NOTICE '085 ALL TESTS PASSED';
 END $$;
