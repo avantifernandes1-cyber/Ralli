@@ -7116,15 +7116,16 @@ const LB_CSS = `
 @media (max-width:640px){
   .lb-podium{flex-direction:column;align-items:stretch}
   .lb-podium-col{max-width:none}
-  .lb-podium-col .lb-plinth{height:auto!important;min-height:0!important}
+  .lb-podium-col .lb-pcard{min-height:0!important}
 }
 `;
 
-// Universally-recognized medal treatment for the top three eligible ranks (not brand invention).
+// Rank tiering for the top three eligible ranks — differentiated by metal color, ring, gradient, and
+// card height only (gold/silver/bronze). No emoji: emphasis comes from typography/color/borders.
 const LB_MEDALS = {
-  1: { emoji: "🥇", metal: "#E0A400", ring: "#F3D250", bg: "linear-gradient(180deg,#FFF7DA 0%,#FFEFB8 100%)", plinth: 128 },
-  2: { emoji: "🥈", metal: "#8B94A3", ring: "#CBD2DB", bg: "linear-gradient(180deg,#F3F5F8 0%,#E7EBF0 100%)", plinth: 104 },
-  3: { emoji: "🥉", metal: "#B4794E", ring: "#DDB48A", bg: "linear-gradient(180deg,#F8EEE3 0%,#EFDCC7 100%)", plinth: 88 },
+  1: { metal: "#E0A400", ring: "#F3D250", bg: "linear-gradient(180deg,#FFF7DA 0%,#FFEFB8 100%)", minH: 248 },
+  2: { metal: "#8B94A3", ring: "#CBD2DB", bg: "linear-gradient(180deg,#F3F5F8 0%,#E7EBF0 100%)", minH: 214 },
+  3: { metal: "#B4794E", ring: "#DDB48A", bg: "linear-gradient(180deg,#F8EEE3 0%,#EFDCC7 100%)", minH: 190 },
 };
 
 // Deterministic avatar hue from a stable id — presentational only (no emoji is in the RPC payload).
@@ -7228,8 +7229,7 @@ function RalliLeaderboard({ currentUser, isManager }) {
     return (
       <div className="lb-reco-grid">
         {most && (
-          <div style={{ display: "flex", alignItems: "center", gap: 12, padding: "14px 16px", borderRadius: 14, background: C.orangeLight, border: `1px solid ${C.orangeBorder}` }}>
-            <div style={{ fontSize: 26 }}>🎯</div>
+          <div style={{ display: "flex", alignItems: "center", gap: 12, padding: "14px 16px", borderRadius: 14, background: C.orangeLight, border: `1px solid ${C.orangeBorder}`, borderLeft: `4px solid ${C.orangeDark}` }}>
             <div style={{ minWidth: 0 }}>
               <div style={{ fontSize: 10, fontWeight: 800, letterSpacing: "0.08em", textTransform: "uppercase", color: C.orangeDark }}>Most Accurate</div>
               <div style={{ fontSize: 15, fontWeight: 800, color: C.text, whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis" }}>{most.name}</div>
@@ -7238,8 +7238,7 @@ function RalliLeaderboard({ currentUser, isManager }) {
           </div>
         )}
         {fast.length > 0 && (
-          <div style={{ display: "flex", alignItems: "center", gap: 12, padding: "14px 16px", borderRadius: 14, background: C.trueGreenBg, border: `1px solid ${C.trueGreen}33` }}>
-            <div style={{ fontSize: 26 }}>⚡</div>
+          <div style={{ display: "flex", alignItems: "center", gap: 12, padding: "14px 16px", borderRadius: 14, background: C.trueGreenBg, border: `1px solid ${C.trueGreen}33`, borderLeft: `4px solid ${C.trueGreen}` }}>
             <div style={{ minWidth: 0 }}>
               <div style={{ fontSize: 10, fontWeight: 800, letterSpacing: "0.08em", textTransform: "uppercase", color: C.trueGreen }}>Fast &amp; Accurate</div>
               <div style={{ fontSize: 15, fontWeight: 800, color: C.text, whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis" }}>{fast.map((r) => r.name).join(", ")}</div>
@@ -7263,13 +7262,14 @@ function RalliLeaderboard({ currentUser, isManager }) {
           const isMe = r.player_id === currentUser?.id;
           return (
             <div key={r.player_id} className="lb-podium-col">
-              <div style={{
+              <div className="lb-pcard" style={{
                 display: "flex", flexDirection: "column", alignItems: "center", gap: 8,
-                padding: "16px 12px", borderRadius: "16px 16px 0 0", background: m.bg,
-                border: `1px solid ${m.ring}`, borderBottom: "none",
+                padding: "14px 12px 18px", borderRadius: 16, background: m.bg,
+                border: `1px solid ${m.ring}`, minHeight: m.minH,
                 boxShadow: r.rank === 1 ? C.shadowMd : C.shadowSm,
               }}>
-                <div style={{ fontSize: 30, lineHeight: 1 }}>{m.emoji}</div>
+                {/* Rank at the TOP of the card — gold/silver/bronze by metal color + weight (no emoji). */}
+                <div style={{ fontFamily: "'Unbounded', sans-serif", fontSize: r.rank === 1 ? 34 : 26, fontWeight: 800, color: m.metal, lineHeight: 1 }}>#{r.rank}</div>
                 <LbAvatar name={r.name} id={r.player_id} size={r.rank === 1 ? 56 : 48} ring={isMe ? C.blue : m.ring} />
                 <div style={{ display: "flex", alignItems: "center", gap: 6, maxWidth: "100%" }}>
                   <span style={{ fontWeight: 800, fontSize: 14, color: C.text, whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis" }}>{r.name}</span>
@@ -7285,13 +7285,6 @@ function RalliLeaderboard({ currentUser, isManager }) {
                   {recognitions.fastAndAccurateIds?.has(r.player_id) && <LbBadge kind="fast" />}
                 </div>
               </div>
-              <div className="lb-plinth" style={{
-                height: m.plinth, background: m.bg, borderLeft: `1px solid ${m.ring}`, borderRight: `1px solid ${m.ring}`,
-                borderBottom: `1px solid ${m.ring}`, borderRadius: "0 0 12px 12px",
-                display: "flex", alignItems: "flex-start", justifyContent: "center", paddingTop: 8,
-              }}>
-                <span style={{ fontFamily: "'Unbounded', sans-serif", fontSize: r.rank === 1 ? 40 : 32, fontWeight: 800, color: `${m.metal}55` }}>#{r.rank}</span>
-              </div>
             </div>
           );
         })}
@@ -7302,7 +7295,7 @@ function RalliLeaderboard({ currentUser, isManager }) {
   const IndividualsTable = ({ rows, scopedToTeam = false }) => {
     const { ranked, pending } = partitionIndividuals(rows);
     if (ranked.length === 0 && pending.length === 0) {
-      return <LbStateCard icon="🏁" title="No verified games yet" body="Rankings appear once completed Ralli Live sessions finish server verification. Recently-completed games may take a moment to be counted." />;
+      return <LbStateCard title="No verified games yet" body="Rankings appear once completed Ralli Live sessions finish server verification. Recently-completed games may take a moment to be counted." />;
     }
     const rest = ranked.slice(3);
     return (
@@ -7310,7 +7303,7 @@ function RalliLeaderboard({ currentUser, isManager }) {
         {!scopedToTeam && <RecognitionCards rows={ranked} />}
 
         {ranked.length === 0 ? (
-          <LbStateCard icon="📈" title="Not enough data to rank yet" body="No learner has met the ranking threshold (at least 20 questions faced across at least 3 games) in this timeframe." />
+          <LbStateCard title="Not enough data to rank yet" body="No learner has met the ranking threshold (at least 20 questions faced across at least 3 games) in this timeframe." />
         ) : (
           <>
             <Podium rows={ranked} />
@@ -7384,16 +7377,16 @@ function RalliLeaderboard({ currentUser, isManager }) {
   // ── Teams: honest qualification cards (median adj accuracy, eligible members, participation). ──
   const TeamsView = () => {
     if (teams.loading) return <LbStateCard title="Loading team standings…" />;
-    if (teams.error) return <LbStateCard icon="⚠️" title="Couldn't load team standings" body="The leaderboard service returned an error." action={retryBtn} />;
+    if (teams.error) return <LbStateCard title="Couldn't load team standings" body="The leaderboard service returned an error." action={retryBtn} />;
     const { ranked, pending } = partitionTeams(teams.data?.rows || []);
     if (ranked.length === 0 && pending.length === 0) {
-      return <LbStateCard icon="🏁" title="No verified games yet" body="Team standings appear once completed Ralli Live sessions finish server verification." />;
+      return <LbStateCard title="No verified games yet" body="Team standings appear once completed Ralli Live sessions finish server verification." />;
     }
     const canOpen = (t) => isManager || t.team_id === myTeamId;
     return (
       <div style={{ display: "flex", flexDirection: "column", gap: 20 }}>
         {ranked.length === 0 ? (
-          <LbStateCard icon="📈" title="Not enough data to rank teams yet" body="A team ranks once at least 2 members are eligible and at least half of its active learners are eligible in this timeframe." />
+          <LbStateCard title="Not enough data to rank teams yet" body="A team ranks once at least 2 members are eligible and at least half of its active learners are eligible in this timeframe." />
         ) : (
           <div className="lb-teamgrid">
             {ranked.map((t) => {
@@ -7408,9 +7401,8 @@ function RalliLeaderboard({ currentUser, isManager }) {
                     outline: mine ? `2px solid ${C.blue}` : "none",
                   }}>
                   <div style={{ display: "flex", alignItems: "center", gap: 10, marginBottom: 12 }}>
-                    <div style={{ fontSize: 24 }}>{m ? m.emoji : "🏅"}</div>
                     <div style={{ minWidth: 0 }}>
-                      <div style={{ fontSize: 10, fontWeight: 800, letterSpacing: "0.08em", color: C.textMuted }}>RANK #{t.rank}</div>
+                      <div style={{ fontSize: 10, fontWeight: 800, letterSpacing: "0.08em", color: m ? m.metal : C.textMuted }}>RANK #{t.rank}</div>
                       <div style={{ fontSize: 15, fontWeight: 800, color: C.text, whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis" }}>
                         {t.team_name || "Unnamed team"}{mine && <> <LbBadge kind="you" /></>}
                       </div>
@@ -7453,7 +7445,7 @@ function RalliLeaderboard({ currentUser, isManager }) {
       <button onClick={() => setDrill(null)} style={{ alignSelf: "flex-start", background: "none", border: "none", cursor: "pointer", fontSize: 13, fontWeight: 700, color: C.textSub, padding: 0 }}>← Back to Teams</button>
       <h3 style={{ margin: 0, fontFamily: "'Unbounded', sans-serif", fontSize: 18, fontWeight: 800, color: C.text }}>{drill.teamName || "Team"}</h3>
       {members.loading ? <LbStateCard title="Loading team members…" />
-        : members.error ? <LbStateCard icon="⚠️" title="Couldn't load this team" body="You may only view your own team, or the service returned an error." action={retryBtn} />
+        : members.error ? <LbStateCard title="Couldn't load this team" body="You may only view your own team, or the service returned an error." action={retryBtn} />
         : <IndividualsTable rows={members.data?.rows || []} scopedToTeam />}
     </div>
   );
@@ -7488,7 +7480,7 @@ function RalliLeaderboard({ currentUser, isManager }) {
       {drill ? <DrillDown />
         : view === "individuals"
           ? (ind.loading ? <LbStateCard title="Loading individuals…" />
-             : ind.error ? <LbStateCard icon="⚠️" title="Couldn't load the leaderboard" body="The leaderboard service returned an error." action={retryBtn} />
+             : ind.error ? <LbStateCard title="Couldn't load the leaderboard" body="The leaderboard service returned an error." action={retryBtn} />
              : <IndividualsTable rows={ind.data?.rows || []} />)
           : <TeamsView />}
     </div>
