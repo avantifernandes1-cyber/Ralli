@@ -23,9 +23,10 @@ test("no decorative emoji anywhere in the leaderboard UI (incl. team ranking/med
 });
 
 test("team rank uses the same prominent podium typography + gold/silver/bronze metal", () => {
-  // A big Unbounded, metal-colored #rank exists for BOTH individuals (#{r.rank}) and teams (#{t.rank}).
-  assert.match(lb, /'Unbounded', sans-serif"[^}]*color: m\.metal[^>]*>#\{r\.rank\}/s);
-  assert.match(lb, /'Unbounded', sans-serif"[^}]*color: m \? m\.metal : C\.text[^>]*>#\{t\.rank\}/s);
+  // A big Unbounded (heading token), metal-colored #rank exists for BOTH individuals (#{r.rank})
+  // and teams (#{t.rank}). The family now comes from the canonical TYPO.headingFont (var(--font-heading)).
+  assert.match(lb, /TYPO\.headingFont[^}]*color: m\.metal[^>]*>#\{r\.rank\}/s);
+  assert.match(lb, /TYPO\.headingFont[^}]*color: m \? m\.metal : C\.text[^>]*>#\{t\.rank\}/s);
   assert.ok(!/RANK #\{t\.rank\}/.test(lb), "old compressed 'RANK #n' label is gone");
 });
 

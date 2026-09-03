@@ -398,7 +398,9 @@ function useGameChannel(pin, role) {
 }
 
 // ── DESIGN TOKENS (exact Figma theme.css values) ────────────
-// Font: Inter 400/500/600/700/800/900
+// Typography: Unbounded (display headings) + Outfit (body/UI). The canonical font stacks
+// are defined ONCE in index.html as --font-heading / --font-body; prefer the TYPO tokens
+// below (or the .ty-* classes) over hard-coding a font-family string.
 
 const C = {
   // Backgrounds
@@ -466,6 +468,28 @@ const C = {
   radiusSm:  8,
   radiusMd: 12,
   radiusLg: 20,
+};
+
+// ── CANONICAL TYPOGRAPHY TOKENS ──────────────────────────────────────────────
+// Mirror of the .ty-* classes + --font-heading / --font-body vars in index.html.
+// Spread these into inline styles for div-based titles / metrics so headings use
+// Unbounded and body/UI text uses Outfit from ONE source. `headingFont`/`bodyFont`
+// are the raw stacks (via CSS vars) for cases that only need the family.
+const TYPO = {
+  headingFont: "var(--font-heading)",
+  bodyFont:    "var(--font-body)",
+  display:      { fontFamily: "var(--font-heading)", fontWeight: 800, lineHeight: 1.08, letterSpacing: "-0.015em" },
+  pageTitle:    { fontFamily: "var(--font-heading)", fontWeight: 800, lineHeight: 1.12, letterSpacing: "-0.01em" },
+  sectionTitle: { fontFamily: "var(--font-heading)", fontWeight: 700, lineHeight: 1.18, letterSpacing: "-0.005em" },
+  cardTitle:    { fontFamily: "var(--font-heading)", fontWeight: 700, lineHeight: 1.2 },
+  modalTitle:   { fontFamily: "var(--font-heading)", fontWeight: 700, lineHeight: 1.2 },
+  emptyTitle:   { fontFamily: "var(--font-heading)", fontWeight: 700, lineHeight: 1.2 },
+  subtitle:     { fontFamily: "var(--font-body)", fontWeight: 500, lineHeight: 1.5 },
+  body:         { fontFamily: "var(--font-body)", fontWeight: 400, lineHeight: 1.55 },
+  caption:      { fontFamily: "var(--font-body)", fontWeight: 500, lineHeight: 1.4 },
+  label:        { fontFamily: "var(--font-body)", fontWeight: 700, letterSpacing: "0.02em" },
+  control:      { fontFamily: "var(--font-body)", fontWeight: 700 },
+  metric:       { fontFamily: "var(--font-heading)", fontWeight: 800, fontVariantNumeric: "tabular-nums", letterSpacing: "-0.01em" },
 };
 
 // ── FEATURE ACCESS + ROLE PERMISSIONS ────────────────────────────────────────
@@ -3360,7 +3384,7 @@ function KahootHostView({ onNav, sessionName, pin, sessionDbId, demoMode, tenant
               )}
             </div>
           </div>
-          <h2 style={{ margin: 0, fontSize: 20, fontWeight: 900, color: C.text }}>{q.q}</h2>
+          <h2 className="rl-content" style={{ margin: 0, fontSize: 20, fontWeight: 900, color: C.text }}>{q.q}</h2>
           <p style={{ margin: "4px 0 0", fontSize: 12, color: C.textMuted }}>
             {openResponses.length} response{openResponses.length !== 1 ? "s" : ""} · grade each one, then continue
           </p>
@@ -3634,7 +3658,7 @@ function KahootHostView({ onNav, sessionName, pin, sessionDbId, demoMode, tenant
       {/* Question */}
       <div style={{ padding: mobile ? "16px 16px 12px" : "24px 40px 16px", flexShrink: 0 }}>
         <p style={{ margin: "0 0 6px", fontSize: 11, fontWeight: 700, letterSpacing: "0.1em", color: C.textMuted, textTransform: "uppercase" }}>{Q_TYPE_LABELS[q.type] ?? "Question"}</p>
-        <h2 style={{ margin: 0, fontSize: mobile ? 18 : 24, fontWeight: 900, color: C.text, lineHeight: 1.3 }}>{q.q}</h2>
+        <h2 className="rl-content" style={{ margin: 0, fontSize: mobile ? 18 : 24, fontWeight: 900, color: C.text, lineHeight: 1.3 }}>{q.q}</h2>
       </div>
 
       {/* Answer options — type question shows accepted-answer panel, not a grid */}
@@ -4719,7 +4743,7 @@ function KahootPlayerView({ onNav, playerName, playerEmoji, playerId, pin, sessi
       {/* Question */}
       <div style={{ padding: "20px 20px 14px", flexShrink: 0 }}>
         <p style={{ margin: "0 0 4px", fontSize: 10, fontWeight: 700, letterSpacing: "0.1em", color: C.textMuted, textTransform: "uppercase" }}>{Q_TYPE_LABELS[question?.type] ?? "Question"}</p>
-        <h2 style={{ margin: 0, fontSize: 18, fontWeight: 900, color: C.text, lineHeight: 1.3 }}>{question?.q}</h2>
+        <h2 className="rl-content" style={{ margin: 0, fontSize: 18, fontWeight: 900, color: C.text, lineHeight: 1.3 }}>{question?.q}</h2>
       </div>
 
       {/* Retryable submit error: a durable submission that did not confirm (identity still restoring right
@@ -5566,7 +5590,7 @@ function RankdGameScreen({ onNav, sessionName, role, playerName, playerEmoji, qu
             {Q_TYPE_LABELS[q.type] ?? "Question"} · {q.timeLimit}s
           </span>
         </div>
-        <h2 style={{
+        <h2 className="rl-content" style={{
           margin: 0, fontSize: mobile ? 17 : 22, fontWeight: 900, color: C.text,
           lineHeight: 1.4, maxWidth: 680, marginLeft: "auto", marginRight: "auto",
         }}>{q.q}</h2>
@@ -7345,13 +7369,13 @@ function RalliLeaderboard({ currentUser, isManager }) {
                   + (m.glow ? `, ${m.glow}` : ""),
               }}>
                 {/* Rank at the TOP of the card — gold/silver/bronze by metal color + weight (no emoji). */}
-                <div style={{ fontFamily: "'Unbounded', sans-serif", fontSize: r.rank === 1 ? 34 : 26, fontWeight: 800, color: m.metal, lineHeight: 1 }}>#{r.rank}</div>
+                <div style={{ fontFamily: TYPO.headingFont, fontSize: r.rank === 1 ? 34 : 26, fontWeight: 800, color: m.metal, lineHeight: 1 }}>#{r.rank}</div>
                 <LbAvatar name={r.name} id={r.player_id} size={r.rank === 1 ? 64 : 48} ring={isMe ? C.blue : m.ring} />
                 <div style={{ display: "flex", alignItems: "center", gap: 6, maxWidth: "100%" }}>
                   <span style={{ fontWeight: 800, fontSize: 14, color: C.text, whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis" }}>{r.name}</span>
                   {isMe && <LbBadge kind="you" />}
                 </div>
-                <div style={{ fontFamily: "'Unbounded', sans-serif", fontSize: r.rank === 1 ? 30 : 24, fontWeight: 800, color: m.metal, lineHeight: 1 }}>
+                <div style={{ fontFamily: TYPO.headingFont, fontSize: r.rank === 1 ? 30 : 24, fontWeight: 800, color: m.metal, lineHeight: 1 }}>
                   {formatAccuracyPct(r.adjusted_accuracy)}
                 </div>
                 <LbTip label="adjusted accuracy" ariaLabel="Adjusted accuracy" tip={LB_TIP.adjusted} labelStyle={{ fontSize: 11, color: C.textSub }} />
@@ -7482,14 +7506,14 @@ function RalliLeaderboard({ currentUser, isManager }) {
                     display: "flex", flexDirection: "column", alignItems: "center", gap: 8, textAlign: "center",
                   }}>
                   {/* 1. Rank — same prominent podium typography + gold/silver/bronze metal color */}
-                  <div style={{ fontFamily: "'Unbounded', sans-serif", fontSize: t.rank === 1 ? 32 : 26, fontWeight: 800, color: m ? m.metal : C.text, lineHeight: 1 }}>#{t.rank}</div>
+                  <div style={{ fontFamily: TYPO.headingFont, fontSize: t.rank === 1 ? 32 : 26, fontWeight: 800, color: m ? m.metal : C.text, lineHeight: 1 }}>#{t.rank}</div>
                   {/* 2. Team name */}
                   <div style={{ fontSize: 16, fontWeight: 800, color: C.text, maxWidth: "100%", whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis" }}>
                     {t.team_name || "Unnamed team"}{mine && <> <LbBadge kind="you" /></>}
                   </div>
                   {/* 3. Median adjusted accuracy */}
                   <div style={{ display: "flex", flexDirection: "column", alignItems: "center", gap: 3, marginTop: 2 }}>
-                    <div style={{ fontFamily: "'Unbounded', sans-serif", fontSize: 30, fontWeight: 800, color: m ? m.metal : C.text, lineHeight: 1 }}>{formatAccuracyPct(t.median_adjusted_accuracy)}</div>
+                    <div style={{ fontFamily: TYPO.headingFont, fontSize: 30, fontWeight: 800, color: m ? m.metal : C.text, lineHeight: 1 }}>{formatAccuracyPct(t.median_adjusted_accuracy)}</div>
                     <LbTip label="Median adjusted accuracy" tip={LB_TIP.median} labelStyle={{ fontSize: 10, fontWeight: 700, letterSpacing: "0.06em", textTransform: "uppercase", color: C.textSub }} />
                   </div>
                   {/* 4. Qualification information */}
@@ -7537,7 +7561,7 @@ function RalliLeaderboard({ currentUser, isManager }) {
   const DrillDown = () => (
     <div style={{ display: "flex", flexDirection: "column", gap: 16 }}>
       <button onClick={() => setDrill(null)} style={{ alignSelf: "flex-start", background: "none", border: "none", cursor: "pointer", fontSize: 13, fontWeight: 700, color: C.textSub, padding: 0 }}>← Back to Teams</button>
-      <h3 style={{ margin: 0, fontFamily: "'Unbounded', sans-serif", fontSize: 18, fontWeight: 800, color: C.text }}>{drill.teamName || "Team"}</h3>
+      <h3 style={{ margin: 0, fontFamily: TYPO.headingFont, fontSize: 18, fontWeight: 800, color: C.text }}>{drill.teamName || "Team"}</h3>
       {members.loading ? <LbStateCard title="Loading team members…" />
         : members.error ? <LbStateCard title="Couldn't load this team" body="You may only view your own team, or the service returned an error." action={retryBtn} />
         : <IndividualsTable rows={members.data?.rows || []} scopedToTeam />}
@@ -23322,7 +23346,7 @@ function InviteScreen({ token, onSuccess }) {
     <div style={{
       minHeight: "100vh", background: C.pageBg,
       display: "flex", alignItems: "center", justifyContent: "center",
-      padding: 20, fontFamily: "'Plus Jakarta Sans', sans-serif",
+      padding: 20, fontFamily: TYPO.bodyFont,
     }}>
       <div style={{ width: "100%", maxWidth: 420 }}>
 
@@ -23524,7 +23548,7 @@ function ResetPasswordScreen({ onSuccess }) {
     <div style={{
       minHeight: "100vh", display: "flex", alignItems: "flex-start", justifyContent: "center",
       background: C.cream,
-      fontFamily: "'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif",
+      fontFamily: TYPO.bodyFont,
       padding: "48px 20px 24px",
     }}>
       <div style={{ width: "100%", maxWidth: 400, margin: "0 auto" }}>
@@ -23696,7 +23720,7 @@ function LoginScreen({ onLogin, users = USERS }) {
     <div style={{
       minHeight: "100vh", display: "flex", alignItems: "flex-start", justifyContent: "center",
       background: C.cream,
-      fontFamily: "'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif",
+      fontFamily: TYPO.bodyFont,
       padding: "48px 20px 24px",
     }}>
       <div style={{ width: "100%", maxWidth: 400, margin: "0 auto" }}>
@@ -24916,7 +24940,7 @@ function ToastContainer() {
               boxShadow: "0 4px 16px rgba(0,0,0,0.10)",
               maxWidth: 360, minWidth: 240,
               animation: "ralliToastIn 0.2s ease",
-              fontFamily: "'Plus Jakarta Sans',sans-serif",
+              fontFamily: TYPO.bodyFont,
             }}>
               <span style={{
                 width: 18, height: 18, borderRadius: "50%",
@@ -25079,7 +25103,7 @@ class AppErrorBoundary extends React.Component {
     return (
       <div style={{
         minHeight: "100vh", display: "flex", alignItems: "center", justifyContent: "center",
-        background: "#F9FAFB", fontFamily: "'Inter', sans-serif", padding: 24,
+        background: "#F9FAFB", fontFamily: TYPO.bodyFont, padding: 24,
       }}>
         <div style={{ maxWidth: 420, textAlign: "center" }}>
           <div style={{ fontSize: 36, marginBottom: 16 }}>⚠️</div>
@@ -25098,13 +25122,9 @@ class AppErrorBoundary extends React.Component {
 }
 
 export default function App() {
-  React.useEffect(() => {
-    const link = document.createElement("link");
-    link.rel = "stylesheet";
-    link.href = "https://fonts.googleapis.com/css2?family=Plus+Jakarta+Sans:wght@400;500;600;700;800;900&display=swap";
-    document.head.appendChild(link);
-    document.body.style.fontFamily = "'Plus Jakarta Sans', sans-serif";
-  }, []);
+  // Typography is governed centrally by index.html (--font-body = Outfit, --font-heading =
+  // Unbounded). The previous runtime injection of "Plus Jakarta Sans" (a conflicting family that
+  // overrode the intended Outfit body) has been removed — see docs/engineering/TYPOGRAPHY_AND_VISUAL_SYSTEM.md.
   const mobile = useMobile();
   const toast  = useToast();
   const assignSkipPanel = useAssignmentSkipPanel(); // Sprint 2 Task 6 — "View details" on skipped users
@@ -27010,7 +27030,7 @@ export default function App() {
     <AppErrorBoundary>
     <div style={{
       display: "flex", height: "100vh",
-      fontFamily: "'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif",
+      fontFamily: TYPO.bodyFont,
       fontSize: 14, background: C.pageBg, overflow: "hidden",
       flexDirection: mobile ? "column" : "row",
     }}>

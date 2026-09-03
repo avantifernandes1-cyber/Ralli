@@ -37,11 +37,67 @@
     <!-- Fonts -->
     <link rel="preconnect" href="https://fonts.googleapis.com" />
     <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
-    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800;900&family=Outfit:wght@400;500;600;700;800&family=Unbounded:wght@700;800&display=swap" rel="stylesheet" />
+    <link href="https://fonts.googleapis.com/css2?family=Outfit:wght@400;500;600;700;800;900&family=Unbounded:wght@500;600;700;800;900&display=swap" rel="stylesheet" />
     <style>
       *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
-      body { font-family: 'Outfit', -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; }
+
+      /* ── Ralli canonical typography — single source of truth ──────────────────
+         Heading stack = Unbounded (display). Body/UI stack = Outfit. Both keep safe
+         system fallbacks so text stays readable if a web font fails to load; the app
+         shell renders normally on font failure (no blank page, no FOIT beyond swap). */
+      :root {
+        --font-heading: 'Unbounded', 'Outfit', -apple-system, BlinkMacSystemFont, 'Segoe UI', system-ui, sans-serif;
+        --font-body:    'Outfit', -apple-system, BlinkMacSystemFont, 'Segoe UI', system-ui, sans-serif;
+      }
+      html { -webkit-text-size-adjust: 100%; }
+      body {
+        font-family: var(--font-body);
+        font-synthesis-weight: none;          /* never fake-bold a missing weight */
+        -webkit-font-smoothing: antialiased;
+        text-rendering: optimizeLegibility;
+      }
       #root { height: 100vh; }
+
+      /* Meaningful DISPLAY headings → Unbounded. h3 stays Outfit on purpose so small
+         section labels / table-ish h3s don't lose readability. Per-heading inline
+         font-size and font-weight are preserved — only family + leading are set here. */
+      h1, h2 { font-family: var(--font-heading); line-height: 1.15; letter-spacing: -0.01em; }
+
+      /* CONTENT is not display type: quiz questions/answers, lesson & battle-card body,
+         and user-authored rich text stay in Outfit even when marked up as a heading.
+         (:where keeps specificity at .rl-content so it overrides the h1/h2 rule but any
+         inline style still wins; user bold/italic/list formatting is untouched.) */
+      .rl-content, .rl-content :where(h1, h2, h3, h4, h5, h6) {
+        font-family: var(--font-body); letter-spacing: normal;
+      }
+
+      /* Opt-in semantic classes for div-based titles + supporting text (mirror of TYPO tokens). */
+      .ty-display       { font-family: var(--font-heading); font-weight: 800; line-height: 1.08; letter-spacing: -0.015em; font-size: clamp(28px, 4.5vw, 44px); }
+      .ty-page-title    { font-family: var(--font-heading); font-weight: 800; line-height: 1.12; letter-spacing: -0.01em; font-size: clamp(22px, 2.6vw, 30px); }
+      .ty-section-title { font-family: var(--font-heading); font-weight: 700; line-height: 1.18; letter-spacing: -0.005em; font-size: clamp(17px, 1.6vw, 20px); }
+      .ty-card-title    { font-family: var(--font-heading); font-weight: 700; line-height: 1.2; }
+      .ty-modal-title   { font-family: var(--font-heading); font-weight: 700; line-height: 1.2; font-size: clamp(18px, 2vw, 22px); }
+      .ty-empty-title   { font-family: var(--font-heading); font-weight: 700; line-height: 1.2; }
+      .ty-subtitle      { font-family: var(--font-body); font-weight: 500; line-height: 1.5; }
+      .ty-body          { font-family: var(--font-body); font-weight: 400; line-height: 1.55; }
+      .ty-caption       { font-family: var(--font-body); font-weight: 500; line-height: 1.4; font-size: 12px; }
+      .ty-label         { font-family: var(--font-body); font-weight: 700; letter-spacing: 0.02em; }
+      .ty-control       { font-family: var(--font-body); font-weight: 700; }
+      .ty-metric        { font-family: var(--font-heading); font-weight: 800; font-variant-numeric: tabular-nums; letter-spacing: -0.01em; }
+
+      /* Accessibility: restrained keyboard focus ring for interactive elements that don't
+         already define one. :where() keeps specificity 0 so any component style wins. */
+      :where(a, button, [role="button"], input, select, textarea, summary, [tabindex]):focus-visible {
+        outline: 2px solid #0EA5E9; outline-offset: 2px; border-radius: 4px;
+      }
+
+      /* Respect reduced-motion for every animation/transition. */
+      @media (prefers-reduced-motion: reduce) {
+        *, *::before, *::after {
+          animation-duration: 0.001ms !important; animation-iteration-count: 1 !important;
+          transition-duration: 0.001ms !important; scroll-behavior: auto !important;
+        }
+      }
     </style>
   </head>
   <body>
