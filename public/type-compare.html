@@ -1,0 +1,213 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Ralli — heading font comparison</title>
+<meta name="robots" content="noindex" />
+<link rel="preconnect" href="https://fonts.googleapis.com" />
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+<!-- Body = Outfit. Candidate heading faces: Space Grotesk / Sora / Manrope. Only weights displayed
+     (500/600/700) are loaded for each candidate so nothing is synthesised; display=swap; fallbacks. -->
+<link href="https://fonts.googleapis.com/css2?family=Outfit:wght@400;500;600;700;800&family=Space+Grotesk:wght@500;600;700&family=Sora:wght@500;600;700&family=Manrope:wght@500;600;700&display=swap" rel="stylesheet" />
+<style>
+  :root{
+    --body:'Outfit',-apple-system,BlinkMacSystemFont,'Segoe UI',system-ui,sans-serif;
+    --grotesk:'Space Grotesk',var(--body);
+    --sora:'Sora',var(--body);
+    --manrope:'Manrope',var(--body);
+    --pageBg:#F6F7F9; --card:#FFFBF0; --cardBorder:#EDE8D4; --white:#fff; --muted:#FFFBEF;
+    --text:#0B1220; --sub:#334155; --mut:#64748B; --border:rgba(11,18,32,.08);
+    --orange:#FDBF24; --orangeL:#FFFBEF; --orangeB:#FFD86A; --orangeD:#B07C00;
+    --green:#22C55E; --greenBg:#DCFCE7; --blue:#0EA5E9; --blueBg:#F0F9FF;
+    --shadowSm:0 1px 2px rgba(11,18,32,.05),0 1px 4px rgba(11,18,32,.04);
+    --shadowMd:0 2px 8px rgba(11,18,32,.07),0 1px 2px rgba(11,18,32,.04);
+  }
+  *{box-sizing:border-box;margin:0;padding:0}
+  body{font-family:var(--body);background:var(--pageBg);color:var(--text);-webkit-font-smoothing:antialiased;text-rendering:optimizeLegibility;font-synthesis-weight:none;padding:0 0 60px}
+  .v-grotesk{--h:var(--grotesk)} .v-sora{--h:var(--sora)} .v-manrope{--h:var(--manrope)}
+
+  /* CANDIDATE heading font — applied ONLY via these explicit roles, never to every h-tag. */
+  .t-pagetitle{font-family:var(--h);font-weight:700;font-size:26px;line-height:1.12;letter-spacing:-.01em;color:var(--text)}
+  .t-sectiontitle{font-family:var(--h);font-weight:700;font-size:18px;line-height:1.2;letter-spacing:-.005em;color:var(--text)}
+  .t-cardtitle{font-family:var(--h);font-weight:600;font-size:15px;line-height:1.2;color:var(--text)}
+  .t-modaltitle{font-family:var(--h);font-weight:700;font-size:20px;line-height:1.18;color:var(--text)}
+  .t-metric{font-family:var(--h);font-weight:700;font-size:30px;line-height:1;letter-spacing:-.01em;color:var(--text);font-variant-numeric:tabular-nums}
+
+  /* OUTFIT for everything else (defaults, but named for clarity). */
+  .t-subtitle{font-weight:500;font-size:14px;line-height:1.5;color:var(--sub)}
+  .t-label{font-weight:700;font-size:11px;letter-spacing:.06em;text-transform:uppercase;color:var(--mut)}
+  .t-body{font-weight:400;font-size:14px;line-height:1.55;color:var(--sub)}
+
+  /* Layout chrome (identical across variants) */
+  .wrap{max-width:1120px;margin:0 auto;padding:0 20px}
+  .variant-head{position:sticky;top:0;z-index:5;background:#0B1220;color:#fff;padding:10px 20px;font-family:var(--body);font-weight:700;font-size:13px;letter-spacing:.04em;display:flex;align-items:center;gap:10px}
+  .variant-head .pill{font-family:var(--h);font-weight:700;background:rgba(255,255,255,.12);padding:3px 10px;border-radius:99px}
+  .app{display:grid;grid-template-columns:200px 1fr;gap:0;min-height:520px;border-bottom:8px solid #E7E9EE}
+  .side{background:var(--white);border-right:1px solid var(--border);padding:16px 10px}
+  .brand{font-family:var(--h);font-weight:700;font-size:18px;color:var(--orangeD);padding:6px 10px 14px}
+  .nav{display:flex;flex-direction:column;gap:2px}
+  .navi{display:flex;align-items:center;gap:10px;padding:9px 12px;border-radius:10px;font-family:var(--body);font-weight:600;font-size:13px;color:var(--sub);cursor:default}
+  .navi.active{background:var(--muted);color:var(--text)}
+  .navi .dot{width:16px;height:16px;border-radius:5px;background:#E5E7EB;flex:0 0 auto}
+  .navi.active .dot{background:var(--orange)}
+  .main{padding:22px 24px;min-width:0}
+  .row{display:flex;align-items:center;justify-content:space-between;gap:12px;flex-wrap:wrap}
+  .tabs{display:inline-flex;gap:4px;background:var(--muted);border-radius:10px;padding:4px;margin:16px 0}
+  .tab{font-family:var(--body);font-weight:700;font-size:13px;padding:7px 16px;border-radius:8px;color:var(--sub);cursor:default}
+  .tab.active{background:var(--white);color:var(--text);box-shadow:var(--shadowSm)}
+  .btn{font-family:var(--body);font-weight:700;font-size:13px;padding:9px 18px;border-radius:10px;border:none;background:var(--orange);color:#111;cursor:default}
+  .btn.ghost{background:var(--white);border:1px solid var(--border);color:var(--text)}
+  .kpis{display:grid;grid-template-columns:repeat(auto-fit,minmax(180px,1fr));gap:12px;margin:6px 0 22px}
+  .kpi{background:var(--white);border:1px solid var(--border);border-radius:14px;padding:16px;box-shadow:var(--shadowSm)}
+  .kpi .delta{font-family:var(--body);font-weight:700;font-size:12px;color:var(--green)}
+  .filters{display:flex;gap:14px;align-items:end;flex-wrap:wrap;margin:6px 0 12px}
+  .field{display:flex;flex-direction:column;gap:5px}
+  .select{font-family:var(--body);font-weight:600;font-size:13px;padding:8px 12px;border-radius:9px;border:1px solid var(--border);background:var(--white);color:var(--text);min-width:150px}
+  table{width:100%;border-collapse:collapse;background:var(--white);border:1px solid var(--border);border-radius:12px;overflow:hidden}
+  th{font-family:var(--body);text-align:left;font-weight:800;font-size:10px;letter-spacing:.07em;text-transform:uppercase;color:var(--mut);padding:10px 12px;background:#FCFCFD}
+  td{font-family:var(--body);font-size:13px;color:var(--text);padding:11px 12px;border-top:1px solid var(--border)}
+  td.num{text-align:right;font-variant-numeric:tabular-nums;color:var(--sub)}
+  .chip{font-family:var(--body);font-weight:700;font-size:11px;padding:3px 9px;border-radius:99px}
+  .chip.ok{background:var(--greenBg);color:#15803D}.chip.warn{background:#FEF3C7;color:#92400E}.chip.new{background:var(--blueBg);color:#0369A1}
+  .card{background:var(--card);border:1px solid var(--cardBorder);border-radius:14px;padding:16px;box-shadow:var(--shadowSm)}
+  .grid2{display:grid;grid-template-columns:1.4fr 1fr;gap:16px;margin-top:22px}
+  /* Podium (approved softened look) */
+  .podium{display:flex;gap:14px;align-items:flex-end;justify-content:center;flex-wrap:nowrap;margin-top:10px}
+  .pcol{flex:1 1 0;min-width:0;max-width:230px}
+  .pcard{display:flex;flex-direction:column;align-items:center;gap:9px;padding:16px 12px 20px;border-radius:16px;border:1px solid;box-shadow:var(--shadowMd)}
+  .p1{min-height:216px;background:radial-gradient(90% 90% at 14% 10%,rgba(255,255,255,.45),rgba(255,255,255,0) 40%),linear-gradient(140deg,#FFFDF4,#FBF1D4 55%,#F4E6BC);border-color:#EBD98A}
+  .p2{min-height:186px;background:radial-gradient(90% 90% at 14% 10%,rgba(255,255,255,.5),rgba(255,255,255,0) 40%),linear-gradient(140deg,#FFFFFF,#F1F4F7 55%,#E6EAEF);border-color:#D3D9E0}
+  .p3{min-height:168px;background:radial-gradient(90% 90% at 14% 10%,rgba(255,255,255,.42),rgba(255,255,255,0) 40%),linear-gradient(140deg,#FFFCF7,#F6EBDD 55%,#EEDBC7);border-color:#E2C6A6}
+  .prank{font-family:var(--h);font-weight:700;line-height:1}
+  .p1 .prank{font-size:32px;color:#B07C00}.p2 .prank{font-size:26px;color:#667081}.p3 .prank{font-size:26px;color:#96602F}
+  .pav{width:48px;height:48px;border-radius:50%;display:flex;align-items:center;justify-content:center;color:#fff;font-family:var(--body);font-weight:800;font-size:17px}
+  .p1 .pav{width:56px;height:56px;font-size:20px;background:hsl(28 52% 52%)}.p2 .pav{background:hsl(210 30% 55%)}.p3 .pav{background:hsl(20 45% 50%)}
+  .pname{font-family:var(--body);font-weight:800;font-size:14px;color:var(--text);max-width:100%;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+  .pscore{font-family:var(--h);font-weight:700;line-height:1;font-variant-numeric:tabular-nums}
+  .p1 .pscore{font-size:28px;color:#B07C00}.p2 .pscore{font-size:24px;color:#667081}.p3 .pscore{font-size:24px;color:#96602F}
+  .pcap{font-family:var(--body);font-size:11px;color:var(--sub)}
+  .pchip{font-family:var(--body);font-weight:700;font-size:11px;color:var(--sub);background:var(--white);border:1px solid var(--border);border-radius:8px;padding:3px 8px}
+  .empty{border:1px dashed var(--border);border-radius:14px;background:var(--white);padding:34px 20px;text-align:center;margin-top:16px}
+  @media (max-width:720px){ .app{grid-template-columns:1fr} .side{display:none} .grid2{grid-template-columns:1fr} .podium{flex-direction:column;align-items:stretch} .pcol{max-width:none} .pcard{min-height:0!important} }
+</style>
+</head>
+<body>
+<template id="panel">
+  <section class="variant">
+    <div class="variant-head">Heading font: <span class="pill">NAME</span> · body/UI stays Outfit · same content, sizes, colours &amp; spacing — only the heading face changes</div>
+    <div class="app">
+      <aside class="side">
+        <div class="brand">ralli</div>
+        <nav class="nav">
+          <div class="navi"><span class="dot"></span>Home</div>
+          <div class="navi active"><span class="dot"></span>Leadership</div>
+          <div class="navi"><span class="dot"></span>Learn</div>
+          <div class="navi"><span class="dot"></span>Ralli</div>
+          <div class="navi"><span class="dot"></span>Battle Cards</div>
+          <div class="navi"><span class="dot"></span>Settings</div>
+        </nav>
+      </aside>
+      <div class="main">
+        <!-- LEADERSHIP DASHBOARD -->
+        <div class="row">
+          <div>
+            <h1 class="t-pagetitle">Leadership Dashboard</h1>
+            <p class="t-subtitle">Team readiness across your organization · updated 2m ago</p>
+          </div>
+          <button class="btn">Export report</button>
+        </div>
+        <div class="tabs"><span class="tab active">Overview</span><span class="tab">Reps</span><span class="tab">Knowledge gaps</span></div>
+        <div class="kpis">
+          <div class="kpi"><div class="t-label">Team readiness</div><div class="t-metric">78%</div><div class="delta">+6 pts this month</div></div>
+          <div class="kpi"><div class="t-label">Avg quiz score</div><div class="t-metric">82%</div><div class="delta">+4% this month</div></div>
+          <div class="kpi"><div class="t-label">Below threshold</div><div class="t-metric">4</div><div class="delta" style="color:var(--mut)">−2 this month</div></div>
+        </div>
+
+        <!-- LEARN → ASSIGNMENTS -->
+        <h2 class="t-sectiontitle" style="margin-bottom:10px">Learn · Assignments</h2>
+        <div class="filters">
+          <div class="field"><span class="t-label">Status</span><select class="select"><option>All statuses</option></select></div>
+          <div class="field"><span class="t-label">Due</span><select class="select"><option>Next 30 days</option></select></div>
+          <div style="margin-left:auto"><button class="btn">Assign</button></div>
+        </div>
+        <table>
+          <thead><tr><th>Assignment</th><th>Type</th><th>Due</th><th style="text-align:right">Completion</th><th>Status</th></tr></thead>
+          <tbody>
+            <tr><td>Objection Handling — Pricing</td><td>Course</td><td>Sep 12</td><td class="num">86%</td><td><span class="chip ok">On track</span></td></tr>
+            <tr><td>Q3 Competitive Landscape</td><td>Quiz</td><td>Sep 09</td><td class="num">61%</td><td><span class="chip warn">At risk</span></td></tr>
+            <tr><td>Discovery Call Framework</td><td>Lesson</td><td>Sep 15</td><td class="num">—</td><td><span class="chip new">Newly assigned</span></td></tr>
+          </tbody>
+        </table>
+
+        <div class="grid2">
+          <div class="card">
+            <div class="t-cardtitle" style="margin-bottom:8px">Recommended for you</div>
+            <p class="t-body">Reps below threshold on <b>Pricing objections</b> improve fastest after the paired micro‑lesson and a live Ralli game. Assign both to close the gap this week.</p>
+          </div>
+          <div class="card" style="background:var(--white);border-color:var(--border)">
+            <div class="t-cardtitle" style="margin-bottom:10px">Knowledge gap</div>
+            <div class="row" style="justify-content:flex-start;gap:10px"><div class="t-metric" style="font-size:24px">−42%</div><p class="t-body" style="margin:0">memory drop · Off‑grid security protocol</p></div>
+          </div>
+        </div>
+
+        <!-- RALLI GAMES → LEADERBOARD -->
+        <h2 class="t-sectiontitle" style="margin:24px 0 4px">Ralli Games · Leaderboard</h2>
+        <p class="t-subtitle" style="margin-bottom:6px">Current month · organization individuals</p>
+        <div class="podium">
+          <div class="pcol"><div class="pcard p2">
+            <div class="prank">#2</div><div class="pav">AV</div>
+            <div class="pname">avanti</div><div class="pscore">77.8%</div><div class="pcap">adjusted accuracy</div>
+            <div style="display:flex;gap:6px"><span class="pchip">4 games</span><span class="pchip">26 q</span></div>
+          </div></div>
+          <div class="pcol"><div class="pcard p1">
+            <div class="prank">#1</div><div class="pav">AB</div>
+            <div class="pname">Avanti 815</div><div class="pscore">79.9%</div><div class="pcap">adjusted accuracy</div>
+            <div style="display:flex;gap:6px"><span class="pchip">4 games</span><span class="pchip">26 q</span></div>
+          </div></div>
+          <div class="pcol"><div class="pcard p3">
+            <div class="prank">#3</div><div class="pav">JM</div>
+            <div class="pname">Jordan M.</div><div class="pscore">74.1%</div><div class="pcap">adjusted accuracy</div>
+            <div style="display:flex;gap:6px"><span class="pchip">3 games</span><span class="pchip">22 q</span></div>
+          </div></div>
+        </div>
+
+        <!-- EMPTY / MODAL TITLE -->
+        <div class="empty">
+          <div class="t-modaltitle" style="margin-bottom:6px">No archived assignments yet</div>
+          <p class="t-body" style="max-width:420px;margin:0 auto">Completed and archived assignments will appear here with full analytics and per‑rep breakdowns.</p>
+          <button class="btn ghost" style="margin-top:14px">Learn more</button>
+        </div>
+      </div>
+    </div>
+  </section>
+</template>
+
+<div class="wrap" style="padding-top:18px">
+  <div class="t-pagetitle" style="font-family:var(--body);font-weight:800">Ralli — heading font comparison</div>
+  <p class="t-subtitle">Three otherwise‑identical variants. Body/UI is Outfit everywhere; only the heading font differs (page/section/modal/card titles + display metric &amp; podium values). Scroll through all three.</p>
+</div>
+
+<div id="mount"></div>
+
+<script>
+  const variants = [
+    { cls: "v-grotesk", name: "1 · Space Grotesk (recommended)" },
+    { cls: "v-sora",    name: "2 · Sora" },
+    { cls: "v-manrope", name: "3 · Manrope" },
+  ];
+  const tpl = document.getElementById("panel");
+  const mount = document.getElementById("mount");
+  for (const v of variants) {
+    const node = tpl.content.cloneNode(true);
+    const sec = node.querySelector(".variant");
+    sec.classList.add(v.cls);
+    sec.id = v.cls;
+    node.querySelector(".pill").textContent = v.name.split("·")[1] ? v.name.split(" · ")[1] || v.name : v.name;
+    node.querySelector(".variant-head").childNodes[0].textContent = "Heading font: ";
+    node.querySelector(".pill").textContent = v.name;
+    mount.appendChild(node);
+  }
+</script>
+</body>
+</html>
