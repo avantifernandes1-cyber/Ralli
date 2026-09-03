@@ -7112,7 +7112,12 @@ const LB_CSS = `
 .lb-podium{display:flex;gap:14px;align-items:flex-end;justify-content:center;flex-wrap:nowrap}
 .lb-podium-col{flex:1 1 0;min-width:0;max-width:260px}
 .lb-tablewrap{overflow-x:auto;border:1px solid ${C.border};border-radius:12px}
-.lb-teamgrid{display:grid;grid-template-columns:repeat(auto-fit,minmax(260px,1fr));gap:12px}
+.lb-teamgrid{display:grid;grid-template-columns:repeat(auto-fit,minmax(240px,1fr));gap:12px}
+.lb-tip{position:relative;display:inline-flex;align-items:center;cursor:help;outline:none}
+.lb-tip-label{border-bottom:1px dotted currentColor}
+.lb-tip:focus-visible .lb-tip-label{outline:2px solid #0EA5E9;outline-offset:2px;border-radius:3px}
+.lb-tip-bubble{position:absolute;left:50%;bottom:calc(100% + 8px);transform:translateX(-50%) translateY(4px);z-index:30;width:max-content;max-width:min(260px,78vw);white-space:normal;text-align:left;background:#0B1220;color:#fff;font-size:12px;font-weight:500;line-height:1.45;letter-spacing:normal;text-transform:none;padding:8px 10px;border-radius:8px;box-shadow:0 6px 20px rgba(11,18,32,.22);opacity:0;visibility:hidden;transition:opacity .12s,transform .12s;pointer-events:none}
+.lb-tip:hover .lb-tip-bubble,.lb-tip:focus .lb-tip-bubble,.lb-tip:focus-within .lb-tip-bubble{opacity:1;visibility:visible;transform:translateX(-50%) translateY(0)}
 @media (max-width:640px){
   .lb-podium{flex-direction:column;align-items:stretch}
   .lb-podium-col{max-width:none}
@@ -7164,6 +7169,26 @@ function LbProgress({ value, target, unit }) {
     </div>
   );
 }
+
+// Accessible explanatory tooltip: reveals `tip` on hover AND keyboard focus (tabbable), announces
+// "<label>. <tip>" to screen readers, and its bubble wraps + caps at 78vw so it never clips or
+// overflows on narrow screens. Plain-language copy only — ineligible learners simply lack enough data.
+function LbTip({ label, tip, ariaLabel, labelStyle, wrapStyle }) {
+  return (
+    <span className="lb-tip" tabIndex={0} role="note" aria-label={`${ariaLabel ?? (typeof label === "string" ? label : "")}. ${tip}`} style={wrapStyle}>
+      <span className="lb-tip-label" style={labelStyle}>{label}</span>
+      <span className="lb-tip-bubble" role="tooltip">{tip}</span>
+    </span>
+  );
+}
+
+// Plain-language tooltip copy (numbers are interpolated from the RPC payload at the call site).
+const LB_TIP = {
+  adjusted: "Adjusted accuracy uses only verified Ralli Live answers, with a confidence adjustment so a very small number of games doesn't dominate the rankings.",
+  median: "The middle adjusted-accuracy score among the team's eligible learners. This prevents one unusually high or low result from dominating the team score.",
+  participation: "The percentage of active learners on this team who have enough verified Ralli Live data to be ranked.",
+  qualified: "This team has at least 2 eligible learners and at least 50% eligible participation, so it can appear in team rankings.",
+};
 
 function RalliLeaderboard({ currentUser, isManager }) {
   const [timeframe, setTimeframe] = useState(DEFAULT_TIMEFRAME);
@@ -7278,7 +7303,7 @@ function RalliLeaderboard({ currentUser, isManager }) {
                 <div style={{ fontFamily: "'Unbounded', sans-serif", fontSize: r.rank === 1 ? 30 : 24, fontWeight: 800, color: m.metal, lineHeight: 1 }}>
                   {formatAccuracyPct(r.adjusted_accuracy)}
                 </div>
-                <div style={{ fontSize: 11, color: C.textSub }}>adjusted accuracy</div>
+                <LbTip label="adjusted accuracy" ariaLabel="Adjusted accuracy" tip={LB_TIP.adjusted} labelStyle={{ fontSize: 11, color: C.textSub }} />
                 <div style={{ display: "flex", gap: 6, flexWrap: "wrap", justifyContent: "center" }}>
                   <span style={{ fontSize: 11, fontWeight: 700, color: C.textSub, background: C.white, borderRadius: 8, padding: "3px 8px", border: `1px solid ${C.border}` }}>{r.games} games</span>
                   <span style={{ fontSize: 11, fontWeight: 700, color: C.textSub, background: C.white, borderRadius: 8, padding: "3px 8px", border: `1px solid ${C.border}` }}>{r.questions_faced} q</span>
@@ -7393,31 +7418,48 @@ function RalliLeaderboard({ currentUser, isManager }) {
               const m = LB_MEDALS[t.rank];
               const mine = t.team_id === myTeamId;
               return (
-                <div key={t.team_id} onClick={canOpen(t) ? () => setDrill({ teamId: t.team_id, teamName: t.team_name }) : undefined}
+                <div key={t.team_id} className="lb-teamcard"
+                  onClick={canOpen(t) ? () => setDrill({ teamId: t.team_id, teamName: t.team_name }) : undefined}
+                  role={canOpen(t) ? "button" : undefined} tabIndex={canOpen(t) ? 0 : undefined}
+                  onKeyDown={canOpen(t) ? (e) => { if (e.key === "Enter" || e.key === " ") { e.preventDefault(); setDrill({ teamId: t.team_id, teamName: t.team_name }); } } : undefined}
                   style={{
-                    position: "relative", padding: "16px", borderRadius: 16,
+                    position: "relative", padding: "18px 16px 16px", borderRadius: 16,
                     background: m ? m.bg : C.cardBg, border: `1px solid ${m ? m.ring : C.cardBorder}`,
                     cursor: canOpen(t) ? "pointer" : "default", boxShadow: t.rank === 1 ? C.shadowMd : C.shadowSm,
                     outline: mine ? `2px solid ${C.blue}` : "none",
+                    display: "flex", flexDirection: "column", alignItems: "center", gap: 8, textAlign: "center",
                   }}>
-                  <div style={{ display: "flex", alignItems: "center", gap: 10, marginBottom: 12 }}>
-                    <div style={{ minWidth: 0 }}>
-                      <div style={{ fontSize: 10, fontWeight: 800, letterSpacing: "0.08em", color: m ? m.metal : C.textMuted }}>RANK #{t.rank}</div>
-                      <div style={{ fontSize: 15, fontWeight: 800, color: C.text, whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis" }}>
-                        {t.team_name || "Unnamed team"}{mine && <> <LbBadge kind="you" /></>}
-                      </div>
-                    </div>
-                    <div style={{ marginLeft: "auto", textAlign: "right" }}>
-                      <div style={{ fontFamily: "'Unbounded', sans-serif", fontSize: 22, fontWeight: 800, color: m ? m.metal : C.text, lineHeight: 1 }}>{formatAccuracyPct(t.median_adjusted_accuracy)}</div>
-                      <div style={{ fontSize: 10, color: C.textSub }}>median adj.</div>
-                    </div>
+                  {/* 1. Rank — same prominent podium typography + gold/silver/bronze metal color */}
+                  <div style={{ fontFamily: "'Unbounded', sans-serif", fontSize: t.rank === 1 ? 32 : 26, fontWeight: 800, color: m ? m.metal : C.text, lineHeight: 1 }}>#{t.rank}</div>
+                  {/* 2. Team name */}
+                  <div style={{ fontSize: 16, fontWeight: 800, color: C.text, maxWidth: "100%", whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis" }}>
+                    {t.team_name || "Unnamed team"}{mine && <> <LbBadge kind="you" /></>}
                   </div>
-                  <div style={{ display: "flex", gap: 8, flexWrap: "wrap" }}>
-                    <span style={{ fontSize: 11, fontWeight: 700, color: C.textSub, background: C.white, borderRadius: 8, padding: "4px 10px", border: `1px solid ${C.border}` }}>{t.eligible_members}/{t.active_learners} eligible</span>
-                    <span style={{ fontSize: 11, fontWeight: 700, color: C.textSub, background: C.white, borderRadius: 8, padding: "4px 10px", border: `1px solid ${C.border}` }}>{t.participation_pct != null ? `${t.participation_pct}%` : "—"} participation</span>
-                    <span style={{ fontSize: 11, fontWeight: 800, color: C.trueGreen, background: C.trueGreenBg, borderRadius: 8, padding: "4px 10px" }}>Qualified</span>
+                  {/* 3. Median adjusted accuracy */}
+                  <div style={{ display: "flex", flexDirection: "column", alignItems: "center", gap: 3, marginTop: 2 }}>
+                    <div style={{ fontFamily: "'Unbounded', sans-serif", fontSize: 30, fontWeight: 800, color: m ? m.metal : C.text, lineHeight: 1 }}>{formatAccuracyPct(t.median_adjusted_accuracy)}</div>
+                    <LbTip label="Median adjusted accuracy" tip={LB_TIP.median} labelStyle={{ fontSize: 10, fontWeight: 700, letterSpacing: "0.06em", textTransform: "uppercase", color: C.textSub }} />
                   </div>
-                  {canOpen(t) && <div style={{ position: "absolute", top: 14, right: 14, color: C.textMuted, fontSize: 16 }}>›</div>}
+                  {/* 4. Qualification information */}
+                  <div style={{ display: "flex", gap: 8, flexWrap: "wrap", justifyContent: "center", marginTop: 4 }}>
+                    <LbTip
+                      label={`${t.eligible_members}/${t.active_learners} eligible`}
+                      ariaLabel={`${t.eligible_members} of ${t.active_learners} eligible`}
+                      tip={`${t.eligible_members} of the team's ${t.active_learners} active learners have enough verified Ralli Live data to be ranked.`}
+                      wrapStyle={{ background: C.white, borderRadius: 8, padding: "4px 10px", border: `1px solid ${C.border}` }}
+                      labelStyle={{ fontSize: 11, fontWeight: 700, color: C.textSub }} />
+                    <LbTip
+                      label={`${t.participation_pct != null ? `${t.participation_pct}%` : "—"} participation`}
+                      ariaLabel="Participation"
+                      tip={LB_TIP.participation}
+                      wrapStyle={{ background: C.white, borderRadius: 8, padding: "4px 10px", border: `1px solid ${C.border}` }}
+                      labelStyle={{ fontSize: 11, fontWeight: 700, color: C.textSub }} />
+                    <LbTip
+                      label="Qualified" tip={LB_TIP.qualified}
+                      wrapStyle={{ background: C.trueGreenBg, borderRadius: 8, padding: "4px 10px" }}
+                      labelStyle={{ fontSize: 11, fontWeight: 800, color: C.trueGreen }} />
+                  </div>
+                  {canOpen(t) && <div aria-hidden="true" style={{ position: "absolute", top: 12, right: 14, color: C.textMuted, fontSize: 16 }}>›</div>}
                 </div>
               );
             })}
