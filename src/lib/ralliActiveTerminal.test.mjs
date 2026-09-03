@@ -5,6 +5,7 @@
 import { readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { dirname, join } from "node:path";
+import { resolveHostPin } from "./hostPin.js";
 const here = dirname(fileURLToPath(import.meta.url));
 const app = readFileSync(join(here, "..", "..", "rankd-app.jsx"), "utf8");
 
@@ -58,9 +59,32 @@ ok("15 progressReqRef is a monotonic ref (declared once)",
 ok("16 denominator shows a genuine 0 active as 0 (no Math.max floor once the snapshot is loaded)",
    /const playerCount   = answerProgress \? answerProgress\.active : Math\.max\(chPlayers\.length, 1\)/.test(app));
 
-// ── Manager UI: game PIN in the host gameplay header ──────────────────────────
-ok("17 host gameplay top bar shows the game PIN next to the players-answered count",
-   /\{pin\}<\/div>[\s\S]{0,120}Game PIN[\s\S]{0,400}\{answeredCount\}\/\{playerCount\}/.test(app));
+// ── Host Game PIN (429bd0f): displayed value is derived from resolveHostPin(pin, restoredPin)
+//    and shown across EVERY host phase, surviving a host refresh via the durable restored PIN.
+//    These assert the CURRENT source/behavioral contract — the header no longer renders the raw
+//    `pin` prop, so this file no longer requires the obsolete literal `{pin}` markup. ──────────
+ok("17 host header imports resolveHostPin and derives the displayed value from resolveHostPin(pin, restoredPin)",
+   /import \{ resolveHostPin \} from "\.\/src\/lib\/hostPin\.js"/.test(app) &&
+   /const sessionPin = resolveHostPin\(pin, restoredPin\)/.test(app));
+ok("18 the active gameplay header renders <HostGamePin pin={sessionPin} /> in the SAME control region as the players-answered count",
+   /<HostGamePin pin=\{sessionPin\} \/>[\s\S]{0,400}\{answeredCount\}\/\{playerCount\}[\s\S]{0,140}players answered/.test(app));
+ok("19 HostGamePin renders nothing when there is no PIN (no empty label)",
+   /function HostGamePin\(\{ pin \}\) \{\s*if \(!pin\) return null;/.test(app));
+ok("20 the durable restored-session PIN is captured as the fallback (setRestoredPin from the host restore)",
+   /const \[restoredPin,\s*setRestoredPin\][\s\S]{0,80}useState\(null\)/.test(app) &&
+   /if \(sess\.pin\) setRestoredPin\(sess\.pin\)/.test(app));
+ok("21 PIN coverage across ALL host phases: open-review + scoreboard + question/reveal (HostGamePin), countdown (PIN: {sessionPin}), pause overlays (pinBlock)",
+   (app.match(/<HostGamePin pin=\{sessionPin\} \/>/g) || []).length >= 3 &&
+   /PIN: \{sessionPin\}/.test(app) &&
+   /const pinBlock = sessionPin \? \(/.test(app) &&
+   (app.match(/\{pinBlock\}/g) || []).length >= 2);
+ok("22 pause overlays render the PIN only when it exists (pinBlock is sessionPin ? … : null)",
+   /const pinBlock = sessionPin \? \([\s\S]{0,1000}\) : null;/.test(app));
+// Behavioral contract of the resolver the header relies on (imported directly; no app code changed).
+ok("23 resolveHostPin: empty live PIN + a restored PIN resolves to the restored value",
+   resolveHostPin("", "492188") === "492188" && resolveHostPin(null, "492188") === "492188");
+ok("24 resolveHostPin: live PIN preferred; both absent → null (so callers render no empty label)",
+   resolveHostPin("492188", "999") === "492188" && resolveHostPin(null, null) === null && resolveHostPin("  ", "") === null);
 
 console.log(`\n${pass} passed, ${fail} failed`);
 if (fail > 0) process.exit(1);

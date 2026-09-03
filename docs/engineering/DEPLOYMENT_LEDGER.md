@@ -1449,3 +1449,88 @@ isolation intact).
 **Status:** Ralli Live gameplay, recovery, scoring, and historical analytics — **live-QA passed, beta
 complete.** The future organization/team/individual **leaderboard remains separate and unimplemented**; no
 leaderboard UI is exposed. Ledger row 47.
+
+---
+
+## 2026-09-02 — Ralli Live leaderboard foundation (085) + marker lock (086) — APPLIED TO PRODUCTION
+
+Applied to production via the controlled `apply_migration` process from branch
+`feature/ralli-live-leaderboard-085`. No data backfill. Evidence: `list_migrations` (versions below are
+the two latest applied, no 087), read-only post-apply checks, and the committed migration file SHA-256.
+
+| # | version | migration | file | commit | SHA-256 | applied (UTC) | status |
+|---|---|---|---|---|---|---|---|
+| 48 | `20260902150740` | 085_ralli_live_leaderboard_foundation | supabase/migrations/085_ralli_live_leaderboard_foundation.sql | `518f70d` | `04981163c5aa1eecc47c0112d5db1756ecd74addff79678793d8878e720de326` | 2026-09-02 15:07:40 | PASS |
+| 49 | `20260902155414` | 086_lock_exposure_tracking_marker | supabase/migrations/086_lock_exposure_tracking_marker.sql | `4b4137e` | `e976abf7a316f868dc901af4f7f156929643db0766103d5cb41cece16ce40b1b` | 2026-09-02 15:54:14 | PASS |
+
+085 adds the immutable `game_question_exposures` denominator, the confidence-adjusted leaderboard RPCs
+(`rpc_ralli_leaderboard_individuals/_teams`, `rpc_ralli_team_members`, `ralli_resolve_timeframe`), the
+`game_sessions.exposure_fully_tracked` admission marker, and the durable `game_verification_queue` outbox.
+086 adds a `BEFORE INSERT OR UPDATE` trigger locking the marker to server-authoritative roles
+(`postgres`/`service_role`). Post-apply verified clean (queue/exposures/marker all 0; no data change;
+migrations 084–086 byte-identical; no 087).
+
+## 2026-09-02 — Edge Function deploys: verify-game-session v2 + verify-queue-worker v1
+
+Deployed via the controlled `deploy_edge_function` MCP tool; platform JWT verification kept ENABLED.
+
+- **Row 50 — verify-game-session v1 → v2** (id `a2b745d8-306c-4fc4-8b52-0e4d6dfa552a`): deployed
+  2026-09-02 17:07:39 UTC, ACTIVE, `verify_jwt=true`, `import_map=true`, ezbr
+  `6132240dd365a758ca2f2a36acee988cfa1f531b607ee2437f8d7abb79edd9af`. Moves grading + the record RPC into
+  the ONE shared canonical verifier; external HTTP contract unchanged (backward-compatible).
+- **Row 51 — verify-queue-worker v1** (id `3f8bf06c-c202-453b-bfd3-dea10ae3dc7f`): first deploy
+  2026-09-02 17:20:22 UTC, ACTIVE, `verify_jwt=true`, `import_map=false`, ezbr
+  `7f3acd8effc163d7e3f0e4e217295bf941e5839ed4e268e03f4612bd7642df9f` (recorded at the v1 deploy; the
+  function is now v2 — see Row 52). Durable drain for the 085 queue; not yet scheduled.
+
+## 2026-09-03 — Secure ~1-minute worker scheduling + worker authorization correction (v2) — Row 52
+
+- **Scheduler:** Supabase Cron via `pg_cron` (1.6.4) + `pg_net` (0.20.3) + Vault. Single job
+  `verify-queue-worker-every-minute`, schedule `* * * * *`, runs as `postgres`, POST to the exact worker
+  URL, with the bearer read at runtime from the Vault secret **`verify_worker_bearer`** (secret name only;
+  its value is NOT stored in the cron command, logs, or this ledger). The first authorized run under
+  worker v1 returned 401 — v1 used exact-string equality against `SUPABASE_SERVICE_ROLE_KEY`, which a valid
+  Vault `service_role` JWT does not byte-match — so the schedule was disabled pending the fix.
+- **verify-queue-worker v1 → v2** (authorization correction, commit `15b73b7`): deployed
+  2026-09-03 13:05:54 UTC, ACTIVE, `verify_jwt=true`, `import_map=false`, ezbr
+  `f61e9791bf91d1b3b653ea01143c80c3105f101fb26f106ba64cc6ec1885fcbb`. The gate now authorizes the
+  gateway-verified `role === "service_role"` claim of the JWT instead of string equality. The existing
+  Vault JWT then passed (authorized empty-queue run → `{ok:true, empty:true}`); the schedule was re-enabled
+  and a natural scheduled run succeeded. Current authoritative state (`list_edge_functions` + `cron.job`,
+  2026-09-03): worker **v2** ACTIVE, exactly one active job, `pg_cron`/`pg_net` installed, Vault secret
+  `verify_worker_bearer` present, **413 succeeded scheduled runs**.
+
+## 2026-09-03 — Leaderboard frontend merged to main + production deploy — Row 53
+
+Merge commit `2e39fb7` (`--no-ff`, parents `69b2e1e` + `15b73b7`) brought the server-verified leaderboard
+read path (RalliLeaderboard component + `ralliLeaderboardService/view/timeframe`) into `main`; the backend
+(085/086 + functions/worker/scheduler) was already live. Vercel production deployment
+`dpl_9PF7KHH9Lb56pSqfkw76AhF8ZJWQ` — **READY**, target production, commit `2e39fb7`, created
+2026-09-03 17:00:18 UTC, alias `runralli.com`.
+
+## 2026-09-03 — Host Game PIN visibility fix merged + production deploy — Row 54
+
+Merge commit `9157863` (`--no-ff`, parents `2e39fb7` + `429bd0f`) keeps the host Game PIN visible across
+all host phases and after a host refresh/restore (via `resolveHostPin`/`HostGamePin`, `src/lib/hostPin.js`);
+presentation-only, no backend change. Vercel production deployment `dpl_6iNWu1Xe8cDcY8hSuxT9p9AoHiEt` —
+**READY**, target production, commit `9157863`, created 2026-09-03 19:18:24 UTC, alias `runralli.com`.
+
+## 2026-09-03 — Leaderboard role-parity + gamified/polished presentation merged + production deploy — Row 55
+
+Merge commit `e75dcfe` (`--no-ff`, parents `9157863` + `b69aefc`) — one server-verified leaderboard inside
+Ralli Games for EVERY role (learner + manager/orgAdmin), global Leaderboard nav item removed, dead legacy
+XP `LeaderboardScreen` removed, gamified podium (rank-on-top, softened gold/silver/bronze), recognitions
+below the podium, podium-consistent team cards, and accessible (hover + keyboard) tooltips. Frontend-only —
+no RPC/scoring/worker/scheduler/Vault/migration/Game-PIN change; the Game PIN implementation is unchanged by
+this merge. Vercel production deployment `dpl_6mRpXpD7iarPw3GdHQbZep8kybSL` — **READY**, target production,
+commit `e75dcfe`, created 2026-09-03 19:39:33 UTC, alias `runralli.com` (current `origin/main`).
+
+## 2026-09-03 — Final authenticated production QA — Row 56
+
+Authenticated production QA **passed** for both the Host Game PIN (visible across host phases and after
+restore) and the leaderboard (learner AND manager/orgAdmin Leaderboard tabs inside Ralli Games; no global
+Leaderboard nav; podium / Teams / within-team / recognitions / tooltips; honest loading/empty/insufficient
+states). Read-only production RPC reconciliation (`current_month`) confirms the two eligible learners rank
+#1/#2 and the team qualifies (2 of 3 eligible, ≥50% participation); the exact percentages move over time as
+more verified games are played. No managers, admins, inactive users, demo sessions, or incompletely
+verified sessions appear. No credential value is recorded in this ledger. Ledger row 56.
