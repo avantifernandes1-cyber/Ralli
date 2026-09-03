@@ -7109,8 +7109,8 @@ const LB_CSS = `
 .lb-wrap{max-width:960px}
 .lb-controls{display:flex;align-items:center;justify-content:space-between;gap:12px;margin-bottom:8px;flex-wrap:wrap}
 .lb-reco-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(240px,1fr));gap:12px}
-.lb-podium{display:flex;gap:14px;align-items:flex-end;justify-content:center;flex-wrap:nowrap}
-.lb-podium-col{flex:1 1 0;min-width:0;max-width:260px}
+.lb-podium{display:flex;gap:16px;align-items:flex-end;justify-content:center;flex-wrap:nowrap}
+.lb-podium-col{flex:1 1 0;min-width:0;max-width:292px}
 .lb-tablewrap{overflow-x:auto;border:1px solid ${C.border};border-radius:12px}
 .lb-teamgrid{display:grid;grid-template-columns:repeat(auto-fit,minmax(240px,1fr));gap:12px}
 .lb-tip{position:relative;display:inline-flex;align-items:center;cursor:help;outline:none}
@@ -7128,9 +7128,12 @@ const LB_CSS = `
 // Rank tiering for the top three eligible ranks — differentiated by metal color, ring, gradient, and
 // card height only (gold/silver/bronze). No emoji: emphasis comes from typography/color/borders.
 const LB_MEDALS = {
-  1: { metal: "#E0A400", ring: "#F3D250", bg: "linear-gradient(180deg,#FFF7DA 0%,#FFEFB8 100%)", minH: 248 },
-  2: { metal: "#8B94A3", ring: "#CBD2DB", bg: "linear-gradient(180deg,#F3F5F8 0%,#E7EBF0 100%)", minH: 214 },
-  3: { metal: "#B4794E", ring: "#DDB48A", bg: "linear-gradient(180deg,#F8EEE3 0%,#EFDCC7 100%)", minH: 190 },
+  1: { metal: "#E0A400", ring: "#F3D250", minH: 288, glow: "0 0 0 3px rgba(243,210,80,0.55), 0 0 28px rgba(224,164,0,0.30)",
+       bg: "radial-gradient(120% 120% at 12% 8%, rgba(255,255,255,0.60) 0%, rgba(255,255,255,0) 44%), linear-gradient(135deg,#FFF3CC 0%,#F6C64B 52%,#E09E00 100%)" },
+  2: { metal: "#8B94A3", ring: "#CBD2DB", minH: 246, glow: "",
+       bg: "radial-gradient(120% 120% at 12% 8%, rgba(255,255,255,0.65) 0%, rgba(255,255,255,0) 44%), linear-gradient(135deg,#FBFCFE 0%,#D7DEE7 52%,#B9C2CE 100%)" },
+  3: { metal: "#B4794E", ring: "#DDB48A", minH: 220, glow: "",
+       bg: "radial-gradient(120% 120% at 12% 8%, rgba(255,255,255,0.50) 0%, rgba(255,255,255,0) 44%), linear-gradient(135deg,#F7E6D2 0%,#DFAE7C 52%,#C07E45 100%)" },
 };
 
 // Deterministic avatar hue from a stable id — presentational only (no emoji is in the RPC payload).
@@ -7288,14 +7291,17 @@ function RalliLeaderboard({ currentUser, isManager }) {
           return (
             <div key={r.player_id} className="lb-podium-col">
               <div className="lb-pcard" style={{
-                display: "flex", flexDirection: "column", alignItems: "center", gap: 8,
-                padding: "14px 12px 18px", borderRadius: 16, background: m.bg,
+                display: "flex", flexDirection: "column", alignItems: "center", gap: 12,
+                padding: "22px 16px 26px", borderRadius: 18, background: m.bg,
                 border: `1px solid ${m.ring}`, minHeight: m.minH,
-                boxShadow: r.rank === 1 ? C.shadowMd : C.shadowSm,
+                boxShadow: (r.rank === 1
+                  ? "0 22px 48px rgba(11,18,32,0.18), 0 6px 16px rgba(11,18,32,0.10)"
+                  : "0 16px 36px rgba(11,18,32,0.14), 0 4px 12px rgba(11,18,32,0.08)")
+                  + (m.glow ? `, ${m.glow}` : ""),
               }}>
                 {/* Rank at the TOP of the card — gold/silver/bronze by metal color + weight (no emoji). */}
                 <div style={{ fontFamily: "'Unbounded', sans-serif", fontSize: r.rank === 1 ? 34 : 26, fontWeight: 800, color: m.metal, lineHeight: 1 }}>#{r.rank}</div>
-                <LbAvatar name={r.name} id={r.player_id} size={r.rank === 1 ? 56 : 48} ring={isMe ? C.blue : m.ring} />
+                <LbAvatar name={r.name} id={r.player_id} size={r.rank === 1 ? 64 : 48} ring={isMe ? C.blue : m.ring} />
                 <div style={{ display: "flex", alignItems: "center", gap: 6, maxWidth: "100%" }}>
                   <span style={{ fontWeight: 800, fontSize: 14, color: C.text, whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis" }}>{r.name}</span>
                   {isMe && <LbBadge kind="you" />}
@@ -7304,7 +7310,7 @@ function RalliLeaderboard({ currentUser, isManager }) {
                   {formatAccuracyPct(r.adjusted_accuracy)}
                 </div>
                 <LbTip label="adjusted accuracy" ariaLabel="Adjusted accuracy" tip={LB_TIP.adjusted} labelStyle={{ fontSize: 11, color: C.textSub }} />
-                <div style={{ display: "flex", gap: 6, flexWrap: "wrap", justifyContent: "center" }}>
+                <div style={{ display: "flex", gap: 6, flexWrap: "wrap", justifyContent: "center", marginTop: 8 }}>
                   <span style={{ fontSize: 11, fontWeight: 700, color: C.textSub, background: C.white, borderRadius: 8, padding: "3px 8px", border: `1px solid ${C.border}` }}>{r.games} games</span>
                   <span style={{ fontSize: 11, fontWeight: 700, color: C.textSub, background: C.white, borderRadius: 8, padding: "3px 8px", border: `1px solid ${C.border}` }}>{r.questions_faced} q</span>
                   {recognitions.fastAndAccurateIds?.has(r.player_id) && <LbBadge kind="fast" />}
