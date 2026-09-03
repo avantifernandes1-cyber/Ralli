@@ -19,13 +19,21 @@ test("reuses the shared canonical verification path and the pure orchestrator (n
 });
 
 test("service-role-only gate runs before any admin client or DB work", () => {
-  const gateIdx = src.indexOf("isAuthorizedWorkerRequest");
+  const gateIdx = src.indexOf("isAuthorizedWorkerRequest(req.headers");
   const adminIdx = src.indexOf("createClient(SUPABASE_URL, SERVICE_ROLE_KEY");
   const claimIdx = src.indexOf("rpc_claim_verification_job");
   assert.ok(gateIdx > 0, "gate present");
   assert.ok(gateIdx < adminIdx, "gate before service-role client");
   assert.ok(gateIdx < claimIdx, "gate before any claim");
   assert.match(src, /return json\(\{ error: "unauthorized" \}, 401\)/);
+});
+
+test("gate is claim-based (NOT exact-string equality against SUPABASE_SERVICE_ROLE_KEY)", () => {
+  // authorizes by the gateway-verified identity via an options object …
+  assert.match(src, /isAuthorizedWorkerRequest\(\s*req\.headers\.get\("Authorization"\)\s*,\s*\{\s*projectRef/);
+  // … and the service-role key is NOT passed into the gate as a secret to string-match.
+  assert.ok(!/isAuthorizedWorkerRequest\([^)]*SERVICE_ROLE_KEY/.test(src),
+    "service-role key must not be used for request authorization");
 });
 
 test("uses the migration-085 claim + complete RPCs", () => {

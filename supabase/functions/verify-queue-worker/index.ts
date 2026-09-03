@@ -7,12 +7,16 @@
 // completed real session is eventually verified.
 //
 // Security contract:
-//   - Server-owned only. The caller MUST present the service-role key as the bearer token
-//     (isAuthorizedWorkerRequest). Anonymous and ordinary authenticated callers are rejected 401.
+//   - Server-owned only. The caller MUST present a SERVICE-ROLE JWT as the bearer token. Platform
+//     `verify_jwt=true` cryptographically verifies that JWT (signature/project/expiry) BEFORE this
+//     code runs; isAuthorizedWorkerRequest then authorizes by the verified `role === "service_role"`
+//     identity (NOT by exact-string equality against the env key). Anonymous, ordinary authenticated,
+//     and app-role (learner/manager/org-admin) callers are rejected 401.
 //   - All DB work uses a service-role client; the migration-085 claim/complete RPCs additionally
 //     enforce the service_role JWT role, so even a leaked call path cannot claim jobs as a user.
-//   - The service-role key is read from the function env (Supabase secret); it is NEVER returned or
-//     logged. Failures are recorded as short generic codes only — no answers/snapshots/secrets.
+//   - The service-role key is read from the function env (Supabase secret) SOLELY to construct the
+//     admin Supabase client; it is NEVER used for request authorization, returned, or logged. No
+//     token or decoded claim is logged. Failures are short generic codes only — no answers/snapshots.
 //
 // Safety:
 //   - Bounded batch (MAX_BATCH) and wall-clock budget (MAX_RUNTIME_MS) so one invocation is always safe.
@@ -31,7 +35,19 @@ import { verifyCompletedSession, VERIFICATION_SOURCE_WORKER } from "../_shared/v
 import { runVerificationBatch, isAuthorizedWorkerRequest } from "../_shared/verifyQueueWorker.js";
 
 const SUPABASE_URL = Deno.env.get("SUPABASE_URL")!;
-const SERVICE_ROLE_KEY = Deno.env.get("SUPABASE_SERVICE_ROLE_KEY")!; // server-only secret
+const SERVICE_ROLE_KEY = Deno.env.get("SUPABASE_SERVICE_ROLE_KEY")!; // used ONLY to build the admin client below — never for request auth
+
+// Optional project pinning for the worker gate (belt-and-suspenders; the gateway already binds the
+// project via the JWT signature). Derived only for the standard *.supabase.co host, so a custom
+// domain can never cause a valid service-role token to be rejected.
+const PROJECT_REF = (() => {
+  try {
+    const host = new URL(SUPABASE_URL).host;
+    return host.endsWith(".supabase.co") ? host.split(".")[0] : undefined;
+  } catch {
+    return undefined;
+  }
+})();
 
 const MAX_BATCH = 10;          // bounded work per invocation
 const MAX_RUNTIME_MS = 25_000; // wall-clock budget < the 5-min processing lease, so a live job is never stolen
@@ -39,8 +55,9 @@ const MAX_RUNTIME_MS = 25_000; // wall-clock budget < the 5-min processing lease
 Deno.serve(async (req) => {
   if (req.method !== "POST") return json({ error: "method not allowed" }, 405);
 
-  // Service-role-only gate: reject anonymous and ordinary authenticated callers.
-  if (!isAuthorizedWorkerRequest(req.headers.get("Authorization"), SERVICE_ROLE_KEY)) {
+  // Service-role-only gate: authorize the SERVICE-ROLE IDENTITY of the JWT already cryptographically
+  // verified by the platform gateway (verify_jwt=true). Not a secret-string match against the env key.
+  if (!isAuthorizedWorkerRequest(req.headers.get("Authorization"), { projectRef: PROJECT_REF })) {
     return json({ error: "unauthorized" }, 401);
   }
 

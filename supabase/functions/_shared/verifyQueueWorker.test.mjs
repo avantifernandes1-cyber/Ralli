@@ -1,26 +1,105 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { runVerificationBatch, isAuthorizedWorkerRequest, safeEqual, sanitizeError } from "./verifyQueueWorker.js";
+import { readFileSync } from "node:fs";
+import { fileURLToPath } from "node:url";
+import { dirname, join } from "node:path";
+import { runVerificationBatch, isAuthorizedWorkerRequest, decodeSignedJwt, sanitizeError, WORKER_TRUSTED_ROLE } from "./verifyQueueWorker.js";
 
-// ── Auth gate ────────────────────────────────────────────────────────────────
-test("worker auth: only the exact service-role bearer is accepted", () => {
-  const key = "svc_role_key_ABC123";
-  assert.equal(isAuthorizedWorkerRequest(`Bearer ${key}`, key), true);
+// ── Worker authorization (claim-based, post-gateway) ─────────────────────────
+// DISTINCTION these tests make explicit:
+//   • CRYPTO ENFORCEMENT (signature, project binding, expiry) is done by the Supabase platform
+//     gateway (verify_jwt=true) BEFORE the worker runs. These unit tests exercise the POST-GATEWAY
+//     authorization logic; test tokens carry an arbitrary (fake) signature segment because the worker
+//     correctly does NOT re-verify the signature — that would require the project JWT secret.
+//   • WORKER CODE additionally admits only role==="service_role", re-checks expiry, optionally pins the
+//     project ref when present, and structurally rejects unsigned/alg:none/malformed tokens so it is
+//     not a forgeable claim reader if ever run without the gateway.
+const NOW = 1_700_000_000;                    // fixed test clock (seconds)
+const REF = "jdwqaypjxnnvxbqnxpet";
+const b64url = (v) => Buffer.from(typeof v === "string" ? v : JSON.stringify(v), "utf8").toString("base64url");
+// Build a compact JWS test token. A non-empty `sig` stands in for "gateway-verified".
+function jwt({ header = { alg: "HS256", typ: "JWT" }, payload = {}, sig = "gateway_verified_sig" } = {}) {
+  return `${b64url(header)}.${b64url(payload)}.${sig}`;
+}
+const svc = (over = {}) => jwt({ payload: { role: "service_role", ref: REF, iat: NOW - 10, exp: NOW + 3600, ...over } });
+const auth = (h, o = { now: NOW, projectRef: REF }) => isAuthorizedWorkerRequest(h, o);
+
+test("1) a gateway-verified service_role JWT is accepted", () => {
+  assert.equal(auth(`Bearer ${svc()}`), true);
 });
-test("worker auth: anonymous / ordinary / malformed callers denied", () => {
-  const key = "svc_role_key_ABC123";
-  assert.equal(isAuthorizedWorkerRequest("", key), false);                 // no header
-  assert.equal(isAuthorizedWorkerRequest("Bearer ", key), false);          // empty token
-  assert.equal(isAuthorizedWorkerRequest("Bearer user.jwt.token", key), false); // ordinary user
-  assert.equal(isAuthorizedWorkerRequest(`Bearer ${key}x`, key), false);   // wrong length
-  assert.equal(isAuthorizedWorkerRequest(`Basic ${key}`, key), false);     // wrong scheme
-  assert.equal(isAuthorizedWorkerRequest(`Bearer ${key}`, ""), false);     // no configured key ⇒ deny
+
+test("2) a DIFFERENT service_role JWT string (same identity) is also accepted — string-equality is gone", () => {
+  const t1 = jwt({ payload: { role: "service_role", ref: REF, iat: 1, exp: NOW + 3600 }, sig: "sigAAAA" });
+  const t2 = jwt({ payload: { role: "service_role", ref: REF, iat: 2, exp: NOW + 7200 }, sig: "sigZZZZ" });
+  assert.notEqual(t1, t2);
+  assert.equal(auth(`Bearer ${t1}`), true);
+  assert.equal(auth(`Bearer ${t2}`), true);
 });
-test("safeEqual is length-checked and value-correct", () => {
-  assert.equal(safeEqual("abc", "abc"), true);
-  assert.equal(safeEqual("abc", "abd"), false);
-  assert.equal(safeEqual("abc", "abcd"), false);
-  assert.equal(safeEqual(undefined, "abc"), false);
+
+test("3) authenticated JWT denied", () => {
+  assert.equal(auth(`Bearer ${jwt({ payload: { role: "authenticated", ref: REF, exp: NOW + 3600 } })}`), false);
+});
+
+test("4-6) learner / manager / org-admin (app roles under role=authenticated) denied", () => {
+  for (const appRole of ["learner", "manager", "org_admin"]) {
+    const t = jwt({ payload: { role: "authenticated", ref: REF, exp: NOW + 3600, app_metadata: { role: appRole } } });
+    assert.equal(auth(`Bearer ${t}`), false, `${appRole} must be denied`);
+  }
+});
+
+test("7) anon JWT denied", () => {
+  assert.equal(auth(`Bearer ${jwt({ payload: { role: "anon", ref: REF, exp: NOW + 3600 } })}`), false);
+});
+
+test("8) publishable key denied (not a JWT)", () => {
+  assert.equal(auth("Bearer sb_publishable_23QmHMDguaI4sVgkSXdGZQ_6-zV9KCF"), false);
+});
+
+test("9) sb_secret_ key denied as a JWT bearer (not a JWT)", () => {
+  assert.equal(auth("Bearer sb_secret_ABCDEFghijklmnop0123456789"), false);
+});
+
+test("10) malformed tokens denied", () => {
+  assert.equal(auth("Bearer abc"), false);       // no dots
+  assert.equal(auth("Bearer a.b"), false);       // 2 segments
+  assert.equal(auth("Bearer a.b.c.d"), false);   // 4 segments
+  assert.equal(auth("Bearer !.!.!"), false);     // not base64url / JSON
+  assert.equal(auth(""), false);                  // no header
+  assert.equal(auth("Bearer "), false);           // empty token
+  assert.equal(auth(`Basic ${svc()}`), false);    // wrong scheme
+});
+
+test("11) unsigned / alg:none tokens denied (structural, defense-in-depth)", () => {
+  assert.equal(auth(`Bearer ${jwt({ header: { alg: "none" }, payload: { role: "service_role", ref: REF, exp: NOW + 3600 }, sig: "" })}`), false);
+  assert.equal(auth(`Bearer ${jwt({ header: { alg: "none" }, payload: { role: "service_role", ref: REF, exp: NOW + 3600 }, sig: "x" })}`), false);
+  assert.equal(auth(`Bearer ${jwt({ payload: { role: "service_role", ref: REF, exp: NOW + 3600 }, sig: "" })}`), false);
+});
+
+test("12) expired service_role JWT denied", () => {
+  assert.equal(auth(`Bearer ${svc({ exp: NOW - 10 })}`), false);
+});
+
+test("13) wrong-project denied via optional ref pin; a token WITHOUT ref is NOT rejected (gateway is the project boundary)", () => {
+  assert.equal(auth(`Bearer ${svc({ ref: "someotherproject" })}`), false);
+  const noRef = jwt({ payload: { role: "service_role", exp: NOW + 3600 } });
+  assert.equal(auth(`Bearer ${noRef}`), true);
+});
+
+test("14) missing role claim denied", () => {
+  assert.equal(auth(`Bearer ${jwt({ payload: { ref: REF, exp: NOW + 3600 } })}`), false);
+});
+
+test("15) a spoofed role in a NON-gateway-verified (unsigned/alg:none) token cannot be accepted", () => {
+  assert.equal(auth(`Bearer ${jwt({ header: { alg: "none" }, payload: { role: "service_role", ref: REF, exp: NOW + 3600 }, sig: "" })}`), false);
+  assert.equal(decodeSignedJwt(jwt({ header: { alg: "none" }, payload: { role: "service_role" }, sig: "" })), null);
+});
+
+test("16) authorization returns a boolean only (no token/claims returned); shared module has no logging", () => {
+  assert.equal(typeof auth(`Bearer ${svc()}`), "boolean");
+  assert.equal(typeof auth("Bearer nope"), "boolean");
+  const modSrc = readFileSync(join(dirname(fileURLToPath(import.meta.url)), "verifyQueueWorker.js"), "utf8");
+  assert.ok(!/console\.(log|info|warn|error|debug)/.test(modSrc), "no console.* in the shared worker module");
+  assert.equal(WORKER_TRUSTED_ROLE, "service_role");
 });
 
 // ── Batch orchestration (verifyOne returns a typed { outcome }) ───────────────
