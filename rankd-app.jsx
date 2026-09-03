@@ -62,6 +62,7 @@ import { reconcileReveal } from "./src/lib/revealReconcile.js";
 // canonical question locally for its own reveal/scoring. See src/lib/playerSafeQuestion.js.
 import { toPlayerSafeQuestion, applyRevealToQuestion } from "./src/lib/playerSafeQuestion.js";
 import { evaluateConnectivity } from "./src/lib/zeroPlayerHalt.js";
+import { resolveHostPin } from "./src/lib/hostPin.js";
 import {
   getTenantCourses,
   getTenantLessons,
@@ -1965,6 +1966,28 @@ const Q_TYPE_ICONS  = { mc: "", tf: "", type: "", open: "", slider: "", match: "
 // ── REAL GAME HOST VIEW ──────────────────────────────────────
 const PURPLE = "#8B5CF6";
 
+// Presentation-only host PIN chip. Compact "PIN 123456" form that stays legible at
+// every width: it never shrinks (flexShrink 0) and never wraps its own value
+// (whiteSpace nowrap), so at narrow/split-screen widths it repositions with the rest
+// of the header rather than clipping or disappearing. Renders nothing when there is no
+// PIN (guarded) — it only displays the existing session PIN, never generates one.
+function HostGamePin({ pin }) {
+  if (!pin) return null;
+  return (
+    <div
+      title="Game PIN"
+      style={{
+        display: "inline-flex", alignItems: "baseline", gap: 6, flexShrink: 0,
+        whiteSpace: "nowrap", padding: "4px 10px", borderRadius: 10,
+        background: C.cardBg, border: `1px solid ${C.creamBorder}`,
+      }}
+    >
+      <span style={{ fontSize: 10, fontWeight: 800, letterSpacing: "0.08em", color: C.textMuted, textTransform: "uppercase" }}>PIN</span>
+      <span style={{ fontSize: 14, fontWeight: 900, letterSpacing: "0.10em", color: C.dark, fontVariantNumeric: "tabular-nums" }}>{pin}</span>
+    </div>
+  );
+}
+
 function KahootHostView({ onNav, sessionName, pin, sessionDbId, demoMode, tenantId, questions, broadcast, chAnswers, chPlayers, chStatus, onGameEnd, setChAnswers }) {
   const mobile       = useMobile();
   const toast        = useToast(); // in-scope notifications (scoreboard-publish failure, etc.)
@@ -2035,6 +2058,10 @@ function KahootHostView({ onNav, sessionName, pin, sessionDbId, demoMode, tenant
   const [restoreState, setRestoreState] = useState(sessionDbId ? "loading" : "done");
   const [restoreError, setRestoreError] = useState(null);
   const [retryCount,   setRetryCount]   = useState(0);
+  // Durable session PIN captured from the server-authorized host restore, used as a
+  // fallback for display when the `pin` prop (lobbyPin) is not rehydrated after a host
+  // refresh. Presentation-only; sourced from the existing session, never generated.
+  const [restoredPin,  setRestoredPin]  = useState(null);
 
   useEffect(() => {
     if (!sessionDbId) return; // demo mode — nothing to restore
@@ -2053,6 +2080,10 @@ function KahootHostView({ onNav, sessionName, pin, sessionDbId, demoMode, tenant
         if (!session.data) throw new Error("Session not found");
 
         const sess = session.data;
+
+        // Capture the durable session PIN so the host chrome can display it even when
+        // the `pin` prop (lobbyPin) wasn't rehydrated on a refresh. Existing value only.
+        if (sess.pin) setRestoredPin(sess.pin);
 
         // 2. phase==="waiting" → new game has not progressed past lobby; start normally
         if (sess.phase === "waiting") {
@@ -2713,17 +2744,21 @@ function KahootHostView({ onNav, sessionName, pin, sessionDbId, demoMode, tenant
     return () => { stale = true; };
   }, [sessionDbId, phase, openReveal]); // eslint-disable-line react-hooks/exhaustive-deps
 
+  // Single durable PIN for all host chrome: prefer the live prop, fall back to the
+  // PIN captured from the host restore so it survives a host refresh. Never generated.
+  const sessionPin = resolveHostPin(pin, restoredPin);
+
   // Shown on both pause overlays so the host can read the EXISTING game PIN to a
   // player who needs to rejoin (the overlay otherwise covers it). Purely
-  // presentational — uses the `pin` prop as-is; never generates a new PIN,
+  // presentational — uses the durable session PIN as-is; never generates a new PIN,
   // changes the session, or touches the channel. Copy reuses the same
   // navigator.clipboard.writeText pattern used elsewhere (invite links).
-  const pinBlock = pin ? (
+  const pinBlock = sessionPin ? (
     <div style={{ display: "flex", flexDirection: "column", alignItems: "center", gap: 6, marginTop: 4 }}>
       <span style={{ fontSize: 12, fontWeight: 700, letterSpacing: "0.14em", color: "rgba(255,255,255,0.65)", textTransform: "uppercase" }}>Game PIN</span>
-      <span style={{ fontSize: 40, fontWeight: 900, letterSpacing: "0.14em", color: "#fff", fontVariantNumeric: "tabular-nums" }}>{pin}</span>
+      <span style={{ fontSize: 40, fontWeight: 900, letterSpacing: "0.14em", color: "#fff", fontVariantNumeric: "tabular-nums" }}>{sessionPin}</span>
       <button
-        onClick={() => { navigator.clipboard.writeText(String(pin)); setPinCopied(true); setTimeout(() => setPinCopied(false), 1500); }}
+        onClick={() => { navigator.clipboard.writeText(String(sessionPin)); setPinCopied(true); setTimeout(() => setPinCopied(false), 1500); }}
         style={{ padding: "6px 16px", borderRadius: 99, border: `1px solid rgba(255,255,255,0.35)`, background: "transparent", color: "#fff", fontSize: 12, fontWeight: 700, cursor: "pointer" }}>
         {pinCopied ? "Copied!" : "Copy PIN"}
       </button>
@@ -3315,7 +3350,8 @@ function KahootHostView({ onNav, sessionName, pin, sessionDbId, demoMode, tenant
             <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
                             <span style={{ fontSize: 11, fontWeight: 700, color: "#7C3AED", letterSpacing: "0.1em" }}>OPEN-ENDED RESPONSES</span>
             </div>
-            <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
+            <div style={{ display: "flex", alignItems: "center", flexWrap: "wrap", justifyContent: "flex-end", gap: 8 }}>
+              <HostGamePin pin={sessionPin} />
               <span style={{ fontSize: 12, color: "rgba(255,255,255,0.35)" }}>Q{qIdx + 1}/{total}</span>
               {openResponses.length > 0 && (
                 <button onClick={() => setOpenGrades(g => ({ ...g, __showNames: !g.__showNames }))} style={{ padding: "4px 10px", borderRadius: 8, border: `1px solid ${PURPLE}44`, cursor: "pointer", background: openGrades.__showNames ? PURPLE + "33" : "transparent", color: openGrades.__showNames ? PURPLE : "rgba(255,255,255,0.4)", fontSize: 11, fontWeight: 700 }}>
@@ -3393,8 +3429,8 @@ function KahootHostView({ onNav, sessionName, pin, sessionDbId, demoMode, tenant
           <div style={{ position: "absolute", top: 3, width: 10, height: 10, borderRadius: "50%", background: C.gamePurple, opacity: cdNum === 0 ? 0 : 1, left: dotPos, transition: "left 0.35s cubic-bezier(0.34,1.56,0.64,1), opacity 0.2s" }} />
         </div>
         <div style={{ marginTop: 16, display: "flex", alignItems: "center", gap: 10, padding: "8px 18px", borderRadius: 12, background: C.cardBg, border: `1px solid ${C.creamBorder}` }}>
-          <span style={{ fontSize: 13, fontWeight: 800, letterSpacing: "0.1em", color: C.text }}>PIN: {pin}</span>
-          <span style={{ fontSize: 13, color: C.textMuted }}>· {dbParticipantCount} player{dbParticipantCount !== 1 ? "s" : ""}</span>
+          {sessionPin && <span style={{ fontSize: 13, fontWeight: 800, letterSpacing: "0.1em", color: C.text }}>PIN: {sessionPin}</span>}
+          <span style={{ fontSize: 13, color: C.textMuted }}>{sessionPin ? "· " : ""}{dbParticipantCount} player{dbParticipantCount !== 1 ? "s" : ""}</span>
         </div>
       </div>
     );
@@ -3408,6 +3444,9 @@ function KahootHostView({ onNav, sessionName, pin, sessionDbId, demoMode, tenant
             {isFinalQ ? "Final Leaderboard" : `After Question ${qIdx + 1} of ${total}`}
           </p>
           <h2 style={{ margin: "0 0 12px", fontSize: 26, fontWeight: 900, color: C.text }}>Leaderboard</h2>
+          {/* Keep the PIN visible on the between-question leaderboard too, so a host can
+              still read it to a rejoining learner. Presentational; existing PIN only. */}
+          <div style={{ display: "flex", justifyContent: "center" }}><HostGamePin pin={sessionPin} /></div>
         </div>
         <div style={{ width: "100%", maxWidth: 540, display: "flex", flexDirection: "column", gap: 8, marginBottom: 28 }}>
           {scores.map((p, i) => (
@@ -3434,39 +3473,42 @@ function KahootHostView({ onNav, sessionName, pin, sessionDbId, demoMode, tenant
 
   return (
     <div style={{ minHeight: "100%", display: "flex", flexDirection: "column", background: C.cream }}>
-      {/* Top bar */}
-      <div style={{ padding: "14px 28px", display: "flex", alignItems: "center", gap: 16, borderBottom: `1px solid ${C.border}`, flexShrink: 0, background: "rgba(255,255,255,0.7)", backdropFilter: "blur(8px)" }}>
+      {/* Top bar — wraps (never clips) at narrow/split-screen widths: the right-hand
+          cluster (PIN, player count, timer, controls) drops to its own line instead of
+          overflowing, so nothing disappears. */}
+      <div style={{ padding: "14px 28px", display: "flex", alignItems: "center", flexWrap: "wrap", columnGap: 16, rowGap: 10, borderBottom: `1px solid ${C.border}`, flexShrink: 0, background: "rgba(255,255,255,0.7)", backdropFilter: "blur(8px)" }}>
         <div style={{ padding: "5px 14px", borderRadius: 10, background: C.orangeLight, border: `1px solid ${C.orangeBorder}`, flexShrink: 0 }}>
           <span style={{ fontSize: 12, fontWeight: 900, color: C.dark }}>Q{qIdx + 1}</span>
           <span style={{ fontSize: 12, color: C.textMuted }}> / {total}</span>
         </div>
-        <div style={{ flex: 1, display: "flex", gap: 3 }}>
+        <div style={{ flex: "1 1 120px", minWidth: 80, display: "flex", gap: 3 }}>
           {questions.map((_, i) => (
             <div key={i} style={{ flex: 1, height: 4, borderRadius: 2, background: i < qIdx ? C.green : i === qIdx ? C.orange : "rgba(255,255,255,0.12)", transition: "background 0.3s" }} />
           ))}
         </div>
-        <div style={{ display: "flex", alignItems: "center", gap: 14 }}>
-          {/* Presentational: the existing game PIN next to the player count, so the host can read it to a
-              rejoining learner without leaving gameplay. Uses the `pin` prop — no session/channel change. */}
-          <div style={{ textAlign: "right" }}>
-            <div style={{ fontSize: 15, fontWeight: 800, letterSpacing: "0.08em", color: C.dark }}>{pin}</div>
-            <div style={{ fontSize: 10, color: C.textMuted }}>Game PIN</div>
-          </div>
-          <div style={{ textAlign: "right" }}>
+        <div style={{ display: "flex", alignItems: "center", flexWrap: "wrap", justifyContent: "flex-end", columnGap: 14, rowGap: 8, minWidth: 0, marginLeft: "auto" }}>
+          {/* Presentational: the existing durable session PIN beside the player count, so
+              the host can read it to a rejoining learner without leaving gameplay. Compact
+              chip that never shrinks/clips and repositions (wraps) at narrow widths. Uses
+              the restore-aware session PIN — no session/channel change. The cluster
+              (minWidth:0) wraps to its own line at narrow widths, and its non-shrinking
+              children wrap among themselves at ultra-narrow widths rather than clipping. */}
+          <HostGamePin pin={sessionPin} />
+          <div style={{ textAlign: "right", flexShrink: 0 }}>
             <div style={{ fontSize: 18, fontWeight: 900, color: answeredCount >= playerCount ? "#059669" : C.dark }}>{answeredCount}/{playerCount}</div>
             <div style={{ fontSize: 10, color: C.textMuted }}>players answered</div>
           </div>
-          <div style={{ width: 36, height: 36, borderRadius: "50%", background: timerColor, display: "flex", alignItems: "center", justifyContent: "center", fontWeight: 900, fontSize: 13, color: "#fff", transition: "background 0.3s" }}>{phase === "reveal" ? "✓" : timeLeft}</div>
+          <div style={{ width: 36, height: 36, borderRadius: "50%", background: timerColor, display: "flex", alignItems: "center", justifyContent: "center", fontWeight: 900, fontSize: 13, color: "#fff", flexShrink: 0, transition: "background 0.3s" }}>{phase === "reveal" ? "✓" : timeLeft}</div>
           {/* Admin controls */}
-          <button onClick={doTogglePause} title={paused ? "Resume" : "Pause"} style={{ width: 36, height: 36, borderRadius: "50%", border: `1px solid ${C.border}`, background: paused ? C.orange : "rgba(255,255,255,0.9)", color: paused ? "#fff" : C.dark, fontSize: 14, cursor: "pointer", display: "flex", alignItems: "center", justifyContent: "center" }}>
+          <button onClick={doTogglePause} title={paused ? "Resume" : "Pause"} style={{ width: 36, height: 36, borderRadius: "50%", border: `1px solid ${C.border}`, background: paused ? C.orange : "rgba(255,255,255,0.9)", color: paused ? "#fff" : C.dark, fontSize: 14, cursor: "pointer", display: "flex", alignItems: "center", justifyContent: "center", flexShrink: 0 }}>
             {paused ? "▶" : "⏸"}
           </button>
           {phase === "question" && (
-            <button onClick={() => setShowSkipConfirm(true)} title="Skip question — no points awarded" style={{ width: 36, height: 36, borderRadius: "50%", border: `1px solid ${C.border}`, background: "rgba(255,255,255,0.9)", color: C.dark, fontSize: 14, cursor: "pointer", display: "flex", alignItems: "center", justifyContent: "center" }}>
+            <button onClick={() => setShowSkipConfirm(true)} title="Skip question — no points awarded" style={{ width: 36, height: 36, borderRadius: "50%", border: `1px solid ${C.border}`, background: "rgba(255,255,255,0.9)", color: C.dark, fontSize: 14, cursor: "pointer", display: "flex", alignItems: "center", justifyContent: "center", flexShrink: 0 }}>
               ⏭
             </button>
           )}
-          <button onClick={() => setShowEndConfirm(true)} title="End game early" style={{ width: 36, height: 36, borderRadius: "50%", border: "1px solid rgba(239,68,68,0.5)", background: "rgba(239,68,68,0.08)", color: "#ef4444", fontSize: 14, cursor: "pointer", display: "flex", alignItems: "center", justifyContent: "center" }}>
+          <button onClick={() => setShowEndConfirm(true)} title="End game early" style={{ width: 36, height: 36, borderRadius: "50%", border: "1px solid rgba(239,68,68,0.5)", background: "rgba(239,68,68,0.08)", color: "#ef4444", fontSize: 14, cursor: "pointer", display: "flex", alignItems: "center", justifyContent: "center", flexShrink: 0 }}>
             ■
           </button>
         </div>
