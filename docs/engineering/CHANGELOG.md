@@ -1,5 +1,117 @@
 # Changelog
 
+## September 2026
+
+Ralli Live Leaderboard — Denominator Foundation (implemented locally, NOT applied/deployed/merged)
+
+On `feature/ralli-live-leaderboard-085` (branched from `origin/main`). Migration 085 is written and
+fully validated locally but is **NOT applied to production, no Edge Function deployed, no historical
+backfill, and the branch is not merged.** Until 085 is applied, the in-app leaderboard honestly shows
+its backend-unavailable / error+retry states.
+
+Foundation (migration 085, local only):
+
+- **Exposure denominator** (`game_question_exposures`): a durable, immutable, append-only row per
+  `(session_id, player_id, question_idx)` proving a canonical player was durably active when a
+  question began. Inserted idempotently inside the authoritative question-start transition of
+  `rpc_set_session_phase` (a faithful superset of the 084 version) for roster-active + participant-
+  active + fresh-heartbeat (≤40s) members only. Explicit-leave and stale members are never exposed;
+  disconnect-after-start keeps the exposure; demo/canceled/completed never expose. Blocked from
+  UPDATE/DELETE by trigger; tenant-scoped RLS; no client writes.
+- **Individual formula** (`rpc_ralli_leaderboard_individuals`): `adjusted_accuracy =
+  (verified_correct + 20·tenant_mean) / (eligible_questions_faced + 20)`, verified_correct from
+  authoritative 072 verifications only, denominator from exposure rows only, open-ended-pending
+  (no verdict) excluded from BOTH numerator and denominator, neutral prior 0.5 when no tenant
+  baseline. Eligibility ≥20 faced AND ≥3 games; otherwise unranked with progress. Dense ranking;
+  speed is a tie-break only (server-derived median normalized correct-response time). No XP / lifetime
+  / volume / client correctness anywhere.
+- **Team formula** (`rpc_ralli_leaderboard_teams`, `rpc_ralli_team_members`): median of eligible
+  members' adjusted accuracy from the 084 roster-snapshot team; ranked only with ≥2 eligible AND ≥50%
+  of active learners eligible. Learners may drill into their own team only; managers any same-tenant.
+- **Org timezone** (`tenants.timezone`, `rpc_get_org_timezone` / `rpc_set_org_timezone`): IANA,
+  default UTC, validated against `pg_timezone_names`, manager/orgAdmin write-only, learner read-only.
+  Half-open `[from, to)` timeframe boundaries computed client-side in the org tz.
+- **Durable verification queue/outbox** (`game_verification_queue` + completion trigger +
+  service-role-only `rpc_claim_verification_job` / `rpc_complete_verification_job`): a real session
+  reaching `completed` enqueues exactly once; demo/canceled excluded; exponential-backoff retries to a
+  terminal `failed`; stores no answer/verdict/snapshot material. No outbound HTTP from a trigger.
+- All privileged functions SECURITY DEFINER with `SET search_path=''`, tenant/caller server-derived,
+  anon/Public denied, aggregate-only returns (no answer text / correct-answer keys / snapshots).
+
+Frontend (feature branch only):
+
+- Leaderboard moved **into Ralli Live**: managers get Active / Past Sessions / Leaderboard; learners
+  get Join a Game / My Scores / Leaderboard. Leaderboard = Individuals (default) / Teams / team
+  drill-down, with a timeframe filter (Current month default, Last 2/3/4 months, Current calendar
+  year) and the active org timezone shown beside it. New `ralliLeaderboardService` + pure, unit-tested
+  `ralliLeaderboardTimeframe` (tz/DST-correct half-open ranges) and `ralliLeaderboardView`
+  (recognitions + formatting) helpers. All states implemented: loading / error+retry / no-verified-
+  games / not-enough-individual / not-enough-team / valid — service errors are never converted to
+  empty results.
+- Removed the global **Leaderboard** nav item and the old Home "Team Leaderboard" widget, which ranked
+  blended lifetime XP from `user_point_events` (not a valid readiness ranking). Scoring services kept
+  for their remaining consumers.
+
+Historical Ralli Live sessions predating 085 remain visible in Past Sessions/analytics but are
+excluded from ranking (no backfill/inference) — "Pre-leaderboard tracking."
+
+Pre-production corrections (still local only; 085 unapplied, worker not deployed/scheduled):
+
+- **Exposure freshness reuses the canonical durable-active definition.** Audit found the established
+  Ralli Live lifecycle uses a 15s participant heartbeat and a single 40s freshness window
+  (`HEARTBEAT_FRESH_MS`) shared by lobby visibility, in-game active count, and the zero-player halt;
+  the "~25s stale" figure survives only as a stale code comment, not in code. 085 already used that 40s
+  window via one helper; the only divergence was an inclusive `<=` vs the frontend's strict `<`. Fixed to
+  strict `<` so a heartbeat exactly at the edge is stale in the DB and client identically — no new,
+  more-permissive rule. Boundary tests added (39.5s in; exactly 40s + 41s out; Leave-over-fresh,
+  active-without-heartbeat, fresh-without-active-roster all excluded; rejoin re-qualifies at a later
+  question).
+- **Durable verification worker.** Added the server-owned worker the outbox needed (no worker existed;
+  the frontend fire-and-forget was not one): `verify-queue-worker` (Deno, service-role-only, bounded
+  batch + runtime budget) reusing the canonical verify path (`_shared/verifySession.js` → shared grader
+  + `record_game_verification`) via a pure, unit-tested orchestrator (`_shared/verifyQueueWorker.js`).
+  Added a **processing lease** to migration 085 (`lease_expires_at` + reclaim-expired-on-claim +
+  release-on-complete) so a crashed worker's job is never permanently stuck. Implemented + tested; NOT
+  deployed or scheduled (see docs/engineering/085_VERIFICATION_WORKER.md).
+- **Server-authoritative timeframes.** The leaderboard RPCs no longer accept client `from`/`to` dates;
+  they take an approved enum (`current_month`, `last_2_months`, `last_3_months`, `last_4_months`,
+  `current_year`) and a single server resolver (`ralli_resolve_timeframe`) derives the tenant, reads the
+  tenant IANA timezone (fallback UTC), computes the exact half-open `[from, to)` window, rejects
+  unsupported enums, and returns the resolved `{ timeframe, from, to, timezone, rows }`. Individuals,
+  Teams, and Team Members share the one resolver so their windows cannot disagree, and a client can no
+  longer widen the period. The frontend pure timeframe util is retained for labels/tests only. Server
+  timeframe tests added (UTC + America/New_York + year/last_N boundaries, invalid enum rejected,
+  all-three-RPCs-agree, arbitrary-date signature uncallable, invalid stored tz → UTC, tenant isolation).
+
+Canonical-verifier correction (still local only):
+
+- **One session-verification implementation.** Extracted the grade+record core into
+  `_shared/verifySession.js` (`verifyLoadedSession` + `verifyCompletedSession`) with a typed result
+  contract (verified/idempotent, ineligible, not_ready, integrity, transient, unauthorized,
+  bad_request). BOTH `verify-game-session` (on-demand) and `verify-queue-worker` now call it — the
+  grader (`buildSessionVerdicts`) and the writer RPC (`record_game_verification`) have exactly one call
+  site, so the two paths cannot drift. The Edge Function keeps only transport/auth/authz/CORS and its
+  existing HTTP mappings (external behavior preserved); authorization is entrypoint-owned (edge:
+  host/manager/admin; worker: service-role) and passed to the shared loader as a policy, never decided
+  from request fields. The worker maps the typed contract to the queue: verified/ineligible → done;
+  not_ready/transient → backoff retry; integrity/bad_request → terminal fail-fast (new `p_terminal` on
+  `rpc_complete_verification_job`). CORS/wiring tests updated to assert the shared implementation (and
+  that the entrypoint no longer re-implements the grader/RPC) without weakening security assertions.
+- **Stale heartbeat comment removed.** The lingering "~25s freshness" comment in `rankd-app.jsx` was
+  corrected to the exact contract (15s heartbeat write; fresh while age is STRICTLY < 40s; zero-player
+  halt adds its own 5s grace); a guard test (`ralliHeartbeatThreshold.test.mjs`) now fails if the
+  frontend `HEARTBEAT_FRESH_MS` and the DB `ralli_heartbeat_fresh_window()` ever diverge or go inclusive.
+- **Secure scheduler-secret docs.** `085_VERIFICATION_WORKER.md` now documents Vault-based secret
+  storage (pg_cron + pg_net pulling the bearer from `vault.decrypted_secrets`, or protected Scheduled
+  Functions), rotation, log redaction, and uncommitted local-dev env — placeholders only, no token-like
+  examples, service-role key never in SQL/docs/source/client vars.
+
+Validation (all local, green): 085 SQL harness (exposure lifecycle, individual/team formula, timezone,
+security, confidentiality, verification queue) + 085 two-connection concurrency (exposure idempotency,
+enqueue-once); 084 unchanged (byte-identical) and its concurrency still passes; full JS suite incl. new
+timeframe/view tests; esbuild parse; Vite build; trace/secret/payload-leak scans; migration-integrity
+scan (no prior migration edited).
+
 ## July 2026
 
 Ralli Live — Lifecycle & Confidentiality Foundation (in progress, not beta-complete)

@@ -120,6 +120,8 @@ import { getProfile, createMissingProfile, getTenantProfiles } from "./src/lib/p
 import { sendInviteEmail } from "./src/lib/emailService.js";
 import { provisionTenant, buildInviteUrl, normalizeProvisionedOrg, createMemberInvite } from "./src/lib/provisioningService.js";
 import { awardLessonPoints, awardCoursePoints, awardGamePointsForSession, getLeaderboard, computeUserMeta, getUserStreak } from "./src/lib/scoringService.js";
+import { TIMEFRAMES, DEFAULT_TIMEFRAME, loadIndividuals, loadTeams, loadTeamMembers } from "./src/lib/ralliLeaderboardService.js";
+import { computeRecognitions, partitionIndividuals, partitionTeams, formatAccuracyPct } from "./src/lib/ralliLeaderboardView.js";
 import { triggerReadinessUpdate, getTopicHeatmap, getOrgMetrics, getRepTopicScores, getUserPerformance, getRecommendations } from "./src/lib/insightsService.js";
 import { cellScore as heatmapCellScore, coverageLine as heatmapCoverageLine, thresholdNote as heatmapThresholdNote, hasVerifiedEvidence as heatmapHasEvidence } from "./src/lib/heatmapModel.js";
 import { listTenantQuizTags, listQuizTagMap, listQuizClassification, getQuizTagState, createQuizTag, renameQuizTag, archiveQuizTag, restoreQuizTag, mergeQuizTags, setQuizTags } from "./src/lib/taxonomyService.js";
@@ -829,14 +831,9 @@ function HomeScreen({ user, onNav, quizAssignments = [], onResumeLesson, onStart
   const [catalogLoading,     setCatalogLoading]     = useState(isReal);
   const [catalogError,       setCatalogError]       = useState(null);
 
-  // ── Leaderboard sidebar — reads from user_point_events (single source of truth)
-  const [homeLbRows, setHomeLbRows] = useState([]);
-  useEffect(() => {
-    if (!isReal || !tenantId) return;
-    getLeaderboard(tenantId, user?.id).then(({ data }) => {
-      if (data) setHomeLbRows(data.slice(0, 5));
-    });
-  }, [isReal, tenantId, user?.id]); // eslint-disable-line react-hooks/exhaustive-deps
+  // (The old Home "Team Leaderboard" sidebar widget — which ranked blended lifetime XP from
+  //  user_point_events — was removed. The leaderboard now lives in Ralli Live and is scored
+  //  server-side from verified Ralli Live accuracy over a chosen timeframe, migration 085.)
 
   // Course/lesson catalog — needed to render assignment cards (title,
   // lessonIds, etc.). Kept as its own small retryable fetch; combined with
@@ -956,7 +953,6 @@ function HomeScreen({ user, onNav, quizAssignments = [], onResumeLesson, onStart
       onResumeLesson={onResumeLesson}
       onStartCourse={onStartCourse}
       onStartQuiz={onStartQuiz}
-      homeLbRows={homeLbRows}
       quizzes={quizzes}
       quizAssignments={quizAssignments}
       homeCourses={homeCourses}
@@ -974,7 +970,7 @@ function HomeScreen({ user, onNav, quizAssignments = [], onResumeLesson, onStart
 function PersonalDashboardScreen({
   user, onNav, isReal, tenantId, orgUsers,
   enrichedAssignments, pendingAssignments, completedAssignments, overdueAssignments,
-  homeLoading, homeError, onRetryHome, onResumeLesson, onStartCourse, onStartQuiz, homeLbRows, quizzes,
+  homeLoading, homeError, onRetryHome, onResumeLesson, onStartCourse, onStartQuiz, quizzes,
   quizAssignments = [], homeCourses = [], homeLessons = [], homeQuizAttempts = [],
   readinessThreshold = 80,
 }) {
@@ -1567,57 +1563,10 @@ function PersonalDashboardScreen({
             </Card>
           </div>
 
-          {/* Mini Leaderboard */}
-          <div>
-            {SH("Team Leaderboard", "")}
-            <Card style={{ padding: 0, overflow: "hidden" }}>
-              {(() => {
-                const lbData = isReal
-                  ? homeLbRows.map(r => ({ ...r, score: r.total }))
-                  : leaderboardData.slice(0, 5).map(p => ({ ...p, isMe: p.userId ? p.userId === user?.id : !!p.isMe }));
-                if (!lbData.length) {
-                  return (
-                    <div style={{ padding: "20px", textAlign: "center", fontSize: 12, color: C.textSub }}>
-                      Rankings appear once your team earns XP.
-                    </div>
-                  );
-                }
-                return (
-                  <>
-                    {lbData.map((p, i) => (
-                      <div
-                        key={p.userId ?? i}
-                        style={{ display: "flex", alignItems: "center", gap: 10, padding: "10px 16px",
-                          background: p.isMe ? C.orangeLight : "transparent",
-                          borderBottom: i < lbData.length - 1 ? `1px solid ${C.border}` : "none" }}
-                      >
-                        <div style={{ width: 20, height: 20, borderRadius: "50%",
-                          background: p.rank === 1 ? "#F5A623" : p.rank === 2 ? "#A8B2C0" : p.rank === 3 ? "#CD7F32" : C.pageBg,
-                          display: "flex", alignItems: "center", justifyContent: "center",
-                          fontSize: 10, fontWeight: 800, color: p.rank <= 3 ? "#fff" : C.textSub, flexShrink: 0 }}>
-                          {p.rank}
-                        </div>
-                        <Avatar initials={p.initials} size={26} color={p.color} />
-                        <div style={{ flex: 1, minWidth: 0, fontSize: 12, fontWeight: p.isMe ? 700 : 500,
-                          color: p.isMe ? C.orange : C.text, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
-                          {p.name}
-                        </div>
-                        <div style={{ fontSize: 12, fontWeight: 700, color: C.text, flexShrink: 0 }}>
-                          {(p.score ?? 0).toLocaleString()}
-                        </div>
-                      </div>
-                    ))}
-                    <div style={{ padding: "10px 16px", borderTop: `1px solid ${C.border}`, textAlign: "center" }}>
-                      <span onClick={() => onNav?.("leaderboard")}
-                        style={{ fontSize: 12, color: C.orange, fontWeight: 600, cursor: "pointer" }}>
-                        Full leaderboard →
-                      </span>
-                    </div>
-                  </>
-                );
-              })()}
-            </Card>
-          </div>
+          {/* Team Leaderboard moved into Ralli Live (server-authoritative, timeframe-scoped,
+              verified-accuracy ranking — migration 085). The old Home widget ranked blended
+              lifetime XP from user_point_events, which is not a valid readiness ranking, so it
+              was removed rather than re-pointed here. */}
         </div>
       </div>
 
@@ -4192,10 +4141,15 @@ function KahootPlayerView({ onNav, playerName, playerEmoji, playerId, pin, sessi
   }, [sessionDbId, playerId, reconcile]);
 
   // Heartbeat: keep last_seen_at fresh while in-game so the host can detect
-  // stale connections. 15s interval pairs with the host's 25s freshness window
-  // (see the roster poll) so a present player is never dropped, but a gone
-  // player is detected within ~25s. Fire one immediately so a just-joined
-  // player has a fresh timestamp right away, not only after the first interval.
+  // stale connections. The 15s write interval pairs with the canonical freshness
+  // window HEARTBEAT_FRESH_MS = 40000 (see the top-of-file constant and the roster
+  // poll): a participant is "fresh" while (now - last_seen_at) is STRICTLY under 40s,
+  // so a present player (heartbeat every 15s) is never dropped, and a gone player is
+  // detected once its heartbeat crosses 40s (the zero-player halt then adds its own
+  // separate 5s grace). Migration 085 exposure eligibility uses this exact same
+  // definition (ralli_heartbeat_fresh_window() = 40s, strict "<"), so the database and
+  // the frontend agree. Fire one beat immediately so a just-joined player has a fresh
+  // timestamp right away, not only after the first interval.
   useEffect(() => {
     if (!sessionDbId || !playerId) return;
     const beat = () => updateParticipantHeartbeat(sessionDbId, playerId)
@@ -6710,15 +6664,15 @@ function RankdJoinPanel({ onJoin, sessions, currentUser }) {
     <div style={{ padding: 32, maxWidth: 900 }}>
       {/* Sub-tabs */}
       <div style={{ display: "flex", gap: 8, marginBottom: 28 }}>
-        {["join", "scores"].map(t => (
-          <button key={t} onClick={() => setTab(t)} style={{
+        {[{ id: "join", label: "Join a Game" }, { id: "scores", label: "My Scores" }, { id: "leaderboard", label: "Leaderboard" }].map(t => (
+          <button key={t.id} onClick={() => setTab(t.id)} style={{
             padding: "8px 20px", borderRadius: 12, border: "none", cursor: "pointer",
             fontSize: 13, fontWeight: 700,
-            ...(tab === t
+            ...(tab === t.id
               ? { background: C.orange, color: "#fff" }
               : { background: C.white, color: C.textSub, border: `1px solid ${C.border}` }),
           }}>
-            {t === "join" ? "Join a Game" : "My Scores"}
+            {t.label}
           </button>
         ))}
       </div>
@@ -6960,13 +6914,17 @@ function RankdJoinPanel({ onJoin, sessions, currentUser }) {
           );
         })()
       )}
+
+      {tab === "leaderboard" && (
+        <RalliLeaderboard currentUser={currentUser} isManager={false} />
+      )}
     </div>
   );
 }
 
 // ── RANKD ADMIN PANEL ────────────────────────────────────────
 
-function RankdAdminPanel({ onNav, sessions, pastSessions = [], onLaunch, onViewResults, onRelaunch }) {
+function RankdAdminPanel({ onNav, sessions, pastSessions = [], onLaunch, onViewResults, onRelaunch, currentUser }) {
   const [tab, setTab] = useState("active");
 
   // All statuses that can appear from the DB or local state
@@ -7049,8 +7007,9 @@ function RankdAdminPanel({ onNav, sessions, pastSessions = [], onLaunch, onViewR
       <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", marginBottom: 24 }}>
         <div style={{ display: "flex", gap: 4, background: C.muted, borderRadius: 10, padding: 4 }}>
           {[
-            { id: "active", label: "Active"        },
-            { id: "past",   label: "Past Sessions" },
+            { id: "active",      label: "Active"        },
+            { id: "past",        label: "Past Sessions" },
+            { id: "leaderboard", label: "Leaderboard"   },
           ].map(t => (
             <button key={t.id} onClick={() => setTab(t.id)} style={{
               padding: "8px 18px", borderRadius: 8, border: "none", cursor: "pointer",
@@ -7105,6 +7064,277 @@ function RankdAdminPanel({ onNav, sessions, pastSessions = [], onLaunch, onViewR
           )}
         </>
       )}
+
+      {/* Leaderboard tab */}
+      {tab === "leaderboard" && (
+        <RalliLeaderboard currentUser={currentUser} isManager={true} />
+      )}
+    </div>
+  );
+}
+
+// ── RALLI LIVE LEADERBOARD (server-authoritative, migration 085) ────────────
+// Lives inside Ralli Live. Individuals (default) / Teams / team drill-down. Every ranking
+// number comes from the SECURITY DEFINER RPCs; this component only picks the timeframe,
+// renders the returned aggregates, and derives the two recognitions from server values.
+// It never converts a service error into an empty result — errors get an explicit retry.
+
+function LbStateCard({ icon, title, body, action }) {
+  return (
+    <div style={{ textAlign: "center", padding: "48px 24px", background: C.pageBg, borderRadius: 14, border: `1px solid ${C.border}` }}>
+      {icon && <div style={{ fontSize: 32, marginBottom: 12 }}>{icon}</div>}
+      <div style={{ fontSize: 15, fontWeight: 700, color: C.text, marginBottom: 6 }}>{title}</div>
+      {body && <p style={{ margin: "0 auto", maxWidth: 440, fontSize: 13, color: C.textSub }}>{body}</p>}
+      {action}
+    </div>
+  );
+}
+
+function LbBadge({ kind }) {
+  const map = {
+    most:  { label: "Most Accurate",     bg: C.orangeLight, fg: C.orangeDark },
+    fast:  { label: "Fast & Accurate",   bg: C.greenBg,     fg: C.green },
+    you:   { label: "You",               bg: C.blueBg,      fg: C.blue },
+  };
+  const b = map[kind]; if (!b) return null;
+  return <span style={{ fontSize: 10, fontWeight: 800, padding: "2px 8px", borderRadius: 99, background: b.bg, color: b.fg, letterSpacing: "0.02em" }}>{b.label}</span>;
+}
+
+function RalliLeaderboard({ currentUser, isManager }) {
+  const [timeframe, setTimeframe] = useState(DEFAULT_TIMEFRAME);
+  const [view, setView] = useState("individuals"); // "individuals" | "teams"
+  const [drill, setDrill] = useState(null);        // { teamId, teamName } | null
+  const [reloadKey, setReloadKey] = useState(0);
+
+  // Each holds the server payload verbatim: data = { timeframe, from, to, timezone, rows }.
+  // The server owns the window + timezone; the client only sends the selected enum.
+  const [ind, setInd] = useState({ loading: true, error: null, data: null });
+  const [teams, setTeams] = useState({ loading: true, error: null, data: null });
+  const [members, setMembers] = useState({ loading: false, error: null, data: null });
+
+  // Individuals + Teams reload together whenever the timeframe / retry changes.
+  useEffect(() => {
+    let cancelled = false;
+    setInd((s) => ({ ...s, loading: true, error: null }));
+    setTeams((s) => ({ ...s, loading: true, error: null }));
+    loadIndividuals(timeframe).then(({ data, error }) => {
+      if (cancelled) return;
+      setInd({ loading: false, error: error || null, data: error ? null : (data || null) });
+    });
+    loadTeams(timeframe).then(({ data, error }) => {
+      if (cancelled) return;
+      setTeams({ loading: false, error: error || null, data: error ? null : (data || null) });
+    });
+    return () => { cancelled = true; };
+  }, [timeframe, reloadKey]);
+
+  // Team drill-down members.
+  useEffect(() => {
+    if (!drill) { setMembers({ loading: false, error: null, data: null }); return; }
+    let cancelled = false;
+    setMembers({ loading: true, error: null, data: null });
+    loadTeamMembers(timeframe, drill.teamId).then(({ data, error }) => {
+      if (cancelled) return;
+      setMembers({ loading: false, error: error || null, data: error ? null : (data || null) });
+    });
+    return () => { cancelled = true; };
+  }, [timeframe, drill, reloadKey]);
+
+  const indRows = ind.data?.rows || [];
+  const myTeamId = useMemo(() => {
+    const me = indRows.find((r) => r.player_id === currentUser?.id);
+    return me ? me.team_id : null;
+  }, [ind.data, currentUser]);   // eslint-disable-line react-hooks/exhaustive-deps
+
+  const recognitions = useMemo(() => computeRecognitions(indRows), [ind.data]); // eslint-disable-line react-hooks/exhaustive-deps
+  // The active org timezone comes from the server response (whichever view has loaded), for honest display.
+  const resolvedTz = ind.data?.timezone || teams.data?.timezone || members.data?.timezone || null;
+  const retry = () => setReloadKey((k) => k + 1);
+
+  const retryBtn = (
+    <button onClick={retry} style={{ marginTop: 16, padding: "8px 20px", borderRadius: 10, border: "none", background: C.dark, color: "#fff", fontSize: 13, fontWeight: 700, cursor: "pointer" }}>Retry</button>
+  );
+
+  // ── shared row cell styles ──
+  const th = { textAlign: "left", fontSize: 10, fontWeight: 800, letterSpacing: "0.08em", textTransform: "uppercase", color: C.textMuted, padding: "8px 12px" };
+  const td = { fontSize: 13, color: C.text, padding: "12px 12px", borderTop: `1px solid ${C.border}` };
+  const num = { ...td, textAlign: "right", fontVariantNumeric: "tabular-nums" };
+
+  const IndividualsTable = ({ rows, scopedToTeam = false }) => {
+    const { ranked, pending } = partitionIndividuals(rows);
+    if (ranked.length === 0 && pending.length === 0) {
+      return <LbStateCard icon="🏁" title="No verified games yet" body="Rankings appear once completed Ralli Live sessions finish server verification. Recently-completed games may take a moment to be counted." />;
+    }
+    return (
+      <div style={{ display: "flex", flexDirection: "column", gap: 20 }}>
+        {!scopedToTeam && !recognitions.notEnough && (recognitions.mostAccuratePlayerId || recognitions.fastAndAccurateIds.size > 0) && (
+          <div style={{ display: "flex", gap: 10, flexWrap: "wrap" }}>
+            {recognitions.mostAccuratePlayerId && (() => {
+              const p = ranked.find((r) => r.player_id === recognitions.mostAccuratePlayerId);
+              return p ? <div style={{ display: "flex", alignItems: "center", gap: 8, padding: "10px 14px", borderRadius: 12, background: C.orangeLight, border: `1px solid ${C.orangeBorder}` }}><LbBadge kind="most" /><span style={{ fontSize: 13, fontWeight: 800, color: C.text }}>{p.name}</span><span style={{ fontSize: 12, color: C.textSub }}>{formatAccuracyPct(p.adjusted_accuracy)} adj</span></div> : null;
+            })()}
+          </div>
+        )}
+
+        {ranked.length === 0 ? (
+          <LbStateCard icon="📈" title="Not enough data to rank yet" body="No learner has met the ranking threshold (at least 20 questions faced across at least 3 games) in this timeframe." />
+        ) : (
+          <div style={{ overflowX: "auto", border: `1px solid ${C.border}`, borderRadius: 12 }}>
+            <table style={{ width: "100%", borderCollapse: "collapse", minWidth: 560 }}>
+              <thead><tr>
+                <th style={{ ...th, width: 48 }}>#</th>
+                <th style={th}>Learner</th>
+                <th style={{ ...th, textAlign: "right" }}>Adj. accuracy</th>
+                <th style={{ ...th, textAlign: "right" }}>Raw</th>
+                <th style={{ ...th, textAlign: "right" }}>Questions</th>
+                <th style={{ ...th, textAlign: "right" }}>Games</th>
+              </tr></thead>
+              <tbody>
+                {ranked.map((r) => {
+                  const isMe = r.player_id === currentUser?.id;
+                  return (
+                    <tr key={r.player_id} style={{ background: isMe ? C.blueBg : "transparent" }}>
+                      <td style={{ ...num, fontWeight: 800, color: C.textSub }}>{r.rank}</td>
+                      <td style={td}>
+                        <div style={{ display: "flex", alignItems: "center", gap: 8, flexWrap: "wrap" }}>
+                          <span style={{ fontWeight: 700 }}>{r.name}</span>
+                          {isMe && <LbBadge kind="you" />}
+                          {recognitions.fastAndAccurateIds.has(r.player_id) && <LbBadge kind="fast" />}
+                        </div>
+                      </td>
+                      <td style={{ ...num, fontWeight: 800 }}>{formatAccuracyPct(r.adjusted_accuracy)}</td>
+                      <td style={{ ...num, color: C.textSub }}>{formatAccuracyPct(r.raw_accuracy)}</td>
+                      <td style={{ ...num, color: C.textSub }}>{r.questions_faced}</td>
+                      <td style={{ ...num, color: C.textSub }}>{r.games}</td>
+                    </tr>
+                  );
+                })}
+              </tbody>
+            </table>
+          </div>
+        )}
+
+        {pending.length > 0 && (
+          <div>
+            <p style={{ margin: "0 0 8px", fontSize: 11, fontWeight: 800, letterSpacing: "0.08em", textTransform: "uppercase", color: C.textMuted }}>Building a ranking</p>
+            <div style={{ display: "flex", flexDirection: "column", gap: 6 }}>
+              {pending.map((r) => (
+                <div key={r.player_id} style={{ display: "flex", alignItems: "center", justifyContent: "space-between", gap: 12, padding: "10px 14px", borderRadius: 10, background: C.pageBg, border: `1px solid ${C.border}` }}>
+                  <span style={{ fontSize: 13, fontWeight: 700, color: C.text }}>{r.name}{r.player_id === currentUser?.id ? " " : ""}{r.player_id === currentUser?.id && <LbBadge kind="you" />}</span>
+                  <span style={{ fontSize: 12, color: C.textSub }}>
+                    Not enough data — {r.questions_to_go > 0 ? `${r.questions_to_go} more question${r.questions_to_go !== 1 ? "s" : ""}` : "enough questions"}{r.questions_to_go > 0 && r.games_to_go > 0 ? ", " : ""}{r.games_to_go > 0 ? `${r.games_to_go} more game${r.games_to_go !== 1 ? "s" : ""}` : ""}
+                  </span>
+                </div>
+              ))}
+            </div>
+          </div>
+        )}
+      </div>
+    );
+  };
+
+  const TeamsTable = () => {
+    if (teams.loading) return <LbStateCard title="Loading team standings…" />;
+    if (teams.error) return <LbStateCard icon="⚠️" title="Couldn't load team standings" body="The leaderboard service returned an error." action={retryBtn} />;
+    const { ranked, pending } = partitionTeams(teams.data?.rows || []);
+    if (ranked.length === 0 && pending.length === 0) {
+      return <LbStateCard icon="🏁" title="No verified games yet" body="Team standings appear once completed Ralli Live sessions finish server verification." />;
+    }
+    const canOpen = (t) => isManager || t.team_id === myTeamId;
+    return (
+      <div style={{ display: "flex", flexDirection: "column", gap: 20 }}>
+        {ranked.length === 0 ? (
+          <LbStateCard icon="📈" title="Not enough data to rank teams yet" body="A team ranks once at least 2 members are eligible and at least half of its active learners are eligible in this timeframe." />
+        ) : (
+          <div style={{ overflowX: "auto", border: `1px solid ${C.border}`, borderRadius: 12 }}>
+            <table style={{ width: "100%", borderCollapse: "collapse", minWidth: 560 }}>
+              <thead><tr>
+                <th style={{ ...th, width: 48 }}>#</th>
+                <th style={th}>Team</th>
+                <th style={{ ...th, textAlign: "right" }}>Median adj. accuracy</th>
+                <th style={{ ...th, textAlign: "right" }}>Eligible</th>
+                <th style={{ ...th, textAlign: "right" }}>Participation</th>
+                <th style={{ ...th, width: 40 }}></th>
+              </tr></thead>
+              <tbody>
+                {ranked.map((t) => (
+                  <tr key={t.team_id} onClick={canOpen(t) ? () => setDrill({ teamId: t.team_id, teamName: t.team_name }) : undefined}
+                      style={{ cursor: canOpen(t) ? "pointer" : "default", background: t.team_id === myTeamId ? C.blueBg : "transparent" }}>
+                    <td style={{ ...num, fontWeight: 800, color: C.textSub }}>{t.rank}</td>
+                    <td style={td}><span style={{ fontWeight: 700 }}>{t.team_name || "Unnamed team"}</span>{t.team_id === myTeamId && <> <LbBadge kind="you" /></>}</td>
+                    <td style={{ ...num, fontWeight: 800 }}>{formatAccuracyPct(t.median_adjusted_accuracy)}</td>
+                    <td style={{ ...num, color: C.textSub }}>{t.eligible_members} / {t.active_learners}</td>
+                    <td style={{ ...num, color: C.textSub }}>{t.participation_pct != null ? `${t.participation_pct}%` : "—"}</td>
+                    <td style={{ ...num, color: C.textMuted }}>{canOpen(t) ? "›" : ""}</td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+        )}
+        {pending.length > 0 && (
+          <div>
+            <p style={{ margin: "0 0 8px", fontSize: 11, fontWeight: 800, letterSpacing: "0.08em", textTransform: "uppercase", color: C.textMuted }}>Not enough data</p>
+            <div style={{ display: "flex", flexDirection: "column", gap: 6 }}>
+              {pending.map((t) => (
+                <div key={t.team_id} style={{ display: "flex", alignItems: "center", justifyContent: "space-between", gap: 12, padding: "10px 14px", borderRadius: 10, background: C.pageBg, border: `1px solid ${C.border}` }}>
+                  <span style={{ fontSize: 13, fontWeight: 700, color: C.text }}>{t.team_name || "Unnamed team"}</span>
+                  <span style={{ fontSize: 12, color: C.textSub }}>{t.eligible_members} of {t.active_learners} eligible</span>
+                </div>
+              ))}
+            </div>
+          </div>
+        )}
+      </div>
+    );
+  };
+
+  const DrillDown = () => {
+    return (
+      <div style={{ display: "flex", flexDirection: "column", gap: 16 }}>
+        <button onClick={() => setDrill(null)} style={{ alignSelf: "flex-start", background: "none", border: "none", cursor: "pointer", fontSize: 13, fontWeight: 700, color: C.textSub, padding: 0 }}>← Back to Teams</button>
+        <h3 style={{ margin: 0, fontSize: 18, fontWeight: 900, color: C.text }}>{drill.teamName || "Team"}</h3>
+        {members.loading ? <LbStateCard title="Loading team members…" />
+          : members.error ? <LbStateCard icon="⚠️" title="Couldn't load this team" body="You may only view your own team, or the service returned an error." action={retryBtn} />
+          : <IndividualsTable rows={members.data?.rows || []} scopedToTeam />}
+      </div>
+    );
+  };
+
+  const tfActive = TIMEFRAMES.find((t) => t.id === timeframe);
+
+  return (
+    <div style={{ maxWidth: 900 }}>
+      {/* Controls: sub-tabs (left) + timeframe (right) */}
+      <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", gap: 12, marginBottom: 8, flexWrap: "wrap" }}>
+        <div style={{ display: "flex", gap: 4, background: C.muted, borderRadius: 10, padding: 4 }}>
+          {[{ id: "individuals", label: "Individuals" }, { id: "teams", label: "Teams" }].map((t) => (
+            <button key={t.id} onClick={() => { setView(t.id); setDrill(null); }} style={{
+              padding: "8px 18px", borderRadius: 8, border: "none", cursor: "pointer", fontSize: 13, fontWeight: 700,
+              background: view === t.id && !drill ? C.white : "transparent",
+              color: view === t.id && !drill ? C.text : C.textSub,
+              boxShadow: view === t.id && !drill ? "0 1px 4px rgba(0,0,0,0.08)" : "none",
+            }}>{t.label}</button>
+          ))}
+        </div>
+        <select value={timeframe} onChange={(e) => setTimeframe(e.target.value)} style={{
+          padding: "8px 12px", borderRadius: 10, border: `1px solid ${C.border}`, background: C.white,
+          color: C.text, fontSize: 13, fontWeight: 700, cursor: "pointer",
+        }}>
+          {TIMEFRAMES.map((t) => <option key={t.id} value={t.id}>{t.label}</option>)}
+        </select>
+      </div>
+      <p style={{ margin: "0 0 20px", fontSize: 11, color: C.textMuted }}>
+        {tfActive ? tfActive.label : ""} · times shown in {resolvedTz || "org timezone"}
+      </p>
+
+      {/* Body */}
+      {drill ? <DrillDown />
+        : view === "individuals"
+          ? (ind.loading ? <LbStateCard title="Loading individuals…" />
+             : ind.error ? <LbStateCard icon="⚠️" title="Couldn't load the leaderboard" body="The leaderboard service returned an error." action={retryBtn} />
+             : <IndividualsTable rows={ind.data?.rows || []} />)
+          : <TeamsTable />}
     </div>
   );
 }
@@ -7166,7 +7396,7 @@ function RankdScreen({ onNav, onJoin, sessions, pastSessions = [], onLaunch, onV
       {/* Content */}
       <div style={{ background: C.white, borderRadius: "0 0 12px 12px", border: `1px solid ${C.border}`, borderTop: "none" }}>
         {role === "admin"
-          ? <RankdAdminPanel onNav={onNav} sessions={sessions} pastSessions={pastSessions} onLaunch={onLaunch} onViewResults={onViewResults} onRelaunch={onRelaunch} />
+          ? <RankdAdminPanel onNav={onNav} sessions={sessions} pastSessions={pastSessions} onLaunch={onLaunch} onViewResults={onViewResults} onRelaunch={onRelaunch} currentUser={currentUser} />
           : <RankdJoinPanel onJoin={onJoin} sessions={sessions} currentUser={currentUser} />}
       </div>
     </div>
@@ -24080,7 +24310,7 @@ function InsightsScreen({ user, isReal = false, tenantId = null, orgUsers = [], 
 //               defaults to item.id when not specified
 const NAV_ITEMS = [
   { id: "home",        label: "Home",         icon: "", featureKey: "dashboard",   permKey: "home" },
-  { id: "leaderboard", label: "Leaderboard",  icon: "", featureKey: "leaderboard", permKey: "leaderboard" },
+  // Leaderboard moved into Ralli Live (Individuals / Teams / team drill-down) — no global nav item.
   { id: "rankd",       label: "Ralli",   icon: "", badge: "LIVE", featureKey: "games", permKey: "games" },
   { id: "learn",       label: "Learn",        icon: "", featureKey: "learn",       permKey: "learn" },
   { id: "battlecards", label: "Battle Cards", icon: "", featureKey: "learn",       permKey: "battlecards" },
@@ -26673,7 +26903,9 @@ export default function App() {
       case "progress":          return isAdminType
         ? <LeadershipDashboardScreen currentOrg={currentOrg} orgUsers={orgUsers} isReal={!!user?._isReal} readinessThreshold={readinessThreshold} />
         : <ProgressScreen currentUser={user} isReal={!!user?._isReal} tenantId={currentOrg?.id ?? null} />;
-      case "leaderboard":       return <LeaderboardScreen currentUser={user} isReal={!!user?._isReal} tenantId={currentOrg?.id ?? null} />;
+      // "leaderboard" is no longer a global screen — the leaderboard lives inside Ralli Live.
+      // Any stale deep-link/remembered screen falls through to Ralli Live.
+      case "leaderboard":       return <RankdScreen onNav={navigate} onJoin={handleEnterPin} sessions={sessions} pastSessions={pastSessions} onLaunch={handleLaunch} onViewResults={handleViewResults} onRelaunch={handleRelaunch} role={gameRole} currentUser={currentUser} />;
       case "organizations":     return selectedOrg
         ? <OrgDetailScreen org={selectedOrg} orgUsers={orgUsers} onBack={() => setSelectedOrg(null)} onAddUser={handleAddUser} onDeactivateOrg={handleDeactivateOrg} onReactivateOrg={handleReactivateOrg} onDeleteOrg={handleDeleteOrg} onCancelOrg={handleCancelOrg} onUpdateOrg={handleUpdateOrg} onUpdateMember={handleUpdateMember} onRemoveMember={handleRemoveMember} onCancelInvite={handleCancelInvite} onResendMemberInvite={handleResendMemberInvite} />
         : <OrganizationsScreen orgs={orgs} onInviteOrg={handleInviteOrg} onSelectOrg={(org) => setSelectedOrg(org)} onRefresh={handleRefreshOrgs} onDeactivateOrg={handleDeactivateOrg} onReactivateOrg={handleReactivateOrg} onDeleteOrg={handleDeleteOrg} onCancelOrg={handleCancelOrg} />;

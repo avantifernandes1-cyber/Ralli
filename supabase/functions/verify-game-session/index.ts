@@ -44,10 +44,10 @@
 // with no third-party deps, so they bundle as-is with no copy.
 
 import { createClient } from "https://esm.sh/@supabase/supabase-js@2.45.0";
-// THE single source of grading truth — same file the live client imports. Lives
-// in supabase/functions/_shared so `supabase functions deploy` bundles it via the
-// standard in-functions-dir path (no import reaching outside supabase/functions).
-import { buildSessionVerdicts, GRADER_VERSION } from "../_shared/gameGrading.js";
+// THE single canonical per-session verifier (grader + record RPC live there, shared with the
+// verify-queue-worker so the two paths cannot drift). Lives in supabase/functions/_shared so
+// `supabase functions deploy` bundles it via the standard in-functions-dir path.
+import { verifyLoadedSession, VERIFICATION_SOURCE_EDGE } from "../_shared/verifySession.js";
 // Explicit, auditable CORS origin policy (pure module; unit-tested in Node).
 import { corsHeaders } from "../_shared/cors.js";
 
@@ -57,7 +57,6 @@ const SERVICE_ROLE_KEY = Deno.env.get("SUPABASE_SERVICE_ROLE_KEY")!; // server-o
 
 const MANAGER_ROLES = new Set(["orgAdmin", "manager"]);
 const ADMIN_ROLES = new Set(["ralli_admin", "superadmin"]);
-const VERIFICATION_SOURCE = "edge:verify-game-session";
 
 Deno.serve(async (req) => {
   // CORS is resolved ONCE, up front, from the request Origin against the explicit
@@ -114,35 +113,19 @@ Deno.serve(async (req) => {
     const authorized = isAdmin || (sameTenant && (isHost || isManager));
     if (!authorized) return json({ error: "not authorized for this session" }, 403, cors);
 
-    // 5. Only real, durably-completed sessions are verifiable.
+    // 5. Only real, durably-completed sessions are verifiable (transport-level HTTP contract).
     if (session.demo_mode === true) return json({ status: "ineligible", reason: "demo_session" }, 200, cors);
     if (session.status !== "completed") return json({ error: "session not completed", retryable: true }, 409, cors);
 
-    // 6. Missing snapshot → honest ineligible (RPC records it durably). Never guessed.
-    const snapshot = Array.isArray(session.question_snapshot) ? session.question_snapshot : null;
-
-    // 7. Load raw answers for THIS session only (never cross sessions/tenants).
-    let verdicts: unknown[] = [];
-    if (snapshot) {
-      const { data: answers, error: aErr } = await admin
-        .from("game_answers")
-        .select("id, player_id, question_idx, option_idx, answer_text, numeric_value, answer_json, was_skipped, answered_at")
-        .eq("session_id", sessionId);
-      if (aErr) return json({ error: "answers load failed", retryable: true }, 500, cors);
-      // 8. Independently grade with the SHARED grader (client fields ignored).
-      verdicts = buildSessionVerdicts(snapshot, answers ?? []);
+    // 6. Grade + record via the ONE shared canonical verifier (snapshot handling, the shared grader,
+    //    and the idempotent record RPC all live in ../_shared/verifySession.js — not duplicated here).
+    const r = await verifyLoadedSession(admin, session, { source: VERIFICATION_SOURCE_EDGE });
+    if (r.outcome === "verified" || (r.outcome === "ineligible" && r.reason === "no_snapshot")) {
+      const result = r.result ?? {};
+      return json({ ok: true, ...(result as object) }, 200, cors); // 200 success / honest ineligible (no_snapshot)
     }
-
-    // 9. Atomic, idempotent write via the service-role-only RPC.
-    const { data: result, error: rErr } = await admin.rpc("record_game_verification", {
-      p_session_id: sessionId,
-      p_grader_version: GRADER_VERSION,
-      p_source: VERIFICATION_SOURCE,
-      p_verdicts: verdicts,
-    });
-    if (rErr) return json({ error: "verification write failed", retryable: true }, 500, cors);
-
-    return json({ ok: true, ...(result as object) }, 200, cors);
+    // integrity + transient both map to the existing retryable 500 (external behavior unchanged).
+    return json({ error: "verification write failed", retryable: true }, 500, cors);
   } catch (_e) {
     return json({ error: "internal error", retryable: true }, 500, cors);
   }
