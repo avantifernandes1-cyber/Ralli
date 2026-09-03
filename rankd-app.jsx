@@ -7128,12 +7128,12 @@ const LB_CSS = `
 // Rank tiering for the top three eligible ranks — differentiated by metal color, ring, gradient, and
 // card height only (gold/silver/bronze). No emoji: emphasis comes from typography/color/borders.
 const LB_MEDALS = {
-  1: { metal: "#E0A400", ring: "#F3D250", minH: 288, glow: "0 0 0 3px rgba(243,210,80,0.55), 0 0 28px rgba(224,164,0,0.30)",
-       bg: "radial-gradient(120% 120% at 12% 8%, rgba(255,255,255,0.60) 0%, rgba(255,255,255,0) 44%), linear-gradient(135deg,#FFF3CC 0%,#F6C64B 52%,#E09E00 100%)" },
-  2: { metal: "#8B94A3", ring: "#CBD2DB", minH: 246, glow: "",
-       bg: "radial-gradient(120% 120% at 12% 8%, rgba(255,255,255,0.65) 0%, rgba(255,255,255,0) 44%), linear-gradient(135deg,#FBFCFE 0%,#D7DEE7 52%,#B9C2CE 100%)" },
-  3: { metal: "#B4794E", ring: "#DDB48A", minH: 220, glow: "",
-       bg: "radial-gradient(120% 120% at 12% 8%, rgba(255,255,255,0.50) 0%, rgba(255,255,255,0) 44%), linear-gradient(135deg,#F7E6D2 0%,#DFAE7C 52%,#C07E45 100%)" },
+  1: { metal: "#B07C00", ring: "#EBD98A", minH: 288, glow: "0 0 0 2px rgba(240,205,120,0.40), 0 0 16px rgba(224,164,0,0.10)",
+       bg: "radial-gradient(90% 90% at 14% 10%, rgba(255,255,255,0.45) 0%, rgba(255,255,255,0) 40%), linear-gradient(140deg,#FFFDF4 0%,#FBF1D4 55%,#F4E6BC 100%)" },
+  2: { metal: "#667081", ring: "#D3D9E0", minH: 246, glow: "",
+       bg: "radial-gradient(90% 90% at 14% 10%, rgba(255,255,255,0.50) 0%, rgba(255,255,255,0) 40%), linear-gradient(140deg,#FFFFFF 0%,#F1F4F7 55%,#E6EAEF 100%)" },
+  3: { metal: "#96602F", ring: "#E2C6A6", minH: 220, glow: "",
+       bg: "radial-gradient(90% 90% at 14% 10%, rgba(255,255,255,0.42) 0%, rgba(255,255,255,0) 40%), linear-gradient(140deg,#FFFCF7 0%,#F6EBDD 55%,#EEDBC7 100%)" },
 };
 
 // Deterministic avatar hue from a stable id — presentational only (no emoji is in the RPC payload).
@@ -7255,7 +7255,9 @@ function RalliLeaderboard({ currentUser, isManager }) {
     const fast = rows.filter((r) => recognitions.fastAndAccurateIds.has(r.player_id));
     if (!most && fast.length === 0) return null;
     return (
-      <div className="lb-reco-grid">
+      <div>
+        <p style={{ margin: "0 0 8px", fontSize: 11, fontWeight: 800, letterSpacing: "0.08em", textTransform: "uppercase", color: C.textMuted }}>Recognition</p>
+        <div className="lb-reco-grid">
         {most && (
           <div style={{ display: "flex", alignItems: "center", gap: 12, padding: "14px 16px", borderRadius: 14, background: C.orangeLight, border: `1px solid ${C.orangeBorder}`, borderLeft: `4px solid ${C.orangeDark}` }}>
             <div style={{ minWidth: 0 }}>
@@ -7274,6 +7276,7 @@ function RalliLeaderboard({ currentUser, isManager }) {
             </div>
           </div>
         )}
+        </div>
       </div>
     );
   };
@@ -7331,8 +7334,6 @@ function RalliLeaderboard({ currentUser, isManager }) {
     const rest = ranked.slice(3);
     return (
       <div style={{ display: "flex", flexDirection: "column", gap: 20 }}>
-        {!scopedToTeam && <RecognitionCards rows={ranked} />}
-
         {ranked.length === 0 ? (
           <LbStateCard title="Not enough data to rank yet" body="No learner has met the ranking threshold (at least 20 questions faced across at least 3 games) in this timeframe." />
         ) : (
@@ -7376,6 +7377,9 @@ function RalliLeaderboard({ currentUser, isManager }) {
             )}
           </>
         )}
+
+        {/* Recognitions sit BELOW the full podium/rankings — supporting achievements, not the headline. */}
+        {!scopedToTeam && <RecognitionCards rows={ranked} />}
 
         {pending.length > 0 && (
           <div>
