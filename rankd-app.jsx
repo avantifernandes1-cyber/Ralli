@@ -7142,6 +7142,99 @@ function LbBadge({ kind }) {
   return <span style={{ fontSize: 10, fontWeight: 800, padding: "2px 8px", borderRadius: 99, background: b.bg, color: b.fg, letterSpacing: "0.02em" }}>{b.label}</span>;
 }
 
+// ── Ralli Live leaderboard — gamified presentation (server-verified data only) ──
+// Presentation layer ONLY. Every number (rank, adjusted/raw accuracy, games, questions,
+// eligibility, team median/participation, recognitions) comes verbatim from the migration-085
+// RPCs via ralliLeaderboardService + the pure ralliLeaderboardView helpers. This file adds no
+// scoring, no lifetime XP, no fabricated trend/movement, and no speed-first award.
+const LB_CSS = `
+.lb-wrap{max-width:960px}
+.lb-controls{display:flex;align-items:center;justify-content:space-between;gap:12px;margin-bottom:8px;flex-wrap:wrap}
+.lb-reco-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(240px,1fr));gap:12px}
+.lb-podium{display:flex;gap:16px;align-items:flex-end;justify-content:center;flex-wrap:nowrap}
+.lb-podium-col{flex:1 1 0;min-width:0;max-width:292px}
+.lb-tablewrap{overflow-x:auto;border:1px solid ${C.border};border-radius:12px}
+.lb-teamgrid{display:grid;grid-template-columns:repeat(auto-fit,minmax(240px,1fr));gap:12px}
+.lb-tip{position:relative;display:inline-flex;align-items:center;cursor:help;outline:none}
+.lb-tip-label{border-bottom:1px dotted currentColor}
+.lb-tip:focus-visible .lb-tip-label{outline:2px solid #0EA5E9;outline-offset:2px;border-radius:3px}
+.lb-tip-bubble{position:absolute;left:50%;bottom:calc(100% + 8px);transform:translateX(-50%) translateY(4px);z-index:30;width:max-content;max-width:min(260px,78vw);white-space:normal;text-align:left;background:#0B1220;color:#fff;font-size:12px;font-weight:500;line-height:1.45;letter-spacing:normal;text-transform:none;padding:8px 10px;border-radius:8px;box-shadow:0 6px 20px rgba(11,18,32,.22);opacity:0;visibility:hidden;transition:opacity .12s,transform .12s;pointer-events:none}
+.lb-tip:hover .lb-tip-bubble,.lb-tip:focus .lb-tip-bubble,.lb-tip:focus-within .lb-tip-bubble{opacity:1;visibility:visible;transform:translateX(-50%) translateY(0)}
+@media (max-width:640px){
+  .lb-podium{flex-direction:column;align-items:stretch}
+  .lb-podium-col{max-width:none}
+  .lb-podium-col .lb-pcard{min-height:0!important}
+}
+`;
+
+// Rank tiering for the top three eligible ranks — differentiated by metal color, ring, gradient, and
+// card height only (gold/silver/bronze). No emoji: emphasis comes from typography/color/borders.
+const LB_MEDALS = {
+  1: { metal: "#B07C00", ring: "#EBD98A", minH: 288, glow: "0 0 0 2px rgba(240,205,120,0.40), 0 0 16px rgba(224,164,0,0.10)",
+       bg: "radial-gradient(90% 90% at 14% 10%, rgba(255,255,255,0.45) 0%, rgba(255,255,255,0) 40%), linear-gradient(140deg,#FFFDF4 0%,#FBF1D4 55%,#F4E6BC 100%)" },
+  2: { metal: "#667081", ring: "#D3D9E0", minH: 246, glow: "",
+       bg: "radial-gradient(90% 90% at 14% 10%, rgba(255,255,255,0.50) 0%, rgba(255,255,255,0) 40%), linear-gradient(140deg,#FFFFFF 0%,#F1F4F7 55%,#E6EAEF 100%)" },
+  3: { metal: "#96602F", ring: "#E2C6A6", minH: 220, glow: "",
+       bg: "radial-gradient(90% 90% at 14% 10%, rgba(255,255,255,0.42) 0%, rgba(255,255,255,0) 40%), linear-gradient(140deg,#FFFCF7 0%,#F6EBDD 55%,#EEDBC7 100%)" },
+};
+
+// Deterministic avatar hue from a stable id — presentational only (no emoji is in the RPC payload).
+function lbHue(seed) {
+  const s = String(seed || "");
+  let h = 0;
+  for (let i = 0; i < s.length; i++) h = (h * 31 + s.charCodeAt(i)) >>> 0;
+  return h % 360;
+}
+function LbAvatar({ name, id, size = 40, ring = null }) {
+  const initials = String(name || "?").trim().split(/\s+/).map((w) => w[0]).slice(0, 2).join("").toUpperCase() || "?";
+  const hue = lbHue(id || name);
+  return (
+    <div style={{
+      width: size, height: size, borderRadius: "50%", flexShrink: 0, display: "flex",
+      alignItems: "center", justifyContent: "center", fontWeight: 800, fontSize: Math.round(size * 0.36),
+      color: "#fff", background: `hsl(${hue} 52% 52%)`,
+      boxShadow: `inset 0 -2px 4px rgba(0,0,0,0.14)${ring ? `, 0 0 0 3px ${ring}` : ""}`,
+    }}>{initials}</div>
+  );
+}
+
+// Honest progress toward a ranking threshold (uses only server-returned counts).
+function LbProgress({ value, target, unit }) {
+  const v = Math.max(0, Math.min(target, Number(value) || 0));
+  const pct = target > 0 ? Math.round((v / target) * 100) : 0;
+  const done = v >= target;
+  return (
+    <div style={{ display: "flex", flexDirection: "column", gap: 4, minWidth: 120, flex: 1 }}>
+      <div style={{ display: "flex", justifyContent: "space-between", fontSize: 11, color: C.textMuted }}>
+        <span>{unit}</span><span style={{ fontWeight: 700, color: done ? C.trueGreen : C.textSub }}>{v}/{target}</span>
+      </div>
+      <div style={{ height: 6, borderRadius: 99, background: C.muted, overflow: "hidden" }}>
+        <div style={{ width: `${pct}%`, height: "100%", borderRadius: 99, background: done ? C.trueGreen : C.orange, transition: "width 0.3s" }} />
+      </div>
+    </div>
+  );
+}
+
+// Accessible explanatory tooltip: reveals `tip` on hover AND keyboard focus (tabbable), announces
+// "<label>. <tip>" to screen readers, and its bubble wraps + caps at 78vw so it never clips or
+// overflows on narrow screens. Plain-language copy only — ineligible learners simply lack enough data.
+function LbTip({ label, tip, ariaLabel, labelStyle, wrapStyle }) {
+  return (
+    <span className="lb-tip" tabIndex={0} role="note" aria-label={`${ariaLabel ?? (typeof label === "string" ? label : "")}. ${tip}`} style={wrapStyle}>
+      <span className="lb-tip-label" style={labelStyle}>{label}</span>
+      <span className="lb-tip-bubble" role="tooltip">{tip}</span>
+    </span>
+  );
+}
+
+// Plain-language tooltip copy (numbers are interpolated from the RPC payload at the call site).
+const LB_TIP = {
+  adjusted: "Adjusted accuracy uses only verified Ralli Live answers, with a confidence adjustment so a very small number of games doesn't dominate the rankings.",
+  median: "The middle adjusted-accuracy score among the team's eligible learners. This prevents one unusually high or low result from dominating the team score.",
+  participation: "The percentage of active learners on this team who have enough verified Ralli Live data to be ranked.",
+  qualified: "This team has at least 2 eligible learners and at least 50% eligible participation, so it can appear in team rankings.",
+};
+
 function RalliLeaderboard({ currentUser, isManager }) {
   const [timeframe, setTimeframe] = useState(DEFAULT_TIMEFRAME);
   const [view, setView] = useState("individuals"); // "individuals" | "teams"
@@ -7149,12 +7242,10 @@ function RalliLeaderboard({ currentUser, isManager }) {
   const [reloadKey, setReloadKey] = useState(0);
 
   // Each holds the server payload verbatim: data = { timeframe, from, to, timezone, rows }.
-  // The server owns the window + timezone; the client only sends the selected enum.
   const [ind, setInd] = useState({ loading: true, error: null, data: null });
   const [teams, setTeams] = useState({ loading: true, error: null, data: null });
   const [members, setMembers] = useState({ loading: false, error: null, data: null });
 
-  // Individuals + Teams reload together whenever the timeframe / retry changes.
   useEffect(() => {
     let cancelled = false;
     setInd((s) => ({ ...s, loading: true, error: null }));
@@ -7170,7 +7261,6 @@ function RalliLeaderboard({ currentUser, isManager }) {
     return () => { cancelled = true; };
   }, [timeframe, reloadKey]);
 
-  // Team drill-down members.
   useEffect(() => {
     if (!drill) { setMembers({ loading: false, error: null, data: null }); return; }
     let cancelled = false;
@@ -7189,7 +7279,6 @@ function RalliLeaderboard({ currentUser, isManager }) {
   }, [ind.data, currentUser]);   // eslint-disable-line react-hooks/exhaustive-deps
 
   const recognitions = useMemo(() => computeRecognitions(indRows), [ind.data]); // eslint-disable-line react-hooks/exhaustive-deps
-  // The active org timezone comes from the server response (whichever view has loaded), for honest display.
   const resolvedTz = ind.data?.timezone || teams.data?.timezone || members.data?.timezone || null;
   const retry = () => setReloadKey((k) => k + 1);
 
@@ -7197,77 +7286,164 @@ function RalliLeaderboard({ currentUser, isManager }) {
     <button onClick={retry} style={{ marginTop: 16, padding: "8px 20px", borderRadius: 10, border: "none", background: C.dark, color: "#fff", fontSize: 13, fontWeight: 700, cursor: "pointer" }}>Retry</button>
   );
 
-  // ── shared row cell styles ──
   const th = { textAlign: "left", fontSize: 10, fontWeight: 800, letterSpacing: "0.08em", textTransform: "uppercase", color: C.textMuted, padding: "8px 12px" };
   const td = { fontSize: 13, color: C.text, padding: "12px 12px", borderTop: `1px solid ${C.border}` };
   const num = { ...td, textAlign: "right", fontVariantNumeric: "tabular-nums" };
 
+  // ── Recognition cards (§6): Most Accurate + Fast and Accurate. No standalone "Fastest". ──
+  const RecognitionCards = ({ rows }) => {
+    if (recognitions.notEnough) return null;
+    const most = rows.find((r) => r.player_id === recognitions.mostAccuratePlayerId);
+    const fast = rows.filter((r) => recognitions.fastAndAccurateIds.has(r.player_id));
+    if (!most && fast.length === 0) return null;
+    return (
+      <div>
+        <p style={{ margin: "0 0 8px", fontSize: 11, fontWeight: 800, letterSpacing: "0.08em", textTransform: "uppercase", color: C.textMuted }}>Recognition</p>
+        <div className="lb-reco-grid">
+        {most && (
+          <div style={{ display: "flex", alignItems: "center", gap: 12, padding: "14px 16px", borderRadius: 14, background: C.orangeLight, border: `1px solid ${C.orangeBorder}`, borderLeft: `4px solid ${C.orangeDark}` }}>
+            <div style={{ minWidth: 0 }}>
+              <div style={{ fontSize: 10, fontWeight: 800, letterSpacing: "0.08em", textTransform: "uppercase", color: C.orangeDark }}>Most Accurate</div>
+              <div style={{ fontSize: 15, fontWeight: 800, color: C.text, whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis" }}>{most.name}</div>
+              <div style={{ fontSize: 12, color: C.textSub }}>{formatAccuracyPct(most.adjusted_accuracy)} adjusted accuracy</div>
+            </div>
+          </div>
+        )}
+        {fast.length > 0 && (
+          <div style={{ display: "flex", alignItems: "center", gap: 12, padding: "14px 16px", borderRadius: 14, background: C.trueGreenBg, border: `1px solid ${C.trueGreen}33`, borderLeft: `4px solid ${C.trueGreen}` }}>
+            <div style={{ minWidth: 0 }}>
+              <div style={{ fontSize: 10, fontWeight: 800, letterSpacing: "0.08em", textTransform: "uppercase", color: C.trueGreen }}>Fast &amp; Accurate</div>
+              <div style={{ fontSize: 15, fontWeight: 800, color: C.text, whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis" }}>{fast.map((r) => r.name).join(", ")}</div>
+              <div style={{ fontSize: 12, color: C.textSub }}>above-median accuracy &amp; speed</div>
+            </div>
+          </div>
+        )}
+        </div>
+      </div>
+    );
+  };
+
+  // ── Podium for the top 3 eligible ranks. Desktop order [2,1,3]; stacks to [1,2,3] on mobile. ──
+  const Podium = ({ rows }) => {
+    const top = rows.slice(0, 3);
+    if (top.length === 0) return null;
+    const desktopOrder = top.length >= 3 ? [top[1], top[0], top[2]] : top.length === 2 ? [top[1], top[0]] : [top[0]];
+    return (
+      <div className="lb-podium">
+        {desktopOrder.map((r) => {
+          const m = LB_MEDALS[r.rank] || LB_MEDALS[3];
+          const isMe = r.player_id === currentUser?.id;
+          return (
+            <div key={r.player_id} className="lb-podium-col">
+              <div className="lb-pcard" style={{
+                display: "flex", flexDirection: "column", alignItems: "center", gap: 12,
+                padding: "22px 16px 26px", borderRadius: 18, background: m.bg,
+                border: `1px solid ${m.ring}`, minHeight: m.minH,
+                boxShadow: (r.rank === 1
+                  ? "0 22px 48px rgba(11,18,32,0.18), 0 6px 16px rgba(11,18,32,0.10)"
+                  : "0 16px 36px rgba(11,18,32,0.14), 0 4px 12px rgba(11,18,32,0.08)")
+                  + (m.glow ? `, ${m.glow}` : ""),
+              }}>
+                {/* Rank at the TOP of the card — gold/silver/bronze by metal color + weight (no emoji). */}
+                <div style={{ fontFamily: "'Unbounded', sans-serif", fontSize: r.rank === 1 ? 34 : 26, fontWeight: 800, color: m.metal, lineHeight: 1 }}>#{r.rank}</div>
+                <LbAvatar name={r.name} id={r.player_id} size={r.rank === 1 ? 64 : 48} ring={isMe ? C.blue : m.ring} />
+                <div style={{ display: "flex", alignItems: "center", gap: 6, maxWidth: "100%" }}>
+                  <span style={{ fontWeight: 800, fontSize: 14, color: C.text, whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis" }}>{r.name}</span>
+                  {isMe && <LbBadge kind="you" />}
+                </div>
+                <div style={{ fontFamily: "'Unbounded', sans-serif", fontSize: r.rank === 1 ? 30 : 24, fontWeight: 800, color: m.metal, lineHeight: 1 }}>
+                  {formatAccuracyPct(r.adjusted_accuracy)}
+                </div>
+                <LbTip label="adjusted accuracy" ariaLabel="Adjusted accuracy" tip={LB_TIP.adjusted} labelStyle={{ fontSize: 11, color: C.textSub }} />
+                <div style={{ display: "flex", gap: 6, flexWrap: "wrap", justifyContent: "center", marginTop: 8 }}>
+                  <span style={{ fontSize: 11, fontWeight: 700, color: C.textSub, background: C.white, borderRadius: 8, padding: "3px 8px", border: `1px solid ${C.border}` }}>{r.games} games</span>
+                  <span style={{ fontSize: 11, fontWeight: 700, color: C.textSub, background: C.white, borderRadius: 8, padding: "3px 8px", border: `1px solid ${C.border}` }}>{r.questions_faced} q</span>
+                  {recognitions.fastAndAccurateIds?.has(r.player_id) && <LbBadge kind="fast" />}
+                </div>
+              </div>
+            </div>
+          );
+        })}
+      </div>
+    );
+  };
+
   const IndividualsTable = ({ rows, scopedToTeam = false }) => {
     const { ranked, pending } = partitionIndividuals(rows);
     if (ranked.length === 0 && pending.length === 0) {
-      return <LbStateCard icon="🏁" title="No verified games yet" body="Rankings appear once completed Ralli Live sessions finish server verification. Recently-completed games may take a moment to be counted." />;
+      return <LbStateCard title="No verified games yet" body="Rankings appear once completed Ralli Live sessions finish server verification. Recently-completed games may take a moment to be counted." />;
     }
+    const rest = ranked.slice(3);
     return (
       <div style={{ display: "flex", flexDirection: "column", gap: 20 }}>
-        {!scopedToTeam && !recognitions.notEnough && (recognitions.mostAccuratePlayerId || recognitions.fastAndAccurateIds.size > 0) && (
-          <div style={{ display: "flex", gap: 10, flexWrap: "wrap" }}>
-            {recognitions.mostAccuratePlayerId && (() => {
-              const p = ranked.find((r) => r.player_id === recognitions.mostAccuratePlayerId);
-              return p ? <div style={{ display: "flex", alignItems: "center", gap: 8, padding: "10px 14px", borderRadius: 12, background: C.orangeLight, border: `1px solid ${C.orangeBorder}` }}><LbBadge kind="most" /><span style={{ fontSize: 13, fontWeight: 800, color: C.text }}>{p.name}</span><span style={{ fontSize: 12, color: C.textSub }}>{formatAccuracyPct(p.adjusted_accuracy)} adj</span></div> : null;
-            })()}
-          </div>
+        {ranked.length === 0 ? (
+          <LbStateCard title="Not enough data to rank yet" body="No learner has met the ranking threshold (at least 20 questions faced across at least 3 games) in this timeframe." />
+        ) : (
+          <>
+            <Podium rows={ranked} />
+            {rest.length > 0 && (
+              <div className="lb-tablewrap">
+                <table style={{ width: "100%", borderCollapse: "collapse", minWidth: 520 }}>
+                  <thead><tr>
+                    <th style={{ ...th, width: 48 }}>#</th>
+                    <th style={th}>Learner</th>
+                    <th style={{ ...th, textAlign: "right" }}>Adj. accuracy</th>
+                    <th style={{ ...th, textAlign: "right" }}>Raw</th>
+                    <th style={{ ...th, textAlign: "right" }}>Questions</th>
+                    <th style={{ ...th, textAlign: "right" }}>Games</th>
+                  </tr></thead>
+                  <tbody>
+                    {rest.map((r) => {
+                      const isMe = r.player_id === currentUser?.id;
+                      return (
+                        <tr key={r.player_id} style={{ background: isMe ? C.blueBg : "transparent" }}>
+                          <td style={{ ...num, fontWeight: 800, color: C.textSub }}>{r.rank}</td>
+                          <td style={td}>
+                            <div style={{ display: "flex", alignItems: "center", gap: 8, flexWrap: "wrap" }}>
+                              <LbAvatar name={r.name} id={r.player_id} size={28} />
+                              <span style={{ fontWeight: 700 }}>{r.name}</span>
+                              {isMe && <LbBadge kind="you" />}
+                              {recognitions.fastAndAccurateIds.has(r.player_id) && <LbBadge kind="fast" />}
+                            </div>
+                          </td>
+                          <td style={{ ...num, fontWeight: 800 }}>{formatAccuracyPct(r.adjusted_accuracy)}</td>
+                          <td style={{ ...num, color: C.textSub }}>{formatAccuracyPct(r.raw_accuracy)}</td>
+                          <td style={{ ...num, color: C.textSub }}>{r.questions_faced}</td>
+                          <td style={{ ...num, color: C.textSub }}>{r.games}</td>
+                        </tr>
+                      );
+                    })}
+                  </tbody>
+                </table>
+              </div>
+            )}
+          </>
         )}
 
-        {ranked.length === 0 ? (
-          <LbStateCard icon="📈" title="Not enough data to rank yet" body="No learner has met the ranking threshold (at least 20 questions faced across at least 3 games) in this timeframe." />
-        ) : (
-          <div style={{ overflowX: "auto", border: `1px solid ${C.border}`, borderRadius: 12 }}>
-            <table style={{ width: "100%", borderCollapse: "collapse", minWidth: 560 }}>
-              <thead><tr>
-                <th style={{ ...th, width: 48 }}>#</th>
-                <th style={th}>Learner</th>
-                <th style={{ ...th, textAlign: "right" }}>Adj. accuracy</th>
-                <th style={{ ...th, textAlign: "right" }}>Raw</th>
-                <th style={{ ...th, textAlign: "right" }}>Questions</th>
-                <th style={{ ...th, textAlign: "right" }}>Games</th>
-              </tr></thead>
-              <tbody>
-                {ranked.map((r) => {
-                  const isMe = r.player_id === currentUser?.id;
-                  return (
-                    <tr key={r.player_id} style={{ background: isMe ? C.blueBg : "transparent" }}>
-                      <td style={{ ...num, fontWeight: 800, color: C.textSub }}>{r.rank}</td>
-                      <td style={td}>
-                        <div style={{ display: "flex", alignItems: "center", gap: 8, flexWrap: "wrap" }}>
-                          <span style={{ fontWeight: 700 }}>{r.name}</span>
-                          {isMe && <LbBadge kind="you" />}
-                          {recognitions.fastAndAccurateIds.has(r.player_id) && <LbBadge kind="fast" />}
-                        </div>
-                      </td>
-                      <td style={{ ...num, fontWeight: 800 }}>{formatAccuracyPct(r.adjusted_accuracy)}</td>
-                      <td style={{ ...num, color: C.textSub }}>{formatAccuracyPct(r.raw_accuracy)}</td>
-                      <td style={{ ...num, color: C.textSub }}>{r.questions_faced}</td>
-                      <td style={{ ...num, color: C.textSub }}>{r.games}</td>
-                    </tr>
-                  );
-                })}
-              </tbody>
-            </table>
-          </div>
-        )}
+        {/* Recognitions sit BELOW the full podium/rankings — supporting achievements, not the headline. */}
+        {!scopedToTeam && <RecognitionCards rows={ranked} />}
 
         {pending.length > 0 && (
           <div>
             <p style={{ margin: "0 0 8px", fontSize: 11, fontWeight: 800, letterSpacing: "0.08em", textTransform: "uppercase", color: C.textMuted }}>Building a ranking</p>
-            <div style={{ display: "flex", flexDirection: "column", gap: 6 }}>
-              {pending.map((r) => (
-                <div key={r.player_id} style={{ display: "flex", alignItems: "center", justifyContent: "space-between", gap: 12, padding: "10px 14px", borderRadius: 10, background: C.pageBg, border: `1px solid ${C.border}` }}>
-                  <span style={{ fontSize: 13, fontWeight: 700, color: C.text }}>{r.name}{r.player_id === currentUser?.id ? " " : ""}{r.player_id === currentUser?.id && <LbBadge kind="you" />}</span>
-                  <span style={{ fontSize: 12, color: C.textSub }}>
-                    Not enough data — {r.questions_to_go > 0 ? `${r.questions_to_go} more question${r.questions_to_go !== 1 ? "s" : ""}` : "enough questions"}{r.questions_to_go > 0 && r.games_to_go > 0 ? ", " : ""}{r.games_to_go > 0 ? `${r.games_to_go} more game${r.games_to_go !== 1 ? "s" : ""}` : ""}
-                  </span>
-                </div>
-              ))}
+            <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
+              {pending.map((r) => {
+                const isMe = r.player_id === currentUser?.id;
+                return (
+                  <div key={r.player_id} style={{ padding: "12px 14px", borderRadius: 12, background: C.pageBg, border: `1px solid ${C.border}` }}>
+                    <div style={{ display: "flex", alignItems: "center", gap: 8, marginBottom: 10, flexWrap: "wrap" }}>
+                      <LbAvatar name={r.name} id={r.player_id} size={28} />
+                      <span style={{ fontSize: 13, fontWeight: 700, color: C.text }}>{r.name}</span>
+                      {isMe && <LbBadge kind="you" />}
+                      <span style={{ marginLeft: "auto", fontSize: 11, fontWeight: 700, color: C.textMuted }}>Not enough data yet</span>
+                    </div>
+                    <div style={{ display: "flex", gap: 16, flexWrap: "wrap" }}>
+                      <LbProgress value={r.questions_faced} target={20} unit="Questions faced" />
+                      <LbProgress value={r.games} target={3} unit="Games completed" />
+                    </div>
+                  </div>
+                );
+              })}
             </div>
           </div>
         )}
@@ -7275,53 +7451,80 @@ function RalliLeaderboard({ currentUser, isManager }) {
     );
   };
 
-  const TeamsTable = () => {
+  // ── Teams: honest qualification cards (median adj accuracy, eligible members, participation). ──
+  const TeamsView = () => {
     if (teams.loading) return <LbStateCard title="Loading team standings…" />;
-    if (teams.error) return <LbStateCard icon="⚠️" title="Couldn't load team standings" body="The leaderboard service returned an error." action={retryBtn} />;
+    if (teams.error) return <LbStateCard title="Couldn't load team standings" body="The leaderboard service returned an error." action={retryBtn} />;
     const { ranked, pending } = partitionTeams(teams.data?.rows || []);
     if (ranked.length === 0 && pending.length === 0) {
-      return <LbStateCard icon="🏁" title="No verified games yet" body="Team standings appear once completed Ralli Live sessions finish server verification." />;
+      return <LbStateCard title="No verified games yet" body="Team standings appear once completed Ralli Live sessions finish server verification." />;
     }
     const canOpen = (t) => isManager || t.team_id === myTeamId;
     return (
       <div style={{ display: "flex", flexDirection: "column", gap: 20 }}>
         {ranked.length === 0 ? (
-          <LbStateCard icon="📈" title="Not enough data to rank teams yet" body="A team ranks once at least 2 members are eligible and at least half of its active learners are eligible in this timeframe." />
+          <LbStateCard title="Not enough data to rank teams yet" body="A team ranks once at least 2 members are eligible and at least half of its active learners are eligible in this timeframe." />
         ) : (
-          <div style={{ overflowX: "auto", border: `1px solid ${C.border}`, borderRadius: 12 }}>
-            <table style={{ width: "100%", borderCollapse: "collapse", minWidth: 560 }}>
-              <thead><tr>
-                <th style={{ ...th, width: 48 }}>#</th>
-                <th style={th}>Team</th>
-                <th style={{ ...th, textAlign: "right" }}>Median adj. accuracy</th>
-                <th style={{ ...th, textAlign: "right" }}>Eligible</th>
-                <th style={{ ...th, textAlign: "right" }}>Participation</th>
-                <th style={{ ...th, width: 40 }}></th>
-              </tr></thead>
-              <tbody>
-                {ranked.map((t) => (
-                  <tr key={t.team_id} onClick={canOpen(t) ? () => setDrill({ teamId: t.team_id, teamName: t.team_name }) : undefined}
-                      style={{ cursor: canOpen(t) ? "pointer" : "default", background: t.team_id === myTeamId ? C.blueBg : "transparent" }}>
-                    <td style={{ ...num, fontWeight: 800, color: C.textSub }}>{t.rank}</td>
-                    <td style={td}><span style={{ fontWeight: 700 }}>{t.team_name || "Unnamed team"}</span>{t.team_id === myTeamId && <> <LbBadge kind="you" /></>}</td>
-                    <td style={{ ...num, fontWeight: 800 }}>{formatAccuracyPct(t.median_adjusted_accuracy)}</td>
-                    <td style={{ ...num, color: C.textSub }}>{t.eligible_members} / {t.active_learners}</td>
-                    <td style={{ ...num, color: C.textSub }}>{t.participation_pct != null ? `${t.participation_pct}%` : "—"}</td>
-                    <td style={{ ...num, color: C.textMuted }}>{canOpen(t) ? "›" : ""}</td>
-                  </tr>
-                ))}
-              </tbody>
-            </table>
+          <div className="lb-teamgrid">
+            {ranked.map((t) => {
+              const m = LB_MEDALS[t.rank];
+              const mine = t.team_id === myTeamId;
+              return (
+                <div key={t.team_id} className="lb-teamcard"
+                  onClick={canOpen(t) ? () => setDrill({ teamId: t.team_id, teamName: t.team_name }) : undefined}
+                  role={canOpen(t) ? "button" : undefined} tabIndex={canOpen(t) ? 0 : undefined}
+                  onKeyDown={canOpen(t) ? (e) => { if (e.key === "Enter" || e.key === " ") { e.preventDefault(); setDrill({ teamId: t.team_id, teamName: t.team_name }); } } : undefined}
+                  style={{
+                    position: "relative", padding: "18px 16px 16px", borderRadius: 16,
+                    background: m ? m.bg : C.cardBg, border: `1px solid ${m ? m.ring : C.cardBorder}`,
+                    cursor: canOpen(t) ? "pointer" : "default", boxShadow: t.rank === 1 ? C.shadowMd : C.shadowSm,
+                    outline: mine ? `2px solid ${C.blue}` : "none",
+                    display: "flex", flexDirection: "column", alignItems: "center", gap: 8, textAlign: "center",
+                  }}>
+                  {/* 1. Rank — same prominent podium typography + gold/silver/bronze metal color */}
+                  <div style={{ fontFamily: "'Unbounded', sans-serif", fontSize: t.rank === 1 ? 32 : 26, fontWeight: 800, color: m ? m.metal : C.text, lineHeight: 1 }}>#{t.rank}</div>
+                  {/* 2. Team name */}
+                  <div style={{ fontSize: 16, fontWeight: 800, color: C.text, maxWidth: "100%", whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis" }}>
+                    {t.team_name || "Unnamed team"}{mine && <> <LbBadge kind="you" /></>}
+                  </div>
+                  {/* 3. Median adjusted accuracy */}
+                  <div style={{ display: "flex", flexDirection: "column", alignItems: "center", gap: 3, marginTop: 2 }}>
+                    <div style={{ fontFamily: "'Unbounded', sans-serif", fontSize: 30, fontWeight: 800, color: m ? m.metal : C.text, lineHeight: 1 }}>{formatAccuracyPct(t.median_adjusted_accuracy)}</div>
+                    <LbTip label="Median adjusted accuracy" tip={LB_TIP.median} labelStyle={{ fontSize: 10, fontWeight: 700, letterSpacing: "0.06em", textTransform: "uppercase", color: C.textSub }} />
+                  </div>
+                  {/* 4. Qualification information */}
+                  <div style={{ display: "flex", gap: 8, flexWrap: "wrap", justifyContent: "center", marginTop: 4 }}>
+                    <LbTip
+                      label={`${t.eligible_members}/${t.active_learners} eligible`}
+                      ariaLabel={`${t.eligible_members} of ${t.active_learners} eligible`}
+                      tip={`${t.eligible_members} of the team's ${t.active_learners} active learners have enough verified Ralli Live data to be ranked.`}
+                      wrapStyle={{ background: C.white, borderRadius: 8, padding: "4px 10px", border: `1px solid ${C.border}` }}
+                      labelStyle={{ fontSize: 11, fontWeight: 700, color: C.textSub }} />
+                    <LbTip
+                      label={`${t.participation_pct != null ? `${t.participation_pct}%` : "—"} participation`}
+                      ariaLabel="Participation"
+                      tip={LB_TIP.participation}
+                      wrapStyle={{ background: C.white, borderRadius: 8, padding: "4px 10px", border: `1px solid ${C.border}` }}
+                      labelStyle={{ fontSize: 11, fontWeight: 700, color: C.textSub }} />
+                    <LbTip
+                      label="Qualified" tip={LB_TIP.qualified}
+                      wrapStyle={{ background: C.trueGreenBg, borderRadius: 8, padding: "4px 10px" }}
+                      labelStyle={{ fontSize: 11, fontWeight: 800, color: C.trueGreen }} />
+                  </div>
+                  {canOpen(t) && <div aria-hidden="true" style={{ position: "absolute", top: 12, right: 14, color: C.textMuted, fontSize: 16 }}>›</div>}
+                </div>
+              );
+            })}
           </div>
         )}
         {pending.length > 0 && (
           <div>
             <p style={{ margin: "0 0 8px", fontSize: 11, fontWeight: 800, letterSpacing: "0.08em", textTransform: "uppercase", color: C.textMuted }}>Not enough data</p>
-            <div style={{ display: "flex", flexDirection: "column", gap: 6 }}>
+            <div className="lb-teamgrid">
               {pending.map((t) => (
-                <div key={t.team_id} style={{ display: "flex", alignItems: "center", justifyContent: "space-between", gap: 12, padding: "10px 14px", borderRadius: 10, background: C.pageBg, border: `1px solid ${C.border}` }}>
-                  <span style={{ fontSize: 13, fontWeight: 700, color: C.text }}>{t.team_name || "Unnamed team"}</span>
-                  <span style={{ fontSize: 12, color: C.textSub }}>{t.eligible_members} of {t.active_learners} eligible</span>
+                <div key={t.team_id} style={{ padding: "14px 16px", borderRadius: 14, background: C.pageBg, border: `1px solid ${C.border}` }}>
+                  <div style={{ fontSize: 14, fontWeight: 800, color: C.text, marginBottom: 6 }}>{t.team_name || "Unnamed team"}</div>
+                  <div style={{ fontSize: 12, color: C.textSub }}>{t.eligible_members} of {t.active_learners} learners eligible · needs ≥2 eligible &amp; ≥50% participation</div>
                 </div>
               ))}
             </div>
@@ -7331,32 +7534,30 @@ function RalliLeaderboard({ currentUser, isManager }) {
     );
   };
 
-  const DrillDown = () => {
-    return (
-      <div style={{ display: "flex", flexDirection: "column", gap: 16 }}>
-        <button onClick={() => setDrill(null)} style={{ alignSelf: "flex-start", background: "none", border: "none", cursor: "pointer", fontSize: 13, fontWeight: 700, color: C.textSub, padding: 0 }}>← Back to Teams</button>
-        <h3 style={{ margin: 0, fontSize: 18, fontWeight: 900, color: C.text }}>{drill.teamName || "Team"}</h3>
-        {members.loading ? <LbStateCard title="Loading team members…" />
-          : members.error ? <LbStateCard icon="⚠️" title="Couldn't load this team" body="You may only view your own team, or the service returned an error." action={retryBtn} />
-          : <IndividualsTable rows={members.data?.rows || []} scopedToTeam />}
-      </div>
-    );
-  };
+  const DrillDown = () => (
+    <div style={{ display: "flex", flexDirection: "column", gap: 16 }}>
+      <button onClick={() => setDrill(null)} style={{ alignSelf: "flex-start", background: "none", border: "none", cursor: "pointer", fontSize: 13, fontWeight: 700, color: C.textSub, padding: 0 }}>← Back to Teams</button>
+      <h3 style={{ margin: 0, fontFamily: "'Unbounded', sans-serif", fontSize: 18, fontWeight: 800, color: C.text }}>{drill.teamName || "Team"}</h3>
+      {members.loading ? <LbStateCard title="Loading team members…" />
+        : members.error ? <LbStateCard title="Couldn't load this team" body="You may only view your own team, or the service returned an error." action={retryBtn} />
+        : <IndividualsTable rows={members.data?.rows || []} scopedToTeam />}
+    </div>
+  );
 
   const tfActive = TIMEFRAMES.find((t) => t.id === timeframe);
+  const segBtn = (activeSel) => ({
+    padding: "8px 18px", borderRadius: 8, border: "none", cursor: "pointer", fontSize: 13, fontWeight: 700,
+    background: activeSel ? C.white : "transparent", color: activeSel ? C.text : C.textSub,
+    boxShadow: activeSel ? "0 1px 4px rgba(0,0,0,0.08)" : "none",
+  });
 
   return (
-    <div style={{ maxWidth: 900 }}>
-      {/* Controls: sub-tabs (left) + timeframe (right) */}
-      <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", gap: 12, marginBottom: 8, flexWrap: "wrap" }}>
+    <div className="lb-wrap">
+      <style>{LB_CSS}</style>
+      <div className="lb-controls">
         <div style={{ display: "flex", gap: 4, background: C.muted, borderRadius: 10, padding: 4 }}>
           {[{ id: "individuals", label: "Individuals" }, { id: "teams", label: "Teams" }].map((t) => (
-            <button key={t.id} onClick={() => { setView(t.id); setDrill(null); }} style={{
-              padding: "8px 18px", borderRadius: 8, border: "none", cursor: "pointer", fontSize: 13, fontWeight: 700,
-              background: view === t.id && !drill ? C.white : "transparent",
-              color: view === t.id && !drill ? C.text : C.textSub,
-              boxShadow: view === t.id && !drill ? "0 1px 4px rgba(0,0,0,0.08)" : "none",
-            }}>{t.label}</button>
+            <button key={t.id} onClick={() => { setView(t.id); setDrill(null); }} style={segBtn(view === t.id && !drill)}>{t.label}</button>
           ))}
         </div>
         <select value={timeframe} onChange={(e) => setTimeframe(e.target.value)} style={{
@@ -7370,13 +7571,12 @@ function RalliLeaderboard({ currentUser, isManager }) {
         {tfActive ? tfActive.label : ""} · times shown in {resolvedTz || "org timezone"}
       </p>
 
-      {/* Body */}
       {drill ? <DrillDown />
         : view === "individuals"
           ? (ind.loading ? <LbStateCard title="Loading individuals…" />
-             : ind.error ? <LbStateCard icon="⚠️" title="Couldn't load the leaderboard" body="The leaderboard service returned an error." action={retryBtn} />
+             : ind.error ? <LbStateCard title="Couldn't load the leaderboard" body="The leaderboard service returned an error." action={retryBtn} />
              : <IndividualsTable rows={ind.data?.rows || []} />)
-          : <TeamsTable />}
+          : <TeamsView />}
     </div>
   );
 }
@@ -20835,160 +21035,6 @@ const fullLeaderboard = [
   { rank: 7, initials: "NB", name: "Nina Barnes", title: "BDR", score: 78, weeklyXp: 680, streak: 8, color: "#EC4899" },
   { rank: 8, initials: "CR", name: "Carlos Reyes", title: "SDR", score: 74, weeklyXp: 610, streak: 2, color: "#14B8A6" },
 ];
-
-function LeaderboardScreen({ currentUser, isReal = false, tenantId = null }) {
-  const mobile = useMobile();
-  const [rows,    setRows]    = useState([]);
-  const [loading, setLoading] = useState(isReal);
-
-  useEffect(() => {
-    if (!isReal || !tenantId) { setLoading(false); return; }
-    // Inline import to avoid circular dep — scoringService is not imported at the module level for this component
-    import("./src/lib/scoringService.js").then(({ getLeaderboard }) => {
-      getLeaderboard(tenantId, currentUser?.id).then(({ data }) => {
-        setRows(data ?? []);
-        setLoading(false);
-      });
-    });
-  }, [tenantId, isReal, currentUser?.id]); // eslint-disable-line react-hooks/exhaustive-deps
-
-  const leaderboard = isReal ? rows : fullLeaderboard.map(p => ({ ...p, isMe: p.userId ? p.userId === currentUser?.id : !!p.isMe }));
-
-  const colGrid = "48px 1fr 90px 80px 80px 72px 72px 72px";
-  const colHeader = ["#", "MEMBER", "TOTAL", "QUIZ PTS", "GAME PTS", "LEARN XP", "GAMES", "QUIZZES"];
-
-  if (loading) {
-    return (
-      <div style={{ display: "flex", flexDirection: "column", gap: 20 }}>
-        <div>
-          <h2 style={{ margin: 0, fontSize: 22, fontWeight: 800, color: C.text }}>Leaderboard</h2>
-          <p style={{ margin: "4px 0 0", fontSize: 13, color: C.textSub }}>Team rankings based on total points earned</p>
-        </div>
-        <LoadingState rows={5} message="Loading rankings…" />
-      </div>
-    );
-  }
-
-  if (isReal && leaderboard.length === 0) {
-    return (
-      <div style={{ display: "flex", flexDirection: "column", gap: 20 }}>
-        <div>
-          <h2 style={{ margin: 0, fontSize: 22, fontWeight: 800, color: C.text }}>Leaderboard</h2>
-          <p style={{ margin: "4px 0 0", fontSize: 13, color: C.textSub }}>Team rankings based on total points earned</p>
-        </div>
-        <EmptyState
-          icon="🏆"
-          title="No rankings yet"
-          message="Rankings appear once your team starts completing lessons, quizzes, and live games."
-        />
-      </div>
-    );
-  }
-
-  const podium = leaderboard.slice(0, 3);
-  const podiumOrder = podium.length >= 3 ? [podium[1], podium[0], podium[2]] : podium;
-  const podiumMedals = ["2nd", "1st", "3rd"];
-  const podiumColors = [C.orange, "#F5A623", "#CD7F32"];
-
-  return (
-    <div style={{ display: "flex", flexDirection: "column", gap: 20 }}>
-      <div>
-        <h2 style={{ margin: 0, fontSize: 22, fontWeight: 800, color: C.text }}>Leaderboard</h2>
-        <p style={{ margin: "4px 0 0", fontSize: 13, color: C.textSub }}>Team rankings based on total points earned</p>
-      </div>
-
-      {/* Top 3 podium */}
-      {podiumOrder.length >= 2 && (
-        <Card style={{ background: `linear-gradient(135deg, ${C.dark}, #1F2937)`, border: "none" }}>
-          <div style={{ display: "flex", alignItems: "flex-end", justifyContent: "center", gap: 20, padding: "20px 0 8px" }}>
-            {podiumOrder.map((p, i) => {
-              if (!p) return null;
-              const isFirst = i === 1;
-              const scoreColor = podiumColors[i] ?? "#A8B2C0";
-              return (
-                <div key={p.userId ?? p.rank} style={{ textAlign: "center", flex: 1 }}>
-                  <div style={{ fontSize: isFirst ? 28 : 20, marginBottom: 8 }}>{podiumMedals[i]}</div>
-                  <Avatar initials={p.initials} size={isFirst ? 60 : 48} color={scoreColor} bg={scoreColor + "33"} />
-                  <div style={{ fontSize: isFirst ? 14 : 12, fontWeight: 700, color: "#fff", marginTop: 8 }}>
-                    {(p.name ?? "").split(" ")[0]}{p.isMe ? " (you)" : ""}
-                  </div>
-                  <div style={{ fontSize: isFirst ? 22 : 18, fontWeight: 800, color: scoreColor, marginTop: 4 }}>
-                    {(isReal ? p.total : p.score ?? p.total ?? 0).toLocaleString()}
-                  </div>
-                  <div style={{ height: isFirst ? 80 : i === 0 ? 60 : 50, background: "rgba(255,255,255,0.06)", borderRadius: "6px 6px 0 0", marginTop: 10, border: "1px solid rgba(255,255,255,0.1)" }} />
-                </div>
-              );
-            })}
-          </div>
-        </Card>
-      )}
-
-      {/* Full table — horizontal scroll on mobile */}
-      <Card style={{ padding: 0, overflow: "hidden" }}>
-        <div style={{ overflowX: mobile ? "auto" : "visible", WebkitOverflowScrolling: "touch" }}>
-          <div style={{ minWidth: mobile ? 600 : "auto" }}>
-            {/* Header */}
-            <div style={{
-              padding: "10px 20px",
-              borderBottom: `1px solid ${C.border}`,
-              display: "grid",
-              gridTemplateColumns: colGrid,
-              gap: 6,
-              fontSize: 10,
-              fontWeight: 700,
-              color: C.textMuted,
-              letterSpacing: "0.08em",
-              textTransform: "uppercase",
-            }}>
-              {colHeader.map((h, i) => (
-                <div key={h} style={{ textAlign: i >= 2 ? "right" : "left" }}>{h}</div>
-              ))}
-            </div>
-
-            {/* Rows */}
-            {leaderboard.map((p, i) => {
-              const total        = isReal ? p.total        : (p.score ?? 0);
-              const quizPoints   = isReal ? p.quizPoints   : 0;
-              const gamePoints   = isReal ? p.gamePoints   : 0;
-              const learningXp   = isReal ? p.learningXp   : (p.weeklyXp ?? 0);
-              const gamesPlayed  = isReal ? p.gamesPlayed  : 0;
-              const quizzesDone  = isReal ? p.quizzesCompleted : 0;
-              return (
-                <div key={p.userId ?? p.rank} style={{
-                  padding: "12px 20px",
-                  display: "grid",
-                  gridTemplateColumns: colGrid,
-                  gap: 6,
-                  alignItems: "center",
-                  background: p.isMe ? C.orangeLight : "transparent",
-                  borderBottom: i < leaderboard.length - 1 ? `1px solid ${C.border}` : "none",
-                  borderLeft: `3px solid ${p.isMe ? C.orange : "transparent"}`,
-                }}>
-                  <div style={{ fontSize: 14, fontWeight: 700, color: p.rank <= 3 ? C.orange : C.textSub }}>#{p.rank}</div>
-                  <div style={{ display: "flex", alignItems: "center", gap: 10, minWidth: 0 }}>
-                    <Avatar initials={p.initials} size={34} color={p.color ?? C.orange} />
-                    <div style={{ minWidth: 0 }}>
-                      <div style={{ fontSize: 14, fontWeight: p.isMe ? 700 : 500, color: p.isMe ? C.orange : C.text, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
-                        {p.name}{p.isMe ? " (you)" : ""}
-                      </div>
-                      {p.title && <div style={{ fontSize: 12, color: C.textSub }}>{p.title}</div>}
-                    </div>
-                  </div>
-                  <div style={{ textAlign: "right", fontSize: 15, fontWeight: 800, color: C.text }}>{total.toLocaleString()}</div>
-                  <div style={{ textAlign: "right", fontSize: 13, fontWeight: 600, color: C.purple ?? "#8B5CF6" }}>{quizPoints.toLocaleString()}</div>
-                  <div style={{ textAlign: "right", fontSize: 13, fontWeight: 600, color: C.orange }}>{gamePoints.toLocaleString()}</div>
-                  <div style={{ textAlign: "right", fontSize: 13, fontWeight: 600, color: C.green ?? "#22C55E" }}>{learningXp.toLocaleString()}</div>
-                  <div style={{ textAlign: "right", fontSize: 13, color: C.textSub }}>{gamesPlayed}</div>
-                  <div style={{ textAlign: "right", fontSize: 13, color: C.textSub }}>{quizzesDone}</div>
-                </div>
-              );
-            })}
-          </div>
-        </div>
-      </Card>
-    </div>
-  );
-}
 
 // ── LOGIN SCREEN ───────────────────────────────────────────
 
