@@ -127,6 +127,8 @@ import { triggerReadinessUpdate, getTopicHeatmap, getOrgMetrics, getRepTopicScor
 import { cellScore as heatmapCellScore, coverageLine as heatmapCoverageLine, thresholdNote as heatmapThresholdNote, hasVerifiedEvidence as heatmapHasEvidence } from "./src/lib/heatmapModel.js";
 import { listTenantQuizTags, listQuizTagMap, listQuizClassification, getQuizTagState, createQuizTag, renameQuizTag, archiveQuizTag, restoreQuizTag, mergeQuizTags, setQuizTags } from "./src/lib/taxonomyService.js";
 import { activeMappedTagIds, classificationFromActiveCount, tagCapabilities, buildBuilderTagRows, quizTagModel, filterQuizzesByTag, tagUsageCounts, resolveTag, normalizeTagError, savePayloadId, hasActiveSelection, selectedActiveTagIds, tagRequirementError, governanceOutcome, quizSaveSuccessMessage, canBeginSave, runQuizSave } from "./src/lib/quizTagsUi.js";
+import { getTagCandidates as readinessGetTagCandidates, saveDraft as readinessSaveDraft, activateConfig as readinessActivateConfig } from "./src/lib/readinessAdminService.js";
+import { deriveSetupState as readinessDeriveSetupState, draftDesignationsFrom as readinessDraftDesignations, isDraftDirty as readinessDraftDirty, warningLabel as readinessWarningLabel, setupBanner as readinessSetupBanner, canAccessReadinessSettings } from "./src/lib/readinessConfig.js";
 
 // ── MOBILE HOOK ────────────────────────────────────────────
 function useMobile() {
@@ -23878,11 +23880,12 @@ function LoginScreen({ onLogin, users = USERS }) {
 // Tabbed settings for Organization Admin: Role Access + Team Settings
 // ─────────────────────────────────────────────────────────────────────────────
 function OrgAdminSettingsScreen({ rolePermissions, onSaveRolePermissions, currentOrg, orgId, orgName, orgUsers, onAddUser, readinessThreshold = 80, onSaveReadinessThreshold }) {
-  const [tab, setTab] = useState("roles"); // "roles" | "team" | "learning"
+  const [tab, setTab] = useState("roles"); // "roles" | "team" | "learning" | "readiness"
   const tabs = [
-    { id: "roles",    label: "Role Access" },
-    { id: "team",     label: "Team Settings" },
-    { id: "learning", label: "Learning" },
+    { id: "roles",     label: "Role Access" },
+    { id: "team",      label: "Team Settings" },
+    { id: "learning",  label: "Learning" },
+    { id: "readiness", label: "Readiness" },
   ];
   return (
     <div style={{ display: "flex", flexDirection: "column", gap: 20 }}>
@@ -23901,6 +23904,7 @@ function OrgAdminSettingsScreen({ rolePermissions, onSaveRolePermissions, curren
       {tab === "roles"    && <RoleAccessScreen rolePermissions={rolePermissions} onSave={onSaveRolePermissions} currentOrg={currentOrg} />}
       {tab === "team"     && <TeamScreen orgId={orgId} orgName={orgName} orgUsers={orgUsers} onAddUser={onAddUser} />}
       {tab === "learning" && <LearningSettingsScreen readinessThreshold={readinessThreshold} onSave={onSaveReadinessThreshold} />}
+      {tab === "readiness" && <ReadinessSettingsScreen />}
     </div>
   );
 }
@@ -23995,6 +23999,158 @@ function LearningSettingsScreen({ readinessThreshold = READINESS_THRESHOLD_DEFAU
           ✓ Saved
         </div>
       )}
+    </div>
+  );
+}
+
+// ── ReadinessSettingsScreen — designate quiz tags as readiness knowledge areas ──
+// Rendered for same-tenant managers and orgAdmins only (via OrgAdminSettingsScreen's
+// Readiness tab for orgAdmins, and UserSettingsScreen's manager-only section). The
+// server RPCs (readiness_caller_can_configure + tenant-scoped RLS) are the real
+// authorization + cross-tenant boundary; this UI gate is convenience. All
+// counts/validity come from the server — the client never computes readiness.
+// Shadow phase: activating a configuration does NOT change the live dashboard.
+function ReadinessSettingsScreen() {
+  const [rows, setRows] = useState(null);          // editable tag rows
+  const [saved, setSaved] = useState([]);          // last-saved designations (for dirty check)
+  const [versionId, setVersionId] = useState(null);
+  const [loading, setLoading] = useState(true);
+  const [err, setErr] = useState(null);
+  const [busy, setBusy] = useState(false);
+  const [notice, setNotice] = useState(null);
+
+  const load = async () => {
+    setLoading(true); setErr(null);
+    const { data, error } = await readinessGetTagCandidates();
+    if (error) { setErr(error.message || "Failed to load readiness configuration."); setLoading(false); return; }
+    const tags = (data?.tags ?? []).map(t => ({ ...t }));
+    setRows(tags);
+    setSaved(readinessDraftDesignations(tags));
+    setVersionId(data?.configVersionId ?? null);
+    setLoading(false);
+  };
+  useEffect(() => { load(); /* eslint-disable-next-line react-hooks/exhaustive-deps */ }, []);
+
+  const state = readinessDeriveSetupState({ tags: rows ?? [] });
+  const dirty = rows ? readinessDraftDirty(rows, saved) : false;
+
+  const toggleCounts = (tagId) => setRows(rs => rs.map(r => r.tagId === tagId
+    ? { ...r, countsTowardReadiness: !r.countsTowardReadiness, isRequired: r.countsTowardReadiness ? false : r.isRequired }
+    : r));
+  const toggleRequired = (tagId) => setRows(rs => rs.map(r => r.tagId === tagId && r.countsTowardReadiness
+    ? { ...r, isRequired: !r.isRequired } : r));
+
+  const handleSaveDraft = async () => {
+    setBusy(true); setErr(null); setNotice(null);
+    const { data, error } = await readinessSaveDraft(readinessDraftDesignations(rows));
+    setBusy(false);
+    if (error) { setErr(error.message || "Failed to save draft."); return; }
+    setSaved(readinessDraftDesignations(rows));
+    if (data?.draftVersionId) setVersionId(data.draftVersionId);
+    setNotice("Draft saved. Review coverage, then activate to make it the live readiness configuration.");
+  };
+
+  const handleActivate = async () => {
+    if (!versionId) return;
+    if (!window.confirm("Activate this readiness configuration?\n\nReps' readiness will be measured against these tags. Removing or archiving a required tag later can leave reps without coverage until you assign a replacement.")) return;
+    setBusy(true); setErr(null); setNotice(null);
+    const { data, error } = await readinessActivateConfig(versionId);
+    setBusy(false);
+    if (error) { setErr(error.message || "Failed to activate configuration."); return; }
+    setNotice("Readiness configuration activated.");
+    await load();
+  };
+
+  if (loading) return <div style={{ fontSize: 13, color: C.textSub, padding: 24 }}>Loading readiness configuration…</div>;
+  if (err && !rows) return <div style={{ fontSize: 13, color: C.red, padding: 24 }}>{err}</div>;
+
+  return (
+    <div style={{ display: "flex", flexDirection: "column", gap: 16, maxWidth: 820 }}>
+      <div style={{ background: C.white, borderRadius: 16, border: `1px solid ${C.border}`, padding: 24 }}>
+        <div style={{ fontSize: 16, fontWeight: 800, color: C.text, marginBottom: 6 }}>Readiness Tags</div>
+        <p style={{ margin: "0 0 4px", fontSize: 13, color: C.textSub, lineHeight: 1.6 }}>
+          A <strong>readiness tag</strong> is a knowledge area you designate as required for official readiness.
+          Readiness is measured only from <strong>verified quiz mastery</strong> in these areas — ordinary quiz tags
+          keep organizing content and analytics but never affect a rep's readiness unless designated here.
+        </p>
+        <p style={{ margin: "0 0 2px", fontSize: 12.5, color: C.textSub, lineHeight: 1.6 }}>
+          Mark <strong>Required</strong> for areas every rep must demonstrate. A rep is only scored once they have
+          enough recent verified evidence; until then they show “Establishing readiness,” never a low score.
+        </p>
+      </div>
+
+      {/* Setup-complete / incomplete banner */}
+      <div style={{
+        borderRadius: 12, padding: "12px 16px", fontSize: 13, fontWeight: 700,
+        border: `1px solid ${state.setupComplete ? "#a7f3d0" : "#fde68a"}`,
+        background: state.setupComplete ? "#ecfdf5" : "#fffbeb",
+        color: state.setupComplete ? "#047857" : "#92400e",
+      }}>
+        {state.setupComplete ? "✓ " : "⚠ "}{readinessSetupBanner(state)}
+      </div>
+
+      {/* Tag table */}
+      <div style={{ background: C.white, borderRadius: 16, border: `1px solid ${C.border}`, overflow: "hidden" }}>
+        <div style={{ display: "grid", gridTemplateColumns: "1.6fr 0.9fr 0.7fr 0.7fr 1.4fr", gap: 0,
+          padding: "10px 16px", background: C.bg2 ?? "#f8fafc", fontSize: 11, fontWeight: 800,
+          color: C.textSub, letterSpacing: "0.04em", textTransform: "uppercase" }}>
+          <div>Tag</div><div>Counts / Required</div><div>Quizzes</div><div>Questions</div><div>Status</div>
+        </div>
+        {(rows ?? []).length === 0 && (
+          <div style={{ padding: 20, fontSize: 13, color: C.textSub }}>No active quiz tags yet. Create and assign tags to quizzes first.</div>
+        )}
+        {(rows ?? []).map(r => {
+          const valid = r.status === "active" && r.coverageSufficient;
+          return (
+            <div key={r.tagId} style={{ display: "grid", gridTemplateColumns: "1.6fr 0.9fr 0.7fr 0.7fr 1.4fr",
+              gap: 0, padding: "12px 16px", borderTop: `1px solid ${C.border}`, alignItems: "center" }}>
+              <div style={{ fontSize: 14, fontWeight: 700, color: C.text }}>{r.label}</div>
+              <div style={{ display: "flex", gap: 12, alignItems: "center", fontSize: 12, fontWeight: 700 }}>
+                <label style={{ display: "flex", gap: 5, alignItems: "center", cursor: "pointer", color: r.countsTowardReadiness ? C.text : C.textSub }}>
+                  <input type="checkbox" checked={!!r.countsTowardReadiness} onChange={() => toggleCounts(r.tagId)} /> Counts
+                </label>
+                <label style={{ display: "flex", gap: 5, alignItems: "center", cursor: r.countsTowardReadiness ? "pointer" : "not-allowed", color: r.countsTowardReadiness ? C.text : C.muted }}>
+                  <input type="checkbox" disabled={!r.countsTowardReadiness} checked={!!r.isRequired} onChange={() => toggleRequired(r.tagId)} /> Required
+                </label>
+              </div>
+              <div style={{ fontSize: 13, fontWeight: 700, color: r.activeQuizCount >= 1 ? C.text : C.red }}>{r.activeQuizCount}</div>
+              <div style={{ fontSize: 13, fontWeight: 700, color: r.distinctQuestionCount >= 1 ? C.text : C.red }}>{r.distinctQuestionCount}</div>
+              <div style={{ fontSize: 12, fontWeight: 700 }}>
+                {valid
+                  ? <span style={{ color: "#047857" }}>Adequate coverage</span>
+                  : <span style={{ color: "#b45309" }}>{(r.warnings && r.warnings.length ? readinessWarningLabel(r.warnings[0]) : "Insufficient coverage")}</span>}
+              </div>
+            </div>
+          );
+        })}
+      </div>
+
+      {notice && <div style={{ fontSize: 12.5, color: "#047857", fontWeight: 700 }}>✓ {notice}</div>}
+      {err && <div style={{ fontSize: 12.5, color: C.red, fontWeight: 700 }}>{err}</div>}
+
+      {/* Actions: save draft (dirty) vs activate (valid + saved). */}
+      <div style={{ display: "flex", gap: 10, alignItems: "center" }}>
+        <button onClick={handleSaveDraft} disabled={!dirty || busy} style={{
+          padding: "10px 20px", borderRadius: 10, border: "none", fontSize: 13, fontWeight: 700, color: "#fff",
+          cursor: (!dirty || busy) ? "not-allowed" : "pointer", background: (!dirty || busy) ? C.muted : C.orange }}>
+          Save draft
+        </button>
+        <button onClick={handleActivate} disabled={!state.canActivate || dirty || busy || !versionId} style={{
+          padding: "10px 20px", borderRadius: 10, border: `1px solid ${(!state.canActivate || dirty) ? C.border : "#047857"}`,
+          fontSize: 13, fontWeight: 700,
+          color: (!state.canActivate || dirty || busy) ? C.muted : "#047857",
+          background: C.white, cursor: (!state.canActivate || dirty || busy || !versionId) ? "not-allowed" : "pointer" }}>
+          Activate configuration
+        </button>
+        {dirty && <span style={{ fontSize: 12, color: C.textSub }}>Unsaved changes — save the draft before activating.</span>}
+      </div>
+
+      <p style={{ margin: 0, fontSize: 11.5, color: C.textSub, lineHeight: 1.6 }}>
+        Activating a configuration makes it the live readiness definition for scoring. Existing verified evidence
+        for an archived quiz or tag stays valid until it ages out; archived content cannot produce new evidence.
+        Changing designations creates a new draft you can preview before activating — historical scores keep the
+        configuration version they were computed under.
+      </p>
     </div>
   );
 }
@@ -24672,7 +24828,7 @@ function RoleAccessScreen({ rolePermissions, onSave, currentOrg }) {
 // Production hook: replace localStorage reads/writes with API calls to
 // /api/users/:id/profile and /api/users/:id/notification-prefs
 // ─────────────────────────────────────────────────────────────────────────────
-function UserSettingsScreen({ user, profile, notifPrefs, onSaveProfile, onSaveNotifs, currentOrg, onSignOut }) {
+function UserSettingsScreen({ user, profile, notifPrefs, onSaveProfile, onSaveNotifs, currentOrg, onSignOut, showReadiness = false }) {
   // Local draft state so unsaved changes don't immediately affect the app
   const [nick,   setNick]   = useState(profile.nickname ?? "");
   const [avatar, setAvatar] = useState(profile.avatarEmoji ?? null);
@@ -24727,6 +24883,14 @@ function UserSettingsScreen({ user, profile, notifPrefs, onSaveProfile, onSaveNo
   return (
     <div style={{ maxWidth: 600, margin: "0 auto", padding: "32px 24px" }}>
       <h1 style={{ margin: "0 0 32px", fontSize: 22, fontWeight: 900, color: C.text }}>Settings</h1>
+
+      {/* ── READINESS (managers only; learners never see this) ── */}
+      {showReadiness && (
+        <div style={{ marginBottom: 28 }}>
+          <SectionHeader title="Readiness" subtitle="Designate the knowledge areas that count toward rep readiness." />
+          <ReadinessSettingsScreen />
+        </div>
+      )}
 
       {/* ── PROFILE ── */}
       <Card style={{ marginBottom: 20 }}>
@@ -27001,7 +27165,7 @@ export default function App() {
       case "settings":
         if (isSuperAdmin)  return <RoleAccessScreen rolePermissions={rolePermissions} onSave={handleSaveRolePermissions} currentOrg={currentOrg} />;
         if (isOrgAdmin)    return <OrgAdminSettingsScreen rolePermissions={rolePermissions} onSaveRolePermissions={handleSaveRolePermissions} currentOrg={currentOrg} orgId={user.orgId} orgName={currentOrg?.name ?? "Your Team"} orgUsers={orgUsers} onAddUser={handleAddUser} readinessThreshold={readinessThreshold} onSaveReadinessThreshold={handleSaveReadinessThreshold} />;
-        return <UserSettingsScreen user={user} profile={userProfile} notifPrefs={notifPrefs} onSaveProfile={handleSaveProfile} onSaveNotifs={handleSaveNotifs} currentOrg={currentOrg} onSignOut={async () => { if (user?._isReal) { await supabase.auth.signOut(); /* SIGNED_OUT handler redirects */ } else { setCurrentUser(null); setLastSeenAt(null); setNewAssignmentCount(0); setPendingLessonId(null); setPendingCourseId(null); setPendingQuizId(null); setOrgs(INITIAL_ORGS); setOrgUsers(INITIAL_ORG_USERS); setQuizzesReady(false); setSessions(INITIAL_SESSIONS); setBattleCards(INITIAL_BATTLE_CARDS); clearLearnNavSessionState(); clearActiveGameContext(); clearBattleCardDrafts(); window.location.replace("/login"); } }} />;
+        return <UserSettingsScreen user={user} profile={userProfile} notifPrefs={notifPrefs} onSaveProfile={handleSaveProfile} onSaveNotifs={handleSaveNotifs} currentOrg={currentOrg} showReadiness={canAccessReadinessSettings(role)} onSignOut={async () => { if (user?._isReal) { await supabase.auth.signOut(); /* SIGNED_OUT handler redirects */ } else { setCurrentUser(null); setLastSeenAt(null); setNewAssignmentCount(0); setPendingLessonId(null); setPendingCourseId(null); setPendingQuizId(null); setOrgs(INITIAL_ORGS); setOrgUsers(INITIAL_ORG_USERS); setQuizzesReady(false); setSessions(INITIAL_SESSIONS); setBattleCards(INITIAL_BATTLE_CARDS); clearLearnNavSessionState(); clearActiveGameContext(); clearBattleCardDrafts(); window.location.replace("/login"); } }} />;
       default:                  return <HomeScreen user={user} />;
     }
   };
