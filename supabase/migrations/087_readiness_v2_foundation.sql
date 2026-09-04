@@ -22,7 +22,7 @@
 --
 -- Mastery model (platform-owned in beta): per-quiz mastery FIRST (≤3 most-recent
 -- CURRENT-COMPARABLE verified attempts, 60-day half-life, recency-only weighting),
--- multi-tag 1/N allocation, tag-level averaging for the overall, breadth gates
+-- one PRIMARY readiness tag per quiz (one-influence-per-quiz), tag-level averaging, breadth gates
 -- (≥3 distinct quizzes, ≥2 readiness tags, ≥10 distinct current-version graded
 -- questions, all required tags covered), 120-day staleness, bands Ready≥80 /
 -- Developing 65–79 / Needs Attention <65. Missing evidence is NEVER zero:
@@ -386,7 +386,7 @@ DECLARE
   v_req_met boolean; v_req_current boolean; v_breadth_met boolean;
   v_was_established boolean; v_last_known int;
   v_newest_age numeric; v_state text; v_success text; v_confidence text; v_band text;
-  v_tag_masteries jsonb; v_included jsonb; v_excluded jsonb; v_evidence jsonb; v_flags jsonb;
+  v_tag_masteries jsonb; v_secondary jsonb; v_included jsonb; v_excluded jsonb; v_evidence jsonb; v_flags jsonb;
   v_material text; v_comp jsonb; v_eff_weights jsonb;
 BEGIN
   IF NOT public.readiness_is_scorable_rep(p_tenant, p_user) THEN
@@ -401,8 +401,8 @@ BEGIN
   -- (current quiz_tag_map never rewrites history; mirrors migration 062). Merged
   -- tags resolve transitively to their active target; archived tags/quizzes keep
   -- their historical attribution (grace) until 120-day staleness. Per-quiz mastery
-  -- first (≤3 most-recent CURRENT-COMPARABLE verified attempts), then 1/N tag
-  -- allocation from the quiz's most-recent counted attempt snapshot. ──
+  -- first (≤3 most-recent CURRENT-COMPARABLE verified attempts), then PRIMARY-tag
+  -- attribution from the quiz's most-recent counted attempt snapshot. ──
   WITH RECURSIVE rt AS (
     SELECT tag_id, is_required FROM public.readiness_tag_designations WHERE formula_version_id = p_version_id
   ),
@@ -446,12 +446,30 @@ BEGIN
            (array_agg(attempt_id ORDER BY created_at DESC))[1] AS recent_attempt
     FROM capped GROUP BY quiz_id
   ),
-  -- Tag attribution per quiz from its most-recent COUNTED attempt's designated tags:
-  quiz_tag AS ( SELECT pq.quiz_id, pq.mastery, x.tag_id FROM per_quiz pq JOIN att_tags x ON x.attempt_id = pq.recent_attempt ),
-  quiz_n AS ( SELECT quiz_id, count(*)::numeric AS n FROM quiz_tag GROUP BY quiz_id ),
-  alloc AS ( SELECT qt.tag_id, qt.quiz_id, qt.mastery, (1.0 / qn.n) AS w FROM quiz_tag qt JOIN quiz_n qn ON qn.quiz_id = qt.quiz_id ),
-  tag_mastery AS ( SELECT tag_id, SUM(w*mastery)/NULLIF(SUM(w),0) AS tag_score, count(DISTINCT quiz_id) AS quizzes FROM alloc GROUP BY tag_id ),
-  contrib_quiz AS ( SELECT DISTINCT quiz_id FROM quiz_tag ),
+  -- OFFICIAL scoring attributes each quiz to exactly ONE PRIMARY readiness tag: the
+  -- lowest tag_id among the designated tags on its most-recent counted attempt. This
+  -- guarantees one-total-influence-per-quiz — a quiz's coefficient in the overall is
+  -- identical whether it carries one tag or several, so a multi-tag quiz can never be
+  -- re-amplified (the earlier 1/N-then-renormalize model could). Every other
+  -- designated tag on the quiz is SECONDARY: surfaced as insights only, and it never
+  -- affects the overall score, tag coverage, or required coverage.
+  quiz_primary AS (
+    SELECT pq.quiz_id, pq.mastery, pq.newest_age_days,
+           (SELECT x.tag_id FROM att_tags x WHERE x.attempt_id = pq.recent_attempt ORDER BY x.tag_id LIMIT 1) AS tag_id
+    FROM per_quiz pq
+  ),
+  tag_mastery AS (   -- each quiz counts ONCE, in its primary tag (simple mean; tags then equal-weighted)
+    SELECT tag_id, avg(mastery) AS tag_score, count(*) AS quizzes, min(newest_age_days) AS tag_newest_age
+    FROM quiz_primary GROUP BY tag_id
+  ),
+  secondary AS (     -- insights only: designated tags on a quiz that are NOT its primary
+    SELECT x.tag_id, round(avg(pq.mastery),1) AS tag_score
+    FROM per_quiz pq
+    JOIN att_tags x ON x.attempt_id = pq.recent_attempt
+    WHERE x.tag_id <> (SELECT y.tag_id FROM att_tags y WHERE y.attempt_id = pq.recent_attempt ORDER BY y.tag_id LIMIT 1)
+    GROUP BY x.tag_id
+  ),
+  contrib_quiz AS ( SELECT DISTINCT quiz_id FROM quiz_primary ),
   -- distinct current-version gradeable question ids across contributing quizzes:
   qdistinct AS (
     SELECT DISTINCT cq.quiz_id, COALESCE(e->>'id', cq.quiz_id::text||':'||ord::text) AS qkey
@@ -462,21 +480,18 @@ BEGIN
     WHERE (e->>'type') IN ('mc','tf','type','match','slider')
   )
   SELECT
-    (SELECT avg(tag_score) FROM tag_mastery),
-    (SELECT count(*) FROM contrib_quiz),
-    (SELECT count(*) FROM tag_mastery),
-    (SELECT count(*) FROM qdistinct),
-    (SELECT count(*) FROM rt WHERE is_required),
-    (SELECT count(*) FROM rt r WHERE r.is_required AND EXISTS (SELECT 1 FROM tag_mastery tm WHERE tm.tag_id = r.tag_id)),
-    -- required tags with CURRENT (≤120d) comparable evidence — per-tag currency:
-    (SELECT count(*) FROM rt r WHERE r.is_required AND EXISTS (
-        SELECT 1 FROM quiz_tag qtc JOIN per_quiz pqc ON pqc.quiz_id = qtc.quiz_id
-        WHERE qtc.tag_id = r.tag_id AND pqc.newest_age_days <= v_stale)),
-    (SELECT min(newest_age_days) FROM per_quiz pq JOIN contrib_quiz cq ON cq.quiz_id = pq.quiz_id),
+    (SELECT avg(tag_score) FROM tag_mastery),                       -- overall = equal mean over primary tags
+    (SELECT count(*) FROM contrib_quiz),                            -- distinct contributing quizzes
+    (SELECT count(*) FROM tag_mastery),                             -- distinct primary readiness tags
+    (SELECT count(*) FROM qdistinct),                               -- distinct current-version graded questions
+    (SELECT count(*) FROM rt WHERE is_required),                    -- required tags total
+    (SELECT count(*) FROM rt r WHERE r.is_required AND EXISTS (SELECT 1 FROM tag_mastery tm WHERE tm.tag_id = r.tag_id)),                       -- required covered (as a primary tag)
+    (SELECT count(*) FROM rt r WHERE r.is_required AND EXISTS (SELECT 1 FROM tag_mastery tm WHERE tm.tag_id = r.tag_id AND tm.tag_newest_age <= v_stale)),  -- required current (≤120d)
+    (SELECT min(newest_age_days) FROM quiz_primary),                -- newest evidence age
     (SELECT COALESCE(jsonb_object_agg(tag_id, round(tag_score,1)), '{}'::jsonb) FROM tag_mastery),
-    (SELECT COALESCE(jsonb_agg(jsonb_build_object('quizId',quiz_id,'mastery',round(mastery,1)) ORDER BY quiz_id), '[]'::jsonb)
-       FROM per_quiz pq2 WHERE EXISTS (SELECT 1 FROM contrib_quiz cq WHERE cq.quiz_id = pq2.quiz_id))
-  INTO v_overall, v_dq, v_dt, v_dqu, v_req_total, v_req_ok, v_req_current_ok, v_newest_age, v_tag_masteries, v_included;
+    (SELECT COALESCE(jsonb_agg(jsonb_build_object('quizId',quiz_id,'mastery',round(mastery,1),'primaryTag',tag_id) ORDER BY quiz_id), '[]'::jsonb) FROM quiz_primary),
+    (SELECT COALESCE(jsonb_object_agg(tag_id, tag_score), '{}'::jsonb) FROM secondary)
+  INTO v_overall, v_dq, v_dt, v_dqu, v_req_total, v_req_ok, v_req_current_ok, v_newest_age, v_tag_masteries, v_included, v_secondary;
 
   v_req_met     := (v_req_total = v_req_ok);          -- every required tag has evidence (any age)
   v_req_current := (v_req_total = v_req_current_ok);  -- every required tag has ≤120d evidence
@@ -564,6 +579,7 @@ BEGIN
                                      'halfLifeDays',v_hl,'staleDays',v_stale,'attemptCap',v_cap),
     'newestEvidenceAgeDays', CASE WHEN v_newest_age IS NULL THEN NULL ELSE round(v_newest_age,1) END,
     'tagMastery', v_tag_masteries,
+    'secondaryTagMastery', v_secondary,   -- insights only; NOT part of the official score
     'includedQuizzes', v_included,
     'excludedCounts', v_excluded,
     -- Stale keeps the last ESTABLISHED score from history (not a fresh recompute).

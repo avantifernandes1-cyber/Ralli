@@ -143,6 +143,71 @@ INSERT INTO public.quiz_tag_map (quiz_id,tag_id,tenant_id) VALUES
  ('00000000-0000-0000-0000-0000000e0033','00000000-0000-0000-0000-0000000d0002','00000000-0000-0000-0000-0000000000a0'),
  ('00000000-0000-0000-0000-0000000e0034','00000000-0000-0000-0000-0000000d0001','00000000-0000-0000-0000-0000000000a0');
 
+-- ── Blocker 1 fixtures: independent roles. Manager (role='manager') in tenant A,
+-- a ralli_admin platform user (tenant NULL), and a separate tenant C with its own
+-- MANAGER for a full manager flow (candidates/save/activate/compare). ──
+INSERT INTO auth.users (id,aud,role,email,created_at,updated_at) VALUES
+ ('00000000-0000-0000-0000-0000000000da','authenticated','authenticated','mgr-a@t.test',now(),now()),
+ ('00000000-0000-0000-0000-0000000000db','authenticated','authenticated','ralli-admin@t.test',now(),now()),
+ ('00000000-0000-0000-0000-0000000000c9','authenticated','authenticated','mgr-c@t.test',now(),now());
+UPDATE public.profiles SET role='manager', tenant_id='00000000-0000-0000-0000-0000000000a0', status='active', name='MGRA' WHERE id='00000000-0000-0000-0000-0000000000da';
+UPDATE public.profiles SET role='ralli_admin', tenant_id=NULL, status='active', name='RA' WHERE id='00000000-0000-0000-0000-0000000000db';
+INSERT INTO public.tenants (id,slug,name) VALUES ('00000000-0000-0000-0000-0000000000c0','tc','TC');
+INSERT INTO public.tenant_settings (tenant_id, learning_settings) VALUES ('00000000-0000-0000-0000-0000000000c0','{"readinessThreshold":80}');
+INSERT INTO public.readiness_formula_versions (tenant_id,version,status,configuration,readiness_threshold,config_hash,source,created_at,activated_at)
+VALUES ('00000000-0000-0000-0000-0000000000c0',1,'active','{"model":"v1_legacy","weights":{"game":0.25,"learning":0.35,"quiz":0.40}}'::jsonb,80,public.readiness_v1_config_hash(80),'ralli_default',now(),now());
+UPDATE public.profiles SET role='manager', tenant_id='00000000-0000-0000-0000-0000000000c0', status='active', name='MGRC' WHERE id='00000000-0000-0000-0000-0000000000c9';
+INSERT INTO public.tenant_quiz_tags (id,tenant_id,label,created_by) VALUES
+ ('00000000-0000-0000-0000-000000dc0001','00000000-0000-0000-0000-0000000000c0','C-Product','00000000-0000-0000-0000-0000000000c9'),
+ ('00000000-0000-0000-0000-000000dc0002','00000000-0000-0000-0000-0000000000c0','C-Objections','00000000-0000-0000-0000-0000000000c9');
+INSERT INTO public.tenant_quizzes (id,tenant_id,name,status,questions)
+SELECT v.id,'00000000-0000-0000-0000-0000000000c0',v.nm,'active',
+  jsonb_build_array(jsonb_build_object('id',v.nm||'a','type','mc'),jsonb_build_object('id',v.nm||'b','type','tf'),jsonb_build_object('id',v.nm||'c','type','mc'),jsonb_build_object('id',v.nm||'d','type','type'))
+FROM (VALUES ('00000000-0000-0000-0000-000000ec0001'::uuid,'Qtc1'),('00000000-0000-0000-0000-000000ec0002','Qtc2')) v(id,nm);
+INSERT INTO public.quiz_tag_map (quiz_id,tag_id,tenant_id) VALUES
+ ('00000000-0000-0000-0000-000000ec0001','00000000-0000-0000-0000-000000dc0001','00000000-0000-0000-0000-0000000000c0'),
+ ('00000000-0000-0000-0000-000000ec0002','00000000-0000-0000-0000-000000dc0002','00000000-0000-0000-0000-0000000000c0');
+
+-- ── Blocker 2 fixtures: multi-tag weighting Cases A–D (tenant A). QA13=T1+T3, Qmt=T1+T2+T3. ──
+INSERT INTO public.tenant_quizzes (id,tenant_id,name,status,questions)
+SELECT v.id,'00000000-0000-0000-0000-0000000000a0',v.nm,'active',
+  jsonb_build_array(jsonb_build_object('id',v.nm||'a','type','mc'),jsonb_build_object('id',v.nm||'b','type','tf'),jsonb_build_object('id',v.nm||'c','type','mc'),jsonb_build_object('id',v.nm||'d','type','type'))
+FROM (VALUES ('00000000-0000-0000-0000-0000000e0041'::uuid,'QA13'),('00000000-0000-0000-0000-0000000e0043','Qmt')) v(id,nm);
+INSERT INTO public.quiz_tag_map (quiz_id,tag_id,tenant_id) VALUES
+ ('00000000-0000-0000-0000-0000000e0041','00000000-0000-0000-0000-0000000d0001','00000000-0000-0000-0000-0000000000a0'),
+ ('00000000-0000-0000-0000-0000000e0041','00000000-0000-0000-0000-0000000d0003','00000000-0000-0000-0000-0000000000a0'),
+ ('00000000-0000-0000-0000-0000000e0043','00000000-0000-0000-0000-0000000d0001','00000000-0000-0000-0000-0000000000a0'),
+ ('00000000-0000-0000-0000-0000000e0043','00000000-0000-0000-0000-0000000d0002','00000000-0000-0000-0000-0000000000a0'),
+ ('00000000-0000-0000-0000-0000000e0043','00000000-0000-0000-0000-0000000d0003','00000000-0000-0000-0000-0000000000a0');
+INSERT INTO auth.users (id,aud,role,email,created_at,updated_at) VALUES
+ ('00000000-0000-0000-0000-0000000000c1','authenticated','authenticated','rca@t.test',now(),now()),
+ ('00000000-0000-0000-0000-0000000000c2','authenticated','authenticated','rcb@t.test',now(),now()),
+ ('00000000-0000-0000-0000-0000000000c3','authenticated','authenticated','rcc@t.test',now(),now()),
+ ('00000000-0000-0000-0000-0000000000c4','authenticated','authenticated','rd1@t.test',now(),now()),
+ ('00000000-0000-0000-0000-0000000000c5','authenticated','authenticated','rd2@t.test',now(),now());
+UPDATE public.profiles SET role='user', tenant_id='00000000-0000-0000-0000-0000000000a0', status='active' WHERE id IN
+ ('00000000-0000-0000-0000-0000000000c1','00000000-0000-0000-0000-0000000000c2','00000000-0000-0000-0000-0000000000c3','00000000-0000-0000-0000-0000000000c4','00000000-0000-0000-0000-0000000000c5');
+-- Case A: QA13=100 (T1+T3), Q1=0 (T1). Primary(QA13)=T1 → T1=avg(100,0)=50; T3 insights=100.
+SELECT pg_temp.mkatt('00000000-0000-0000-0000-0000000000a0','00000000-0000-0000-0000-0000000000c1','00000000-0000-0000-0000-0000000e0041',100,5,ARRAY['00000000-0000-0000-0000-0000000d0001','00000000-0000-0000-0000-0000000d0003']::uuid[]);
+SELECT pg_temp.mkatt('00000000-0000-0000-0000-0000000000a0','00000000-0000-0000-0000-0000000000c1','00000000-0000-0000-0000-0000000e0011',0,5,ARRAY['00000000-0000-0000-0000-0000000d0001']::uuid[]);
+-- Case B: Qmt=60 (T1+T2+T3→T1), Qs1=90 (T1), Q2=80 (T2), Q6=70 (T3). T1=75,T2=80,T3=70 → 75.
+SELECT pg_temp.mkatt('00000000-0000-0000-0000-0000000000a0','00000000-0000-0000-0000-0000000000c2','00000000-0000-0000-0000-0000000e0043',60,5,ARRAY['00000000-0000-0000-0000-0000000d0001','00000000-0000-0000-0000-0000000d0002','00000000-0000-0000-0000-0000000d0003']::uuid[]);
+SELECT pg_temp.mkatt('00000000-0000-0000-0000-0000000000a0','00000000-0000-0000-0000-0000000000c2','00000000-0000-0000-0000-0000000e0031',90,5,ARRAY['00000000-0000-0000-0000-0000000d0001']::uuid[]);
+SELECT pg_temp.mkatt('00000000-0000-0000-0000-0000000000a0','00000000-0000-0000-0000-0000000000c2','00000000-0000-0000-0000-0000000e0012',80,5,ARRAY['00000000-0000-0000-0000-0000000d0002']::uuid[]);
+SELECT pg_temp.mkatt('00000000-0000-0000-0000-0000000000a0','00000000-0000-0000-0000-0000000000c2','00000000-0000-0000-0000-0000000e0016',70,5,ARRAY['00000000-0000-0000-0000-0000000d0003']::uuid[]);
+-- Case C: Qs3=50 (T1+T2→T1) is the only quiz for T1; Q2=90,Qd=70 (T2). T1=50, T2=80 → 65.
+SELECT pg_temp.mkatt('00000000-0000-0000-0000-0000000000a0','00000000-0000-0000-0000-0000000000c3','00000000-0000-0000-0000-0000000e0033',50,5,ARRAY['00000000-0000-0000-0000-0000000d0001','00000000-0000-0000-0000-0000000d0002']::uuid[]);
+SELECT pg_temp.mkatt('00000000-0000-0000-0000-0000000000a0','00000000-0000-0000-0000-0000000000c3','00000000-0000-0000-0000-0000000e0012',90,5,ARRAY['00000000-0000-0000-0000-0000000d0002']::uuid[]);
+SELECT pg_temp.mkatt('00000000-0000-0000-0000-0000000000a0','00000000-0000-0000-0000-0000000000c3','00000000-0000-0000-0000-0000000e001e',70,5,ARRAY['00000000-0000-0000-0000-0000000d0002']::uuid[]);
+-- Case D single (c4): Q1=100 (T1), Qs1=0 (T1), Q2=80 (T2). T1=50, T2=80 → 65.
+SELECT pg_temp.mkatt('00000000-0000-0000-0000-0000000000a0','00000000-0000-0000-0000-0000000000c4','00000000-0000-0000-0000-0000000e0011',100,5,ARRAY['00000000-0000-0000-0000-0000000d0001']::uuid[]);
+SELECT pg_temp.mkatt('00000000-0000-0000-0000-0000000000a0','00000000-0000-0000-0000-0000000000c4','00000000-0000-0000-0000-0000000e0031',0,5,ARRAY['00000000-0000-0000-0000-0000000d0001']::uuid[]);
+SELECT pg_temp.mkatt('00000000-0000-0000-0000-0000000000a0','00000000-0000-0000-0000-0000000000c4','00000000-0000-0000-0000-0000000e0012',80,5,ARRAY['00000000-0000-0000-0000-0000000d0002']::uuid[]);
+-- Case D multi (c5): SAME as c4 but the 100-quiz carries a 2nd tag (QA13 T1+T3). Overall must stay 65.
+SELECT pg_temp.mkatt('00000000-0000-0000-0000-0000000000a0','00000000-0000-0000-0000-0000000000c5','00000000-0000-0000-0000-0000000e0041',100,5,ARRAY['00000000-0000-0000-0000-0000000d0001','00000000-0000-0000-0000-0000000d0003']::uuid[]);
+SELECT pg_temp.mkatt('00000000-0000-0000-0000-0000000000a0','00000000-0000-0000-0000-0000000000c5','00000000-0000-0000-0000-0000000e0031',0,5,ARRAY['00000000-0000-0000-0000-0000000d0001']::uuid[]);
+SELECT pg_temp.mkatt('00000000-0000-0000-0000-0000000000a0','00000000-0000-0000-0000-0000000000c5','00000000-0000-0000-0000-0000000e0012',80,5,ARRAY['00000000-0000-0000-0000-0000000d0002']::uuid[]);
+
 -- ════════════ AUTHORIZATION ════════════
 -- Learner cannot configure / view candidates / run.
 SELECT pg_temp.as_user('00000000-0000-0000-0000-0000000000a1');
@@ -152,9 +217,36 @@ SELECT pg_temp.expect_error($$ SELECT public.readiness_run_shadow('00000000-0000
 -- Anon denied.
 SELECT pg_temp.as_user(NULL);
 SELECT pg_temp.expect_error($$ SELECT public.readiness_v2_save_draft('[]'::jsonb) $$, 'anon cannot save_draft');
--- Manager of tenant B cannot configure tenant A (cross-tenant); tB has no tenant-A tags so a save under MB is its own tenant.
-SELECT pg_temp.as_user('00000000-0000-0000-0000-0000000000b9');
-SELECT pg_temp.expect_error($$ SELECT public.readiness_v2_compare('00000000-0000-0000-0000-0000000000a0') $$, 'cross-tenant compare denied');
+-- Client-supplied role in the JWT cannot grant authority (server reads profiles.role by auth.uid).
+SELECT set_config('request.jwt.claims','{"sub":"00000000-0000-0000-0000-0000000000a1","role":"authenticated","user_role":"orgAdmin","app_metadata":{"role":"orgAdmin"}}',true);
+SELECT pg_temp.expect_error($$ SELECT public.readiness_v2_save_draft('[]'::jsonb) $$, 'client-supplied JWT role cannot grant authority');
+
+-- ── MANAGER (role=manager) — full flow, INDEPENDENT of orgAdmin, in tenant C ──
+SELECT pg_temp.as_user('00000000-0000-0000-0000-0000000000c9');  -- MGRC, manager of tenant C
+SELECT pg_temp.ok( jsonb_typeof(public.readiness_v2_tag_candidates()->'tags')='array', 'MANAGER: view tag candidates');
+SELECT pg_temp.ok( (public.readiness_v2_save_draft('[{"tagId":"00000000-0000-0000-0000-000000dc0001","required":true},{"tagId":"00000000-0000-0000-0000-000000dc0002","required":true}]'::jsonb,80)->>'setupComplete')::boolean, 'MANAGER: create/save valid draft');
+SELECT pg_temp.ok( public.readiness_v2_activate((SELECT id FROM public.readiness_formula_versions WHERE tenant_id='00000000-0000-0000-0000-0000000000c0' AND status='draft'))->>'status'='active', 'MANAGER: activate valid configuration');
+SELECT pg_temp.ok( jsonb_typeof(public.readiness_v2_compare('00000000-0000-0000-0000-0000000000c0')->'reps')='array', 'MANAGER: view shadow comparison');
+
+-- ── orgAdmin — independently view candidates + comparison (save/activate proven below in tenant A) ──
+SELECT pg_temp.as_user('00000000-0000-0000-0000-0000000000a9');  -- MA, orgAdmin of tenant A
+SELECT pg_temp.ok( jsonb_typeof(public.readiness_v2_tag_candidates()->'tags')='array', 'orgAdmin: view tag candidates');
+SELECT pg_temp.ok( jsonb_typeof(public.readiness_v2_compare('00000000-0000-0000-0000-0000000000a0')->'reps')='array', 'orgAdmin: view shadow comparison');
+
+-- ── Platform admin (ralli_admin — the real production role, NOT superadmin) ──
+SELECT pg_temp.as_user('00000000-0000-0000-0000-0000000000db');  -- RA, ralli_admin, tenant NULL
+SELECT pg_temp.ok( jsonb_typeof(public.readiness_v2_compare('00000000-0000-0000-0000-0000000000a0')->'reps')='array', 'ralli_admin: cross-tenant compare (tenant A)');
+SELECT pg_temp.ok( jsonb_typeof(public.readiness_v2_compare('00000000-0000-0000-0000-0000000000c0')->'reps')='array', 'ralli_admin: cross-tenant compare (tenant C)');
+SELECT pg_temp.expect_error($$ SELECT public.readiness_v2_save_draft('[]'::jsonb) $$, 'ralli_admin has no tenant → not a per-tenant author (by convention)');
+
+-- ── Cross-tenant denials, per role, separately ──
+SELECT pg_temp.as_user('00000000-0000-0000-0000-0000000000da');  -- MGRA, manager of tenant A
+SELECT pg_temp.ok( jsonb_typeof(public.readiness_v2_tag_candidates()->'tags')='array', 'manager A: candidates for OWN tenant allowed');
+SELECT pg_temp.expect_error($$ SELECT public.readiness_v2_compare('00000000-0000-0000-0000-0000000000b0') $$, 'manager A cannot inspect tenant B');
+SELECT pg_temp.expect_error($$ SELECT public.readiness_v2_activate((SELECT id FROM public.readiness_formula_versions WHERE tenant_id='00000000-0000-0000-0000-0000000000b0' LIMIT 1)) $$, 'manager A cannot activate a tenant-B version');
+SELECT pg_temp.as_user('00000000-0000-0000-0000-0000000000a9');  -- orgAdmin A
+SELECT pg_temp.expect_error($$ SELECT public.readiness_v2_compare('00000000-0000-0000-0000-0000000000b0') $$, 'orgAdmin A cannot inspect tenant B');
+SELECT pg_temp.expect_error($$ SELECT public.readiness_v2_activate((SELECT id FROM public.readiness_formula_versions WHERE tenant_id='00000000-0000-0000-0000-0000000000b0' LIMIT 1)) $$, 'orgAdmin A cannot activate a tenant-B version');
 
 -- ════════════ CONFIG VALIDITY GATES (manager MA) ════════════
 SELECT pg_temp.as_user('00000000-0000-0000-0000-0000000000a9');
@@ -253,9 +345,12 @@ SELECT pg_temp.ok((SELECT success_status='ok' AND overall_score=80 AND flags->>'
    AND (evidence_summary->>'distinctQuizzes')='3' AND (evidence_summary->>'distinctReadinessTags')='2'
    AND (evidence_summary->>'distinctQuestions')='12'
    FROM public.readiness_scores_current WHERE user_id='00000000-0000-0000-0000-0000000000a1'), 'Restab Established 80/ready 3-2-12');
-SELECT pg_temp.ok((SELECT (component_scores->'tagMastery'->>'00000000-0000-0000-0000-0000000d0001')::numeric = 83.3
-   AND (component_scores->'tagMastery'->>'00000000-0000-0000-0000-0000000d0002')::numeric = 76.7
-   FROM public.readiness_scores_current WHERE user_id='00000000-0000-0000-0000-0000000000a1'), 'Restab 1/N allocation T1=83.3 T2=76.7');
+-- Primary-tag attribution: Q3 (T1+T2) counts once in its primary T1 (lowest id); its
+-- T2 side is insights-only. T1=avg(90,70)=80, T2=avg(80)=80, overall=80.
+SELECT pg_temp.ok((SELECT (component_scores->'tagMastery'->>'00000000-0000-0000-0000-0000000d0001')::numeric = 80
+   AND (component_scores->'tagMastery'->>'00000000-0000-0000-0000-0000000d0002')::numeric = 80
+   AND (evidence_summary->'secondaryTagMastery'->>'00000000-0000-0000-0000-0000000d0002')::numeric = 70
+   FROM public.readiness_scores_current WHERE user_id='00000000-0000-0000-0000-0000000000a1'), 'Restab primary attribution T1=80 T2=80; Q3 T2 side is insights-only (secondary=70)');
 
 -- Rnew: Establishing — NO score, NO band, NOT ranked/at-risk.
 SELECT pg_temp.ok((SELECT success_status='insufficient_evidence' AND overall_score IS NULL
@@ -353,6 +448,40 @@ SELECT pg_temp.as_user('00000000-0000-0000-0000-0000000000a1');
 SELECT pg_temp.ok((public.readiness_v2_my_result()->>'state')='established' AND (public.readiness_v2_my_result()->>'score')='80', 'learner own result (established)');
 SELECT pg_temp.as_user('00000000-0000-0000-0000-0000000000a2');
 SELECT pg_temp.ok((public.readiness_v2_my_result()->>'state')='establishing' AND (public.readiness_v2_my_result()->>'score') IS NULL, 'learner own result (establishing, no score)');
+
+-- ════════════ MULTI-TAG WEIGHTING INVARIANT (Blocker 2, Cases A–D) ════════════
+-- Case A: Quiz A (100, tags T1+T3) + Quiz B (0, T1). Primary(A)=T1 → Product(T1)=avg(100,0)=50;
+-- Pricing(T3) is Quiz A's SECONDARY (insights=100), not official. Quiz A gains NO extra overall
+-- influence from its 2nd tag (coefficient 0.5 = Quiz B's 0.5). Only 1 primary tag → Establishing.
+SELECT pg_temp.ok((SELECT (evidence_summary->'tagMastery'->>'00000000-0000-0000-0000-0000000d0001')::numeric = 50
+   AND (evidence_summary->'secondaryTagMastery'->>'00000000-0000-0000-0000-0000000d0003')::numeric = 100
+   AND (evidence_summary->>'distinctReadinessTags') = '1'
+   FROM public.readiness_scores_current WHERE user_id='00000000-0000-0000-0000-0000000000c1'),
+   'Case A: multi-tag Quiz A not amplified — T1(official)=50, T3(insights)=100');
+
+-- Case B: multi-tag Qmt (3 tags) counts once (primary T1); T1=avg(60,90)=75, T2=80, T3=70 → overall 75.
+SELECT pg_temp.ok((SELECT overall_score = 75
+   AND (component_scores->'tagMastery'->>'00000000-0000-0000-0000-0000000d0001')::numeric = 75
+   AND (component_scores->'tagMastery'->>'00000000-0000-0000-0000-0000000d0002')::numeric = 80
+   AND (component_scores->'tagMastery'->>'00000000-0000-0000-0000-0000000d0003')::numeric = 70
+   AND (evidence_summary->'includedQuizzes'->0->>'primaryTag') IS NOT NULL
+   FROM public.readiness_scores_current WHERE user_id='00000000-0000-0000-0000-0000000000c2'),
+   'Case B: 1 multi-tag + 3 single-tag → overall 75, multi-tag quiz counts once');
+
+-- Case C: a tag supported only by one multi-tag quiz (T1=50) vs a tag with several single-tag quizzes (T2=80) → overall 65.
+SELECT pg_temp.ok((SELECT overall_score = 65
+   AND (component_scores->'tagMastery'->>'00000000-0000-0000-0000-0000000d0001')::numeric = 50
+   AND (component_scores->'tagMastery'->>'00000000-0000-0000-0000-0000000d0002')::numeric = 80
+   FROM public.readiness_scores_current WHERE user_id='00000000-0000-0000-0000-0000000000c3'),
+   'Case C: single-multitag tag=50, multi-quiz tag=80 → overall 65');
+
+-- Case D: c4 (100-quiz single-tag) vs c5 (SAME but 100-quiz carries a 2nd tag). Overall identical (65) —
+-- adding a secondary tag with no new evidence did not change the rep's readiness.
+SELECT pg_temp.ok(
+   (SELECT overall_score FROM public.readiness_scores_current WHERE user_id='00000000-0000-0000-0000-0000000000c4')
+   = (SELECT overall_score FROM public.readiness_scores_current WHERE user_id='00000000-0000-0000-0000-0000000000c5')
+   AND (SELECT overall_score FROM public.readiness_scores_current WHERE user_id='00000000-0000-0000-0000-0000000000c4') = 65,
+   'Case D: adding a secondary tag left overall unchanged (65 == 65)');
 
 SELECT '087 ALL TESTS PASSED' AS result;
 ROLLBACK;
