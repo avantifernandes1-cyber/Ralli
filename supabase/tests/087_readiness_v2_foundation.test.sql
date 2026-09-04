@@ -637,21 +637,96 @@ SELECT pg_temp.ok(
         FROM public.readiness_scores_current WHERE tenant_id='00000000-0000-0000-0000-0000000000a0'),
    'team averages: all established reps share the same required denominator; only established rows carry a score');
 
--- Security: a learner/authenticated role CANNOT write primary_readiness_tag_id directly (column revoke).
-SAVEPOINT sp_colwrite;
+-- ════════════ PRIMARY-TAG WRITE GUARD — PRODUCTION-ACL PARITY (trigger, grant-independent) ════════════
+-- Reproduce PRODUCTION's grant state: authenticated has table-level SELECT/INSERT/UPDATE on
+-- tenant_quizzes (which makes the column-level REVOKE a no-op). The BEFORE INSERT/UPDATE
+-- trigger is the authoritative guard and must deny all untrusted primary writes while leaving
+-- ordinary quiz edits working.
+GRANT SELECT, INSERT, UPDATE ON public.tenant_quizzes TO authenticated;
+-- Dedicated fixtures (created as postgres = trusted).
+INSERT INTO auth.users(id,aud,role,email,created_at,updated_at) VALUES
+ ('00000000-0000-0000-0000-0000000000fa','authenticated','authenticated','mgrg@t.test',now(),now()),
+ ('00000000-0000-0000-0000-0000000000fb','authenticated','authenticated','lg@t.test',now(),now());
+INSERT INTO public.tenants(id,slug,name) VALUES
+ ('00000000-0000-0000-0000-0000000000f0','tg','TG'), ('00000000-0000-0000-0000-0000000000f1','tg2','TG2');
+UPDATE public.profiles SET role='manager', tenant_id='00000000-0000-0000-0000-0000000000f0', status='active' WHERE id='00000000-0000-0000-0000-0000000000fa';
+UPDATE public.profiles SET role='user',    tenant_id='00000000-0000-0000-0000-0000000000f0', status='active' WHERE id='00000000-0000-0000-0000-0000000000fb';
+INSERT INTO public.tenant_quiz_tags(id,tenant_id,label) VALUES
+ ('00000000-0000-0000-0000-00000000fa01','00000000-0000-0000-0000-0000000000f0','TGa'),
+ ('00000000-0000-0000-0000-00000000fa02','00000000-0000-0000-0000-0000000000f0','TGb');
+INSERT INTO public.tenant_quizzes(id,tenant_id,name,status,questions) VALUES
+ ('00000000-0000-0000-0000-00000000fb01','00000000-0000-0000-0000-0000000000f0','QGn','active','[]'::jsonb),
+ ('00000000-0000-0000-0000-00000000fb02','00000000-0000-0000-0000-0000000000f0','QGs','active','[]'::jsonb),
+ ('00000000-0000-0000-0000-00000000fb03','00000000-0000-0000-0000-0000000000f1','QGx','active','[]'::jsonb);
+-- Trusted (postgres) may set the primary — establishes the "already set" baseline for change/clear tests.
+UPDATE public.tenant_quizzes SET primary_readiness_tag_id='00000000-0000-0000-0000-00000000fa01' WHERE id='00000000-0000-0000-0000-00000000fb02';
+SELECT pg_temp.ok((SELECT primary_readiness_tag_id='00000000-0000-0000-0000-00000000fa01' FROM public.tenant_quizzes WHERE id='00000000-0000-0000-0000-00000000fb02'), 'guard: trusted (postgres) CAN set primary');
+
+SAVEPOINT sp_guard;
 SET LOCAL ROLE authenticated;
-DO $$ BEGIN
-  BEGIN
-    UPDATE public.tenant_quizzes SET primary_readiness_tag_id='00000000-0000-0000-0000-0000000d0002'
-      WHERE id='00000000-0000-0000-0000-0000000e0011';
-    RAISE EXCEPTION '087 FAIL: authenticated could directly UPDATE primary_readiness_tag_id';
-  EXCEPTION
-    WHEN insufficient_privilege THEN NULL;   -- expected: column write denied
-    WHEN OTHERS THEN IF SQLERRM LIKE '087 FAIL%' THEN RAISE; ELSE NULL; END IF;
-  END;
+-- Manager (RLS-permitted) — every primary write must be rejected by the trigger; normal edits allowed.
+SELECT set_config('request.jwt.claims','{"sub":"00000000-0000-0000-0000-0000000000fa","role":"authenticated","app_metadata":{"role":"orgAdmin"}}',true);
+DO $$
+DECLARE n int;
+BEGIN
+  -- name-only (primary unchanged) → ALLOWED
+  UPDATE public.tenant_quizzes SET name='QGn2' WHERE id='00000000-0000-0000-0000-00000000fb01';
+  GET DIAGNOSTICS n = ROW_COUNT; IF n <> 1 THEN RAISE EXCEPTION '087 FAIL: manager normal edit blocked (n=%)', n; END IF;
+  -- update with SAME primary (unchanged) → ALLOWED (no trigger fire)
+  UPDATE public.tenant_quizzes SET primary_readiness_tag_id='00000000-0000-0000-0000-00000000fa01' WHERE id='00000000-0000-0000-0000-00000000fb02';
+  -- set primary (NULL→TGa) → DENIED
+  BEGIN UPDATE public.tenant_quizzes SET primary_readiness_tag_id='00000000-0000-0000-0000-00000000fa01' WHERE id='00000000-0000-0000-0000-00000000fb01';
+    RAISE EXCEPTION '087 FAIL: manager could SET primary directly';
+  EXCEPTION WHEN OTHERS THEN IF SQLERRM LIKE '087 FAIL%' THEN RAISE; END IF; END;
+  -- change primary (TGa→TGb) → DENIED
+  BEGIN UPDATE public.tenant_quizzes SET primary_readiness_tag_id='00000000-0000-0000-0000-00000000fa02' WHERE id='00000000-0000-0000-0000-00000000fb02';
+    RAISE EXCEPTION '087 FAIL: manager could CHANGE primary directly';
+  EXCEPTION WHEN OTHERS THEN IF SQLERRM LIKE '087 FAIL%' THEN RAISE; END IF; END;
+  -- clear primary (TGa→NULL) → DENIED
+  BEGIN UPDATE public.tenant_quizzes SET primary_readiness_tag_id=NULL WHERE id='00000000-0000-0000-0000-00000000fb02';
+    RAISE EXCEPTION '087 FAIL: manager could CLEAR primary directly';
+  EXCEPTION WHEN OTHERS THEN IF SQLERRM LIKE '087 FAIL%' THEN RAISE; END IF; END;
+  -- multi-column update (name + primary) → DENIED (cannot smuggle via multi-col)
+  BEGIN UPDATE public.tenant_quizzes SET name='x', primary_readiness_tag_id='00000000-0000-0000-0000-00000000fa02' WHERE id='00000000-0000-0000-0000-00000000fb02';
+    RAISE EXCEPTION '087 FAIL: manager smuggled primary via multi-col update';
+  EXCEPTION WHEN OTHERS THEN IF SQLERRM LIKE '087 FAIL%' THEN RAISE; END IF; END;
+  -- INSERT with non-null primary → DENIED
+  BEGIN INSERT INTO public.tenant_quizzes(id,tenant_id,name,status,questions,primary_readiness_tag_id)
+        VALUES ('00000000-0000-0000-0000-00000000fb09','00000000-0000-0000-0000-0000000000f0','QGi','active','[]'::jsonb,'00000000-0000-0000-0000-00000000fa01');
+    RAISE EXCEPTION '087 FAIL: manager INSERTed a non-null primary';
+  EXCEPTION WHEN OTHERS THEN IF SQLERRM LIKE '087 FAIL%' THEN RAISE; END IF; END;
+  -- UPSERT (INSERT ... ON CONFLICT DO UPDATE SET primary) → DENIED
+  BEGIN INSERT INTO public.tenant_quizzes(id,tenant_id,name,status,questions)
+        VALUES ('00000000-0000-0000-0000-00000000fb02','00000000-0000-0000-0000-0000000000f0','QGs','active','[]'::jsonb)
+        ON CONFLICT (id) DO UPDATE SET primary_readiness_tag_id='00000000-0000-0000-0000-00000000fa02';
+    RAISE EXCEPTION '087 FAIL: manager smuggled primary via upsert';
+  EXCEPTION WHEN OTHERS THEN IF SQLERRM LIKE '087 FAIL%' THEN RAISE; END IF; END;
+  -- cross-tenant: manager of TG cannot touch TG2's quiz (RLS filters → 0 rows)
+  UPDATE public.tenant_quizzes SET primary_readiness_tag_id='00000000-0000-0000-0000-00000000fa01' WHERE id='00000000-0000-0000-0000-00000000fb03';
+  GET DIAGNOSTICS n = ROW_COUNT; IF n <> 0 THEN RAISE EXCEPTION '087 FAIL: manager wrote cross-tenant quiz (n=%)', n; END IF;
 END $$;
+-- Learner (RLS role-gated) cannot change primary; assert no change occurred.
+SELECT set_config('request.jwt.claims','{"sub":"00000000-0000-0000-0000-0000000000fb","role":"authenticated","app_metadata":{"role":"orgAdmin"}}',true);  -- spoofed elevated claim
+DO $$
+DECLARE n int;
+BEGIN
+  UPDATE public.tenant_quizzes SET primary_readiness_tag_id='00000000-0000-0000-0000-00000000fa02' WHERE id='00000000-0000-0000-0000-00000000fb02';
+  GET DIAGNOSTICS n = ROW_COUNT;
+  IF n <> 0 THEN RAISE EXCEPTION '087 FAIL: learner (even with spoofed claim) changed primary (n=%)', n; END IF;
+EXCEPTION WHEN OTHERS THEN IF SQLERRM LIKE '087 FAIL%' THEN RAISE; END IF; END $$;
+-- Anon cannot change primary.
+SELECT set_config('request.jwt.claims','{"role":"anon"}',true);
+DO $$
+DECLARE n int;
+BEGIN
+  UPDATE public.tenant_quizzes SET primary_readiness_tag_id='00000000-0000-0000-0000-00000000fa02' WHERE id='00000000-0000-0000-0000-00000000fb02';
+  GET DIAGNOSTICS n = ROW_COUNT;
+  IF n <> 0 THEN RAISE EXCEPTION '087 FAIL: anon changed primary (n=%)', n; END IF;
+EXCEPTION WHEN OTHERS THEN IF SQLERRM LIKE '087 FAIL%' THEN RAISE; END IF; END $$;
 RESET ROLE;
-ROLLBACK TO SAVEPOINT sp_colwrite;
+-- Confirm the stored primary is STILL TGa (unchanged by any untrusted attempt).
+SELECT pg_temp.ok((SELECT primary_readiness_tag_id='00000000-0000-0000-0000-00000000fa01' FROM public.tenant_quizzes WHERE id='00000000-0000-0000-0000-00000000fb02'), 'guard: primary unchanged after all untrusted attempts (manager/learner/anon/spoof/cross-tenant/upsert/multi-col)');
+ROLLBACK TO SAVEPOINT sp_guard;
 
 SELECT '087 ALL TESTS PASSED' AS result;
 ROLLBACK;

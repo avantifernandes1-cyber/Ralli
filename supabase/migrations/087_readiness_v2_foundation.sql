@@ -77,9 +77,53 @@ DO $$ BEGIN
     FOREIGN KEY (primary_readiness_tag_id, tenant_id)
     REFERENCES public.tenant_quiz_tags (id, tenant_id) ON DELETE SET NULL;
 EXCEPTION WHEN duplicate_object THEN NULL; END $$;
--- Server-authoritative: the primary readiness tag is writable ONLY through the role-gated
--- SECURITY DEFINER RPC (which runs as the owner). Explicitly deny direct column writes to
--- clients even if a broad UPDATE grant on tenant_quizzes is ever added (defense in depth).
+
+-- ── Server-authority guard for primary_readiness_tag_id (086 pattern) ─────────────────
+-- AUTHORITATIVE CONTROL: a BEFORE INSERT OR UPDATE trigger, decided by the real Postgres
+-- role (current_user), NOT spoofable JWT/profile roles. This is grant-INDEPENDENT: it holds
+-- even though production grants `authenticated` table-level UPDATE on tenant_quizzes (which
+-- makes a column-level REVOKE ineffective — see the REVOKE note below). The primary readiness
+-- tag is writable ONLY by trusted server execution: the validated SECURITY DEFINER setter RPC
+-- (readiness_set_quiz_primary_tag, owned by postgres → runs as current_user='postgres') and
+-- service_role/postgres maintenance. Ordinary quiz edits (name/questions/status/tags/…) by
+-- authenticated managers are untouched; the guard fires ONLY when the primary value changes.
+CREATE OR REPLACE FUNCTION public.readiness_role_is_trusted()
+RETURNS boolean LANGUAGE sql STABLE SET search_path = '' AS $$
+  SELECT current_user IN ('postgres', 'service_role')   -- confirmed prod owners (tenant_quizzes + RPCs = postgres)
+$$;
+
+CREATE OR REPLACE FUNCTION public.tenant_quizzes_guard_primary_readiness_tag()
+RETURNS trigger LANGUAGE plpgsql SECURITY INVOKER SET search_path = '' AS $function$
+BEGIN
+  IF TG_OP = 'UPDATE' THEN
+    -- Reject any CHANGE (set / clear / replace); allow when unchanged. IS DISTINCT FROM
+    -- covers NULL↔value and value↔value transitions.
+    IF NEW.primary_readiness_tag_id IS DISTINCT FROM OLD.primary_readiness_tag_id
+       AND NOT public.readiness_role_is_trusted() THEN
+      RAISE EXCEPTION 'tenant_quizzes.primary_readiness_tag_id is server-authoritative and can be changed only via readiness_set_quiz_primary_tag (role=%)', current_user;
+    END IF;
+  ELSIF TG_OP = 'INSERT' THEN
+    -- A client cannot create a quiz that already carries a primary readiness tag.
+    IF NEW.primary_readiness_tag_id IS NOT NULL
+       AND NOT public.readiness_role_is_trusted() THEN
+      RAISE EXCEPTION 'tenant_quizzes.primary_readiness_tag_id cannot be set on insert by a direct client (role=%); it is server-authoritative', current_user;
+    END IF;
+  END IF;
+  RETURN NEW;
+END $function$;
+
+DROP TRIGGER IF EXISTS trg_guard_primary_readiness_tag ON public.tenant_quizzes;
+CREATE TRIGGER trg_guard_primary_readiness_tag
+  BEFORE INSERT OR UPDATE ON public.tenant_quizzes
+  FOR EACH ROW EXECUTE FUNCTION public.tenant_quizzes_guard_primary_readiness_tag();
+
+COMMENT ON FUNCTION public.tenant_quizzes_guard_primary_readiness_tag() IS
+  'Server-authority guard (087): rejects any change to tenant_quizzes.primary_readiness_tag_id (UPDATE) or a non-null value on INSERT unless current_user is trusted (postgres/service_role). This is the AUTHORITATIVE control (the column-level REVOKE below is ineffective in production because authenticated holds table-level UPDATE). readiness_set_quiz_primary_tag is SECURITY DEFINER owned by postgres, so its write runs as current_user=postgres and is allowed; direct authenticated/anon writes are denied. Fires only when the primary value changes, leaving all other tenant_quizzes edits untouched.';
+
+-- Defense in depth only (NOT the security control): in production `authenticated` holds a
+-- table-level UPDATE grant, so this column-level REVOKE is a no-op there. The trigger above is
+-- the authoritative guard. Kept because it protects the column in any environment where
+-- authenticated has only column-level UPDATE grants.
 REVOKE UPDATE (primary_readiness_tag_id) ON public.tenant_quizzes FROM PUBLIC, anon, authenticated;
 
 -- Reps may read the ACTIVE version's designations (what readiness measures);
@@ -999,6 +1043,8 @@ REVOKE ALL ON FUNCTION public.readiness_is_scorable_rep(uuid,uuid) FROM PUBLIC, 
 --   public.readiness_v2_config_hash(integer,uuid) CASCADE;
 -- DROP FUNCTION IF EXISTS public.readiness_set_quiz_primary_tag(uuid,uuid),
 --   public.readiness_v2_quiz_primaries(), public.readiness_resolve_tag(uuid,uuid) CASCADE;
+-- DROP TRIGGER IF EXISTS trg_guard_primary_readiness_tag ON public.tenant_quizzes;
+-- DROP FUNCTION IF EXISTS public.tenant_quizzes_guard_primary_readiness_tag(), public.readiness_role_is_trusted();
 -- ALTER TABLE public.tenant_quizzes DROP CONSTRAINT IF EXISTS tq_primary_readiness_tag_same_tenant;
 -- ALTER TABLE public.tenant_quizzes DROP COLUMN IF EXISTS primary_readiness_tag_id;
 -- DROP TABLE IF EXISTS public.readiness_tag_designations CASCADE;
