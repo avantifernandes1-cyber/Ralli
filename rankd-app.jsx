@@ -127,7 +127,7 @@ import { triggerReadinessUpdate, getTopicHeatmap, getOrgMetrics, getRepTopicScor
 import { cellScore as heatmapCellScore, coverageLine as heatmapCoverageLine, thresholdNote as heatmapThresholdNote, hasVerifiedEvidence as heatmapHasEvidence } from "./src/lib/heatmapModel.js";
 import { listTenantQuizTags, listQuizTagMap, listQuizClassification, getQuizTagState, createQuizTag, renameQuizTag, archiveQuizTag, restoreQuizTag, mergeQuizTags, setQuizTags } from "./src/lib/taxonomyService.js";
 import { activeMappedTagIds, classificationFromActiveCount, tagCapabilities, buildBuilderTagRows, quizTagModel, filterQuizzesByTag, tagUsageCounts, resolveTag, normalizeTagError, savePayloadId, hasActiveSelection, selectedActiveTagIds, tagRequirementError, governanceOutcome, quizSaveSuccessMessage, canBeginSave, runQuizSave } from "./src/lib/quizTagsUi.js";
-import { getTagCandidates as readinessGetTagCandidates, saveDraft as readinessSaveDraft, activateConfig as readinessActivateConfig } from "./src/lib/readinessAdminService.js";
+import { getTagCandidates as readinessGetTagCandidates, saveDraft as readinessSaveDraft, activateConfig as readinessActivateConfig, getQuizPrimaries as readinessGetQuizPrimaries, setQuizPrimary as readinessSetQuizPrimary } from "./src/lib/readinessAdminService.js";
 import { deriveSetupState as readinessDeriveSetupState, draftDesignationsFrom as readinessDraftDesignations, isDraftDirty as readinessDraftDirty, warningLabel as readinessWarningLabel, setupBanner as readinessSetupBanner, canAccessReadinessSettings } from "./src/lib/readinessConfig.js";
 
 // ── MOBILE HOOK ────────────────────────────────────────────
@@ -24029,7 +24029,20 @@ function ReadinessSettingsScreen() {
     setVersionId(data?.configVersionId ?? null);
     setLoading(false);
   };
-  useEffect(() => { load(); /* eslint-disable-next-line react-hooks/exhaustive-deps */ }, []);
+  const [primaries, setPrimaries] = useState(null);  // quizzes carrying designated readiness tags
+  const loadPrimaries = async () => {
+    const { data, error } = await readinessGetQuizPrimaries();
+    if (!error) setPrimaries(data?.quizzes ?? []);
+  };
+  useEffect(() => { load(); loadPrimaries(); /* eslint-disable-next-line react-hooks/exhaustive-deps */ }, []);
+
+  const onPickPrimary = async (quizId, tagId) => {
+    setBusy(true); setErr(null); setNotice(null);
+    const { error } = await readinessSetQuizPrimary(quizId, tagId || null);
+    setBusy(false);
+    if (error) { setErr(error.message || "Failed to set primary readiness tag."); return; }
+    await loadPrimaries();
+  };
 
   const state = readinessDeriveSetupState({ tags: rows ?? [] });
   const dirty = rows ? readinessDraftDirty(rows, saved) : false;
@@ -24076,6 +24089,12 @@ function ReadinessSettingsScreen() {
         <p style={{ margin: "0 0 2px", fontSize: 12.5, color: C.textSub, lineHeight: 1.6 }}>
           Mark <strong>Required</strong> for areas every rep must demonstrate. A rep is only scored once they have
           enough recent verified evidence; until then they show “Establishing readiness,” never a low score.
+        </p>
+        <p style={{ margin: "8px 0 0", fontSize: 12.5, color: C.textSub, lineHeight: 1.6 }}>
+          Weighting is <strong>equal per readiness area</strong>: overall readiness is the average across the areas a rep
+          has demonstrated, so every area counts equally and a quiz in an area with many quizzes individually counts a
+          little less. (This is not equal-per-quiz weighting.) Each quiz counts toward exactly one area — the
+          <strong> primary</strong> tag you choose below — while its other tags stay insights-only.
         </p>
       </div>
 
@@ -24144,6 +24163,37 @@ function ReadinessSettingsScreen() {
         </button>
         {dirty && <span style={{ fontSize: 12, color: C.textSub }}>Unsaved changes — save the draft before activating.</span>}
       </div>
+
+      {/* Primary readiness tag per quiz — the ONE area each quiz counts toward. */}
+      {primaries && primaries.length > 0 && (
+        <div style={{ background: C.white, borderRadius: 16, border: `1px solid ${C.border}`, overflow: "hidden" }}>
+          <div style={{ padding: "12px 16px", borderBottom: `1px solid ${C.border}` }}>
+            <div style={{ fontSize: 14, fontWeight: 800, color: C.text }}>Primary readiness area per quiz</div>
+            <div style={{ fontSize: 12, color: C.textSub, marginTop: 2 }}>
+              Choose the one readiness area each quiz counts toward for official scoring. Other tags stay insights-only.
+              A quiz with no valid primary is excluded from scoring (and its reps see it as unmeasured), never auto-assigned.
+            </div>
+          </div>
+          {primaries.map(q => {
+            const opts = q.designatedAssignedTags || [];
+            return (
+              <div key={q.quizId} style={{ display: "grid", gridTemplateColumns: "1.6fr 1.2fr 0.8fr", gap: 12,
+                padding: "10px 16px", borderTop: `1px solid ${C.border}`, alignItems: "center" }}>
+                <div style={{ fontSize: 13, fontWeight: 700, color: C.text }}>{q.quizName}</div>
+                <select value={q.primaryTagId || ""} disabled={busy} onChange={e => onPickPrimary(q.quizId, e.target.value)}
+                  style={{ padding: "8px 10px", borderRadius: 8, border: `1px solid ${q.primaryValid ? C.border : C.red}`,
+                    fontSize: 13, fontFamily: "inherit", color: C.text, background: C.white }}>
+                  <option value="">— Select primary area —</option>
+                  {opts.map(t => <option key={t.tagId} value={t.tagId}>{t.label}</option>)}
+                </select>
+                <div style={{ fontSize: 12, fontWeight: 700, color: q.primaryValid ? "#047857" : "#b45309" }}>
+                  {q.primaryValid ? "Set" : "Needs a primary"}
+                </div>
+              </div>
+            );
+          })}
+        </div>
+      )}
 
       <p style={{ margin: 0, fontSize: 11.5, color: C.textSub, lineHeight: 1.6 }}>
         Activating a configuration makes it the live readiness definition for scoring. Existing verified evidence

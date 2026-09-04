@@ -22,7 +22,7 @@
 --
 -- Mastery model (platform-owned in beta): per-quiz mastery FIRST (≤3 most-recent
 -- CURRENT-COMPARABLE verified attempts, 60-day half-life, recency-only weighting),
--- one PRIMARY readiness tag per quiz (one-influence-per-quiz), tag-level averaging, breadth gates
+-- one MANAGER-SELECTED PRIMARY readiness tag per quiz, EQUAL-AREA averaging, breadth gates
 -- (≥3 distinct quizzes, ≥2 readiness tags, ≥10 distinct current-version graded
 -- questions, all required tags covered), 120-day staleness, bands Ready≥80 /
 -- Developing 65–79 / Needs Attention <65. Missing evidence is NEVER zero:
@@ -59,6 +59,18 @@ CREATE INDEX IF NOT EXISTS idx_rtd_version ON public.readiness_tag_designations 
 CREATE INDEX IF NOT EXISTS idx_rtd_tenant_tag ON public.readiness_tag_designations (tenant_id, tag_id);
 
 ALTER TABLE public.readiness_tag_designations ENABLE ROW LEVEL SECURITY;
+
+-- MANAGER-SELECTED PRIMARY readiness tag per quiz (the ONE area a quiz counts toward
+-- for official scoring). Additive, nullable; composite FK keeps it same-tenant. It is
+-- NEVER auto-chosen by id/order — a quiz with no valid primary is excluded from
+-- official scoring with an honest reason. Set only via the role-gated RPC below.
+ALTER TABLE public.tenant_quizzes ADD COLUMN IF NOT EXISTS primary_readiness_tag_id uuid;
+DO $$ BEGIN
+  ALTER TABLE public.tenant_quizzes
+    ADD CONSTRAINT tq_primary_readiness_tag_same_tenant
+    FOREIGN KEY (primary_readiness_tag_id, tenant_id)
+    REFERENCES public.tenant_quiz_tags (id, tenant_id) ON DELETE SET NULL;
+EXCEPTION WHEN duplicate_object THEN NULL; END $$;
 
 -- Reps may read the ACTIVE version's designations (what readiness measures);
 -- managers/orgAdmin read all statuses in their tenant; platform admins cross-tenant.
@@ -366,6 +378,100 @@ BEGIN
   RETURN jsonb_build_object('versionId', p_version_id, 'status','active', 'supersededVersionId', v_prior, 'effectiveAt', now());
 END $$;
 
+-- Resolve a merged tag transitively to its ultimate target (cycle-safe). Helper for
+-- primary-tag validation and compute. Returns the input if not merged.
+CREATE OR REPLACE FUNCTION public.readiness_resolve_tag(p_tenant uuid, p_tag uuid)
+RETURNS uuid LANGUAGE sql STABLE SECURITY DEFINER SET search_path = '' AS $$
+  WITH RECURSIVE chain AS (
+    SELECT t.id AS cur, t.merged_into, 0 AS depth
+    FROM public.tenant_quiz_tags t WHERE t.id = p_tag AND t.tenant_id = p_tenant
+    UNION ALL
+    SELECT n.id, n.merged_into, c.depth + 1
+    FROM chain c JOIN public.tenant_quiz_tags n ON n.id = c.merged_into WHERE c.depth < 20
+  )
+  SELECT cur FROM chain WHERE merged_into IS NULL LIMIT 1;
+$$;
+
+-- MANAGER/orgAdmin/admin: set (or clear) a quiz's PRIMARY readiness tag. The tag must
+-- be an ACTIVE tag currently ASSIGNED to the quiz (quiz_tag_map) AND a DESIGNATED
+-- readiness tag of the tenant's current config (active, else latest draft). Passing
+-- NULL clears it. Enqueues a shadow recalc for the tenant's reps.
+CREATE OR REPLACE FUNCTION public.readiness_set_quiz_primary_tag(p_quiz_id uuid, p_tag_id uuid)
+RETURNS jsonb LANGUAGE plpgsql SECURITY DEFINER SET search_path = '' AS $$
+DECLARE v_tenant uuid; v_cfg uuid; v_resolved uuid;
+BEGIN
+  SELECT tenant_id INTO v_tenant FROM public.tenant_quizzes WHERE id = p_quiz_id;
+  IF v_tenant IS NULL THEN RAISE EXCEPTION 'readiness: quiz not found'; END IF;
+  IF NOT (public.is_ralli_admin() OR (v_tenant = public.readiness_caller_tenant() AND public.readiness_caller_can_configure())) THEN
+    RAISE EXCEPTION 'readiness: not authorized to set the quiz primary readiness tag';
+  END IF;
+
+  IF p_tag_id IS NULL THEN
+    UPDATE public.tenant_quizzes SET primary_readiness_tag_id = NULL WHERE id = p_quiz_id;
+  ELSE
+    -- current config version (active preferred, else latest draft):
+    SELECT id INTO v_cfg FROM public.readiness_formula_versions
+     WHERE tenant_id = v_tenant AND configuration->>'model'='v2_quiz_mastery' AND status IN ('active','draft')
+     ORDER BY (status='active') DESC, version DESC LIMIT 1;
+    v_resolved := public.readiness_resolve_tag(v_tenant, p_tag_id);
+    IF v_resolved IS NULL OR NOT EXISTS (SELECT 1 FROM public.tenant_quiz_tags WHERE id = v_resolved AND tenant_id = v_tenant AND status='active') THEN
+      RAISE EXCEPTION 'readiness: primary tag is not an active tag of this tenant';
+    END IF;
+    IF NOT EXISTS (SELECT 1 FROM public.quiz_tag_map m WHERE m.quiz_id = p_quiz_id AND m.tenant_id = v_tenant AND m.tag_id = v_resolved) THEN
+      RAISE EXCEPTION 'readiness: primary tag must be a tag currently assigned to the quiz';
+    END IF;
+    IF v_cfg IS NULL OR NOT EXISTS (SELECT 1 FROM public.readiness_tag_designations d WHERE d.formula_version_id = v_cfg AND d.tag_id = v_resolved) THEN
+      RAISE EXCEPTION 'readiness: primary tag must be a designated readiness tag';
+    END IF;
+    UPDATE public.tenant_quizzes SET primary_readiness_tag_id = v_resolved WHERE id = p_quiz_id;
+  END IF;
+
+  PERFORM public.enqueue_readiness_recalc(v_tenant, p.id, NULL, 'catalog_change', jsonb_build_object('quizId', p_quiz_id, 'primaryTag', p_tag_id))
+  FROM public.profiles p WHERE p.tenant_id = v_tenant AND COALESCE(p.status,'active')<>'inactive' AND p.role='user';
+
+  RETURN jsonb_build_object('quizId', p_quiz_id, 'primaryReadinessTagId', (SELECT primary_readiness_tag_id FROM public.tenant_quizzes WHERE id = p_quiz_id));
+END $$;
+
+-- MANAGER/admin: list quizzes that carry ≥1 designated readiness tag, with their
+-- designated assigned tags, current primary, and whether the primary is valid (so the
+-- Settings UI can prompt the manager to choose one). No question/answer content.
+CREATE OR REPLACE FUNCTION public.readiness_v2_quiz_primaries()
+RETURNS jsonb LANGUAGE plpgsql STABLE SECURITY DEFINER SET search_path = '' AS $$
+DECLARE v_tenant uuid; v_cfg uuid; v_rows jsonb;
+BEGIN
+  IF NOT public.readiness_caller_can_configure() THEN RAISE EXCEPTION 'readiness: not authorized'; END IF;
+  v_tenant := public.readiness_caller_tenant();
+  IF v_tenant IS NULL THEN RAISE EXCEPTION 'readiness: caller has no tenant'; END IF;
+  SELECT id INTO v_cfg FROM public.readiness_formula_versions
+   WHERE tenant_id = v_tenant AND configuration->>'model'='v2_quiz_mastery' AND status IN ('active','draft')
+   ORDER BY (status='active') DESC, version DESC LIMIT 1;
+
+  SELECT COALESCE(jsonb_agg(row ORDER BY (row->>'quizName')), '[]'::jsonb) INTO v_rows FROM (
+    SELECT jsonb_build_object(
+      'quizId', q.id, 'quizName', q.name, 'quizStatus', q.status,
+      'designatedAssignedTags', (
+        SELECT COALESCE(jsonb_agg(jsonb_build_object('tagId', t.id, 'label', t.label) ORDER BY t.label), '[]'::jsonb)
+        FROM public.quiz_tag_map m
+        JOIN public.tenant_quiz_tags t ON t.id = m.tag_id AND t.tenant_id = m.tenant_id AND t.status='active'
+        WHERE m.quiz_id = q.id AND m.tenant_id = v_tenant
+          AND EXISTS (SELECT 1 FROM public.readiness_tag_designations d WHERE d.formula_version_id = v_cfg AND d.tag_id = m.tag_id)),
+      'primaryTagId', q.primary_readiness_tag_id,
+      'primaryValid', (
+        q.primary_readiness_tag_id IS NOT NULL
+        AND EXISTS (SELECT 1 FROM public.quiz_tag_map m WHERE m.quiz_id=q.id AND m.tenant_id=v_tenant AND m.tag_id=q.primary_readiness_tag_id)
+        AND EXISTS (SELECT 1 FROM public.tenant_quiz_tags t WHERE t.id=q.primary_readiness_tag_id AND t.status='active')
+        AND EXISTS (SELECT 1 FROM public.readiness_tag_designations d WHERE d.formula_version_id=v_cfg AND d.tag_id=q.primary_readiness_tag_id))
+    ) AS row
+    FROM public.tenant_quizzes q
+    WHERE q.tenant_id = v_tenant AND q.status = 'active'
+      AND EXISTS (
+        SELECT 1 FROM public.quiz_tag_map m
+        JOIN public.readiness_tag_designations d ON d.formula_version_id = v_cfg AND d.tag_id = m.tag_id
+        WHERE m.quiz_id = q.id AND m.tenant_id = v_tenant)
+  ) sub;
+  RETURN jsonb_build_object('tenantId', v_tenant, 'configVersionId', v_cfg, 'quizzes', v_rows);
+END $$;
+
 -- ══════════════════════════════════════════════════════════════════════════════
 -- SECTION 4 — Shadow compute (core mastery engine) for ONE rep
 -- ══════════════════════════════════════════════════════════════════════════════
@@ -386,7 +492,7 @@ DECLARE
   v_req_met boolean; v_req_current boolean; v_breadth_met boolean;
   v_was_established boolean; v_last_known int;
   v_newest_age numeric; v_state text; v_success text; v_confidence text; v_band text;
-  v_tag_masteries jsonb; v_secondary jsonb; v_included jsonb; v_excluded jsonb; v_evidence jsonb; v_flags jsonb;
+  v_tag_masteries jsonb; v_secondary jsonb; v_included jsonb; v_excluded jsonb; v_excluded_quizzes jsonb; v_evidence jsonb; v_flags jsonb;
   v_material text; v_comp jsonb; v_eff_weights jsonb;
 BEGIN
   IF NOT public.readiness_is_scorable_rep(p_tenant, p_user) THEN
@@ -446,27 +552,51 @@ BEGIN
            (array_agg(attempt_id ORDER BY created_at DESC))[1] AS recent_attempt
     FROM capped GROUP BY quiz_id
   ),
-  -- OFFICIAL scoring attributes each quiz to exactly ONE PRIMARY readiness tag: the
-  -- lowest tag_id among the designated tags on its most-recent counted attempt. This
-  -- guarantees one-total-influence-per-quiz — a quiz's coefficient in the overall is
-  -- identical whether it carries one tag or several, so a multi-tag quiz can never be
-  -- re-amplified (the earlier 1/N-then-renormalize model could). Every other
-  -- designated tag on the quiz is SECONDARY: surfaced as insights only, and it never
-  -- affects the overall score, tag coverage, or required coverage.
-  quiz_primary AS (
-    SELECT pq.quiz_id, pq.mastery, pq.newest_age_days,
-           (SELECT x.tag_id FROM att_tags x WHERE x.attempt_id = pq.recent_attempt ORDER BY x.tag_id LIMIT 1) AS tag_id
+  -- OFFICIAL scoring attributes each quiz to exactly ONE MANAGER-SELECTED PRIMARY
+  -- readiness tag (tenant_quizzes.primary_readiness_tag_id), merge-resolved. It is valid
+  -- only if that tag is ACTIVE, a DESIGNATED readiness tag of this version, and was one of
+  -- the tags the counted attempt actually carried (snapshot-evidenced). A quiz with a
+  -- missing/invalid primary is EXCLUDED from official scoring with an honest reason — a
+  -- primary is NEVER auto-chosen by id or order. Other designated tags on the quiz are
+  -- SECONDARY: insights only, never affecting the overall, tag coverage, or required
+  -- coverage. Aggregation is EQUAL-AREA: overall = equal mean over the primary tags that
+  -- have evidence, so each readiness AREA counts equally and a quiz in a crowded area
+  -- individually counts less (this is NOT equal-per-quiz weighting — see docs).
+  quiz_pick AS (
+    SELECT pq.quiz_id, pq.mastery, pq.newest_age_days, pq.recent_attempt,
+           public.readiness_resolve_tag(p_tenant, q.primary_readiness_tag_id) AS primary_tag,
+           q.primary_readiness_tag_id AS raw_primary
     FROM per_quiz pq
+    JOIN public.tenant_quizzes q ON q.id = pq.quiz_id AND q.tenant_id = p_tenant
   ),
-  tag_mastery AS (   -- each quiz counts ONCE, in its primary tag (simple mean; tags then equal-weighted)
+  quiz_primary AS (   -- quizzes whose manager-selected primary is VALID
+    SELECT qp.quiz_id, qp.mastery, qp.newest_age_days, qp.recent_attempt, qp.primary_tag AS tag_id
+    FROM quiz_pick qp
+    WHERE qp.primary_tag IS NOT NULL
+      AND EXISTS (SELECT 1 FROM rt WHERE rt.tag_id = qp.primary_tag)
+      AND EXISTS (SELECT 1 FROM public.tenant_quiz_tags t WHERE t.id = qp.primary_tag AND t.status='active')
+      AND EXISTS (SELECT 1 FROM att_tags x WHERE x.attempt_id = qp.recent_attempt AND x.tag_id = qp.primary_tag)
+  ),
+  quiz_excluded AS (  -- quizzes with verified evidence but NO valid primary (honest reason)
+    SELECT qp.quiz_id,
+      CASE
+        WHEN qp.raw_primary IS NULL THEN 'primaryMissing'
+        WHEN qp.primary_tag IS NULL OR NOT EXISTS (SELECT 1 FROM public.tenant_quiz_tags t WHERE t.id = qp.primary_tag AND t.status='active') THEN 'primaryArchived'
+        WHEN NOT EXISTS (SELECT 1 FROM rt WHERE rt.tag_id = qp.primary_tag) THEN 'primaryNotDesignated'
+        ELSE 'primaryNotAssigned'
+      END AS reason
+    FROM quiz_pick qp
+    WHERE NOT EXISTS (SELECT 1 FROM quiz_primary p WHERE p.quiz_id = qp.quiz_id)
+  ),
+  tag_mastery AS (
     SELECT tag_id, avg(mastery) AS tag_score, count(*) AS quizzes, min(newest_age_days) AS tag_newest_age
     FROM quiz_primary GROUP BY tag_id
   ),
-  secondary AS (     -- insights only: designated tags on a quiz that are NOT its primary
-    SELECT x.tag_id, round(avg(pq.mastery),1) AS tag_score
-    FROM per_quiz pq
-    JOIN att_tags x ON x.attempt_id = pq.recent_attempt
-    WHERE x.tag_id <> (SELECT y.tag_id FROM att_tags y WHERE y.attempt_id = pq.recent_attempt ORDER BY y.tag_id LIMIT 1)
+  secondary AS (     -- insights only: a valid quiz's OTHER designated tags (not its primary)
+    SELECT x.tag_id, round(avg(qp.mastery),1) AS tag_score
+    FROM quiz_primary qp
+    JOIN att_tags x ON x.attempt_id = qp.recent_attempt
+    WHERE x.tag_id <> qp.tag_id
     GROUP BY x.tag_id
   ),
   contrib_quiz AS ( SELECT DISTINCT quiz_id FROM quiz_primary ),
@@ -480,8 +610,8 @@ BEGIN
     WHERE (e->>'type') IN ('mc','tf','type','match','slider')
   )
   SELECT
-    (SELECT avg(tag_score) FROM tag_mastery),                       -- overall = equal mean over primary tags
-    (SELECT count(*) FROM contrib_quiz),                            -- distinct contributing quizzes
+    (SELECT avg(tag_score) FROM tag_mastery),                       -- overall = EQUAL-AREA mean over primary tags
+    (SELECT count(*) FROM contrib_quiz),                            -- distinct contributing quizzes (valid primary)
     (SELECT count(*) FROM tag_mastery),                             -- distinct primary readiness tags
     (SELECT count(*) FROM qdistinct),                               -- distinct current-version graded questions
     (SELECT count(*) FROM rt WHERE is_required),                    -- required tags total
@@ -490,8 +620,9 @@ BEGIN
     (SELECT min(newest_age_days) FROM quiz_primary),                -- newest evidence age
     (SELECT COALESCE(jsonb_object_agg(tag_id, round(tag_score,1)), '{}'::jsonb) FROM tag_mastery),
     (SELECT COALESCE(jsonb_agg(jsonb_build_object('quizId',quiz_id,'mastery',round(mastery,1),'primaryTag',tag_id) ORDER BY quiz_id), '[]'::jsonb) FROM quiz_primary),
-    (SELECT COALESCE(jsonb_object_agg(tag_id, tag_score), '{}'::jsonb) FROM secondary)
-  INTO v_overall, v_dq, v_dt, v_dqu, v_req_total, v_req_ok, v_req_current_ok, v_newest_age, v_tag_masteries, v_included, v_secondary;
+    (SELECT COALESCE(jsonb_object_agg(tag_id, tag_score), '{}'::jsonb) FROM secondary),
+    (SELECT COALESCE(jsonb_object_agg(reason, cnt), '{}'::jsonb) FROM (SELECT reason, count(*) AS cnt FROM quiz_excluded GROUP BY reason) z)
+  INTO v_overall, v_dq, v_dt, v_dqu, v_req_total, v_req_ok, v_req_current_ok, v_newest_age, v_tag_masteries, v_included, v_secondary, v_excluded_quizzes;
 
   v_req_met     := (v_req_total = v_req_ok);          -- every required tag has evidence (any age)
   v_req_current := (v_req_total = v_req_current_ok);  -- every required tag has ≤120d evidence
@@ -582,6 +713,7 @@ BEGIN
     'secondaryTagMastery', v_secondary,   -- insights only; NOT part of the official score
     'includedQuizzes', v_included,
     'excludedCounts', v_excluded,
+    'excludedQuizzes', v_excluded_quizzes,  -- quizzes dropped from official scoring for lacking a valid primary (by reason)
     -- Stale keeps the last ESTABLISHED score from history (not a fresh recompute).
     'lastKnownScore', CASE WHEN v_state='stale' THEN v_last_known ELSE NULL END
   );
@@ -810,6 +942,11 @@ GRANT EXECUTE ON FUNCTION public.readiness_v2_save_draft(jsonb,integer) TO authe
 GRANT EXECUTE ON FUNCTION public.readiness_v2_activate(uuid) TO authenticated;
 GRANT EXECUTE ON FUNCTION public.readiness_run_shadow(uuid,uuid,text,timestamptz) TO authenticated;
 GRANT EXECUTE ON FUNCTION public.readiness_v2_compare(uuid) TO authenticated;
+REVOKE ALL ON FUNCTION public.readiness_set_quiz_primary_tag(uuid,uuid) FROM PUBLIC, anon;
+REVOKE ALL ON FUNCTION public.readiness_v2_quiz_primaries() FROM PUBLIC, anon;
+GRANT EXECUTE ON FUNCTION public.readiness_set_quiz_primary_tag(uuid,uuid) TO authenticated;
+GRANT EXECUTE ON FUNCTION public.readiness_v2_quiz_primaries() TO authenticated;
+REVOKE ALL ON FUNCTION public.readiness_resolve_tag(uuid,uuid) FROM PUBLIC, anon, authenticated;
 
 -- Learner-safe own read + predicate helpers used by RLS/other definers:
 REVOKE ALL ON FUNCTION public.readiness_v2_my_result() FROM PUBLIC, anon;

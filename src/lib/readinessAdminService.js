@@ -56,3 +56,17 @@ export async function getMyResult() {
   const { data, error } = await supabase.rpc("readiness_v2_my_result");
   return { data: data ?? null, error };
 }
+
+// Quizzes carrying ≥1 designated readiness tag, with their current PRIMARY (the one area
+// they count toward) and whether it is valid — for the primary-selection surface.
+export async function getQuizPrimaries() {
+  const { data, error } = await supabase.rpc("readiness_v2_quiz_primaries");
+  return { data: data ?? null, error };
+}
+
+// Set (tagId) or clear (null) a quiz's PRIMARY readiness tag. Server validates the tag is
+// an active, assigned, designated readiness tag; the primary is never auto-chosen.
+export async function setQuizPrimary(quizId, tagId) {
+  const { data, error } = await supabase.rpc("readiness_set_quiz_primary_tag", { p_quiz_id: quizId, p_tag_id: tagId });
+  return { data: data ?? null, error };
+}

@@ -335,6 +335,61 @@ INSERT INTO public.readiness_score_history
   (tenant_id,user_id,formula_version_id,overall_score,success_status,material_state_hash,calculated_config_hash,idempotency_key,calculated_at)
 VALUES ('00000000-0000-0000-0000-0000000000a0','00000000-0000-0000-0000-0000000000ad',(SELECT vid FROM cfg),85,'ok','seed_ad_ok','seedcfg','seed_ad_ok', now()-interval '150 days');
 
+-- ── MANAGER-SELECTED primary readiness tags for scoring quizzes (explicit, never by id).
+-- Multi-tag quizzes (Q3,Qs3,Qa3,QA13,Qmt) are deliberately assigned primary = T1 (Product);
+-- single-tag quizzes take their own tag. This drives ALL official attribution below.
+UPDATE public.tenant_quizzes SET primary_readiness_tag_id='00000000-0000-0000-0000-0000000d0001'
+ WHERE tenant_id='00000000-0000-0000-0000-0000000000a0' AND id IN (
+  '00000000-0000-0000-0000-0000000e0011','00000000-0000-0000-0000-0000000e0013','00000000-0000-0000-0000-0000000e001c',
+  '00000000-0000-0000-0000-0000000e001d','00000000-0000-0000-0000-0000000e0017','00000000-0000-0000-0000-0000000e0021',
+  '00000000-0000-0000-0000-0000000e0023','00000000-0000-0000-0000-0000000e0031','00000000-0000-0000-0000-0000000e0033',
+  '00000000-0000-0000-0000-0000000e0034','00000000-0000-0000-0000-0000000e0041','00000000-0000-0000-0000-0000000e0043');
+UPDATE public.tenant_quizzes SET primary_readiness_tag_id='00000000-0000-0000-0000-0000000d0002'
+ WHERE tenant_id='00000000-0000-0000-0000-0000000000a0' AND id IN (
+  '00000000-0000-0000-0000-0000000e0012','00000000-0000-0000-0000-0000000e001e','00000000-0000-0000-0000-0000000e0022','00000000-0000-0000-0000-0000000e0032');
+UPDATE public.tenant_quizzes SET primary_readiness_tag_id='00000000-0000-0000-0000-0000000d0003'
+ WHERE tenant_id='00000000-0000-0000-0000-0000000000a0' AND id='00000000-0000-0000-0000-0000000e0016';
+
+-- ── Primary-tag VALIDITY fixtures (missing/not-designated/not-assigned/archived/merged) ──
+INSERT INTO public.tenant_quiz_tags (id,tenant_id,label,created_by) VALUES
+ ('00000000-0000-0000-0000-0000000d0007','00000000-0000-0000-0000-0000000000a0','PrimArch','00000000-0000-0000-0000-0000000000a9'),
+ ('00000000-0000-0000-0000-0000000d0008','00000000-0000-0000-0000-0000000000a0','PrimMerge','00000000-0000-0000-0000-0000000000a9');
+-- Designate PrimArch (optional) in the active version so it can be a valid primary until archived.
+INSERT INTO public.readiness_tag_designations (tenant_id,formula_version_id,tag_id,is_required)
+ VALUES ('00000000-0000-0000-0000-0000000000a0',(SELECT vid FROM cfg),'00000000-0000-0000-0000-0000000d0007',false);
+INSERT INTO public.tenant_quizzes (id,tenant_id,name,status,questions)
+SELECT v.id,'00000000-0000-0000-0000-0000000000a0',v.nm,'active',
+  jsonb_build_array(jsonb_build_object('id',v.nm||'a','type','mc'),jsonb_build_object('id',v.nm||'b','type','tf'),jsonb_build_object('id',v.nm||'c','type','mc'),jsonb_build_object('id',v.nm||'d','type','type'))
+FROM (VALUES ('00000000-0000-0000-0000-0000000e0051'::uuid,'Qpm'),('00000000-0000-0000-0000-0000000e0052','Qpnd'),
+             ('00000000-0000-0000-0000-0000000e0053','Qpna'),('00000000-0000-0000-0000-0000000e0054','Qpar'),
+             ('00000000-0000-0000-0000-0000000e0055','Qmg')) v(id,nm);
+INSERT INTO public.quiz_tag_map (quiz_id,tag_id,tenant_id) VALUES
+ ('00000000-0000-0000-0000-0000000e0051','00000000-0000-0000-0000-0000000d0001','00000000-0000-0000-0000-0000000000a0'),
+ ('00000000-0000-0000-0000-0000000e0052','00000000-0000-0000-0000-0000000d0001','00000000-0000-0000-0000-0000000000a0'),
+ ('00000000-0000-0000-0000-0000000e0053','00000000-0000-0000-0000-0000000d0001','00000000-0000-0000-0000-0000000000a0'),
+ ('00000000-0000-0000-0000-0000000e0054','00000000-0000-0000-0000-0000000d0007','00000000-0000-0000-0000-0000000000a0'),
+ ('00000000-0000-0000-0000-0000000e0055','00000000-0000-0000-0000-0000000d0008','00000000-0000-0000-0000-0000000000a0');
+INSERT INTO auth.users (id,aud,role,email,created_at,updated_at) VALUES
+ ('00000000-0000-0000-0000-0000000000c6','authenticated','authenticated','rp@t.test',now(),now()),
+ ('00000000-0000-0000-0000-0000000000c7','authenticated','authenticated','rmg@t.test',now(),now());
+UPDATE public.profiles SET role='user', tenant_id='00000000-0000-0000-0000-0000000000a0', status='active' WHERE id IN
+ ('00000000-0000-0000-0000-0000000000c6','00000000-0000-0000-0000-0000000000c7');
+-- Rp (c6): four quizzes, each failing a distinct primary check.
+SELECT pg_temp.mkatt('00000000-0000-0000-0000-0000000000a0','00000000-0000-0000-0000-0000000000c6','00000000-0000-0000-0000-0000000e0051',80,5,ARRAY['00000000-0000-0000-0000-0000000d0001']::uuid[]); -- primary NULL → missing
+SELECT pg_temp.mkatt('00000000-0000-0000-0000-0000000000a0','00000000-0000-0000-0000-0000000000c6','00000000-0000-0000-0000-0000000e0052',80,5,ARRAY['00000000-0000-0000-0000-0000000d0001']::uuid[]); -- primary=T4 not designated
+SELECT pg_temp.mkatt('00000000-0000-0000-0000-0000000000a0','00000000-0000-0000-0000-0000000000c6','00000000-0000-0000-0000-0000000e0053',80,5,ARRAY['00000000-0000-0000-0000-0000000d0001']::uuid[]); -- primary=T2 not in snapshot [T1]
+SELECT pg_temp.mkatt('00000000-0000-0000-0000-0000000000a0','00000000-0000-0000-0000-0000000000c6','00000000-0000-0000-0000-0000000e0054',80,5,ARRAY['00000000-0000-0000-0000-0000000d0007']::uuid[]); -- primary=PrimArch (archived later)
+-- Rmerge (c7): Qmg (primary=PrimMerge, later merged into T1) + Q2,Qd (T2).
+SELECT pg_temp.mkatt('00000000-0000-0000-0000-0000000000a0','00000000-0000-0000-0000-0000000000c7','00000000-0000-0000-0000-0000000e0055',80,5,ARRAY['00000000-0000-0000-0000-0000000d0008']::uuid[]);
+SELECT pg_temp.mkatt('00000000-0000-0000-0000-0000000000a0','00000000-0000-0000-0000-0000000000c7','00000000-0000-0000-0000-0000000e0012',90,5,ARRAY['00000000-0000-0000-0000-0000000d0002']::uuid[]);
+SELECT pg_temp.mkatt('00000000-0000-0000-0000-0000000000a0','00000000-0000-0000-0000-0000000000c7','00000000-0000-0000-0000-0000000e001e',70,5,ARRAY['00000000-0000-0000-0000-0000000d0002']::uuid[]);
+-- Explicit primaries (direct, exercising each failure mode; setter RPC is tested separately below):
+UPDATE public.tenant_quizzes SET primary_readiness_tag_id=NULL                                          WHERE id='00000000-0000-0000-0000-0000000e0051';
+UPDATE public.tenant_quizzes SET primary_readiness_tag_id='00000000-0000-0000-0000-0000000d0004'        WHERE id='00000000-0000-0000-0000-0000000e0052'; -- T4 not designated
+UPDATE public.tenant_quizzes SET primary_readiness_tag_id='00000000-0000-0000-0000-0000000d0002'        WHERE id='00000000-0000-0000-0000-0000000e0053'; -- T2 not in snapshot
+UPDATE public.tenant_quizzes SET primary_readiness_tag_id='00000000-0000-0000-0000-0000000d0007'        WHERE id='00000000-0000-0000-0000-0000000e0054'; -- PrimArch
+UPDATE public.tenant_quizzes SET primary_readiness_tag_id='00000000-0000-0000-0000-0000000d0008'        WHERE id='00000000-0000-0000-0000-0000000e0055'; -- PrimMerge
+
 -- ════════════ RUN SHADOW (whole tenant) ════════════
 SELECT pg_temp.ok( (public.readiness_run_shadow('00000000-0000-0000-0000-0000000000a0', (SELECT vid FROM cfg))->>'processed')::int >= 10, 'run processed all reps');
 
@@ -482,6 +537,42 @@ SELECT pg_temp.ok(
    = (SELECT overall_score FROM public.readiness_scores_current WHERE user_id='00000000-0000-0000-0000-0000000000c5')
    AND (SELECT overall_score FROM public.readiness_scores_current WHERE user_id='00000000-0000-0000-0000-0000000000c4') = 65,
    'Case D: adding a secondary tag left overall unchanged (65 == 65)');
+
+-- ════════════ PRIMARY-TAG VALIDITY & EXCLUSIONS (Blocker 1) ════════════
+-- Archive PrimArch and merge PrimMerge → T1 (as the taxonomy RPCs would), then recompute.
+UPDATE public.tenant_quiz_tags SET status='archived' WHERE id='00000000-0000-0000-0000-0000000d0007';
+UPDATE public.tenant_quiz_tags SET status='archived', merged_into='00000000-0000-0000-0000-0000000d0001' WHERE id='00000000-0000-0000-0000-0000000d0008';
+SELECT public.readiness_compute_v2('00000000-0000-0000-0000-0000000000a0','00000000-0000-0000-0000-0000000000c6',(SELECT vid FROM cfg));
+SELECT public.readiness_compute_v2('00000000-0000-0000-0000-0000000000a0','00000000-0000-0000-0000-0000000000c7',(SELECT vid FROM cfg));
+
+-- Rp: every quiz excluded from official scoring for a DISTINCT, honestly-reported reason;
+-- no tag auto-chosen by id/order → Establishing (no valid primary).
+SELECT pg_temp.ok((SELECT flags->>'state'='establishing'
+   AND (evidence_summary->'excludedQuizzes'->>'primaryMissing')::int = 1
+   AND (evidence_summary->'excludedQuizzes'->>'primaryNotDesignated')::int = 1
+   AND (evidence_summary->'excludedQuizzes'->>'primaryNotAssigned')::int = 1
+   AND (evidence_summary->'excludedQuizzes'->>'primaryArchived')::int = 1
+   AND (evidence_summary->>'distinctReadinessTags') = '0'
+   FROM public.readiness_scores_current WHERE user_id='00000000-0000-0000-0000-0000000000c6'),
+   'primary validity: missing/not-designated/not-assigned/archived each excluded honestly; no id fallback');
+
+-- Rmerge: a merged primary tag resolves transparently to its active target (T1) — the quiz
+-- still counts, attributed to the resolved tag. Established; Qmg primaryTag = T1.
+SELECT pg_temp.ok((SELECT success_status='ok'
+   AND EXISTS (SELECT 1 FROM jsonb_array_elements(evidence_summary->'includedQuizzes') e
+               WHERE e->>'quizId'='00000000-0000-0000-0000-0000000e0055' AND e->>'primaryTag'='00000000-0000-0000-0000-0000000d0001')
+   FROM public.readiness_scores_current WHERE user_id='00000000-0000-0000-0000-0000000000c7'),
+   'primary validity: merged primary resolves to active target (T1); quiz still counted');
+
+-- Setter RPC: manager/orgAdmin can set a valid primary; invalid tags rejected; learner denied.
+SELECT pg_temp.as_user('00000000-0000-0000-0000-0000000000a9');  -- orgAdmin A
+SELECT pg_temp.ok( public.readiness_set_quiz_primary_tag('00000000-0000-0000-0000-0000000e0011','00000000-0000-0000-0000-0000000d0001')->>'primaryReadinessTagId'='00000000-0000-0000-0000-0000000d0001', 'setter: orgAdmin sets a valid primary');
+SELECT pg_temp.expect_error($$ SELECT public.readiness_set_quiz_primary_tag('00000000-0000-0000-0000-0000000e0011','00000000-0000-0000-0000-0000000d0004') $$, 'setter: rejects a non-designated tag');
+SELECT pg_temp.expect_error($$ SELECT public.readiness_set_quiz_primary_tag('00000000-0000-0000-0000-0000000e0011','00000000-0000-0000-0000-0000000d0002') $$, 'setter: rejects a tag not assigned to the quiz');
+SELECT pg_temp.as_user('00000000-0000-0000-0000-0000000000c9');  -- MANAGER (tenant C) can set within own tenant
+SELECT pg_temp.ok( public.readiness_set_quiz_primary_tag('00000000-0000-0000-0000-000000ec0001','00000000-0000-0000-0000-000000dc0001')->>'primaryReadinessTagId'='00000000-0000-0000-0000-000000dc0001', 'setter: manager sets a valid primary (own tenant)');
+SELECT pg_temp.as_user('00000000-0000-0000-0000-0000000000a1');  -- learner
+SELECT pg_temp.expect_error($$ SELECT public.readiness_set_quiz_primary_tag('00000000-0000-0000-0000-0000000e0011','00000000-0000-0000-0000-0000000d0001') $$, 'setter: learner denied');
 
 SELECT '087 ALL TESTS PASSED' AS result;
 ROLLBACK;
