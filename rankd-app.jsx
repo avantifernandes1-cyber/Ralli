@@ -24091,10 +24091,13 @@ function ReadinessSettingsScreen() {
           enough recent verified evidence; until then they show “Establishing readiness,” never a low score.
         </p>
         <p style={{ margin: "8px 0 0", fontSize: 12.5, color: C.textSub, lineHeight: 1.6 }}>
-          Weighting is <strong>equal per readiness area</strong>: overall readiness is the average across the areas a rep
-          has demonstrated, so every area counts equally and a quiz in an area with many quizzes individually counts a
-          little less. (This is not equal-per-quiz weighting.) Each quiz counts toward exactly one area — the
-          <strong> primary</strong> tag you choose below — while its other tags stay insights-only.
+          Only <strong>required</strong> areas affect the official score. Overall readiness is the <strong>equal average
+          across the required areas</strong> (the same denominator for every rep, so scores stay comparable and a quiz in
+          an area with many quizzes counts a little less — not equal-per-quiz weighting). <strong>Optional</strong> areas
+          appear as diagnostic insights only and never change the official score, so attempting a weak optional quiz can
+          never lower readiness. A rep is Established only once <strong>every required area</strong> has current evidence;
+          with no required areas, readiness stays “Establishing.” Each quiz counts toward exactly one area — the
+          <strong> primary</strong> tag you choose below.
         </p>
       </div>
 

@@ -51,15 +51,18 @@ export function deriveSetupState(payload) {
   const requiredSupported = required.filter(isValidReadinessTag);
   const unsupportedDesignated = designated.filter(t => !isValidReadinessTag(t));
 
-  const setupComplete = valid.length >= MIN_READINESS_TAGS
+  // Official readiness is scored ONLY over REQUIRED areas, so a config is activatable iff it
+  // has ≥1 REQUIRED readiness tag and every required tag has coverage. Optional tags are
+  // insights only and never block activation (nor are they scored).
+  const setupComplete = required.length >= 1
     && required.length === requiredSupported.length;
 
   let reason = null;
   if (!setupComplete) {
-    if (valid.length < MIN_READINESS_TAGS) {
-      reason = `Readiness setup incomplete — configure at least ${MIN_READINESS_TAGS} readiness tags with adequate assessment coverage (currently ${valid.length}).`;
+    if (required.length < 1) {
+      reason = "Readiness setup incomplete — designate at least one REQUIRED readiness area (optional areas alone are insights only and are never scored).";
     } else if (required.length !== requiredSupported.length) {
-      reason = "Readiness setup incomplete — one or more required readiness tags have no assessment coverage.";
+      reason = "Readiness setup incomplete — one or more required readiness areas have no assessment coverage.";
     } else {
       reason = "Readiness setup incomplete.";
     }

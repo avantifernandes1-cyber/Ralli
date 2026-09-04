@@ -31,21 +31,28 @@ test("deriveSetupState: zero readiness tags → incomplete", () => {
   ok("reason mentions incomplete", /setup incomplete/i.test(s.reason));
 });
 
-test("deriveSetupState: one readiness tag → incomplete", () => {
+test("deriveSetupState: one REQUIRED supported tag → complete (required-only rule)", () => {
   const s = deriveSetupState({ tags: [tag({ id: "T1", designated: true, required: true, quizzes: 2, questions: 8 })] });
-  ok("one < min", s.validCount === 1 && MIN_READINESS_TAGS === 2);
-  ok("not complete", !s.setupComplete);
+  ok("one required supported → complete", s.setupComplete === true);
+  ok("can activate", s.canActivate === true);
 });
 
-test("deriveSetupState: two supported readiness tags → complete", () => {
+test("deriveSetupState: optional-only (no required) → incomplete", () => {
+  const s = deriveSetupState({ tags: [
+    tag({ id: "T1", designated: true, required: false, quizzes: 2, questions: 8 }),
+    tag({ id: "T2", designated: true, required: false, quizzes: 1, questions: 4 }),
+  ] });
+  ok("not complete without a required area", s.setupComplete === false);
+  ok("reason mentions required", /required/i.test(s.reason));
+});
+
+test("deriveSetupState: required + optional supported → complete", () => {
   const s = deriveSetupState({ tags: [
     tag({ id: "T1", designated: true, required: true, quizzes: 2, questions: 8 }),
     tag({ id: "T2", designated: true, required: true, quizzes: 1, questions: 4 }),
     tag({ id: "T3", designated: true, required: false, quizzes: 1, questions: 4 }),
   ] });
   ok("complete", s.setupComplete === true);
-  ok("can activate", s.canActivate === true);
-  ok("valid 3", s.validCount === 3);
   ok("no reason", s.reason === null);
 });
 

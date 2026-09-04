@@ -21,13 +21,19 @@
 --   5. Learner-safe own-result read + authorized legacy-vs-V2 comparison report.
 --
 -- Mastery model (platform-owned in beta): per-quiz mastery FIRST (≤3 most-recent
--- CURRENT-COMPARABLE verified attempts, 60-day half-life, recency-only weighting),
--- one MANAGER-SELECTED PRIMARY readiness tag per quiz, EQUAL-AREA averaging, breadth gates
--- (≥3 distinct quizzes, ≥2 readiness tags, ≥10 distinct current-version graded
--- questions, all required tags covered), 120-day staleness, bands Ready≥80 /
--- Developing 65–79 / Needs Attention <65. Missing evidence is NEVER zero:
--- insufficient breadth → success_status='insufficient_evidence' (Establishing);
--- all-stale evidence → 'insufficient_evidence' + flags.state='stale'.
+-- CURRENT-COMPARABLE verified attempts, 60-day half-life, recency-only weighting), one
+-- MANAGER-SELECTED PRIMARY readiness tag per quiz. Official readiness is EQUAL-AREA over
+-- the tenant's REQUIRED areas ONLY (overall = equal mean across required areas, so every
+-- established rep shares the SAME required-area denominator and a quiz in a crowded area
+-- individually counts less — this is NOT equal-per-quiz weighting). OPTIONAL areas are
+-- diagnostic INSIGHTS only and never affect the official score/state/comparability, so
+-- attempting a weak optional quiz can never lower readiness. Established: tenant has ≥1
+-- required area AND every required area has current (≤120d) evidence AND ≥3 official
+-- quizzes AND ≥10 distinct current-version graded questions. ZERO required areas → Not
+-- established (optional areas are never silently scored). 120-day staleness; bands
+-- Ready≥80 / Developing 65–79 / Needs Attention <65. Missing evidence is NEVER zero:
+-- insufficient required coverage → 'insufficient_evidence' (Establishing); a previously
+-- Established rep whose required coverage lapsed → 'insufficient_evidence' + state 'stale'.
 --
 -- Security: every function is SECURITY DEFINER with SET search_path=''. Clients
 -- cannot write any readiness table (no new write policies; RLS from 051 unchanged).
@@ -71,6 +77,10 @@ DO $$ BEGIN
     FOREIGN KEY (primary_readiness_tag_id, tenant_id)
     REFERENCES public.tenant_quiz_tags (id, tenant_id) ON DELETE SET NULL;
 EXCEPTION WHEN duplicate_object THEN NULL; END $$;
+-- Server-authoritative: the primary readiness tag is writable ONLY through the role-gated
+-- SECURITY DEFINER RPC (which runs as the owner). Explicitly deny direct column writes to
+-- clients even if a broad UPDATE grant on tenant_quizzes is ever added (defense in depth).
+REVOKE UPDATE (primary_readiness_tag_id) ON public.tenant_quizzes FROM PUBLIC, anon, authenticated;
 
 -- Reps may read the ACTIVE version's designations (what readiness measures);
 -- managers/orgAdmin read all statuses in their tenant; platform admins cross-tenant.
@@ -95,7 +105,7 @@ RETURNS text
 LANGUAGE sql STABLE SECURITY DEFINER SET search_path = '' AS $$
   SELECT encode(extensions.digest(
     'v2_quiz_mastery|threshold=' || COALESCE(p_threshold, 80)::text
-      || '|hl=60|stale=120|cap=3|minq=3|mint=2|minqu=10|bands=65/80|tags='
+      || '|model=equal_area_required_only|hl=60|stale=120|cap=3|minq=3|minqu=10|bands=65/80|tags='
       || COALESCE((
            SELECT string_agg(d.tag_id::text || ':' || (CASE WHEN d.is_required THEN '1' ELSE '0' END), ',' ORDER BY d.tag_id)
            FROM public.readiness_tag_designations d
@@ -275,7 +285,10 @@ BEGIN
     'validReadinessTags', v_valid_tags,
     'requiredTags', v_required,
     'requiredTagsSupported', v_required_ok,
-    'setupComplete', (v_valid_tags >= 2 AND v_required = v_required_ok),
+    -- Official readiness is scored ONLY over REQUIRED areas, so a config is activatable
+    -- iff it has ≥1 REQUIRED readiness tag and every required tag has assessment coverage.
+    -- (Optional tags are insights only; without a required tag no rep can be established.)
+    'setupComplete', (v_required >= 1 AND v_required = v_required_ok),
     'issues', v_issues
   );
 END $$;
@@ -348,7 +361,7 @@ BEGIN
 
   v_valid := public.readiness_v2_validate(p_version_id);
   IF NOT (v_valid->>'setupComplete')::boolean THEN
-    RAISE EXCEPTION 'readiness: configuration is not valid for activation (need >=2 supported readiness tags and all required tags supported)';
+    RAISE EXCEPTION 'readiness: configuration is not valid for activation (need >=1 REQUIRED readiness tag, and every required tag must have assessment coverage)';
   END IF;
 
   PERFORM pg_advisory_xact_lock(hashtextextended('readiness_config:'||v_tenant::text, 0));
@@ -492,7 +505,7 @@ DECLARE
   v_req_met boolean; v_req_current boolean; v_breadth_met boolean;
   v_was_established boolean; v_last_known int;
   v_newest_age numeric; v_state text; v_success text; v_confidence text; v_band text;
-  v_tag_masteries jsonb; v_secondary jsonb; v_included jsonb; v_excluded jsonb; v_excluded_quizzes jsonb; v_evidence jsonb; v_flags jsonb;
+  v_tag_masteries jsonb; v_secondary jsonb; v_optional jsonb; v_included jsonb; v_excluded jsonb; v_excluded_quizzes jsonb; v_evidence jsonb; v_flags jsonb;
   v_material text; v_comp jsonb; v_eff_weights jsonb;
 BEGIN
   IF NOT public.readiness_is_scorable_rep(p_tenant, p_user) THEN
@@ -588,19 +601,29 @@ BEGIN
     FROM quiz_pick qp
     WHERE NOT EXISTS (SELECT 1 FROM quiz_primary p WHERE p.quiz_id = qp.quiz_id)
   ),
-  tag_mastery AS (
+  req AS ( SELECT tag_id FROM rt WHERE is_required ),
+  -- OFFICIAL scoring uses ONLY quizzes whose primary is a REQUIRED area. Optional-area
+  -- quizzes are insights and NEVER affect the official score/state/comparability, so
+  -- attempting a weak optional quiz cannot lower readiness and all established reps in a
+  -- tenant are scored against the SAME required-area denominator.
+  official_quiz AS ( SELECT qp.* FROM quiz_primary qp WHERE qp.tag_id IN (SELECT tag_id FROM req) ),
+  insight_quiz  AS ( SELECT qp.* FROM quiz_primary qp WHERE qp.tag_id NOT IN (SELECT tag_id FROM req) ),
+  area_mastery AS (   -- REQUIRED areas only (each quiz counts once in its required primary)
     SELECT tag_id, avg(mastery) AS tag_score, count(*) AS quizzes, min(newest_age_days) AS tag_newest_age
-    FROM quiz_primary GROUP BY tag_id
+    FROM official_quiz GROUP BY tag_id
   ),
-  secondary AS (     -- insights only: a valid quiz's OTHER designated tags (not its primary)
+  optional_mastery AS (   -- INSIGHTS: optional-area masteries (never official)
+    SELECT tag_id, round(avg(mastery),1) AS tag_score FROM insight_quiz GROUP BY tag_id
+  ),
+  secondary AS (     -- INSIGHTS: an official quiz's OTHER designated tags (not its primary)
     SELECT x.tag_id, round(avg(qp.mastery),1) AS tag_score
-    FROM quiz_primary qp
+    FROM official_quiz qp
     JOIN att_tags x ON x.attempt_id = qp.recent_attempt
     WHERE x.tag_id <> qp.tag_id
     GROUP BY x.tag_id
   ),
-  contrib_quiz AS ( SELECT DISTINCT quiz_id FROM quiz_primary ),
-  -- distinct current-version gradeable question ids across contributing quizzes:
+  contrib_quiz AS ( SELECT DISTINCT quiz_id FROM official_quiz ),
+  -- distinct current-version gradeable question ids across OFFICIAL contributing quizzes:
   qdistinct AS (
     SELECT DISTINCT cq.quiz_id, COALESCE(e->>'id', cq.quiz_id::text||':'||ord::text) AS qkey
     FROM contrib_quiz cq
@@ -610,23 +633,24 @@ BEGIN
     WHERE (e->>'type') IN ('mc','tf','type','match','slider')
   )
   SELECT
-    (SELECT avg(tag_score) FROM tag_mastery),                       -- overall = EQUAL-AREA mean over primary tags
-    (SELECT count(*) FROM contrib_quiz),                            -- distinct contributing quizzes (valid primary)
-    (SELECT count(*) FROM tag_mastery),                             -- distinct primary readiness tags
-    (SELECT count(*) FROM qdistinct),                               -- distinct current-version graded questions
-    (SELECT count(*) FROM rt WHERE is_required),                    -- required tags total
-    (SELECT count(*) FROM rt r WHERE r.is_required AND EXISTS (SELECT 1 FROM tag_mastery tm WHERE tm.tag_id = r.tag_id)),                       -- required covered (as a primary tag)
-    (SELECT count(*) FROM rt r WHERE r.is_required AND EXISTS (SELECT 1 FROM tag_mastery tm WHERE tm.tag_id = r.tag_id AND tm.tag_newest_age <= v_stale)),  -- required current (≤120d)
-    (SELECT min(newest_age_days) FROM quiz_primary),                -- newest evidence age
-    (SELECT COALESCE(jsonb_object_agg(tag_id, round(tag_score,1)), '{}'::jsonb) FROM tag_mastery),
-    (SELECT COALESCE(jsonb_agg(jsonb_build_object('quizId',quiz_id,'mastery',round(mastery,1),'primaryTag',tag_id) ORDER BY quiz_id), '[]'::jsonb) FROM quiz_primary),
+    (SELECT avg(tag_score) FROM area_mastery),                      -- overall = EQUAL-AREA mean over REQUIRED areas
+    (SELECT count(*) FROM contrib_quiz),                            -- distinct OFFICIAL contributing quizzes
+    (SELECT count(*) FROM area_mastery),                            -- required areas WITH evidence
+    (SELECT count(*) FROM qdistinct),                               -- distinct current-version graded questions (official)
+    (SELECT count(*) FROM req),                                     -- required areas total (the denominator)
+    (SELECT count(*) FROM req r WHERE EXISTS (SELECT 1 FROM area_mastery a WHERE a.tag_id = r.tag_id)),                       -- required covered
+    (SELECT count(*) FROM req r WHERE EXISTS (SELECT 1 FROM area_mastery a WHERE a.tag_id = r.tag_id AND a.tag_newest_age <= v_stale)),  -- required current (≤120d)
+    (SELECT min(newest_age_days) FROM official_quiz),               -- newest official evidence age
+    (SELECT COALESCE(jsonb_object_agg(tag_id, round(tag_score,1)), '{}'::jsonb) FROM area_mastery),
+    (SELECT COALESCE(jsonb_agg(jsonb_build_object('quizId',quiz_id,'mastery',round(mastery,1),'primaryTag',tag_id) ORDER BY quiz_id), '[]'::jsonb) FROM official_quiz),
     (SELECT COALESCE(jsonb_object_agg(tag_id, tag_score), '{}'::jsonb) FROM secondary),
+    (SELECT COALESCE(jsonb_object_agg(tag_id, tag_score), '{}'::jsonb) FROM optional_mastery),
     (SELECT COALESCE(jsonb_object_agg(reason, cnt), '{}'::jsonb) FROM (SELECT reason, count(*) AS cnt FROM quiz_excluded GROUP BY reason) z)
-  INTO v_overall, v_dq, v_dt, v_dqu, v_req_total, v_req_ok, v_req_current_ok, v_newest_age, v_tag_masteries, v_included, v_secondary, v_excluded_quizzes;
+  INTO v_overall, v_dq, v_dt, v_dqu, v_req_total, v_req_ok, v_req_current_ok, v_newest_age, v_tag_masteries, v_included, v_secondary, v_optional, v_excluded_quizzes;
 
-  v_req_met     := (v_req_total = v_req_ok);          -- every required tag has evidence (any age)
-  v_req_current := (v_req_total = v_req_current_ok);  -- every required tag has ≤120d evidence
-  v_breadth_met := (v_dq >= v_minq AND v_dt >= v_mint AND v_dqu >= v_minqu);
+  v_req_met     := (v_req_total >= 1 AND v_req_total = v_req_ok);          -- every required area has evidence
+  v_req_current := (v_req_total >= 1 AND v_req_total = v_req_current_ok);  -- every required area has ≤120d evidence
+  v_breadth_met := (v_dq >= v_minq AND v_dqu >= v_minqu);                  -- min official quizzes + questions
 
   -- Prior Established state (before this compute) distinguishes Stale from Establishing.
   SELECT EXISTS (SELECT 1 FROM public.readiness_score_history
@@ -665,16 +689,18 @@ BEGIN
     'staleCurrentComparable', count(*) FILTER (WHERE grading_provenance='server_v2' AND verified_revision = question_revision AND age_days > v_stale)
   ) INTO v_excluded FROM rel;
 
-  -- ── Evidence state (approved semantics) ──
-  -- Established: breadth met AND EVERY required tag has current (≤120d) comparable
-  --   evidence. (Per-required-tag currency — an optional/other tag being current
-  --   cannot rescue a stale required tag.)
-  -- Stale — reassessment needed: not currently Established, but the rep was
-  --   previously Established (a required tag's current evidence lapsed, or breadth
-  --   regressed). Not ranked/averaged/Needs-Attention; last Established score kept.
-  -- Establishing readiness: never reached Established (insufficient current required
-  --   coverage from the start).
-  IF v_breadth_met AND v_req_current THEN
+  -- ── Evidence state (approved semantics) — REQUIRED-AREA denominator ──
+  -- Official readiness is scored ONLY over the tenant's REQUIRED readiness areas, so
+  -- every established rep uses the SAME denominator and optional areas never move the
+  -- score. Established: tenant has ≥1 required area AND every required area has current
+  -- (≤120d) evidence AND min-data (≥3 official quizzes, ≥10 official questions).
+  -- ZERO required areas → Not established (never silently score optional areas).
+  -- Stale — reassessment needed: was Established, but a required area's current evidence
+  --   lapsed (optional currency cannot rescue it); last Established score kept.
+  -- Establishing: never reached Established (insufficient current required coverage).
+  IF v_req_total = 0 THEN
+    v_state := 'establishing'; v_success := 'insufficient_evidence';   -- no required areas configured
+  ELSIF v_breadth_met AND v_req_current THEN
     v_state := 'established'; v_success := 'ok';
   ELSIF v_was_established THEN
     v_state := 'stale'; v_success := 'insufficient_evidence';
@@ -702,18 +728,24 @@ BEGIN
 
   v_evidence := jsonb_build_object(
     'state', v_state,
+    -- Weighting is EQUAL-AREA over the REQUIRED areas only (the same denominator for every
+    -- established rep). Optional areas are insights and never affect the official score.
+    'weightingModel', 'equal_area_required_only',
+    'requiredDenominator', v_req_total,
     'distinctQuizzes', v_dq, 'distinctReadinessTags', v_dt, 'distinctQuestions', v_dqu,
     'requiredTags', v_req_total, 'requiredTagsCovered', v_req_ok,
     'requiredTagsCurrent', v_req_current_ok, 'requiredCoverageMet', v_req_met,
     'requiredCoverageCurrent', v_req_current, 'breadthMet', v_breadth_met,
-    'thresholds', jsonb_build_object('minQuizzes',v_minq,'minTags',v_mint,'minQuestions',v_minqu,
+    'noRequiredAreas', (v_req_total = 0),
+    'thresholds', jsonb_build_object('minOfficialQuizzes',v_minq,'minOfficialQuestions',v_minqu,
                                      'halfLifeDays',v_hl,'staleDays',v_stale,'attemptCap',v_cap),
     'newestEvidenceAgeDays', CASE WHEN v_newest_age IS NULL THEN NULL ELSE round(v_newest_age,1) END,
-    'tagMastery', v_tag_masteries,
-    'secondaryTagMastery', v_secondary,   -- insights only; NOT part of the official score
+    'tagMastery', v_tag_masteries,             -- OFFICIAL: required-area masteries (the score)
+    'optionalAreaMastery', v_optional,          -- insights only; optional-area quizzes; NOT scored
+    'secondaryTagMastery', v_secondary,         -- insights only; other tags on official quizzes; NOT scored
     'includedQuizzes', v_included,
     'excludedCounts', v_excluded,
-    'excludedQuizzes', v_excluded_quizzes,  -- quizzes dropped from official scoring for lacking a valid primary (by reason)
+    'excludedQuizzes', v_excluded_quizzes,      -- quizzes dropped from official scoring (invalid primary), by reason
     -- Stale keeps the last ESTABLISHED score from history (not a fresh recompute).
     'lastKnownScore', CASE WHEN v_state='stale' THEN v_last_known ELSE NULL END
   );
@@ -965,4 +997,8 @@ REVOKE ALL ON FUNCTION public.readiness_is_scorable_rep(uuid,uuid) FROM PUBLIC, 
 --   public.readiness_v2_ensure_draft(uuid), public.readiness_tag_support(uuid,uuid),
 --   public.readiness_is_scorable_rep(uuid,uuid), public.readiness_caller_can_configure(),
 --   public.readiness_v2_config_hash(integer,uuid) CASCADE;
+-- DROP FUNCTION IF EXISTS public.readiness_set_quiz_primary_tag(uuid,uuid),
+--   public.readiness_v2_quiz_primaries(), public.readiness_resolve_tag(uuid,uuid) CASCADE;
+-- ALTER TABLE public.tenant_quizzes DROP CONSTRAINT IF EXISTS tq_primary_readiness_tag_same_tenant;
+-- ALTER TABLE public.tenant_quizzes DROP COLUMN IF EXISTS primary_readiness_tag_id;
 -- DROP TABLE IF EXISTS public.readiness_tag_designations CASCADE;

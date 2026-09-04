@@ -251,10 +251,13 @@ SELECT pg_temp.expect_error($$ SELECT public.readiness_v2_activate((SELECT id FR
 -- ════════════ CONFIG VALIDITY GATES (manager MA) ════════════
 SELECT pg_temp.as_user('00000000-0000-0000-0000-0000000000a9');
 SELECT pg_temp.ok( (public.readiness_v2_save_draft('[]'::jsonb)->>'setupComplete')::boolean IS FALSE, 'no tags => setup incomplete');
-SELECT pg_temp.ok( (public.readiness_v2_save_draft('[{"tagId":"00000000-0000-0000-0000-0000000d0001","required":true}]'::jsonb)->>'setupComplete')::boolean IS FALSE, 'one tag => setup incomplete');
--- Two tags but one unsupported (T4 has no active quiz) => still incomplete.
-SELECT pg_temp.ok( (public.readiness_v2_save_draft('[{"tagId":"00000000-0000-0000-0000-0000000d0001","required":true},{"tagId":"00000000-0000-0000-0000-0000000d0004","required":false}]'::jsonb)->>'setupComplete')::boolean IS FALSE, 'unsupported second tag => incomplete');
--- Good config: T1,T2 required + T3 optional (all supported) => complete.
+-- Optional-only (no REQUIRED area) => incomplete: optional areas are never scored.
+SELECT pg_temp.ok( (public.readiness_v2_save_draft('[{"tagId":"00000000-0000-0000-0000-0000000d0003","required":false}]'::jsonb)->>'setupComplete')::boolean IS FALSE, 'optional-only (no required) => incomplete');
+-- One REQUIRED, supported => COMPLETE (required-only rule: ≥1 required area suffices).
+SELECT pg_temp.ok( (public.readiness_v2_save_draft('[{"tagId":"00000000-0000-0000-0000-0000000d0001","required":true}]'::jsonb)->>'setupComplete')::boolean IS TRUE, 'one required supported => complete');
+-- A REQUIRED tag without coverage (T4 has no active quiz) => incomplete.
+SELECT pg_temp.ok( (public.readiness_v2_save_draft('[{"tagId":"00000000-0000-0000-0000-0000000d0001","required":true},{"tagId":"00000000-0000-0000-0000-0000000d0004","required":true}]'::jsonb)->>'setupComplete')::boolean IS FALSE, 'unsupported REQUIRED tag => incomplete');
+-- Good config: T1,T2 required + T3 optional (all required supported) => complete.
 SELECT pg_temp.ok( (public.readiness_v2_save_draft('[{"tagId":"00000000-0000-0000-0000-0000000d0001","required":true},{"tagId":"00000000-0000-0000-0000-0000000d0002","required":true},{"tagId":"00000000-0000-0000-0000-0000000d0003","required":false}]'::jsonb, 80)->>'setupComplete')::boolean IS TRUE, 'two required + one optional => complete');
 -- Candidates surface shows support counts + designation.
 SELECT pg_temp.ok( (SELECT (t->>'activeQuizCount')::int >= 1 AND (t->>'countsTowardReadiness')::boolean
@@ -390,6 +393,31 @@ UPDATE public.tenant_quizzes SET primary_readiness_tag_id='00000000-0000-0000-00
 UPDATE public.tenant_quizzes SET primary_readiness_tag_id='00000000-0000-0000-0000-0000000d0007'        WHERE id='00000000-0000-0000-0000-0000000e0054'; -- PrimArch
 UPDATE public.tenant_quizzes SET primary_readiness_tag_id='00000000-0000-0000-0000-0000000d0008'        WHERE id='00000000-0000-0000-0000-0000000e0055'; -- PrimMerge
 
+-- ── Required-area denominator fixtures (Blocker: optional areas must not change score) ──
+INSERT INTO auth.users (id,aud,role,email,created_at,updated_at) VALUES
+ ('00000000-0000-0000-0000-0000000000e1','authenticated','authenticated','rsame1@t.test',now(),now()),
+ ('00000000-0000-0000-0000-0000000000e2','authenticated','authenticated','rsame2@t.test',now(),now()),
+ ('00000000-0000-0000-0000-0000000000e3','authenticated','authenticated','rzero@t.test',now(),now());
+UPDATE public.profiles SET role='user', tenant_id='00000000-0000-0000-0000-0000000000a0', status='active' WHERE id IN
+ ('00000000-0000-0000-0000-0000000000e1','00000000-0000-0000-0000-0000000000e2','00000000-0000-0000-0000-0000000000e3');
+-- R_same1 (e1): required evidence Q1(90,T1),Q2(80,T2),Q3(70,T1) → T1=80,T2=80 → overall 80.
+SELECT pg_temp.mkatt('00000000-0000-0000-0000-0000000000a0','00000000-0000-0000-0000-0000000000e1','00000000-0000-0000-0000-0000000e0011',90,5,ARRAY['00000000-0000-0000-0000-0000000d0001']::uuid[]);
+SELECT pg_temp.mkatt('00000000-0000-0000-0000-0000000000a0','00000000-0000-0000-0000-0000000000e1','00000000-0000-0000-0000-0000000e0012',80,5,ARRAY['00000000-0000-0000-0000-0000000d0002']::uuid[]);
+SELECT pg_temp.mkatt('00000000-0000-0000-0000-0000000000a0','00000000-0000-0000-0000-0000000000e1','00000000-0000-0000-0000-0000000e0013',70,5,ARRAY['00000000-0000-0000-0000-0000000d0001','00000000-0000-0000-0000-0000000d0002']::uuid[]);
+-- R_same2 (e2): IDENTICAL required evidence + a WEAK OPTIONAL quiz Q6(30,T3). Official score must be unchanged.
+SELECT pg_temp.mkatt('00000000-0000-0000-0000-0000000000a0','00000000-0000-0000-0000-0000000000e2','00000000-0000-0000-0000-0000000e0011',90,5,ARRAY['00000000-0000-0000-0000-0000000d0001']::uuid[]);
+SELECT pg_temp.mkatt('00000000-0000-0000-0000-0000000000a0','00000000-0000-0000-0000-0000000000e2','00000000-0000-0000-0000-0000000e0012',80,5,ARRAY['00000000-0000-0000-0000-0000000d0002']::uuid[]);
+SELECT pg_temp.mkatt('00000000-0000-0000-0000-0000000000a0','00000000-0000-0000-0000-0000000000e2','00000000-0000-0000-0000-0000000e0013',70,5,ARRAY['00000000-0000-0000-0000-0000000d0001','00000000-0000-0000-0000-0000000d0002']::uuid[]);
+SELECT pg_temp.mkatt('00000000-0000-0000-0000-0000000000a0','00000000-0000-0000-0000-0000000000e2','00000000-0000-0000-0000-0000000e0016',30,5,ARRAY['00000000-0000-0000-0000-0000000d0003']::uuid[]);
+-- R_zero (e3): evidence exists but will be computed against a 0-required config → Not established.
+SELECT pg_temp.mkatt('00000000-0000-0000-0000-0000000000a0','00000000-0000-0000-0000-0000000000e3','00000000-0000-0000-0000-0000000e0016',60,5,ARRAY['00000000-0000-0000-0000-0000000d0003']::uuid[]);
+-- A throwaway config version with ONLY an optional designation (0 required areas).
+INSERT INTO public.readiness_formula_versions (tenant_id,version,status,configuration,readiness_threshold,config_hash,source,created_at)
+VALUES ('00000000-0000-0000-0000-0000000000a0',99,'draft','{"model":"v2_quiz_mastery"}'::jsonb,80,'zero_required_cfg','tenant_customized',now());
+INSERT INTO public.readiness_tag_designations (tenant_id,formula_version_id,tag_id,is_required)
+ SELECT '00000000-0000-0000-0000-0000000000a0', id, '00000000-0000-0000-0000-0000000d0003', false
+ FROM public.readiness_formula_versions WHERE tenant_id='00000000-0000-0000-0000-0000000000a0' AND version=99;
+
 -- ════════════ RUN SHADOW (whole tenant) ════════════
 SELECT pg_temp.ok( (public.readiness_run_shadow('00000000-0000-0000-0000-0000000000a0', (SELECT vid FROM cfg))->>'processed')::int >= 10, 'run processed all reps');
 
@@ -514,14 +542,15 @@ SELECT pg_temp.ok((SELECT (evidence_summary->'tagMastery'->>'00000000-0000-0000-
    FROM public.readiness_scores_current WHERE user_id='00000000-0000-0000-0000-0000000000c1'),
    'Case A: multi-tag Quiz A not amplified — T1(official)=50, T3(insights)=100');
 
--- Case B: multi-tag Qmt (3 tags) counts once (primary T1); T1=avg(60,90)=75, T2=80, T3=70 → overall 75.
-SELECT pg_temp.ok((SELECT overall_score = 75
+-- Case B: multi-tag Qmt (3 tags) counts once (primary T1). REQUIRED areas only: T1=avg(60,90)=75,
+-- T2=80 → overall avg(75,80)=78. T3 is OPTIONAL → insights only (optionalAreaMastery=70), NOT scored.
+SELECT pg_temp.ok((SELECT overall_score = 78
    AND (component_scores->'tagMastery'->>'00000000-0000-0000-0000-0000000d0001')::numeric = 75
    AND (component_scores->'tagMastery'->>'00000000-0000-0000-0000-0000000d0002')::numeric = 80
-   AND (component_scores->'tagMastery'->>'00000000-0000-0000-0000-0000000d0003')::numeric = 70
-   AND (evidence_summary->'includedQuizzes'->0->>'primaryTag') IS NOT NULL
+   AND (component_scores->'tagMastery' ? '00000000-0000-0000-0000-0000000d0003') IS FALSE      -- T3 NOT in official score
+   AND (evidence_summary->'optionalAreaMastery'->>'00000000-0000-0000-0000-0000000d0003')::numeric = 70  -- T3 as insight
    FROM public.readiness_scores_current WHERE user_id='00000000-0000-0000-0000-0000000000c2'),
-   'Case B: 1 multi-tag + 3 single-tag → overall 75, multi-tag quiz counts once');
+   'Case B: required-only → overall 78 (T1=75,T2=80); optional T3 is insights-only (70)');
 
 -- Case C: a tag supported only by one multi-tag quiz (T1=50) vs a tag with several single-tag quizzes (T2=80) → overall 65.
 SELECT pg_temp.ok((SELECT overall_score = 65
@@ -573,6 +602,56 @@ SELECT pg_temp.as_user('00000000-0000-0000-0000-0000000000c9');  -- MANAGER (ten
 SELECT pg_temp.ok( public.readiness_set_quiz_primary_tag('00000000-0000-0000-0000-000000ec0001','00000000-0000-0000-0000-000000dc0001')->>'primaryReadinessTagId'='00000000-0000-0000-0000-000000dc0001', 'setter: manager sets a valid primary (own tenant)');
 SELECT pg_temp.as_user('00000000-0000-0000-0000-0000000000a1');  -- learner
 SELECT pg_temp.expect_error($$ SELECT public.readiness_set_quiz_primary_tag('00000000-0000-0000-0000-0000000e0011','00000000-0000-0000-0000-0000000d0001') $$, 'setter: learner denied');
+
+-- ════════════ REQUIRED-AREA DENOMINATOR & COMPARABILITY (Blocker) ════════════
+-- Identical required evidence + different optional evidence → SAME official score;
+-- a weak optional quiz cannot lower readiness; optional evidence still shows in insights.
+SELECT pg_temp.ok(
+   (SELECT overall_score FROM public.readiness_scores_current WHERE user_id='00000000-0000-0000-0000-0000000000e1')
+   = (SELECT overall_score FROM public.readiness_scores_current WHERE user_id='00000000-0000-0000-0000-0000000000e2')
+   AND (SELECT overall_score FROM public.readiness_scores_current WHERE user_id='00000000-0000-0000-0000-0000000000e1') = 80,
+   'same required evidence + different optional → same official score (80); weak optional cannot reduce it');
+SELECT pg_temp.ok((SELECT (evidence_summary->'optionalAreaMastery'->>'00000000-0000-0000-0000-0000000d0003')::numeric = 30
+   AND (component_scores->'tagMastery' ? '00000000-0000-0000-0000-0000000d0003') IS FALSE
+   FROM public.readiness_scores_current WHERE user_id='00000000-0000-0000-0000-0000000000e2'),
+   'optional evidence appears in insights (optionalAreaMastery T3=30) but not in the official score');
+
+-- Zero required areas → Not established (never silently score optional areas).
+SELECT public.readiness_compute_v2('00000000-0000-0000-0000-0000000000a0','00000000-0000-0000-0000-0000000000e3',
+   (SELECT id FROM public.readiness_formula_versions WHERE tenant_id='00000000-0000-0000-0000-0000000000a0' AND version=99));
+SELECT pg_temp.ok((SELECT success_status='insufficient_evidence' AND flags->>'state'='establishing'
+   AND overall_score IS NULL AND (evidence_summary->>'noRequiredAreas')='true'
+   FROM public.readiness_scores_current WHERE user_id='00000000-0000-0000-0000-0000000000e3'
+     AND formula_version_id=(SELECT id FROM public.readiness_formula_versions WHERE tenant_id='00000000-0000-0000-0000-0000000000a0' AND version=99)),
+   'zero required areas → Not established (optional areas never silently scored)');
+
+-- Team/company comparability: every ESTABLISHED rep shares the same required denominator (2),
+-- and AVG(overall_score) naturally includes only established rows (establishing/stale are NULL).
+SELECT pg_temp.ok(
+   NOT EXISTS (SELECT 1 FROM public.readiness_scores_current
+               WHERE tenant_id='00000000-0000-0000-0000-0000000000a0' AND success_status='ok'
+                 AND (evidence_summary->>'requiredDenominator')::int <> 2)
+   AND EXISTS (SELECT 1 FROM public.readiness_scores_current
+               WHERE tenant_id='00000000-0000-0000-0000-0000000000a0' AND overall_score IS NULL)
+   AND (SELECT count(*) FILTER (WHERE overall_score IS NOT NULL) = count(*) FILTER (WHERE success_status='ok')
+        FROM public.readiness_scores_current WHERE tenant_id='00000000-0000-0000-0000-0000000000a0'),
+   'team averages: all established reps share the same required denominator; only established rows carry a score');
+
+-- Security: a learner/authenticated role CANNOT write primary_readiness_tag_id directly (column revoke).
+SAVEPOINT sp_colwrite;
+SET LOCAL ROLE authenticated;
+DO $$ BEGIN
+  BEGIN
+    UPDATE public.tenant_quizzes SET primary_readiness_tag_id='00000000-0000-0000-0000-0000000d0002'
+      WHERE id='00000000-0000-0000-0000-0000000e0011';
+    RAISE EXCEPTION '087 FAIL: authenticated could directly UPDATE primary_readiness_tag_id';
+  EXCEPTION
+    WHEN insufficient_privilege THEN NULL;   -- expected: column write denied
+    WHEN OTHERS THEN IF SQLERRM LIKE '087 FAIL%' THEN RAISE; ELSE NULL; END IF;
+  END;
+END $$;
+RESET ROLE;
+ROLLBACK TO SAVEPOINT sp_colwrite;
 
 SELECT '087 ALL TESTS PASSED' AS result;
 ROLLBACK;
