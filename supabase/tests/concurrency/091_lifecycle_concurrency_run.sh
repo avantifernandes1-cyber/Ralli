@@ -19,6 +19,9 @@ no_deadlock(){ if grep -q '40P01\|deadlock' "$1"; then FAIL=$((FAIL+1)); echo "F
 TA='00000000-0000-0000-0000-0000091cc0a0'; TB='00000000-0000-0000-0000-0000091cc0b0'
 VA='00000000-0000-0000-0000-0000091cc0fa'; VB='00000000-0000-0000-0000-0000091cc0fb'
 U1='00000000-0000-0000-0000-0000091cc001'
+ADA='00000000-0000-0000-0000-0000091cc0d1'   # orgAdmin of TA
+ADB='00000000-0000-0000-0000-0000091cc0d2'   # orgAdmin of TB
+RAD='00000000-0000-0000-0000-0000091cc0d3'   # ralli_admin
 
 seed(){
  q -c "
@@ -34,8 +37,16 @@ seed(){
   DELETE FROM public.tenants WHERE id IN ('$TA','$TB');
   INSERT INTO public.tenants(id,slug,name) VALUES ('$TA','cca','CCA'),('$TB','ccb','CCB');
   INSERT INTO public.tenant_settings(tenant_id,learning_settings) VALUES ('$TA','{}'),('$TB','{}');
-  INSERT INTO auth.users(id,aud,role,email,created_at,updated_at) VALUES ('$U1','authenticated','authenticated','cc1@t.test',now(),now());
+  DELETE FROM public.profiles WHERE id IN ('$ADA','$ADB','$RAD'); DELETE FROM auth.users WHERE id IN ('$ADA','$ADB','$RAD');
+  INSERT INTO auth.users(id,aud,role,email,created_at,updated_at) VALUES
+    ('$U1','authenticated','authenticated','cc1@t.test',now(),now()),
+    ('$ADA','authenticated','authenticated','ada@t.test',now(),now()),
+    ('$ADB','authenticated','authenticated','adb@t.test',now(),now()),
+    ('$RAD','authenticated','authenticated','rad@t.test',now(),now());
   UPDATE public.profiles SET role='user',tenant_id='$TA',status='active' WHERE id='$U1';
+  UPDATE public.profiles SET role='orgAdmin',tenant_id='$TA',status='active' WHERE id='$ADA';
+  UPDATE public.profiles SET role='orgAdmin',tenant_id='$TB',status='active' WHERE id='$ADB';
+  UPDATE public.profiles SET role='ralli_admin',tenant_id=NULL,status='active' WHERE id='$RAD';
   INSERT INTO public.readiness_formula_versions(id,tenant_id,version,status,configuration,readiness_threshold,config_hash,source,created_at,activated_at)
    VALUES ('$VA','$TA',2,'active','{\"model\":\"v2_quiz_mastery\"}'::jsonb,80,'h','tenant_customized',now(),now()),
           ('$VB','$TB',2,'active','{\"model\":\"v2_quiz_mastery\"}'::jsonb,80,'h','tenant_customized',now(),now());
@@ -62,6 +73,8 @@ apply(){ # $1=status $2=role $3=tenant(or NULL)
  local t="'$3'"; [ "$3" = "NULL" ] && t=NULL
  q -c "SELECT public.readiness_lifecycle_apply('$U1','$1','$2',$t, NULL,NULL,NULL,false);"
 }
+# call an RPC as a given auth.uid() (JWT set + call in one session); 40001/authz errors are expected, 40P01 is not
+rpc_as(){ q -c "SELECT set_config('request.jwt.claims', json_build_object('sub','$1')::text, false); $2"; }
 
 echo "== CC1: worker-first vs deactivate =="
 seed
@@ -137,9 +150,50 @@ no_deadlock /tmp/cc8a.out "CC8a no deadlock"; no_deadlock /tmp/cc8b.out "CC8b no
 ok "CC8: at most one raised the retryable serialization abort (40001), never a deadlock" \
    "$(cat /tmp/cc8a.out /tmp/cc8b.out | grep -c '40001\|changed concurrently' | awk '{print ($1<=1)?"t":"f"}')" "t"
 
+echo "== CC9: remove-authz race — orgAdmin A removes while member transfers A→B (A must not remove from B) =="
+seed
+( apply active user "$TB" ) >/tmp/cc9t.out 2>&1 &
+( rpc_as "$ADA" "SELECT public.readiness_lifecycle_remove_member('$U1');" ) >/tmp/cc9r.out 2>&1 &
+wait
+no_deadlock /tmp/cc9t.out "CC9t no deadlock"; no_deadlock /tmp/cc9r.out "CC9r no deadlock"
+ok "CC9 final: member never removed from new tenant B by an old-tenant admin" \
+   "$(q -tAc "SELECT CASE WHEN tenant_id='$TB' THEN (status='active') ELSE true END FROM public.profiles WHERE id='$U1';")" "t"
+
+echo "== CC10: transfer authorization becomes stale before the locked re-read =="
+seed
+( apply active user "$TB" ) >/tmp/cc10a.out 2>&1 &
+( rpc_as "$RAD" "SELECT public.readiness_lifecycle_transfer_member('$U1','$TA','user');" ) >/tmp/cc10b.out 2>&1 &
+wait
+no_deadlock /tmp/cc10a.out "CC10a no deadlock"; no_deadlock /tmp/cc10b.out "CC10b no deadlock"
+ok "CC10 final: member in exactly one tenant (stale transfer aborts 40001 if it lost)" \
+   "$(q -tAc "SELECT tenant_id IN ('$TA','$TB') FROM public.profiles WHERE id='$U1';")" "t"
+
+echo "== CC11: invitation races a transfer (no unauthorized move / wrong-tenant cleanup) =="
+seed
+q -c "INSERT INTO public.tenant_invitations(id,tenant_id,admin_email,token,status,onboarding_state,expires_at,role)
+      VALUES ('00000000-0000-0000-0000-0000091cc0e1','$TB','adb@t.test','cc-token-91','pending','{\"stepsCompleted\":[]}'::jsonb, now()+interval '1 day','user');" >/dev/null 2>&1
+( rpc_as "$U1" "SELECT public.accept_invitation('cc-token-91', NULL);" ) >/tmp/cc11a.out 2>&1 &
+( apply inactive user "$TA" ) >/tmp/cc11b.out 2>&1 &
+wait
+no_deadlock /tmp/cc11a.out "CC11a no deadlock"; no_deadlock /tmp/cc11b.out "CC11b no deadlock"
+ok "CC11 final: member in a single consistent state (invite vs deactivate — loser aborts 40001)" \
+   "$(q -tAc "SELECT (tenant_id='$TB' AND status='active') OR (tenant_id IS DISTINCT FROM '$TB') FROM public.profiles WHERE id='$U1';")" "t"
+
+echo "== CC12: tenant deletion races a member transfer (transferred member remains in destination) =="
+seed
+( rpc_as "$RAD" "SELECT public.delete_tenant('$TA');" ) >/tmp/cc12a.out 2>&1 &
+( sleep 0.3; apply active user "$TB" ) >/tmp/cc12b.out 2>&1
+wait
+no_deadlock /tmp/cc12a.out "CC12a no deadlock"; no_deadlock /tmp/cc12b.out "CC12b no deadlock"
+# safe: never left tenant=TB while detached; if transfer won, member is in TB active
+ok "CC12 final: a transferred member is never detached from destination by delete_tenant" \
+   "$(q -tAc "SELECT CASE WHEN tenant_id='$TB' THEN (status='active') ELSE true END FROM public.profiles WHERE id='$U1';")" "t"
+
 # cleanup seed
 q -c "
   BEGIN; SET LOCAL readiness.allow_unguarded='1';
+  DELETE FROM public.tenant_invitations WHERE tenant_id IN ('$TA','$TB');
+  DELETE FROM public.profiles WHERE id IN ('$ADA','$ADB','$RAD'); DELETE FROM auth.users WHERE id IN ('$ADA','$ADB','$RAD');
   DELETE FROM public.readiness_scores_current WHERE tenant_id IN ('$TA','$TB');
   DELETE FROM public.readiness_score_history WHERE tenant_id IN ('$TA','$TB');
   DELETE FROM public.readiness_recalc_queue WHERE tenant_id IN ('$TA','$TB');

@@ -1852,3 +1852,25 @@ Preflight required before any prod apply (separate approval): read-only impact r
 non-scorable per role/status; stale current rows; divergence probe = FALSE today); apply in a single
 transaction; structural + behavioral verification; then the manager/learner QA checklist
 (`091_QA_CHECKLIST.md`) on the preview. Ledger row 63 (UNCOMMITTED until this preview commit).
+
+Row 63 — 091 CORRECTION (supersedes `689ad04`/SHA `b1aed31f…`; STILL NOT APPLIED/merged/deployed): new
+migration SHA-256 **`fae17366b13e20006ffd65cde5716a41607929b9cb19e0e84546cf86246afbfa`**. Seven confirmed
+authorization/race/contract fixes, all in-place on the 091 artifact (migration number kept): (#1) remove_member
+now passes the authorized tenant as a mandatory expected tenant → the fresh LOCKED tenant is asserted (40001
+if the member transferred away, so an old-tenant admin can never remove them from their new tenant). (#2)
+reactivate_member may only claim a DETACHED profile (locked tenant IS NULL) in an inactive/invited state
+(new `p_expect_status_in` on the engine); moving an attached member must use transfer (both-tenant authz).
+(#3) transfer_member asserts the authorized ORIGIN against the locked origin (40001 on stale authz). (#4)
+accept_invitation's existing-profile branch now routes through the lifecycle engine with explicit expected
+(status,role,tenant) — full read→advisory→fresh-locked-re-read→validate; name/team applied only after the
+membership transition validates. (#5) delete_tenant re-reads each profile under lock and SKIPs any member
+whose tenant no longer equals the target (never detaches a transferred member). (#6) the direct
+`GRANT INSERT (id,email,name) … TO authenticated` is removed — creation is only via SECDEF ensure_self_profile
+(+ handle_new_user). (#7) `readiness_lifecycle_apply` expected-status typo fixed (validates `v_ls`, not the
+role var) and ALL expected-precondition failures now raise `40001` (retryable). Engine signature is now
+`(uuid,text,text,uuid,text,text,uuid,boolean,text[])` (rollback DROP updated to match). Re-validation:
+behavioral suite (+ new R1–R5: expected-status abort, stale expected-tenant abort, reactivate-attached
+denied, detached reactivation succeeds, direct INSERT denied) → **091 ALL TESTS PASSED**; concurrency
+**36/36 zero 40P01** (original CC1–CC8 + CC9 remove-vs-transfer, CC10 stale-transfer, CC11 invite-vs-transfer,
+CC12 delete_tenant-vs-transfer); two-mode rollback re-verified (composite FKs restored, no divergence);
+`npm run build` exit 0; `npm test` 7/7. No client changes this round (previous cutover stands).

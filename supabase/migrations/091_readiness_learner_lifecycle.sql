@@ -265,7 +265,8 @@ CREATE OR REPLACE FUNCTION public.readiness_lifecycle_apply(
   p_expect_status text DEFAULT NULL,
   p_expect_role   text DEFAULT NULL,
   p_expect_tenant uuid DEFAULT NULL,
-  p_expect_tenant_set boolean DEFAULT false   -- when true, p_expect_tenant (incl NULL) is asserted
+  p_expect_tenant_set boolean DEFAULT false,  -- when true, p_expect_tenant (incl NULL) is asserted
+  p_expect_status_in text[] DEFAULT NULL      -- when set, the locked status must be a member of this set
 )
  RETURNS jsonb
  LANGUAGE plpgsql
@@ -293,19 +294,28 @@ BEGIN
   -- (3) re-read WITH the profile row lock (taken AFTER the advisory — correct order)
   SELECT status, role, tenant_id INTO v_ls, v_lr, v_lt FROM public.profiles WHERE id = p_user FOR UPDATE;
 
-  -- (4) recompute from fresh state; abort if the requested transition no longer matches
+  -- (4) recompute from the FRESH LOCKED state; every unmet precondition aborts with 40001 so a caller whose
+  -- authorization/read went stale during the advisory wait retries against fresh state (never applies stale).
   IF (v_ls, v_lr, v_lt) IS DISTINCT FROM (v_os, v_or, v_ot) THEN
     RAISE EXCEPTION 'readiness_lifecycle_apply: profile % changed concurrently; retry', p_user
       USING ERRCODE = '40001';   -- serialization_failure ⇒ caller may safely retry
   END IF;
-  IF p_expect_status IS NOT NULL AND v_lr IS DISTINCT FROM NULL AND v_ls IS DISTINCT FROM p_expect_status THEN
-    RAISE EXCEPTION 'readiness_lifecycle_apply: expected status % but found %', p_expect_status, v_ls;
+  -- (#7 fix) validate STATUS against v_ls (was erroneously gating on v_lr / role).
+  IF p_expect_status IS NOT NULL AND v_ls IS DISTINCT FROM p_expect_status THEN
+    RAISE EXCEPTION 'readiness_lifecycle_apply: expected status % but locked %; retry', p_expect_status, v_ls
+      USING ERRCODE = '40001';
+  END IF;
+  IF p_expect_status_in IS NOT NULL AND NOT (v_ls = ANY(p_expect_status_in)) THEN
+    RAISE EXCEPTION 'readiness_lifecycle_apply: locked status % is not in the allowed set % for this transition', v_ls, p_expect_status_in
+      USING ERRCODE = '40001';
   END IF;
   IF p_expect_role IS NOT NULL AND v_lr IS DISTINCT FROM p_expect_role THEN
-    RAISE EXCEPTION 'readiness_lifecycle_apply: expected role % but found %', p_expect_role, v_lr;
+    RAISE EXCEPTION 'readiness_lifecycle_apply: expected role % but locked %; retry', p_expect_role, v_lr
+      USING ERRCODE = '40001';
   END IF;
   IF p_expect_tenant_set AND v_lt IS DISTINCT FROM p_expect_tenant THEN
-    RAISE EXCEPTION 'readiness_lifecycle_apply: expected tenant % but found %', p_expect_tenant, v_lt;
+    RAISE EXCEPTION 'readiness_lifecycle_apply: expected tenant % but locked % (authorization stale); retry', p_expect_tenant, v_lt
+      USING ERRCODE = '40001';
   END IF;
 
   -- No material change? Do nothing (no delete, no update, no history churn).
@@ -330,8 +340,8 @@ BEGIN
   RETURN jsonb_build_object('userId', p_user, 'changed', true,
                             'status', p_new_status, 'role', p_new_role, 'tenantId', p_new_tenant);
 END $function$;
-REVOKE ALL ON FUNCTION public.readiness_lifecycle_apply(uuid,text,text,uuid,text,text,uuid,boolean) FROM PUBLIC, anon, authenticated;
-GRANT EXECUTE ON FUNCTION public.readiness_lifecycle_apply(uuid,text,text,uuid,text,text,uuid,boolean) TO service_role;
+REVOKE ALL ON FUNCTION public.readiness_lifecycle_apply(uuid,text,text,uuid,text,text,uuid,boolean,text[]) FROM PUBLIC, anon, authenticated;
+GRANT EXECUTE ON FUNCTION public.readiness_lifecycle_apply(uuid,text,text,uuid,text,text,uuid,boolean,text[]) TO service_role;
 
 -- Authorization helper: caller must be ralli_admin/superadmin, or an orgAdmin of the target's tenant.
 CREATE OR REPLACE FUNCTION public.readiness_lifecycle_authz(p_target_tenant uuid)
@@ -353,14 +363,18 @@ GRANT EXECUTE ON FUNCTION public.readiness_lifecycle_authz(uuid) TO service_role
 -- ── F1. Remove a member (reversible; identity + history preserved; current removed immediately) ──
 CREATE OR REPLACE FUNCTION public.readiness_lifecycle_remove_member(p_user uuid)
  RETURNS jsonb LANGUAGE plpgsql SECURITY DEFINER SET search_path TO '' AS $function$
-DECLARE v_tenant uuid;
+DECLARE v_status text; v_role text; v_tenant uuid;
 BEGIN
-  SELECT tenant_id INTO v_tenant FROM public.profiles WHERE id = p_user;
+  SELECT status, role, tenant_id INTO v_status, v_role, v_tenant FROM public.profiles WHERE id = p_user;
   IF NOT FOUND THEN RAISE EXCEPTION 'remove_member: profile not found'; END IF;
-  PERFORM public.readiness_lifecycle_authz(v_tenant);
+  IF v_tenant IS NULL THEN RAISE EXCEPTION 'remove_member: member is already detached'; END IF;
+  PERFORM public.readiness_lifecycle_authz(v_tenant);         -- authorized against v_tenant …
   IF p_user = auth.uid() THEN RAISE EXCEPTION 'remove_member: cannot remove self'; END IF;
-  -- inactive + detached; role reset to user. History rows stay under their original tenant.
-  RETURN public.readiness_lifecycle_apply(p_user, 'inactive', 'user', NULL);
+  -- (#1 fix) … which is asserted (mandatory) against the FRESH LOCKED tenant. If the member transferred
+  -- between authorization and the lock, apply aborts 40001 — an old-tenant admin can never remove them from
+  -- their new tenant. inactive + detached; role reset to user; history stays under its original tenant.
+  RETURN public.readiness_lifecycle_apply(p_user, 'inactive', 'user', NULL,
+                                          v_status, v_role, v_tenant, true);
 END $function$;
 REVOKE ALL ON FUNCTION public.readiness_lifecycle_remove_member(uuid) FROM PUBLIC, anon, authenticated;
 GRANT EXECUTE ON FUNCTION public.readiness_lifecycle_remove_member(uuid) TO authenticated, service_role;
@@ -372,7 +386,12 @@ BEGIN
   IF p_tenant IS NULL THEN RAISE EXCEPTION 'reactivate_member: tenant required'; END IF;
   IF p_role NOT IN ('user','manager','orgAdmin') THEN RAISE EXCEPTION 'reactivate_member: illegal role %', p_role; END IF;
   PERFORM public.readiness_lifecycle_authz(p_tenant);
-  RETURN public.readiness_lifecycle_apply(p_user, 'active', p_role, p_tenant);
+  -- (#2 fix) Reactivation may ONLY claim a DETACHED profile (locked tenant IS NULL) that is inactive/invited.
+  -- If the profile is currently attached to another org, apply aborts (40001) — a destination admin can
+  -- never pull an attached member out of their org this way; moving an attached member must use
+  -- transfer_member (which requires authorization over BOTH origin and destination).
+  RETURN public.readiness_lifecycle_apply(p_user, 'active', p_role, p_tenant,
+                                          NULL, NULL, NULL, true, ARRAY['inactive','invited']);
 END $function$;
 REVOKE ALL ON FUNCTION public.readiness_lifecycle_reactivate_member(uuid,uuid,text) FROM PUBLIC, anon, authenticated;
 GRANT EXECUTE ON FUNCTION public.readiness_lifecycle_reactivate_member(uuid,uuid,text) TO authenticated, service_role;
@@ -380,15 +399,17 @@ GRANT EXECUTE ON FUNCTION public.readiness_lifecycle_reactivate_member(uuid,uuid
 -- ── F3. Change a member's role within their tenant ──
 CREATE OR REPLACE FUNCTION public.readiness_lifecycle_change_role(p_user uuid, p_role text)
  RETURNS jsonb LANGUAGE plpgsql SECURITY DEFINER SET search_path TO '' AS $function$
-DECLARE v_tenant uuid; v_status text;
+DECLARE v_tenant uuid; v_status text; v_role text;
 BEGIN
   IF p_role NOT IN ('user','manager','orgAdmin') THEN RAISE EXCEPTION 'change_role: illegal role %', p_role; END IF;
-  SELECT tenant_id, status INTO v_tenant, v_status FROM public.profiles WHERE id = p_user;
+  SELECT tenant_id, status, role INTO v_tenant, v_status, v_role FROM public.profiles WHERE id = p_user;
   IF NOT FOUND THEN RAISE EXCEPTION 'change_role: profile not found'; END IF;
   IF v_tenant IS NULL THEN RAISE EXCEPTION 'change_role: member has no tenant'; END IF;
   PERFORM public.readiness_lifecycle_authz(v_tenant);
+  -- Assert the authorized tenant AND the read status/role survive to the locked read: a concurrent
+  -- transfer or deactivation aborts 40001 rather than clobbering status or writing to the wrong tenant.
   RETURN public.readiness_lifecycle_apply(p_user, v_status, p_role, v_tenant,
-                                          NULL, NULL, v_tenant, true);
+                                          v_status, v_role, v_tenant, true);
 END $function$;
 REVOKE ALL ON FUNCTION public.readiness_lifecycle_change_role(uuid,text) FROM PUBLIC, anon, authenticated;
 GRANT EXECUTE ON FUNCTION public.readiness_lifecycle_change_role(uuid,text) TO authenticated, service_role;
@@ -402,10 +423,14 @@ BEGIN
   IF p_role NOT IN ('user','manager','orgAdmin') THEN RAISE EXCEPTION 'transfer_member: illegal role %', p_role; END IF;
   SELECT tenant_id INTO v_old_tenant FROM public.profiles WHERE id = p_user;
   IF NOT FOUND THEN RAISE EXCEPTION 'transfer_member: profile not found'; END IF;
+  IF v_old_tenant IS NULL THEN RAISE EXCEPTION 'transfer_member: member is detached; use reactivate_member'; END IF;
   -- caller must be authorized over BOTH the origin and destination tenants
-  IF v_old_tenant IS NOT NULL THEN PERFORM public.readiness_lifecycle_authz(v_old_tenant); END IF;
+  PERFORM public.readiness_lifecycle_authz(v_old_tenant);
   PERFORM public.readiness_lifecycle_authz(p_new_tenant);
-  RETURN public.readiness_lifecycle_apply(p_user, 'active', p_role, p_new_tenant);
+  -- (#3 fix) the authorized ORIGIN is asserted against the FRESH LOCKED tenant: if a concurrent move made
+  -- the origin authorization stale, apply aborts 40001 and the caller must re-authorize + retry.
+  RETURN public.readiness_lifecycle_apply(p_user, 'active', p_role, p_new_tenant,
+                                          NULL, NULL, v_old_tenant, true);
 END $function$;
 REVOKE ALL ON FUNCTION public.readiness_lifecycle_transfer_member(uuid,uuid,text) FROM PUBLIC, anon, authenticated;
 GRANT EXECUTE ON FUNCTION public.readiness_lifecycle_transfer_member(uuid,uuid,text) TO authenticated, service_role;
@@ -483,14 +508,15 @@ END $function$;
 REVOKE ALL ON FUNCTION public.ensure_self_profile(text,text,text,text,jsonb) FROM PUBLIC, anon;
 GRANT EXECUTE ON FUNCTION public.ensure_self_profile(text,text,text,text,jsonb) TO authenticated, service_role;
 
--- Grant hardening: revoke the broad table + column write grants; re-grant only SELECT (RLS-gated),
--- safe presentation-field UPDATE, and narrow INSERT for the signup fallback. role/status/tenant_id/team_id/
--- xp/streak/email/id/timestamps become writable only via SECDEF paths. anon loses everything (no RLS policy).
+-- Grant hardening: revoke the broad table + column write grants; re-grant only SELECT (RLS-gated) and
+-- safe presentation-field UPDATE. role/status/tenant_id/team_id/xp/streak/email/id/timestamps become writable
+-- only via SECDEF paths. anon loses everything (no RLS policy).
+-- (#6 fix) NO direct client INSERT: profile creation is ONLY through the SECDEF ensure_self_profile RPC
+-- (which runs as postgres and does not need a client INSERT grant) and the handle_new_user signup trigger.
 REVOKE ALL ON public.profiles FROM anon;
 REVOKE ALL ON public.profiles FROM authenticated;
 GRANT SELECT ON public.profiles TO authenticated;
 GRANT UPDATE (name, nickname, avatar_emoji, profile_pic_url, notif_prefs) ON public.profiles TO authenticated;
-GRANT INSERT (id, email, name) ON public.profiles TO authenticated;   -- own-row signup fallback only
 
 -- Tighten own-row RLS: add a WITH CHECK so a client cannot re-parent its row id (defence in depth;
 -- the column grants above are the primary gate against role/status/tenant self-escalation).
@@ -518,7 +544,7 @@ DECLARE
   v_uid    uuid := auth.uid();
   v_email  text;
   v_exists boolean;
-  v_ot     uuid;
+  v_ot     uuid; v_os text; v_or text;
 BEGIN
   IF v_uid IS NULL THEN RAISE EXCEPTION 'accept_invitation: must be authenticated'; END IF;
 
@@ -529,23 +555,18 @@ BEGIN
 
   SELECT email INTO v_email FROM auth.users WHERE id = v_uid;
 
-  SELECT true, tenant_id INTO v_exists, v_ot FROM public.profiles WHERE id = v_uid;
+  SELECT true, tenant_id, status, role INTO v_exists, v_ot, v_os, v_or FROM public.profiles WHERE id = v_uid;
 
   IF v_exists IS TRUE THEN
-    -- Existing profile: this is a (re)placement into v_inv.tenant_id — route through the advisory-first
-    -- lifecycle so the old-tenant current row is removed and the FK KEY SHARE lock order is respected.
-    PERFORM public.readiness_begin_lifecycle_write(v_uid, ARRAY[v_ot, v_inv.tenant_id]);
-    PERFORM 1 FROM public.profiles WHERE id = v_uid FOR UPDATE;
-    IF v_ot IS NOT NULL
-       AND NOT (v_inv.tenant_id IS NOT DISTINCT FROM v_ot AND v_inv.role = 'user') THEN
-      DELETE FROM public.readiness_scores_current WHERE user_id = v_uid AND tenant_id = v_ot;
-    END IF;
+    -- (#4 fix) Existing profile → route the membership transition through the validated lifecycle engine,
+    -- which performs the FULL read → advisory → fresh LOCKED re-read → validation contract: expected =
+    -- (status,role,tenant) we just read; a concurrent change aborts 40001 (no stale move / wrong-tenant
+    -- cleanup). Name/team (non-guarded columns) are applied ONLY AFTER the membership transition validates.
+    PERFORM public.readiness_lifecycle_apply(v_uid, 'active', v_inv.role, v_inv.tenant_id,
+                                             v_os, v_or, v_ot, true);
     UPDATE public.profiles SET
-      tenant_id  = v_inv.tenant_id,
-      role       = v_inv.role,
       team_id    = COALESCE(v_inv.team_id, team_id),
       name       = CASE WHEN NULLIF(TRIM(p_name),'') IS NOT NULL THEN TRIM(p_name) ELSE name END,
-      status     = 'active',
       updated_at = now()
     WHERE id = v_uid;
   ELSE
@@ -590,7 +611,7 @@ CREATE OR REPLACE FUNCTION public.delete_tenant(p_tenant_id uuid)
  SECURITY DEFINER
  SET search_path TO ''
 AS $function$
-DECLARE v_uid uuid := auth.uid(); v_role text; v_name text; v_m uuid;
+DECLARE v_uid uuid := auth.uid(); v_role text; v_name text; v_m uuid; v_locked_tenant uuid;
 BEGIN
   SELECT role INTO v_role FROM public.profiles WHERE id = v_uid;
   IF v_role NOT IN ('ralli_admin','superadmin') THEN
@@ -603,7 +624,12 @@ BEGIN
   -- Detach each member via the lifecycle path (advisory FIRST, delete current), deterministic order.
   FOR v_m IN SELECT id FROM public.profiles WHERE tenant_id = p_tenant_id ORDER BY id LOOP
     PERFORM public.readiness_begin_lifecycle_write(v_m, ARRAY[p_tenant_id]);
-    PERFORM 1 FROM public.profiles WHERE id = v_m FOR UPDATE;
+    -- (#5 fix) re-read UNDER LOCK and confirm the member still belongs to this tenant. If they transferred
+    -- out between enumeration and the lock, SKIP them — never detach a member from a DIFFERENT tenant.
+    SELECT tenant_id INTO v_locked_tenant FROM public.profiles WHERE id = v_m FOR UPDATE;
+    IF v_locked_tenant IS DISTINCT FROM p_tenant_id THEN
+      CONTINUE;
+    END IF;
     DELETE FROM public.readiness_scores_current WHERE user_id = v_m AND tenant_id = p_tenant_id;
     UPDATE public.profiles SET tenant_id = NULL, role = 'user', updated_at = now() WHERE id = v_m;
   END LOOP;

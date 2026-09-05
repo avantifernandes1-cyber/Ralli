@@ -35,7 +35,7 @@ DROP FUNCTION IF EXISTS public.readiness_lifecycle_remove_member(uuid);
 DROP FUNCTION IF EXISTS public.readiness_lifecycle_reactivate_member(uuid,uuid,text);
 DROP FUNCTION IF EXISTS public.readiness_lifecycle_change_role(uuid,text);
 DROP FUNCTION IF EXISTS public.readiness_lifecycle_transfer_member(uuid,uuid,text);
-DROP FUNCTION IF EXISTS public.readiness_lifecycle_apply(uuid,text,text,uuid,text,text,uuid,boolean);
+DROP FUNCTION IF EXISTS public.readiness_lifecycle_apply(uuid,text,text,uuid,text,text,uuid,boolean,text[]);
 DROP FUNCTION IF EXISTS public.readiness_lifecycle_authz(uuid);
 DROP FUNCTION IF EXISTS public.readiness_begin_lifecycle_write(uuid,uuid[]);
 DROP FUNCTION IF EXISTS public.ensure_self_profile(text,text,text,text,jsonb);

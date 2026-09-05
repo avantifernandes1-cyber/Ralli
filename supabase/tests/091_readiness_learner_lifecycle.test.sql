@@ -216,6 +216,60 @@ SELECT public.readiness_lifecycle_remove_member(:'u1');
 SELECT pg_temp.ok((SELECT status FROM public.profiles WHERE id=:'u1')='inactive' AND (SELECT tenant_id FROM public.profiles WHERE id=:'u1') IS NULL, 'A2: orgAdmin removed member (inactive, detached)');
 SELECT set_config('request.jwt.claims', NULL, true);
 
+-- ══ R. RE-READ CONTRACT + AUTHZ PRECONDITIONS (correction round) ══
+-- restore u1 to a known active-in-TA baseline (earlier sections deactivated/removed it); break-glass is on.
+UPDATE public.profiles SET status='active', role='user', tenant_id=:'TA' WHERE id=:'u1';
+-- R1 (#7): expected-status mismatch aborts with 40001 (u1 is active; assert expected 'inactive')
+DO $r$ BEGIN
+  BEGIN
+    PERFORM public.readiness_lifecycle_apply('00000000-0000-0000-0000-000000910001','inactive','user',
+              '00000000-0000-0000-0000-0000009100a0','inactive',NULL,NULL,false);
+    RAISE EXCEPTION 'R1_NO_ABORT';
+  EXCEPTION WHEN others THEN
+    IF SQLERRM LIKE '%R1_NO_ABORT%' THEN RAISE EXCEPTION '091 FAIL: R1 expected-status mismatch did not abort'; END IF;
+    IF SQLSTATE <> '40001' THEN RAISE EXCEPTION '091 FAIL: R1 aborted % not 40001', SQLSTATE; END IF;
+  END;
+END $r$ LANGUAGE plpgsql;
+SELECT pg_temp.ok((SELECT status FROM public.profiles WHERE id=:'u1')='active', 'R1: expected-status mismatch aborted 40001, row unchanged');
+
+-- R2 (#1/#3): stale expected-tenant aborts with 40001 (u1 in TA; assert expected TB)
+DO $r$ BEGIN
+  BEGIN
+    PERFORM public.readiness_lifecycle_apply('00000000-0000-0000-0000-000000910001','active','user',
+              '00000000-0000-0000-0000-0000009100a0',NULL,NULL,'00000000-0000-0000-0000-0000009100b0',true);
+    RAISE EXCEPTION 'R2_NO_ABORT';
+  EXCEPTION WHEN others THEN
+    IF SQLERRM LIKE '%R2_NO_ABORT%' THEN RAISE EXCEPTION '091 FAIL: R2 stale expected-tenant did not abort'; END IF;
+    IF SQLSTATE <> '40001' THEN RAISE EXCEPTION '091 FAIL: R2 aborted % not 40001', SQLSTATE; END IF;
+  END;
+END $r$ LANGUAGE plpgsql;
+SELECT pg_temp.ok((SELECT tenant_id FROM public.profiles WHERE id=:'u1')=:'TA', 'R2: stale expected-tenant aborted 40001 (authorization stale), row unchanged');
+
+-- R3 (#2): a destination admin cannot reactivate/claim a member ATTACHED to another org.
+SELECT set_config('request.jwt.claims', json_build_object('sub',:'adm')::text, true);   -- adm = ralli_admin
+DO $r$ BEGIN
+  BEGIN
+    -- u1 is ACTIVE and ATTACHED to TA; reactivating "into" TB must be refused (must use transfer).
+    PERFORM public.readiness_lifecycle_reactivate_member('00000000-0000-0000-0000-000000910001',
+              '00000000-0000-0000-0000-0000009100b0','user');
+    RAISE EXCEPTION 'R3_NO_ABORT';
+  EXCEPTION WHEN others THEN
+    IF SQLERRM LIKE '%R3_NO_ABORT%' THEN RAISE EXCEPTION '091 FAIL: R3 reactivate claimed an attached member'; END IF;
+  END;
+END $r$ LANGUAGE plpgsql;
+SELECT pg_temp.ok((SELECT tenant_id FROM public.profiles WHERE id=:'u1')=:'TA', 'R3: reactivate cannot claim an attached member (still in TA)');
+
+-- R4: reactivation of a genuinely DETACHED (removed) member succeeds.
+SELECT public.readiness_lifecycle_remove_member(:'u1');   -- as adm → detached/inactive
+SELECT pg_temp.ok((SELECT tenant_id FROM public.profiles WHERE id=:'u1') IS NULL, 'R4-pre: member detached after remove');
+SELECT public.readiness_lifecycle_reactivate_member(:'u1', :'TB', 'user');
+SELECT pg_temp.ok((SELECT tenant_id FROM public.profiles WHERE id=:'u1')=:'TB' AND (SELECT status FROM public.profiles WHERE id=:'u1')='active', 'R4: detached member reactivated into TB');
+SELECT public.readiness_lifecycle_transfer_member(:'u1', :'TA', 'user');   -- move back for tidiness
+SELECT set_config('request.jwt.claims', NULL, true);
+
+-- R5 (#6): direct authenticated INSERT on profiles is denied; creation is only via ensure_self_profile.
+SELECT pg_temp.ok(NOT has_table_privilege('authenticated','public.profiles','INSERT'), 'R5: authenticated has NO direct INSERT on profiles');
+
 -- ══ SEC. security metadata + static "no advisory-holder writes the queue" ══
 SELECT pg_temp.ok((SELECT bool_and(prosecdef AND pg_get_userbyid(proowner)='postgres' AND array_to_string(proconfig,',')='search_path=""')
   FROM pg_proc WHERE proname IN ('readiness_is_scorable_rep','enqueue_readiness_recalc','readiness_begin_lifecycle_write',
