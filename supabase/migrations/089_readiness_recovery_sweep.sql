@@ -10,21 +10,28 @@
 --   (1) readiness_recover_missed_enqueues(p_tenant, p_limit): for each tenant with an ACTIVE v2 config,
 --       find ACTIVE SCORABLE learners whose newest ELIGIBLE current-comparable server_v2 attempt is newer
 --       than their readiness_scores_current.last_attempt_at (or who have eligible evidence but NO current
---       row), that do NOT already have a live (pending/processing) ACTIVE job, and enqueue each through the
---       canonical enqueue_readiness_recalc (reason 'backfill', target ACTIVE). Bounded per tenant per run;
+--       row), that have NO UNRESOLVED ACTIVE job (none in pending/processing/dead_letter/failed), and
+--       enqueue each through the canonical enqueue_readiness_recalc (reason 'backfill', target ACTIVE).
+--       A dead-lettered learner is NEVER auto-re-enqueued (admin action, Phase 093). Bounded per tenant per run;
 --       per-rep fail-open. Learners with NO eligible evidence are NEVER enqueued (a missing current row
 --       alone is not a reason).
 --   (2) One postgres-owned pg_cron job 'readiness_recovery_sweep' every 5 minutes calling it in-DB
 --       (no URL / token / Vault / Edge Function). Idempotent install; leaves all other crons untouched.
 --
 -- ── NO-STARVATION / BATCHING CONTINUATION (design proof) ──────────────────────
--- Each run selects only reps WITHOUT a live ACTIVE job, ordered by the most-behind watermark first
+-- Each run selects only reps with NO UNRESOLVED ACTIVE job — i.e. no job in ('pending','processing',
+-- 'dead_letter','failed') for target ACTIVE — ordered by the most-behind watermark first
 -- (last_attempt_at NULLS FIRST), LIMIT p_limit per tenant. Consequences:
 --   * If the consumer lags (enqueued jobs still pending), those reps now HAVE a live job, so the NEXT
 --     run's selection skips them and picks the next p_limit NEW reps — coverage advances every run; the
 --     remainder is never permanently starved behind a fixed "first page".
 --   * When the consumer drains a job, readiness_compute_v2 sets last_attempt_at = now, so that rep's
 --     watermark is no longer behind its newest attempt and it drops out of the eligible set entirely.
+--   * A rep whose job reached 'dead_letter' (or an independent 'failed') is EXCLUDED from auto-recovery
+--     and never re-enqueued, resurrected, reset, or modified here — dead-letter recovery is an explicit
+--     admin action in Phase 093. This also removes the only starvation risk (a permanently-failing rep,
+--     which never advances its watermark and would otherwise sort first forever, can no longer occupy a
+--     slot), so healthy reps behind it always progress.
 -- Either way the eligible set strictly shrinks across runs until empty. Idempotent: enqueue coalesces on
 -- uq_recalc_live_job (no duplicate live jobs) and compute dedups history by material hash (no duplicate
 -- history when evidence is unchanged).
@@ -88,10 +95,11 @@ BEGIN
         FROM newest n
         LEFT JOIN cur c ON c.user_id = n.user_id
        WHERE (c.user_id IS NULL OR c.last_attempt_at IS NULL OR n.newest_at > c.last_attempt_at)  -- behind watermark, or no row despite evidence
-         AND NOT EXISTS (                                                                          -- skip reps already queued (no wasted slot, no starvation)
-           SELECT 1 FROM public.readiness_recalc_queue r
-            WHERE r.tenant_id = v_tenant AND r.user_id = n.user_id
-              AND r.target_key = 'ACTIVE' AND r.status IN ('pending','processing'))
+         AND NOT EXISTS (                                                                          -- skip reps with an UNRESOLVED ACTIVE job:
+           SELECT 1 FROM public.readiness_recalc_queue r                                           --   live (pending/processing) OR stuck (dead_letter/failed).
+            WHERE r.tenant_id = v_tenant AND r.user_id = n.user_id                                 --   Dead-letter recovery is an EXPLICIT admin action (Phase 093), never automatic:
+              AND r.target_key = 'ACTIVE'                                                          --   we never re-enqueue, resurrect, reset, or modify a dead-lettered/failed row here.
+              AND r.status IN ('pending','processing','dead_letter','failed'))
        ORDER BY c.last_attempt_at NULLS FIRST, n.newest_at, n.user_id                              -- most-behind first (fair)
        LIMIT v_lim
     LOOP
@@ -118,7 +126,9 @@ COMMENT ON FUNCTION public.readiness_recover_missed_enqueues(uuid,integer) IS
   'Phase 088B-1 recovery backstop: enqueues (reason backfill, target ACTIVE) active scorable learners in '
   'active-v2 tenants whose newest eligible current-comparable server_v2 attempt is newer than '
   'readiness_scores_current.last_attempt_at (or who have eligible evidence but no current row) and have no '
-  'live ACTIVE job. Bounded per tenant, fail-open, coalesced, watermark-driven (no starvation). Enqueue-only.';
+  'unresolved ACTIVE job (pending/processing/dead_letter/failed). Dead-letter recovery is an explicit admin '
+  'action (Phase 093), never automatic here. Bounded per tenant, fail-open, coalesced, watermark-driven '
+  '(no starvation). Enqueue-only.';
 
 -- ── CONSUMER-INDEPENDENT RECOVERY CRON (in-DB; no Edge/HTTP/Vault/service-role key) ───────────────────
 CREATE EXTENSION IF NOT EXISTS pg_cron;

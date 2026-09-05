@@ -186,5 +186,30 @@ SELECT pg_temp.ok(
   (SELECT md5(coalesce(string_agg(id::text||coalesce(score::text,''),',' ORDER BY id),'')) FROM public.readiness_scores)=(SELECT m FROM _legacy0)
   AND (SELECT count(*) FROM public.readiness_scores)=(SELECT n FROM _legacy0), 'L: legacy readiness_scores unchanged');
 
+-- ══ N. Dead-letter exclusion: never auto-re-enqueue a dead-lettered learner; leave its row untouched ══
+INSERT INTO auth.users(id,aud,role,email,created_at,updated_at) VALUES
+ ('00000000-0000-0000-0000-0000000000d1','authenticated','authenticated','d1@t.test',now(),now()),
+ ('00000000-0000-0000-0000-0000000000d2','authenticated','authenticated','d2@t.test',now(),now());
+UPDATE public.profiles SET role='user',tenant_id=:'TB',status='active' WHERE id IN ('00000000-0000-0000-0000-0000000000d1','00000000-0000-0000-0000-0000000000d2');
+SELECT pg_temp.mkatt(:'TB','00000000-0000-0000-0000-0000000000d1'::uuid,:'qb',90,:'gB',0);  -- 088 auto-enqueues d1
+SELECT pg_temp.mkatt(:'TB','00000000-0000-0000-0000-0000000000d2'::uuid,:'qb',90,:'gB',0);  -- 088 auto-enqueues d2
+-- d1: its job reaches an UNRESOLVED dead_letter; d2: a genuinely missed enqueue (job dropped)
+UPDATE public.readiness_recalc_queue SET status='dead_letter', attempt_count=5, last_error='compute failed'
+ WHERE tenant_id=:'TB' AND user_id='00000000-0000-0000-0000-0000000000d1' AND target_key='ACTIVE';
+DELETE FROM public.readiness_recalc_queue WHERE tenant_id=:'TB' AND user_id='00000000-0000-0000-0000-0000000000d2';
+CREATE TEMP TABLE _dl0 AS SELECT id,status,attempt_count,last_error,updated_at FROM public.readiness_recalc_queue WHERE tenant_id=:'TB' AND user_id='00000000-0000-0000-0000-0000000000d1';
+SELECT public.readiness_recover_missed_enqueues(:'TB', 500);   -- repeated sweeps
+SELECT public.readiness_recover_missed_enqueues(:'TB', 500);
+SELECT pg_temp.ok((SELECT count(*) FROM public.readiness_recalc_queue WHERE tenant_id=:'TB' AND user_id='00000000-0000-0000-0000-0000000000d1' AND status IN ('pending','processing'))=0,
+  'N1: dead-lettered learner NOT auto-re-enqueued across repeated sweeps');
+SELECT pg_temp.ok((SELECT count(*) FROM public.readiness_recalc_queue WHERE tenant_id=:'TB' AND user_id='00000000-0000-0000-0000-0000000000d1')=1,
+  'N2: dead-lettered learner still has exactly one row (the dead_letter) — none added');
+SELECT pg_temp.ok(
+  (SELECT (id,status,attempt_count,last_error,updated_at) FROM public.readiness_recalc_queue WHERE tenant_id=:'TB' AND user_id='00000000-0000-0000-0000-0000000000d1')
+    = (SELECT (id,status,attempt_count,last_error,updated_at) FROM _dl0),
+  'N3: dead_letter row unchanged (not reset/superseded/modified)');
+SELECT pg_temp.ok(pg_temp.live_jobs(:'TB','00000000-0000-0000-0000-0000000000d2'::uuid)=1,
+  'N4: a genuinely missed learner beyond the dead-lettered one is still recovered in the same batch');
+
 SELECT '089 ALL TESTS PASSED' AS result;
 ROLLBACK;
