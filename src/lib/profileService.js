@@ -66,24 +66,13 @@ export async function createMissingProfile(authUser) {
     authUser.user_metadata?.full_name ??
     authUser.email.split("@")[0];
 
-  // Upsert so this is safe even if the row already exists
-  const { data, error } = await supabase
-    .from("profiles")
-    .upsert(
-      {
-        id:     authUser.id,
-        email:  authUser.email,
-        name,
-        role:   authUser.user_metadata?.role ?? "user",
-        status: "active",
-      },
-      { onConflict: "id" }
-    )
-    .select()
-    .single();
+  // Server-authoritative creation (migration 091): the client can no longer self-insert role/status/tenant.
+  // ensure_self_profile derives the identity from auth.uid(), hardcodes role='user'/status='active',
+  // leaves tenant/team NULL, and is a no-op if the row already exists (ON CONFLICT DO NOTHING).
+  const { error } = await supabase.rpc("ensure_self_profile", { p_name: name });
 
   if (error) {
-    console.error("[profileService] createMissingProfile failed:", error);
+    console.error("[profileService] createMissingProfile (ensure_self_profile) failed:", error);
     // Surface the raw error code so callers can show it
     const err = new Error(error.message);
     err.code    = error.code;
@@ -92,7 +81,8 @@ export async function createMissingProfile(authUser) {
     throw err;
   }
 
-  return buildUserObject(data);
+  // Return the freshly-ensured profile in the normalized shape.
+  return getProfile(authUser.id);
 }
 
 /**

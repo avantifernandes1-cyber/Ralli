@@ -1534,3 +1534,321 @@ states). Read-only production RPC reconciliation (`current_month`) confirms the 
 #1/#2 and the team qualifies (2 of 3 eligible, ≥50% participation); the exact percentages move over time as
 more verified games are played. No managers, admins, inactive users, demo sessions, or incompletely
 verified sessions appear. No credential value is recorded in this ledger. Ledger row 56.
+
+## 2026-09-04 — Readiness V2 foundation (migration 087) APPLIED TO PRODUCTION — Row 57
+
+Migration **`087_readiness_v2_foundation`** applied to production (project `jdwqaypjxnnvxbqnxpet`) via one
+controlled `apply_migration` call (not `db push`), from branch `feature/readiness-v2-foundation` commit
+**`b62063f`**, migration file SHA-256 **`aa221d9f14f6faa3dc4c519a0ab18c08e4d92f6d514083a3bee924aa5faf783c`**
+(working == committed == expected, verified pre-apply). Apply result: **success**. Production migration
+version recorded once: **`20260904173759`** (ledger count = 1). Additive, shadow-only; nothing merged,
+deployed, activated, scored, enqueued, or cut over.
+
+Pre-apply gate (read-only): production ended at 086; 087 and all 087 objects absent; deps/owners/trusted
+roles unchanged; active formula `v1_legacy` only; legacy `readiness_scores` = 2 rows, checksum
+`80fb394fd46a4d7170e4ece137c75d99`; recalc_queue = 0; calculation_runs = 0.
+
+Post-apply verification (read-only): 087 in the ledger exactly once. Every 087 object present exactly once —
+`readiness_tag_designations` (RLS enabled, policy `rtd_select`), `tenant_quizzes.primary_readiness_tag_id`
+(+ FK `tq_primary_readiness_tag_same_tenant`), the 14 RPC/compute/helper functions, guard function
+`tenant_quizzes_guard_primary_readiness_tag` (+ COMMENT), and trigger `trg_guard_primary_readiness_tag`
+(ENABLED, BEFORE INSERT OR UPDATE, `current_user`-based; trusted = {postgres, service_role}). Grants:
+compute/process_recalc_batch/resolve_tag NOT executable by authenticated or anon; save_draft/validate/
+activate/run_shadow/compare/tag_candidates/set_quiz_primary_tag/quiz_primaries granted to authenticated
+(gated internally by role); my_result granted to authenticated; anon denied. `primary_readiness_tag_id`
+carries a table-level UPDATE grant (Supabase default) so `has_column_privilege` is true — the ENABLED
+trigger is the authoritative, grant-independent guard (validated at production-ACL parity in the 087 SQL
+harness). Owner: `tenant_quizzes` = postgres; the SECURITY DEFINER setter runs as current_user=postgres →
+allowed. No V2 version activated (active formula still `v1_legacy`; total formula versions = 1); zero
+designations; recalc_queue = 0; calculation_runs = 0; readiness_scores_current = 2; readiness_score_history
+= 2 (unchanged seed rows). Legacy `readiness_scores` AFTER: 2 rows, checksum
+`80fb394fd46a4d7170e4ece137c75d99` (**byte-identical to before**); quizzes with a non-null primary = 0. No
+installation-time DML/backfill/activation/scoring/enqueue/legacy mutation. Leadership Dashboard remains on
+the legacy readiness path (no UI reads versioned readiness tables). No unrelated policies, grants, functions,
+triggers, data, or schema changed.
+
+NOT done (each needs separate approval): branch NOT merged; NO Edge Function deployed; NO V2 config
+activated; NO shadow scoring run; NO recalculation enqueued; dashboard NOT cut over; migration 088 NOT
+started. The optional single-tenant shadow smoke was intentionally NOT run (it would create
+configuration/scoring data). Rollback = the migration file's ROLLBACK block (drops only 087-owned objects).
+Ledger row 57 (UNCOMMITTED).
+
+## 2026-09-05 — Readiness V2 shadow rehearsal — DeAndre Test tenant only (TEST-ONLY) — Row 58
+
+**Mechanism rehearsal only, on placeholder content — NOT a genuine competency assessment.** One controlled,
+tenant-scoped Readiness V2 configure→activate→one-shadow-calc sequence for tenant **DeAndre Test**
+(`0abdfcb1-94c5-4bf3-8d0b-8386b93d2a59`) against the live 087 schema (project `jdwqaypjxnnvxbqnxpet`), run
+as manager DeAndre (`orgAdmin`, `45a62442-…57b4`) through the validated SECURITY DEFINER RPCs only (no direct
+`tenant_quizzes` write). Scope: this tenant only. Nothing merged, deployed, cut over; no app code/Edge
+Function/migration 088; no additional scoring beyond the single shadow calc.
+
+Pre-apply read-only gate (all PASS): tenant id confirmed; migration 087 present (`20260904173759`) with guard
+trigger `trg_guard_primary_readiness_tag` ENABLED; active formula was `v1_legacy` (`6310e05e`, v1); 0
+designations / 0 V2 versions / recalc_queue 0 / calculation_runs 0 / 0 quiz primaries; legacy
+`readiness_scores` = 2 rows (session baseline checksum md5(id||score) = `70cd05a4dbc78aa1a1ab56b20004130e`);
+no active Ralli Live game_sessions (all 83 completed/canceled, 0 not-ended).
+
+Configuration written: draft/version **`fcf2dceb-1ede-40dd-b6e9-ff5f337d912a`** (`v2_quiz_mastery`, version
+2). Designations — `discovery` (`b004420b`) **Required**, `objections` (`66bf5f77`) **Required**. Primaries
+(via `readiness_set_quiz_primary_tag`): Avanti's Quiz (`c87550c7`) → objections; daisy quiz (`6894a830`) →
+discovery; Dre's Quiz (`5a952aba`) → **discovery (this rehearsal only)**. Timer Test Quiz (`463af58c`) left
+untagged/excluded. Validation before activation: `setupComplete=true`, requiredTags 2, requiredTagsSupported
+2, validReadinessTags 2, **no issues/warnings, no security/tenant/primary/formula error**. Activation:
+`fcf2dceb` → active; prior `v1_legacy` (`6310e05e`) → **superseded** (one-active-per-tenant catalog
+bookkeeping — the intended "shadow" state; the Leadership Dashboard reads the client-written
+`readiness_scores` table, not `readiness_formula_versions`, so its data source is unchanged).
+
+One shadow calculation (run `a3e51986-2e10-441d-ba6b-8aec086c12a5`, mode reconciliation): expected 3,
+processed 3, **ok 0, insufficient 3, failed 0**. All three reps **Establishing**, `overall_score` NULL,
+`success=insufficient_evidence` — no percentage presented as established. `requiredDenominator = 2` for every
+rep. avanti: official quizzes 2 / official questions 13, both required areas current, blocked from Established
+solely by the ≥3-official-quiz breadth gate (included: Dre's discovery mastery 96, Avanti's objections
+mastery 70; secondary objections 96 correctly kept as insight, not merged into official objections 70;
+excluded 18 legacyUnverified + 1 supersededRevision). Amanda: 0 official, 1 legacyUnverified. Avanti 815: 0
+official, 0 evidence.
+
+Post verification (all PASS): legacy `readiness_scores` AFTER = 2 rows, md5 `70cd05a4dbc78aa1a1ab56b20004130e`
+(**byte-identical**); formula versions this tenant = {v1_legacy superseded, v2 active}; global active version =
+this tenant only; calculation_runs = 1 (this tenant); score_history this run = 3; 0 other-tenant designations
+/ scores / runs. Queue: 6 pending rows = 3 `catalog_change` (target ACTIVE, from primary-sets) + 3
+`formula_activation` (target `fcf2dceb`, from activation), one per rep, **0 other-tenant, no dead-letter** —
+these are the RPCs' by-design enqueues and were intentionally NOT drained (`process_recalc_batch` would run
+`compute_v2` = additional scoring, out of scope).
+
+NOT done (each needs separate approval): dashboard NOT cut over; branch NOT merged; NO app code/Edge Function
+deployed; NO migration 088; NO further scoring/queue drain. To later produce an Established TEST score, avanti
+must complete the current `daisy quiz` (verified `server_v2`, current revision) to reach 3 official quizzes,
+then a further tenant shadow recalc — a separate approved action; not performed here. All outputs are
+test-only and not representative of actual sales competency. Ledger row 58 (UNCOMMITTED).
+
+## 2026-09-05 — Readiness V2 learner-QA verification — avanti reaches Established (TEST-ONLY) — Row 59
+
+**Test-only, placeholder content — NOT a genuine competency assessment.** Following the Row 58 rehearsal,
+learner **avanti** (`56dafe93-…5b1`) completed the current `daisy quiz`. One controlled, tenant-scoped V2
+verification for **DeAndre Test** (`0abdfcb1-…2a59`) only, run as manager DeAndre via the validated RPC.
+No configuration/primary change, no merge/deploy/cutover, no migration 088, no other tenant, no additional
+scoring beyond one shadow calc.
+
+Read-only preflight (all PASS): new attempt `804b12f7-1ba5-4c80-8b99-1c64b30742c3` — avanti, DeAndre Test,
+`server_v2`, score 100, `verified_revision == question_revision` (current), snapshot present with tag
+`discovery`, age 0d → eligible. daisy quiz primary = discovery; active V2 = `fcf2dceb` with required areas
+discovery + objections (both Required) — unchanged. Legacy `readiness_scores` = 2 rows, md5
+`70cd05a4dbc78aa1a1ab56b20004130e` (session baseline). Worker had NOT processed the new evidence (avanti's
+current V2 row still `establishing` from run `a3e51986` at 00:50; all 6 queue jobs pending, attempt_count 0;
+no trigger/worker enqueue on attempt) → ran exactly one tenant shadow calc.
+
+Shadow run **`8d74126b-da93-4a1a-8f67-9fc3337ae89c`** (reconciliation): expected 3, processed 3, **ok 1,
+insufficient 2, failed 0**. avanti → **Established / Ready, overall 84 (TEST-ONLY)**, confidence limited.
+Evidence: 3 official quizzes (Dre's 96 + daisy 100 → Discovery area 98; Avanti's 70 → Objections area 70;
+equal-area overall = (98+70)/2 = 84 ≥ 80 → Ready), 14 distinct current-version questions, both required
+areas current, requiredDenominator = 2, newest evidence age 0.0d. Secondary `objections=96` (from Dre's Quiz)
+correctly stayed an insight and did NOT change official Objections 70. Excluded (honest): 18 legacyUnverified
++ 1 supersededRevision. Timer Test Quiz remained excluded.
+
+Post verification (all PASS): Amanda & Avanti 815 remain Establishing (score NULL). Legacy `readiness_scores`
+byte-identical (2 rows, md5 `70cd05a4dbc78aa1a1ab56b20004130e`). Formula catalog unchanged {v1_legacy
+superseded, v2 active}; Leadership Dashboard reads the `readiness_scores` table (unchanged). 0 other-tenant V2
+scores; both calc runs are this tenant. History appended exactly 1 row this run (avanti's material change);
+tenant history total 6. Queue: 6 pending, 0 processing, 0 dead-letter, 0 failed attempts, 0 other-tenant — no
+new/unexpected residue (the shadow path does not touch the queue; the 6 by-design enqueues remain undrained,
+intentionally, as draining = additional scoring). NOT done: dashboard cutover, merge, app/Edge deploy,
+migration 088, queue drain, any further scoring. Ledger row 59 (UNCOMMITTED).
+
+## 2026-09-05 — Readiness V2 automation (migration 088) APPLIED TO PRODUCTION — Row 60
+
+Migration **`088_readiness_v2_automation`** applied to production (project `jdwqaypjxnnvxbqnxpet`) via one
+controlled `apply_migration` call (not `db push`), from branch `feature/readiness-v2-foundation` commit
+**`4da860ab29d07930dba73d14dcb786f3d3e11b63`**, file SHA-256
+**`74749d8abc8ca56e482ffeb6b415c1fdb5dd206408ca2b2bffe521e0538ecceb`** (working == committed == expected,
+verified pre-apply). Apply result: **success**. Production migration version recorded once:
+**`20260905033735`** (ledger count = 1). Additive, backend-only, shadow-safe. Scope = the two S1 automation
+wirings ONLY (eligible-attempt enqueue trigger + in-DB queue consumer cron); catalog/profile/staleness
+triggers, observability, and the bounded missed-enqueue recovery are Phase 088B (NOT implemented).
+
+Pre-apply gate (read-only, all PASS): prod ended at 087; 088 and all 088 objects absent; no trigger on
+`quiz_attempts`; deps `enqueue_readiness_recalc`/`readiness_process_recalc_batch`/`readiness_is_scorable_rep`
+owner=postgres, SECURITY DEFINER, EXECUTE=postgres/service_role (not client-executable); `pg_cron` 1.6.4;
+`question_revision`/`target_key` GENERATED, `uq_recalc_live_job`+`idx_recalc_claim` present; active formula
+`fcf2dceb` (v2); 6 queue rows pending/attempt_count 0; v2 history 4; calculation_runs 2; legacy
+`readiness_scores` md5 `70cd05a4dbc78aa1a1ab56b20004130e`; sole cron `verify-queue-worker-every-minute`
+(md5 `734edd0da42543e6db5c97cbf9a6e1a1`); 0 active Ralli Live sessions.
+
+Post-apply object verification (read-only): 088 in ledger exactly once. Trigger
+`trg_enqueue_readiness_on_attempt` ENABLED (AFTER INSERT ON public.quiz_attempts). Function
+`quiz_attempts_enqueue_readiness_recalc` SECURITY DEFINER, owner postgres, REVOKED from anon/authenticated
+(not client-executable), warning is a fixed literal with NO SQLERRM/error-text interpolation. Cron
+`readiness_recalc_consumer` exists exactly once — owner **postgres**, schedule `* * * * *`, active, command
+`SELECT public.readiness_process_recalc_batch(50, 'cron');` (md5 `497e5f7ea3b438de7931efae04bb2095`,
+no URL/token/secret). Ralli Live cron `verify-queue-worker-every-minute` UNCHANGED (md5
+`734edd0da42543e6db5c97cbf9a6e1a1`, active). Total cron jobs = 2.
+
+Natural cron run (03:38:00 UTC, ~25s after apply; NO manual queue processing): all six pre-existing jobs →
+**completed**, attempt_count = 1 each, processed_at 03:38:00, last_error NULL — none failed or dead-lettered,
+no job claimed/computed twice. Each of the 3 reps was computed twice (its `ACTIVE` row resolving to active =
+fcf2dceb, plus its explicit fcf2dceb row) IDEMPOTENTLY: v2 `readiness_score_history` stayed **4** (material
+hashes already present → ON CONFLICT DO NOTHING); `readiness_calculation_runs` stayed **2** (the batch calls
+compute with run_id NULL). `readiness_scores_current` values UNCHANGED — avanti **Established / 84**
+(material `76c54786…`), Amanda **Establishing / null** (`cb0e4467…`), Avanti 815 **Establishing / null**
+(`8914811a…`). Live jobs remaining = 0. Legacy `readiness_scores` AFTER = 2 rows, md5
+`70cd05a4dbc78aa1a1ab56b20004130e` (byte-identical); Leadership Dashboard unchanged (legacy path). No other
+tenant received V2 scores or queue rows; `game_verification_queue` untouched (5 rows). Active formula still
+`fcf2dceb`.
+
+Remaining limitations (honest): fail-open enqueue has NO automatic recovery yet — a dropped enqueue leaves a
+rep's readiness stale until a later qualifying event or a manual/backfill reconciliation (bounded recovery =
+Phase 088B). No catalog/tag/designation, profile-lifecycle, or 120-day staleness enqueues yet; no queue/
+dead-letter observability yet — all Phase 088B.
+
+NOT done (each needs separate approval): branch NOT merged; dashboard NOT cut over; NO Edge Function; migration
+089 NOT started; Phase 088B NOT started; no unrelated change. Rollback = unschedule `readiness_recalc_consumer`
++ DROP TRIGGER `trg_enqueue_readiness_on_attempt` + DROP FUNCTION `quiz_attempts_enqueue_readiness_recalc`
+(pg_cron and the Ralli Live cron left intact). Ledger row 60 (UNCOMMITTED).
+
+## 2026-09-05 — Readiness V2 automation (migration 089, Phase 088B-1) APPLIED TO PRODUCTION — Row 61
+
+Migration **`089_readiness_recovery_sweep`** (missed-enqueue recovery) applied to production (project
+`jdwqaypjxnnvxbqnxpet`) via one controlled `apply_migration` call (not `db push`), from branch
+`feature/readiness-v2-foundation` commit **`cea6cdbbb4aaac73d08bd8c34622dc42ab2d1467`** (the CORRECTED
+artifact), file SHA-256 **`c1195bfa6b4990669b783d5c770f39b4cffea5c90ebbb1f7ab7402ed142de04c`** (working ==
+committed == expected, verified pre-apply). The superseded artifact `c693a5a` / `1d37fc4f…` was NOT applied.
+Apply result: **success**. Production migration version recorded once: **`20260905182924`** (ledger count = 1).
+Additive, enqueue-only, backend-only, shadow-safe. Scope = Phase 088B-1 only (recovery sweep); catalog/
+lifecycle/staleness/observability = 090–093, NOT started.
+
+Pre-apply gate (read-only, all PASS): prod ended at 088; 089 fn + cron absent; deps `enqueue_readiness_recalc`
+/`readiness_process_recalc_batch`/`readiness_is_scorable_rep`/`readiness_compute_v2` owner=postgres, SECURITY
+DEFINER, search_path='', not client-executable; cron set = exactly {`verify-queue-worker-every-minute`
+md5 `734edd0d…`, `readiness_recalc_consumer` md5 `497e5f7e…`}; active formula `fcf2dceb`; queue all completed
+(7); v2 history 5; calculation_runs 2; legacy `readiness_scores` md5 `70cd05a4dbc78aa1a1ab56b20004130e`;
+avanti 91.
+
+Post-apply object verification (read-only): 089 in ledger exactly once. `readiness_recover_missed_enqueues
+(uuid,integer)` — owner **postgres**, SECURITY DEFINER, `search_path=''`, REVOKED from anon/authenticated,
+GRANT service_role (not client-executable). Corrected predicate confirmed present: recovery excludes learners
+with an unresolved ACTIVE job in **('pending','processing','dead_letter','failed')** — dead-lettered learners
+are never auto-re-enqueued/reset/modified (admin action reserved for Phase 093). Cron `readiness_recovery_sweep`
+exists exactly once — owner postgres, `*/5 * * * *`, active, command `SELECT public.readiness_recover_missed_enqueues();`
+(md5 `370e1fe8407b597df02c5264554038c3`, no URL/token/secret). Both existing crons byte-identical and active
+(`734edd0d…`, `497e5f7e…`). Total cron jobs = 3.
+
+Natural recovery run (18:30:00 UTC, ~36s after apply; NO manual invocation — cron.job_run_details shows
+status=succeeded, command `SELECT public.readiness_recover_missed_enqueues()`): selected **0 learners**,
+enqueued **0 jobs**. No score, history, material, or calc-run change: `readiness_scores_current` unchanged —
+avanti Established/**91** (`8daf6818…`, calc_at 14:23:00), Amanda Establishing/null (`cb0e4467…`, 03:38:00),
+Avanti 815 Establishing/null (`8914811a…`, 03:38:00); v2 history **5**; calculation_runs **2**. Queue afterward:
+7 completed, **0 pending/processing/failed/dead_letter**. Legacy `readiness_scores` md5
+`70cd05a4dbc78aa1a1ab56b20004130e` (byte-identical). No other tenant received queue rows or v2 scores;
+`game_verification_queue` = 5 (untouched); active Ralli Live sessions = 0; Leadership Dashboard on legacy path.
+Active formula still `fcf2dceb`.
+
+Installation: no application-table lock, no scoring/history DML (CREATE OR REPLACE FUNCTION + CREATE EXTENSION
+IF NOT EXISTS pg_cron no-op + one cron.schedule). NOT done (each needs separate approval): branch NOT merged;
+dashboard NOT cut over; NO Edge Function; migration 090 NOT started; Phase 088B-2..5 NOT started; no unrelated
+change. Rollback = unschedule `readiness_recovery_sweep` + DROP FUNCTION `readiness_recover_missed_enqueues`
+(pg_cron, 088 trigger/consumer, the game cron, and the V2 formula left intact). Ledger row 61 (UNCOMMITTED).
+
+## 2026-09-05 — Readiness V2 automation (migration 090, Phase 088B-2) APPLIED TO PRODUCTION — Row 62
+
+Migration **`090_readiness_catalog_propagation`** (catalog/taxonomy propagation via a durable outbox +
+bounded worker) applied to production (project `jdwqaypjxnnvxbqnxpet`) via one controlled `apply_migration`
+call (not `db push`), from branch `feature/readiness-v2-foundation` commit
+**`6df65e1341c773151ae09ff987a16842e371636a`** (the CORRECTED artifact), file SHA-256
+**`05cbb3f36febce77582b4ef580622c210b049383af28dbe076e03c358582a6fb`** (working == committed == expected,
+verified pre-apply; the superseded 13fdb8f/5d07a977 was NOT applied). Result: **success**. Production
+migration version recorded once: **`20260905203710`**. Additive, enqueue-only, shadow-safe. Phase 088B-2
+only; 091–093 NOT started.
+
+Pre-apply gate (read-only, all PASS): prod ended at 089; all 090 objects absent; deps (idx_qat_tag,
+idx_qa_tenant_quiz, enqueue_readiness_recalc, readiness_resolve_tag, is_ralli_admin/caller helpers,
+service_role, pg_cron 1.6.4, reason enum allows catalog_change) present; cron set = exactly {game
+734edd0d…, consumer 497e5f7e…, recovery 370e1fe8…}; the deployed readiness_set_quiz_primary_tag was still
+the 087 inline-fan-out body (no drift); active formula fcf2dceb; queue all completed (7); legacy
+`readiness_scores` md5 `70cd05a4dbc78aa1a1ab56b20004130e`.
+
+Structural verification (read-only): 090 in ledger exactly once. Outbox `readiness_propagation_events`
+present, RLS ENABLED, 0 client policies, REVOKED from anon/authenticated (authed/anon SELECT+INSERT =
+false). Indexes uq_prop_subject (unconditional, tenant-scoped), idx_prop_claim, idx_tqt_updated_at,
+idx_tq_updated_at each once. Functions readiness_emit_propagation_event / readiness_reconcile_catalog /
+readiness_process_propagation_batch / tenant_quiz_tags_emit_readiness_propagation each once, SECDEF/owner
+postgres/search_path='' , NOT client-executable (worker+reconcile granted service_role only; emit granted
+none). Trigger trg_tag_readiness_propagation (AFTER UPDATE OF status,merged_into on tenant_quiz_tags).
+readiness_set_quiz_primary_tag now emits the bounded event + stamps updated_at; grants preserved
+(authenticated/service_role/postgres). Cron `readiness_propagation_worker` (`* * * * *`, owner postgres,
+active, md5 12b6cad2ae993a59225e57e5ac957aa4). The three existing crons byte-identical and active
+(734edd0d…, 497e5f7e…, 370e1fe8…); total crons = 4. 087–089 objects, policies, grants, active formula,
+legacy `readiness_scores`, and unrelated schemas unchanged.
+
+Behavioral verification against the APPLIED objects (one self-aborting transaction ending in a sentinel
+RAISE — every fixture/outbox/queue/history write rolled back; sentinel 'OK_ALL_PASSED' reached ⇒ all
+passed): B1 transitive A0→B0→C0 (changing C0 reaches carriers of A0 and C0; changing B0 reaches A0-carrier
+only); B2 a change during a partly-processed event bumps generation + resets cursor (full re-pass); B3 a
+deliberately dropped emit is recovered by reconcile; B4 a completed current event is not re-emitted; B5 a
+dead_letter event is not revived by the worker and is revived only by a genuinely newer change; B6 no
+cross-tenant enqueue; B7 unchanged material creates NO duplicate readiness-history row (§5 acceptance).
+0 fixture rows remained.
+
+Natural scheduler (read-only): `readiness_propagation_worker` ran at 20:40:00 UTC, status **succeeded**,
+empty outbox; `readiness_recalc_consumer` and `readiness_recovery_sweep` continue running (both 20:40:00).
+Post-apply state: readiness_propagation_events = 0 (no backlog / retry / failed / dead-letter); recalc queue
+= 7 completed (0 pending/processing/failed/dead-letter); v2 history = 5; calculation_runs = 2; legacy
+`readiness_scores` md5 `70cd05a4dbc78aa1a1ab56b20004130e` (byte-identical); readiness scores unchanged
+(avanti Established/91, Amanda + Avanti 815 Establishing); Leadership Dashboard on legacy path.
+
+ACCEPTED LIMITATION (§5, product-approved): score-neutral quiz/tag admin actions that stamp updated_at
+(archive_quiz/restore_quiz/set_quiz_tags on a primary-bearing quiz; rename_quiz_tag) cause ONE bounded,
+idempotent recompute via reconcile — no score change and no readiness-history row when the material result
+is unchanged (proven by B7). Documented out-of-band gap: a raw UPDATE that neither emits nor sets
+updated_at is outside recovery coverage (all product paths use the sanctioned RPCs/trigger).
+
+NOT done (each needs separate approval): branch NOT merged; dashboard NOT cut over; migrations 091–093 NOT
+started; no frontend deploy; V2 formula unchanged. Rollback = the self-contained
+`docs/engineering/rollback_090_readiness_catalog_propagation.sql` (drops only 090 objects + restores the
+EXACT pre-090 087 primary-tag RPC body + grants; 087–089 and all three other crons preserved) — verified
+locally, and structurally confirmed byte-identical to the deployed 087 body during preflight. Ledger row 62
+(UNCOMMITTED).
+
+---
+
+Row 63 — Migration 091 (Readiness V2: LEARNER LIFECYCLE, RPC-first) — PREPARED, NOT APPLIED. Committed &
+pushed on branch `feature/readiness-v2-foundation-canonical` for a READY preview only. **NOT applied to
+production, NOT merged, NOT deployed; the three existing crons and 087–090 objects are untouched except the
+two eligibility chokepoints.**
+
+Contents: (A) canonical active-only eligibility (`status='active' AND role='user'`, fail-closed) at the two
+chokepoints every path funnels through — `readiness_is_scorable_rep` (score-write gate) and
+`enqueue_readiness_recalc` (enqueue gate); the inline `<>'inactive'` pre-filters in 087/089/090 remain
+non-authoritative (can only over-select; the chokepoints drop the rest). (B) FK remodel:
+`readiness_score_history` → identity `(user_id)→profiles(id) ON DELETE RESTRICT` (tenant_id kept as an
+immutable stored column; never silently erase history); `readiness_recalc_queue` → identity
+`(user_id)→profiles(id) ON DELETE CASCADE`; `readiness_scores_current` KEEPS its composite FK. (C)
+advisory-FIRST lifecycle: `readiness_lock_key`, `readiness_begin_lifecycle_write` (advisory before the
+profiles write — a trigger cannot, hence RPC-first), the `readiness_scores_current` write-guard, a
+fail-closed `profiles` guard trigger (marker keyed to the user id + ops break-glass requiring
+`current_user IN ('postgres','service_role')`), the `readiness_lifecycle_apply` engine (read → advisory →
+re-read+lock → recompute → abort-if-stale 40001 → apply) and the RPCs remove/reactivate/change_role/transfer
+(update_member/remove_member were NEVER deployed). (D) `readiness_reconcile_cleanup` (advisory+delete only)
++ its own `* * * * *` cron; enqueue stays the 089 sweep (no advisory) — genuinely separate transactions. (E)
+`ensure_self_profile` + profiles grant hardening (REVOKE broad grants; authenticated may UPDATE only
+name/nickname/avatar_emoji/profile_pic_url/notif_prefs; INSERT(id,email,name); no role/status/tenant/team/xp;
+own-row RLS gains WITH CHECK). (F) `accept_invitation` and `delete_tenant` hardened to `search_path=''`,
+fully qualified, anon EXECUTE dropped, routed through the advisory-first lifecycle.
+
+Validation (local `supabase_db_wt-learn`, has 087–090): parse+apply clean; behavioral suite
+`091_readiness_learner_lifecycle.test.sql` → **091 ALL TESTS PASSED** (eligibility fail-closed, FK model +
+history preservation across transfer, transition table, guard marker/team-pass/break-glass, write-guard,
+grant hardening + self-escalation denial, cleanup sweep, static "no readiness-advisory holder writes the
+queue"); concurrency harness `concurrency/091_lifecycle_concurrency_run.sh` → **24/24, zero 40P01** across
+worker-vs-deactivate (both orders), transfer-vs-worker (FK KEY SHARE), two conflicting transfers,
+transfer-vs-removal, removal-vs-reactivation, batch worker holding old+new tenant jobs, and read-vs-re-read
+race. Rollback `rollback_091_readiness_learner_lifecycle.sql` (two-mode, fail-closed divergence probe)
+verified: after apply→rollback the DB returned to pre-091 (composite FKs restored, both function bodies +
+`search_path=public` restored, lifecycle objects/cron/triggers dropped). `npm run build` exit 0; `npm test`
+7/7. Client cutover: `createMissingProfile`→`ensure_self_profile`; member-admin handlers→lifecycle RPCs.
+
+XP: the `user_point_events` self-award vulnerability is recorded in KNOWN_BUGS as the IMMEDIATE next
+high-priority security task (separate migration + scoring-authority decision); NOT addressed in 091.
+
+Preflight required before any prod apply (separate approval): read-only impact re-scan on prod (scorable vs
+non-scorable per role/status; stale current rows; divergence probe = FALSE today); apply in a single
+transaction; structural + behavioral verification; then the manager/learner QA checklist
+(`091_QA_CHECKLIST.md`) on the preview. Ledger row 63 (UNCOMMITTED until this preview commit).

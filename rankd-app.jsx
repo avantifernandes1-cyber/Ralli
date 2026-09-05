@@ -26256,30 +26256,48 @@ export default function App() {
     };
   };
 
+  // Member administration routes through the migration-091 advisory-first lifecycle RPCs
+  // (role/status/tenant are server-only; name is a safe presentation field). update_member/remove_member
+  // were never deployed — these RPCs replace them and keep readiness correct across each transition.
   const handleUpdateMember = async (profileId, fields) => {
-    const { data, error } = await supabase.rpc("update_member", {
-      p_profile_id: profileId,
-      p_name:   fields.name   ?? null,
-      p_role:   fields.role   ?? null,
-      p_status: fields.status ?? null,
-    });
-    if (error) { console.error("[ralli] update_member failed:", error); throw error; }
-    // RPC succeeded — sync App-level orgUsers with the canonical values it returned.
+    const member = orgUsers.find(u => u.id === profileId);
+    const applied = {};
+    try {
+      // name — safe presentation column (direct update)
+      if (fields.name != null && fields.name !== member?.name) {
+        const { error } = await supabase.from("profiles").update({ name: fields.name }).eq("id", profileId);
+        if (error) throw error;
+        applied.name = fields.name;
+      }
+      // role change → lifecycle change_role
+      if (fields.role != null && fields.role !== member?.role) {
+        const { error } = await supabase.rpc("readiness_lifecycle_change_role", { p_user: profileId, p_role: fields.role });
+        if (error) throw error;
+        applied.role = fields.role;
+      }
+      // status change → deactivate (remove) or reactivate into the member's tenant
+      if (fields.status != null && fields.status !== member?.status) {
+        if (fields.status === "inactive") {
+          const { error } = await supabase.rpc("readiness_lifecycle_remove_member", { p_user: profileId });
+          if (error) throw error;
+          applied.status = "inactive";
+        } else if (fields.status === "active") {
+          const { error } = await supabase.rpc("readiness_lifecycle_reactivate_member", {
+            p_user: profileId, p_tenant: member?.orgId ?? null, p_role: fields.role ?? member?.role ?? "user",
+          });
+          if (error) throw error;
+          applied.status = "active";
+        }
+      }
+    } catch (error) { console.error("[ralli] update member (lifecycle) failed:", error); throw error; }
     // Only runs on success; the throw above prevents reaching this on failure.
-    if (data) {
-      setOrgUsers(prev => prev.map(u => u.id === profileId ? {
-        ...u,                          // preserve all fields not touched by this update
-        name:   data.name   ?? u.name,
-        role:   data.role   ?? u.role,
-        status: data.status ?? u.status,
-      } : u));
-    }
-    return data;
+    setOrgUsers(prev => prev.map(u => u.id === profileId ? { ...u, ...applied } : u));
+    return applied;
   };
 
   const handleRemoveMember = async (profileId) => {
-    const { error } = await supabase.rpc("remove_member", { p_profile_id: profileId });
-    if (error) { console.error("[ralli] remove_member failed:", error); throw error; }
+    const { error } = await supabase.rpc("readiness_lifecycle_remove_member", { p_user: profileId });
+    if (error) { console.error("[ralli] remove_member (lifecycle) failed:", error); throw error; }
     // RPC succeeded — remove the user from App-level orgUsers immediately.
     // Only runs on success; the throw above prevents reaching this on failure.
     setOrgUsers(prev => prev.filter(u => u.id !== profileId));
