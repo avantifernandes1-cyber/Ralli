@@ -1892,3 +1892,26 @@ orphaned history); learner-transfer preservation remains proven by L5c. All read
 restored pre-091 bodies + grants are unchanged). Re-ran ALL suites: behavioral **091 ALL TESTS PASSED**;
 concurrency **36/36 zero 40P01**; two-mode rollback restored composite FKs (no divergence); `npm run build`
 exit 0; `npm test` 7/7.
+
+Row 63/64 — ZERO-DOWNTIME STAGED SPLIT of the profile-write hardening (STILL NOT applied/merged/deployed).
+A DB migration and a Vercel deploy cannot be atomic; applying the full lockdown before the frontend switches
+would break the deployed `createMissingProfile` (direct role/status upsert), and deploying the frontend first
+would call `ensure_self_profile` before it exists. Resolution — split so every intermediate state is compatible:
+  * **091 (now ADDITIVE / backward-compatible)** — new SHA-256 `d9886a39ed70462b0541ee7ee8ce85766abf2aafdc9159e757341f7a59e329b0`. Adds all lifecycle machinery +
+    `ensure_self_profile`, applies FK/eligibility/lifecycle changes, routes accept_invitation/delete_tenant
+    through the advisory-first engine — but LEAVES the legacy broad profiles grants intact and does NOT add the
+    guard trigger or own-row WITH CHECK (moved out). The deployed frontend keeps working unchanged; no new
+    deadlock surface (it never directly changes tenant_id; all tenant changes route through the engine).
+  * **092 (NEW, forward-only — profile-write lockdown)** — SHA-256 `2ca30afe0b85ea80f15918f7288a09613aed94f4c7991eb573d32489a702b93e`, file
+    `supabase/migrations/092_profile_write_lockdown.sql`. Applied ONLY after the ffc0e2b frontend is deployed
+    and the legacy write path is proven unused: REVOKE broad profiles grants + re-grant safe presentation
+    columns only; no direct client INSERT; own-row WITH CHECK; the fail-closed guard trigger (marker path +
+    trusted-executor break-glass). (092 supersedes the earlier tentative "staleness" reservation of 092.)
+Docs: `091_092_ROLLOUT_PLAN.md` (3-stage plan + Stage-2 QA + Stage-3 precondition); `rollback_091` no longer
+touches grants/policy; new `rollback_092_profile_write_lockdown.sql` reverts the lockdown (re-opening the
+surface). Static caller scan of ffc0e2b: NO client profiles insert/upsert; NO update of
+role/status/tenant_id/team_id (only `{name}` + updateUserProfile's nickname/avatar_emoji/profile_pic_url/
+notif_prefs, all safe) — legacy path gone. Validation: 091 additive behavioral 091 ALL TESTS PASSED; 091
+concurrency 36/36 zero 40P01; 092 behavioral 092 ALL TESTS PASSED (guard blocks/team-pass/marker/break-glass,
+grant hardening, INSERT denied); full staged apply→092→rollback_092→rollback_091 cycle verified (guard/grants
+toggle correctly, composite FKs restored, no divergence); build exit 0; npm test 7/7.

@@ -52,11 +52,14 @@
 --     the lifecycle RPC deletes the old-tenant current row before the tenant change, so it never blocks.
 --
 -- SECURITY: all new/replaced functions owner postgres, SET search_path='', REVOKE from anon/authenticated,
---   grants only as required. The profiles direct-write self-escalation surface is closed: broad grants
---   revoked; authenticated may self-update only safe presentation fields; creation via ensure_self_profile.
---   A fail-closed guard trigger forbids ANY status/role/tenant change that did not go through a lifecycle
---   RPC (bypass requires BOTH a transaction-local marker set only after advisory acquisition AND, for the
---   documented ops break-glass, a trusted current_user in ('postgres','service_role')).
+--   grants only as required. ensure_self_profile (server-authoritative creation) is added here.
+--   ZERO-DOWNTIME STAGING: the profiles direct-write LOCKDOWN — revoking the broad legacy grants, re-granting
+--   only safe presentation columns, adding the own-row WITH CHECK, and the fail-closed guard trigger that
+--   forbids any status/role/tenant change outside a lifecycle RPC — is DEFERRED to migration 092, because it
+--   is incompatible with the currently-deployed frontend. 091 leaves those legacy grants intact (no worse than
+--   today) so the deployed createMissingProfile fallback keeps working; 092 closes the bypass AFTER the
+--   ffc0e2b frontend is deployed and the legacy write path is proven unused. The lifecycle RPCs already stamp
+--   the per-user marker, so no rework is needed when 092's guard lands.
 --
 -- NOT TOUCHED: migrations 087–090 objects except the two eligibility chokepoints; the three existing crons
 --   (readiness_recalc_consumer, readiness_recovery_sweep, readiness_propagation_worker); the V2 formula/math;
@@ -234,37 +237,17 @@ CREATE TRIGGER trg_readiness_scores_current_write_guard
   FOR EACH ROW EXECUTE FUNCTION public.readiness_scores_current_write_guard();
 
 -- ═══════════════════════════════════════════════════════════════════════════════
--- E. PROFILES LIFECYCLE GUARD (fail-closed: no status/role/tenant change outside a lifecycle RPC)
+-- E. PROFILES LIFECYCLE GUARD — DEFERRED TO MIGRATION 092 (zero-downtime staged rollout).
 -- ═══════════════════════════════════════════════════════════════════════════════
-CREATE OR REPLACE FUNCTION public.readiness_profiles_lifecycle_guard()
- RETURNS trigger
- LANGUAGE plpgsql
- SECURITY INVOKER          -- INVOKER so current_user reflects the true executor for the break-glass check
- SET search_path TO ''
-AS $function$
-BEGIN
-  -- Only guard genuine changes to the three eligibility fields; no-op edits (name/avatar/etc.) pass through.
-  IF (OLD.status, OLD.role, OLD.tenant_id) IS NOT DISTINCT FROM (NEW.status, NEW.role, NEW.tenant_id) THEN
-    RETURN NEW;
-  END IF;
-  -- Normal path: a lifecycle RPC acquired the advisory FIRST and stamped THIS row's user id as the marker.
-  IF current_setting('readiness.lifecycle_write', true) = NEW.id::text THEN
-    RETURN NEW;
-  END IF;
-  -- Documented ops break-glass: requires BOTH the explicit setting AND a trusted executor. Ordinary
-  -- authenticated/anonymous callers can be neither, so they can never bypass.
-  IF current_setting('readiness.allow_unguarded', true) = '1'
-     AND current_user IN ('postgres','service_role') THEN
-    RETURN NEW;
-  END IF;
-  RAISE EXCEPTION 'readiness: direct change of profiles.(status/role/tenant_id) is not allowed; use a lifecycle RPC (readiness_lifecycle_*)';
-END $function$;
-REVOKE ALL ON FUNCTION public.readiness_profiles_lifecycle_guard() FROM PUBLIC, anon, authenticated;
-
-DROP TRIGGER IF EXISTS trg_readiness_profiles_lifecycle_guard ON public.profiles;
-CREATE TRIGGER trg_readiness_profiles_lifecycle_guard
-  BEFORE UPDATE OF status, role, tenant_id ON public.profiles
-  FOR EACH ROW EXECUTE FUNCTION public.readiness_profiles_lifecycle_guard();
+-- The fail-closed guard trigger that forbids any status/role/tenant change outside a lifecycle RPC, and the
+-- profiles GRANT revocation + own-row WITH CHECK, are the "close the bypass" step. They are INCOMPATIBLE with
+-- the CURRENTLY-DEPLOYED frontend (its createMissingProfile still upserts role/status directly), so they are
+-- NOT in this migration. 091 is ADDITIVE/BACKWARD-COMPATIBLE: it leaves the existing profiles grants intact
+-- so the deployed fallback keeps working, while adding all the lifecycle machinery + ensure_self_profile.
+-- After the ffc0e2b frontend is deployed and verified to use ensure_self_profile / lifecycle RPCs, migration
+-- 092 adds the guard trigger, revokes the legacy profile-write grants, and adds the own-row WITH CHECK.
+-- (The lifecycle RPCs already stamp the per-user marker via readiness_begin_lifecycle_write; it is a harmless
+--  no-op until 092's guard reads it, so no change is needed to those functions when 092 lands.)
 
 -- ═══════════════════════════════════════════════════════════════════════════════
 -- F. LIFECYCLE CORE (safeguard #1: read → advisory → re-read+lock → recompute → abort-if-stale → apply)
@@ -523,23 +506,12 @@ END $function$;
 REVOKE ALL ON FUNCTION public.ensure_self_profile(text,text,text,text,jsonb) FROM PUBLIC, anon;
 GRANT EXECUTE ON FUNCTION public.ensure_self_profile(text,text,text,text,jsonb) TO authenticated, service_role;
 
--- Grant hardening: revoke the broad table + column write grants; re-grant only SELECT (RLS-gated) and
--- safe presentation-field UPDATE. role/status/tenant_id/team_id/xp/streak/email/id/timestamps become writable
--- only via SECDEF paths. anon loses everything (no RLS policy).
--- (#6 fix) NO direct client INSERT: profile creation is ONLY through the SECDEF ensure_self_profile RPC
--- (which runs as postgres and does not need a client INSERT grant) and the handle_new_user signup trigger.
-REVOKE ALL ON public.profiles FROM anon;
-REVOKE ALL ON public.profiles FROM authenticated;
-GRANT SELECT ON public.profiles TO authenticated;
-GRANT UPDATE (name, nickname, avatar_emoji, profile_pic_url, notif_prefs) ON public.profiles TO authenticated;
-
--- Tighten own-row RLS: add a WITH CHECK so a client cannot re-parent its row id (defence in depth;
--- the column grants above are the primary gate against role/status/tenant self-escalation).
-DROP POLICY IF EXISTS profiles_update_own ON public.profiles;
-CREATE POLICY profiles_update_own ON public.profiles
-  FOR UPDATE TO authenticated
-  USING (id = auth.uid())
-  WITH CHECK (id = auth.uid());
+-- PROFILES GRANT HARDENING + own-row WITH CHECK are DEFERRED TO MIGRATION 092 (zero-downtime staged rollout).
+-- 091 is additive: ensure_self_profile is now AVAILABLE (the ffc0e2b frontend will use it), but the broad
+-- legacy profiles write grants are intentionally LEFT INTACT so the currently-deployed frontend's
+-- createMissingProfile fallback (a direct upsert of role/status on the caller's own row) keeps working during
+-- the rollout. Only after that frontend is deployed and the legacy write path is proven unused does 092
+-- REVOKE the broad grants, re-grant just the safe presentation columns, and add the WITH CHECK.
 
 -- ═══════════════════════════════════════════════════════════════════════════════
 -- I. HARDEN + RPC-ROUTE THE TWO DEPLOYED SCORABILITY WRITERS (accept_invitation, delete_tenant)

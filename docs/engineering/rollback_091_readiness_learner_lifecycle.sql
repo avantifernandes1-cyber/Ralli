@@ -14,8 +14,10 @@
 --     the preserved divergent history); behaviour is already restored by Section 1.
 --
 -- Preserves migrations 087–090 and the three existing crons. Idempotent-ish (IF EXISTS / OR REPLACE).
--- The profiles GRANT hardening is intentionally NOT reverted by default (reverting it re-opens the direct
--- self-escalation hole); Section 3 holds the (commented) restore commands as an explicit operator choice.
+-- 091 is additive to profiles permissions: it does NOT revoke grants, change the profiles_update_own policy,
+-- or add the guard trigger (that lockdown is migration 092). So this rollback leaves grants/policy untouched;
+-- if 092 is applied, revert it with rollback_092_profile_write_lockdown.sql (and note that reverting 092
+-- re-opens the direct self-escalation surface).
 -- ─────────────────────────────────────────────────────────────────────────────
 
 BEGIN;
@@ -25,11 +27,10 @@ BEGIN;
 -- 1a. remove the 091 cron (only ours)
 DO $r$ BEGIN PERFORM cron.unschedule(j.jobid) FROM cron.job j WHERE j.jobname='readiness_reconcile_cleanup'; END $r$;
 
--- 1b. drop 091 triggers + functions
+-- 1b. drop 091 triggers + functions. (The profiles lifecycle guard + grant lockdown are NOT part of 091 —
+--     they live in migration 092; roll those back with rollback_092 if 092 has been applied.)
 DROP TRIGGER IF EXISTS trg_readiness_scores_current_write_guard ON public.readiness_scores_current;
-DROP TRIGGER IF EXISTS trg_readiness_profiles_lifecycle_guard   ON public.profiles;
 DROP FUNCTION IF EXISTS public.readiness_scores_current_write_guard();
-DROP FUNCTION IF EXISTS public.readiness_profiles_lifecycle_guard();
 DROP FUNCTION IF EXISTS public.readiness_reconcile_cleanup(integer);
 DROP FUNCTION IF EXISTS public.readiness_lifecycle_remove_member(uuid);
 DROP FUNCTION IF EXISTS public.readiness_lifecycle_reactivate_member(uuid,uuid,text);
@@ -178,10 +179,8 @@ $function$;
 REVOKE ALL ON FUNCTION public.delete_tenant(uuid) FROM PUBLIC;
 GRANT EXECUTE ON FUNCTION public.delete_tenant(uuid) TO anon, authenticated, service_role;
 
--- 1g. restore the pre-091 own-row RLS policy (no WITH CHECK)
-DROP POLICY IF EXISTS profiles_update_own ON public.profiles;
-CREATE POLICY profiles_update_own ON public.profiles
-  FOR UPDATE TO authenticated USING (id = auth.uid());
+-- (1g removed: 091 no longer changes profiles grants or the profiles_update_own policy — those are in 092.
+--  Use rollback_092 to revert the profile-write lockdown if 092 has been applied.)
 
 -- ═══ SECTION 2 — FK restore: PRE-DIVERGENCE ONLY. Fails closed after any transfer/removal. ═══
 DO $fk$
@@ -219,11 +218,7 @@ END $fk$;
 
 COMMIT;
 
--- ═══ SECTION 3 — OPTIONAL: revert the profiles GRANT hardening (NOT run by default). ═══
--- Reverting re-opens the direct role/status/tenant self-escalation hole — keep the hardening unless you must
--- restore byte-identical pre-091 grants. To revert, run the following as an explicit operator choice:
---   GRANT INSERT, UPDATE, DELETE, TRUNCATE, REFERENCES, TRIGGER ON public.profiles TO anon, authenticated;
---   GRANT SELECT ON public.profiles TO anon, authenticated;
---   -- (column-level UPDATE grants on every column were the pre-091 state; the table-level GRANTs above
---   --  re-establish full access under the same RLS. ensure_self_profile is already dropped in Section 1.)
+-- NOTE: 091 does NOT change profiles grants or the profiles_update_own policy (that lockdown is migration
+-- 092). This rollback therefore leaves grants/policy exactly as they were — no grant restore is needed here.
+-- If 092 has been applied, revert the lockdown with docs/engineering/rollback_092_profile_write_lockdown.sql.
 -- ─────────────────────────────────────────────────────────────────────────────

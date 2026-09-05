@@ -44,9 +44,12 @@ orgAdmin/manager, two active learners, and a second org for transfer tests.
       with role=user, status=active, no org; the app loads normally.
 - [ ] **Edit safe profile fields** (name, nickname, avatar emoji, profile picture, notification prefs).
       Expect: all save successfully.
-- [ ] **Attempt self-escalation (negative test).** Using the browser devtools/API, a learner attempts to
-      `update` their own `role`, `status`, `tenant_id`, or `team_id` directly. Expect: **rejected** (no column
-      privilege / guard). Safe-field edits above still work.
+- [ ] **Attempt self-escalation (negative test — valid ONLY after Stage 3 / migration 092).** Using the
+      browser devtools/API, a learner attempts to `update` their own `role`, `status`, `tenant_id`, or
+      `team_id` directly. Expect: **rejected** (no column privilege / guard). Safe-field edits above still
+      work. NOTE: this is closed by migration **092**; under 091-only (Stage 1) the legacy grants are still
+      present by design, so this test is expected to pass only after 092 is applied (see
+      `091_092_ROLLOUT_PLAN.md`).
 - [ ] **Take quizzes and accrue readiness as an active learner.** Expect: readiness updates as before.
 - [ ] **After being deactivated by an admin.** Expect: the learner no longer appears in any readiness view;
       re-activation restores them.

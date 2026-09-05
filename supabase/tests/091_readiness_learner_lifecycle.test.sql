@@ -2,12 +2,15 @@
 -- Assumes 091 is applied. One rolled-back transaction. Local only. Expect "091 ALL TESTS PASSED".
 -- Covers: canonical active-only eligibility (fail-closed) at both chokepoints; FK remodel (history/queue
 -- identity, current composite) + history preservation across transfer; the lifecycle transition table via
--- the advisory-first engine; the fail-closed profiles guard (marker path, team-only pass, break-glass);
--- the scores_current write-guard; ensure_self_profile + grant hardening (self-escalation denial); the
--- cleanup sweep; security/grants; and the static "no advisory-holder writes the queue" invariant.
+-- the advisory-first engine; the scores_current write-guard; ensure_self_profile; the cleanup sweep;
+-- re-read/authz preconditions; the history-retention contract; and the static "no advisory-holder writes the
+-- queue" invariant. NOTE (zero-downtime staging): 091 does NOT add the profiles guard trigger or revoke the
+-- legacy profiles grants — those and their tests live in migration 092 / 092_profile_write_lockdown.test.sql.
 \set ON_ERROR_STOP on
 BEGIN;
-SET LOCAL readiness.allow_unguarded = '1';   -- postgres break-glass: FIXTURE state setup only (toggled off for guard tests)
+-- (readiness.allow_unguarded is irrelevant in 091 — the guard is in 092 — but set it so fixture UPDATEs are
+--  order-independent should this test ever be run with 092 also applied.)
+SET LOCAL readiness.allow_unguarded = '1';
 
 CREATE FUNCTION pg_temp.ok(cond boolean, label text) RETURNS void LANGUAGE plpgsql AS $$
 BEGIN IF NOT COALESCE(cond,false) THEN RAISE EXCEPTION '091 FAIL: %', label; END IF; END $$;
@@ -149,50 +152,10 @@ SELECT public.readiness_reconcile_cleanup(500);
 SELECT pg_temp.ok(pg_temp.cur_cnt(:'TA',:'u2')=1, 'C2: cleanup retains scorable current row');
 DELETE FROM public.readiness_scores_current WHERE tenant_id=:'TA' AND user_id=:'u2';
 
--- ══ G. PROFILES LIFECYCLE GUARD (fail-closed) ══
--- G1: direct status change with NO marker and break-glass OFF → guard RAISES
-DO $g$ BEGIN
-  PERFORM set_config('readiness.allow_unguarded','',true);
-  PERFORM set_config('readiness.lifecycle_write','',true);   -- clear any leaked marker: simulate a bare direct write
-  BEGIN
-    UPDATE public.profiles SET status='inactive' WHERE id='00000000-0000-0000-0000-000000910002';
-    RAISE EXCEPTION 'G1_NOT_BLOCKED';
-  EXCEPTION
-    WHEN others THEN
-      IF SQLERRM LIKE '%G1_NOT_BLOCKED%' THEN RAISE EXCEPTION '091 FAIL: G1 guard did not block direct status change'; END IF;
-  END;
-  PERFORM set_config('readiness.allow_unguarded','1',true);  -- restore break-glass for remaining fixtures
-END $g$ LANGUAGE plpgsql;
-SELECT pg_temp.ok((SELECT status FROM public.profiles WHERE id=:'u2')='active', 'G1: blocked direct status change left row unchanged');
--- G2: team_id-only update is NOT guarded (passes even without marker/break-glass)
-DO $g$ BEGIN
-  PERFORM set_config('readiness.allow_unguarded','',true);
-  UPDATE public.profiles SET team_id=NULL WHERE id='00000000-0000-0000-0000-000000910002';   -- no status/role/tenant change → guard no-op
-  PERFORM set_config('readiness.allow_unguarded','1',true);
-END $g$ LANGUAGE plpgsql;
-SELECT pg_temp.ok(true, 'G2: team_id-only update passes (not a guarded column)');
--- G3: lifecycle engine (marker path) with break-glass OFF still works
-DO $g$ BEGIN
-  PERFORM set_config('readiness.allow_unguarded','',true);
-  PERFORM public.readiness_lifecycle_apply('00000000-0000-0000-0000-000000910002','inactive','user','00000000-0000-0000-0000-0000009100a0', NULL,NULL,NULL,false);
-  PERFORM set_config('readiness.allow_unguarded','1',true);
-END $g$ LANGUAGE plpgsql;
-SELECT pg_temp.ok((SELECT status FROM public.profiles WHERE id=:'u2')='inactive', 'G3: lifecycle RPC (marker) applies with break-glass OFF');
-SELECT public.readiness_lifecycle_apply(:'u2','active','user',:'TA', NULL,NULL,NULL,false);
-
--- ══ S. SELF-ESCALATION GRANT HARDENING ══
-SELECT pg_temp.ok(NOT has_column_privilege('authenticated','public.profiles','role','UPDATE'), 'S1a: authenticated cannot UPDATE role');
-SELECT pg_temp.ok(NOT has_column_privilege('authenticated','public.profiles','status','UPDATE'), 'S1b: authenticated cannot UPDATE status');
-SELECT pg_temp.ok(NOT has_column_privilege('authenticated','public.profiles','tenant_id','UPDATE'), 'S1c: authenticated cannot UPDATE tenant_id');
-SELECT pg_temp.ok(NOT has_column_privilege('authenticated','public.profiles','team_id','UPDATE'), 'S1d: authenticated cannot UPDATE team_id');
-SELECT pg_temp.ok(NOT has_column_privilege('authenticated','public.profiles','xp','UPDATE'), 'S1e: authenticated cannot UPDATE xp');
-SELECT pg_temp.ok(has_column_privilege('authenticated','public.profiles','name','UPDATE')
-  AND has_column_privilege('authenticated','public.profiles','nickname','UPDATE')
-  AND has_column_privilege('authenticated','public.profiles','avatar_emoji','UPDATE')
-  AND has_column_privilege('authenticated','public.profiles','notif_prefs','UPDATE'), 'S2: authenticated may UPDATE safe presentation fields');
-SELECT pg_temp.ok(NOT has_table_privilege('anon','public.profiles','SELECT')
-  AND NOT has_table_privilege('anon','public.profiles','UPDATE')
-  AND NOT has_table_privilege('anon','public.profiles','INSERT'), 'S3: anon has no profiles privileges');
+-- ══ G/S1–S3 (profiles guard + grant hardening) MOVED TO the 092 test ══
+-- 091 is additive and intentionally does NOT add the profiles guard trigger or revoke the legacy grants
+-- (zero-downtime staging). Those assertions live in 092_profile_write_lockdown.test.sql. Here we only verify
+-- the additive creation path (S4): ensure_self_profile exists and produces a server-derived identity.
 -- S4: ensure_self_profile creates own row as user/active
 INSERT INTO public.tenants(id,slug,name) VALUES ('00000000-0000-0000-0000-0000009100c0','tc91','TC91');
 SELECT set_config('request.jwt.claims', json_build_object('sub','00000000-0000-0000-0000-000000910013')::text, true);
@@ -266,9 +229,7 @@ SELECT public.readiness_lifecycle_reactivate_member(:'u1', :'TB', 'user');
 SELECT pg_temp.ok((SELECT tenant_id FROM public.profiles WHERE id=:'u1')=:'TB' AND (SELECT status FROM public.profiles WHERE id=:'u1')='active', 'R4: detached member reactivated into TB');
 SELECT public.readiness_lifecycle_transfer_member(:'u1', :'TA', 'user');   -- move back for tidiness
 SELECT set_config('request.jwt.claims', NULL, true);
-
--- R5 (#6): direct authenticated INSERT on profiles is denied; creation is only via ensure_self_profile.
-SELECT pg_temp.ok(NOT has_table_privilege('authenticated','public.profiles','INSERT'), 'R5: authenticated has NO direct INSERT on profiles');
+-- (R5 direct-INSERT-denied moved to the 092 test — 091 keeps the legacy grants during staging.)
 
 -- ══ HC. HISTORY-RETENTION CONTRACT (learner lifecycle PRESERVES; org deletion CASCADES) ══
 INSERT INTO auth.users(id,aud,role,email,created_at,updated_at) VALUES
