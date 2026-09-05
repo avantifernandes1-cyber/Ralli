@@ -225,5 +225,32 @@ SELECT pg_temp.ok(
   AND (SELECT count(*) FROM public.readiness_scores) = (SELECT n FROM _legacy0),
   'J1: legacy readiness_scores unchanged (count + checksum) — dashboard path untouched');
 
+-- ══ K. Fail-open: forced enqueue failure never blocks the attempt; no partial row; safe warning ══
+DELETE FROM public.readiness_recalc_queue;
+CREATE FUNCTION pg_temp.qboom() RETURNS trigger LANGUAGE plpgsql AS $$
+BEGIN RAISE EXCEPTION 'INJECTED enqueue failure (must be swallowed and must not leak)'; END $$;
+CREATE TRIGGER zzz_qboom BEFORE INSERT ON public.readiness_recalc_queue FOR EACH ROW EXECUTE FUNCTION pg_temp.qboom();
+SELECT pg_temp.mkatt(:'tA', :'r1', :'qA', 88, ARRAY[:'pProd'::uuid]);   -- eligible; the enqueue INSERT hits qboom
+DROP TRIGGER zzz_qboom ON public.readiness_recalc_queue;
+SELECT pg_temp.ok((SELECT count(*) FROM public.quiz_attempts WHERE tenant_id=:'tA' AND user_id=:'r1' AND quiz_id=:'qA' AND score=88)=1, 'K1: quiz attempt still commits when enqueue fails (fail-open)');
+SELECT pg_temp.ok(pg_temp.active_jobs(:'tA', :'r1')=0, 'K2: no partial queue row remains after a failed enqueue');
+SELECT pg_temp.ok(position('SQLERRM' in pg_get_functiondef('public.quiz_attempts_enqueue_readiness_recalc'::regproc))=0, 'K3: enqueue trigger fn interpolates no SQLERRM / SQL error text');
+SELECT pg_temp.ok(
+  position('readiness: enqueue skipped for a quiz attempt (non-fatal); pending 088B reconciliation' in pg_get_functiondef('public.quiz_attempts_enqueue_readiness_recalc'::regproc))>0
+  AND position('(non-fatal): %' in pg_get_functiondef('public.quiz_attempts_enqueue_readiness_recalc'::regproc))=0,
+  'K4: warning is the fixed generic literal with no format placeholder (no data interpolation)');
+
+-- ══ L. Cron execution authority ══
+SELECT pg_temp.ok((SELECT username FROM cron.job WHERE jobname='readiness_recalc_consumer')='postgres', 'L1: readiness cron owned/executed by postgres (controlled migration path)');
+SELECT pg_temp.ok(has_function_privilege('postgres','public.readiness_process_recalc_batch(integer,text,timestamp with time zone)','EXECUTE'), 'L2: postgres can execute the batch processor');
+SELECT pg_temp.ok(NOT has_schema_privilege('authenticated','cron','USAGE') AND NOT has_schema_privilege('anon','cron','USAGE'), 'L3: authenticated/anon have no USAGE on the cron schema (cannot alter/run/inspect jobs)');
+SELECT pg_temp.ok((SELECT command FROM cron.job WHERE jobname='readiness_recalc_consumer') !~* '(https?|://|bearer|token|secret|vault|service_role|password|net\.)', 'L4: cron command has no URL/token/secret/service-role/http payload');
+
+-- ══ M. Consumer scope: drains ONLY the readiness queue (never the game verification queue) ══
+SELECT pg_temp.ok(
+  position('readiness_recalc_queue' in pg_get_functiondef('public.readiness_process_recalc_batch'::regproc))>0
+  AND position('game_verification_queue' in pg_get_functiondef('public.readiness_process_recalc_batch'::regproc))=0,
+  'M1: consumer processes only readiness_recalc_queue, never game_verification_queue');
+
 SELECT '088 ALL TESTS PASSED' AS result;
 ROLLBACK;

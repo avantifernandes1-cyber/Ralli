@@ -26,12 +26,16 @@
 -- reason, the learner's already-inserted quiz attempt still commits and the submission succeeds.
 -- Rationale: readiness is a downstream, server-authoritative SHADOW signal; coupling core quiz-taking
 -- availability to the readiness subsystem would let a readiness hiccup block learners — a severe UX/
--- availability regression — whereas a missed enqueue is self-healing and never yields a WRONG score:
--- a later attempt, a config/primary change, or the planned 088B time-based staleness/backfill sweep
--- re-enqueues the rep, and a periodic reconciliation run_shadow recovers any gap. Trade-off: enqueue
--- durability is "eventually", not "exactly at this commit"; the 088B periodic sweep is the durability
--- backstop. On the SUCCESS path the enqueue still commits atomically in the same transaction as the
--- attempt (a rolled-back attempt leaves no queue row). No answers/content/PII are ever logged.
+-- availability regression. A failed enqueue never yields a WRONG score, but — IMPORTANT AND HONEST —
+-- it is NOT automatically self-healing today: there is NO periodic reconciliation/staleness sweep yet
+-- (that is Phase 088B, NOT implemented). So a dropped enqueue leaves that rep's readiness STALE until
+-- one of: (a) a LATER qualifying event for the same rep (another eligible attempt, or a manager
+-- catalog/primary/activation change that re-enqueues), or (b) a MANUAL/backfill reconciliation
+-- (an operator running readiness_run_shadow / enqueue for the tenant). Until 088B lands, treat missed
+-- enqueues as an operational gap that needs the 088B bounded recovery mechanism (see footer).
+-- On the SUCCESS path the enqueue commits atomically in the same transaction as the attempt (a
+-- rolled-back attempt leaves no queue row). The warning is a FIXED generic string — it never includes
+-- SQLERRM/SQL error text, answers, PII, credentials, ids, or any confidential content.
 --
 -- ── LEASE RECOVERY: intentionally NOT included (proven unnecessary) ───────────
 -- readiness_process_recalc_batch is a plpgsql FUNCTION (not a PROCEDURE) and performs no COMMIT: for
@@ -86,8 +90,9 @@ BEGIN
       NEW.tenant_id, NEW.user_id, NULL, 'quiz_attempt',
       jsonb_build_object('attemptId', NEW.id, 'quizId', NEW.quiz_id));
   EXCEPTION WHEN OTHERS THEN
-    -- Never abort the learner's committed attempt for a readiness-side failure. No PII/answers/content.
-    RAISE WARNING 'readiness: enqueue skipped for a quiz attempt (non-fatal): %', SQLERRM;
+    -- Never abort the learner's committed attempt for a readiness-side failure. FIXED literal ONLY:
+    -- deliberately no error text, no ids, no answers, no PII, and no credentials are interpolated.
+    RAISE WARNING 'readiness: enqueue skipped for a quiz attempt (non-fatal); pending 088B reconciliation';
   END;
 
   RETURN NULL;  -- AFTER trigger: return value ignored
@@ -156,6 +161,13 @@ $cron$;
 --   * Profile/role/status lifecycle: AFTER triggers on profiles (status/role/team) to (de)enqueue reps.
 --   * Daily 120-day staleness sweep: a scheduled function that enqueues Established reps whose required-
 --     area currency is about to lapse, so scores recompute with no new user event.
+--   * BOUNDED MISSED-ENQUEUE RECOVERY (the fail-open backstop this migration lacks): a periodic,
+--     tenant-scoped, BOUNDED reconciliation that finds scorable reps whose newest eligible current-
+--     version server_v2 attempt is NEWER than their latest readiness calc (or who have no calc under
+--     the active version) and enqueues them — capped per run (e.g. LIMIT N per tenant) and idempotent
+--     via the existing coalescing, so a burst of dropped enqueues cannot create unbounded work. This
+--     is what makes a fail-open drop eventually self-correct; until it ships, missed enqueues are an
+--     operational gap (see FAIL-OPEN header).
 --   * Queue health / dead-letter observability: a counts-only view/log (no answers/content) for depth,
 --     age, ret#, and dead-letter surfacing; optional processing-lease reclaim IF a committed stuck
 --     'processing' state is ever proven reachable (it is not today — see header).
