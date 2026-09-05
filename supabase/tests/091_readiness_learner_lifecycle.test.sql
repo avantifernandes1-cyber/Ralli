@@ -270,6 +270,43 @@ SELECT set_config('request.jwt.claims', NULL, true);
 -- R5 (#6): direct authenticated INSERT on profiles is denied; creation is only via ensure_self_profile.
 SELECT pg_temp.ok(NOT has_table_privilege('authenticated','public.profiles','INSERT'), 'R5: authenticated has NO direct INSERT on profiles');
 
+-- ══ HC. HISTORY-RETENTION CONTRACT (learner lifecycle PRESERVES; org deletion CASCADES) ══
+INSERT INTO auth.users(id,aud,role,email,created_at,updated_at) VALUES
+ ('00000000-0000-0000-0000-000000910015','authenticated','authenticated','keep@t.test',now(),now()),
+ ('00000000-0000-0000-0000-000000910016','authenticated','authenticated','del@t.test',now(),now());
+INSERT INTO public.tenants(id,slug,name) VALUES ('00000000-0000-0000-0000-0000009100d0','tdel91','TDEL91');
+INSERT INTO public.tenant_settings(tenant_id,learning_settings) VALUES ('00000000-0000-0000-0000-0000009100d0','{}');
+UPDATE public.profiles SET role='user',tenant_id=:'TA',status='active' WHERE id='00000000-0000-0000-0000-000000910015';
+UPDATE public.profiles SET role='user',tenant_id='00000000-0000-0000-0000-0000009100d0',status='active' WHERE id='00000000-0000-0000-0000-000000910016';
+INSERT INTO public.readiness_formula_versions(id,tenant_id,version,status,configuration,readiness_threshold,config_hash,source,created_at,activated_at)
+ VALUES ('00000000-0000-0000-0000-0000009100fd','00000000-0000-0000-0000-0000009100d0',2,'active','{"model":"v2_quiz_mastery"}'::jsonb,80,'h','tenant_customized',now(),now());
+SELECT pg_temp.mkhist(:'TA','00000000-0000-0000-0000-000000910015'::uuid,:'VA','hckeep');
+SELECT pg_temp.mkhist('00000000-0000-0000-0000-0000009100d0'::uuid,'00000000-0000-0000-0000-000000910016'::uuid,'00000000-0000-0000-0000-0000009100fd'::uuid,'hcdel');
+\set uKEEP '00000000-0000-0000-0000-000000910015'
+\set uDEL  '00000000-0000-0000-0000-000000910016'
+\set TDEL  '00000000-0000-0000-0000-0000009100d0'
+
+-- HC1: member REMOVAL preserves history under the original tenant (learner lifecycle never erases history).
+SELECT set_config('request.jwt.claims', json_build_object('sub',:'adm')::text, true);   -- adm = ralli_admin
+SELECT public.readiness_lifecycle_remove_member(:'uKEEP');
+SELECT pg_temp.ok((SELECT tenant_id FROM public.profiles WHERE id=:'uKEEP') IS NULL, 'HC1-pre: removed member is detached');
+SELECT pg_temp.ok(pg_temp.hist_cnt(:'TA',:'uKEEP')=1, 'HC1: member removal PRESERVES history under original tenant');
+-- (member TRANSFER preserving history under the original tenant is additionally proven by L5c above.)
+
+-- HC3: permanent ORGANISATION deletion cascades that tenant's readiness history (intended).
+CREATE TEMP TABLE _hc_ta0 AS SELECT count(*) n FROM public.readiness_score_history WHERE tenant_id=:'TA';
+SELECT pg_temp.ok(pg_temp.hist_cnt(:'TDEL',:'uDEL')=1, 'HC3-pre: TDEL has readiness history before deletion');
+SELECT public.delete_tenant(:'TDEL');
+SELECT pg_temp.ok((SELECT count(*) FROM public.readiness_score_history WHERE tenant_id=:'TDEL')=0, 'HC3: permanent tenant deletion CASCADES tenant-scoped history (by design)');
+
+-- HC4: no cross-tenant history affected; no orphaned history remains.
+SELECT pg_temp.ok((SELECT count(*) FROM public.readiness_score_history WHERE tenant_id=:'TA')=(SELECT n FROM _hc_ta0),
+  'HC4a: other tenants'' history untouched by delete_tenant (no cross-tenant deletion)');
+SELECT pg_temp.ok((SELECT count(*) FROM public.readiness_score_history h
+  WHERE NOT EXISTS (SELECT 1 FROM public.tenants t WHERE t.id = h.tenant_id))=0,
+  'HC4b: no orphaned history — every history row references an existing tenant');
+SELECT set_config('request.jwt.claims', NULL, true);
+
 -- ══ SEC. security metadata + static "no advisory-holder writes the queue" ══
 SELECT pg_temp.ok((SELECT bool_and(prosecdef AND pg_get_userbyid(proowner)='postgres' AND array_to_string(proconfig,',')='search_path=""')
   FROM pg_proc WHERE proname IN ('readiness_is_scorable_rep','enqueue_readiness_recalc','readiness_begin_lifecycle_write',

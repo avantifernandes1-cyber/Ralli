@@ -1874,3 +1874,21 @@ denied, detached reactivation succeeds, direct INSERT denied) → **091 ALL TEST
 **36/36 zero 40P01** (original CC1–CC8 + CC9 remove-vs-transfer, CC10 stale-transfer, CC11 invite-vs-transfer,
 CC12 delete_tenant-vs-transfer); two-mode rollback re-verified (composite FKs restored, no divergence);
 `npm run build` exit 0; `npm test` 7/7. No client changes this round (previous cutover stands).
+
+Row 63 — HISTORY-CONTRACT CLARIFICATION (supersedes the correction commit; STILL NOT applied/merged/deployed):
+corrects a documentation/contract inconsistency — `readiness_score_history` also has (pre-existing, from 087,
+UNCHANGED by 091) `tenant_id → tenants ON DELETE CASCADE` and `(formula_version_id,tenant_id) →
+readiness_formula_versions ON DELETE CASCADE`, so `delete_tenant` (which hard-deletes the tenant) intentionally
+CASCADES that org's readiness history. The 091 user-FK RESTRICT preserves history across LEARNER lifecycle
+changes (remove/deactivate/transfer) and gates individual account hard-deletion, but does NOT make history
+survive ORGANISATION deletion. This round: migration comments (header FK-remodel + section B + delete_tenant),
+this ledger, and `091_QA_CHECKLIST.md` corrected to state the exact contract and NO LONGER imply history
+survives tenant deletion; NO schema/executable change (the migration's executable SQL is byte-identical to the
+correction commit — only comments changed). New tests: behavioral HC1 (removal preserves history under original
+tenant), HC3 (permanent tenant deletion cascades tenant-scoped history), HC4 (no cross-tenant deletion / no
+orphaned history); learner-transfer preservation remains proven by L5c. All readiness tables verified
+`tenant_id → tenants ON DELETE CASCADE`. Rollback signature/grants re-verified correct after the seven fixes
+(only `readiness_lifecycle_apply` signature changed → `(…,boolean,text[])`, matched in the rollback DROP; the
+restored pre-091 bodies + grants are unchanged). Re-ran ALL suites: behavioral **091 ALL TESTS PASSED**;
+concurrency **36/36 zero 40P01**; two-mode rollback restored composite FKs (no divergence); `npm run build`
+exit 0; `npm test` 7/7.

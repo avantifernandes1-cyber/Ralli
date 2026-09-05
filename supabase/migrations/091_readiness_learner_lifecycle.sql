@@ -31,11 +31,20 @@
 --   makes the whole pipeline canonical end-to-end; the inline `<>'inactive'` pre-filters in 087/089/090
 --   remain only as non-authoritative optimisations (they can over-select; the chokepoints drop the rest).
 --
--- FK REMODEL (so tenant transfer/removal never blocks and history survives under its original tenant):
---   * readiness_score_history: composite (user_id,tenant_id)->profiles(id,tenant_id) becomes identity
+-- FK REMODEL — so tenant transfer/removal never BLOCKS, and the HISTORY-RETENTION CONTRACT is exact:
+--   HISTORY CONTRACT (product-approved):
+--     • A learner removed / deactivated / transferred → their history is PRESERVED under its ORIGINAL tenant
+--       (the identity user FK below tracks the person, not the membership, so detach/move never touches it).
+--     • Permanently deleting the ENTIRE organisation → its tenant-scoped history is DELETED intentionally
+--       (readiness_score_history.tenant_id -> tenants ON DELETE CASCADE, and the (formula_version_id,tenant_id)
+--       -> readiness_formula_versions CASCADE — BOTH pre-existing from 087 and left UNCHANGED here). So
+--       delete_tenant, which hard-deletes the tenant row, cascades away that org's readiness history by design.
+--       History does NOT survive tenant deletion — only learner-lifecycle changes.
+--   * readiness_score_history user FK: composite (user_id,tenant_id)->profiles(id,tenant_id) becomes identity
 --     (user_id)->profiles(id) ON DELETE RESTRICT. tenant_id stays an immutable stored column (RLS-scoped).
---     RESTRICT ⇒ deleting a profile/auth user cannot silently erase immutable history (a future explicit
---     privacy/GDPR anonymisation workflow is REQUIRED before permanent account deletion — post-beta task).
+--     RESTRICT ⇒ deleting a single PROFILE/auth user cannot silently erase that learner's history (a future
+--     explicit privacy/GDPR anonymisation workflow is REQUIRED before permanent ACCOUNT deletion — post-beta).
+--     This is orthogonal to the tenant-CASCADE above: account deletion is gated; org deletion cascades.
 --   * readiness_recalc_queue: composite becomes identity (user_id)->profiles(id) ON DELETE CASCADE, so
 --     old-tenant terminal (completed/failed/dead_letter) rows survive a transfer with their original
 --     tenant_id (operational history, RLS keeps them tenant-A scoped) and are not deleted casually.
@@ -138,7 +147,13 @@ GRANT EXECUTE ON FUNCTION public.enqueue_readiness_recalc(uuid,uuid,uuid,text,js
 -- ═══════════════════════════════════════════════════════════════════════════════
 -- B. FK REMODEL — history/queue to identity; current keeps composite
 -- ═══════════════════════════════════════════════════════════════════════════════
--- history: identity FK, RESTRICT (never silently erase immutable history; tenant_id stays a stored column)
+-- history: ONLY the user FK changes — composite (user_id,tenant_id) → identity (user_id)->profiles(id)
+-- RESTRICT, so a learner detach/transfer/removal preserves their history under its original tenant and a
+-- single account cannot be hard-deleted out from under its history. The OTHER two history FKs are LEFT
+-- UNCHANGED from 087 and remain ON DELETE CASCADE: tenant_id->tenants(id) and
+-- (formula_version_id,tenant_id)->readiness_formula_versions(id,tenant_id). Therefore permanently deleting
+-- the ENTIRE tenant (delete_tenant) intentionally cascades away that org's readiness history — history is
+-- preserved across LEARNER-lifecycle changes but NOT across ORGANISATION deletion.
 ALTER TABLE public.readiness_score_history  DROP CONSTRAINT rsh_user_same_tenant;
 ALTER TABLE public.readiness_score_history  ADD  CONSTRAINT rsh_user_fk
   FOREIGN KEY (user_id) REFERENCES public.profiles(id) ON DELETE RESTRICT;
@@ -605,6 +620,10 @@ GRANT EXECUTE ON FUNCTION public.accept_invitation(text,text) TO authenticated, 
 
 -- delete_tenant: detach every member through the advisory-first lifecycle (per-member advisory + current
 -- delete) BEFORE the membership change, so the composite current FK never blocks the tenant nulling.
+-- HISTORY CONTRACT: this PERMANENTLY deletes the org, so its tenant-scoped readiness history is cascaded
+-- away by design (readiness_score_history.tenant_id -> tenants ON DELETE CASCADE). That is intentional and
+-- distinct from learner removal/transfer, which PRESERVE history. Only the target tenant's history is
+-- affected — other tenants' history is untouched and no orphaned history remains.
 CREATE OR REPLACE FUNCTION public.delete_tenant(p_tenant_id uuid)
  RETURNS jsonb
  LANGUAGE plpgsql

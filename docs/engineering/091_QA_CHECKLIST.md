@@ -32,6 +32,11 @@ orgAdmin/manager, two active learners, and a second org for transfer tests.
 - [ ] **Authorization:** a plain learner cannot deactivate/transfer/role-change another member (the action
       is rejected). An orgAdmin can only administer members of their own org.
 - [ ] **Cross-org isolation:** as an org-B manager, you cannot see any org-A learner's readiness or history.
+- [ ] **Permanent organization deletion (history contract):** deleting an entire org (`delete_tenant`)
+      permanently removes that org's readiness history **by design** — history is preserved across learner
+      removal/transfer but is intentionally cascaded away when the whole tenant is deleted. Verify only the
+      deleted org's readiness data is gone and other orgs are untouched. (History survives a learner leaving,
+      NOT the organization being deleted.)
 
 ## Lane B — Learner (self-service + visibility)
 
@@ -56,7 +61,15 @@ orgAdmin/manager, two active learners, and a second org for transfer tests.
 
 ---
 
+**History-retention contract (091):** a learner removed / deactivated / transferred keeps their readiness
+history under its ORIGINAL tenant (the user FK is identity `ON DELETE RESTRICT`, so a learner leaving never
+erases it, and an individual account cannot be hard-deleted out from under its history). Permanently deleting
+the ENTIRE organization (`delete_tenant`) DOES remove that org's tenant-scoped history — the history
+`tenant_id → tenants` and `(formula_version_id,tenant_id) → readiness_formula_versions` FKs are pre-existing
+`ON DELETE CASCADE` and are intentionally left unchanged. **History does not survive tenant deletion; only
+learner-lifecycle changes.**
+
 **Out of scope for 091 (do NOT test as fixed here):** the `user_point_events` self-award vulnerability
 (tracked in KNOWN_BUGS as the immediate next security task); the GDPR/anonymisation workflow required before
-permanent account deletion (history FK is `ON DELETE RESTRICT`); broader content-access for
+permanent ACCOUNT deletion (the individual-profile RESTRICT gate); broader content-access for
 suspended/invited/unknown-status profiles (separate high-priority audit).
