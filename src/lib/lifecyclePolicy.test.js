@@ -2,6 +2,7 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 import {
   isRalliLevel, assignableRoles, canManageTenant, canTransfer, canActOnMember, rpcSpec, friendlyError,
+  reinvitePrefill,
 } from "./lifecyclePolicy.js";
 
 // ── role visibility ──────────────────────────────────────────────────────────
@@ -82,6 +83,31 @@ test("rpcSpec: removeFromTeam detaches team only (p_team_id null), never the org
 });
 test("rpcSpec: unknown action throws", () => {
   assert.throws(() => rpcSpec("nuke", {}), /unknown action/);
+});
+
+// ── reinvite prefill (role stays within the caller's allowed set — #7) ────────
+test("reinvitePrefill: keeps the previous role when the operator may assign it", () => {
+  assert.deepEqual(reinvitePrefill({ email: "x@e.co", previous_role: "manager" }, "orgAdmin"),
+    { email: "x@e.co", role: "manager" });
+});
+test("reinvitePrefill: clamps a non-assignable previous role to 'user' (orgAdmin cannot assign orgAdmin)", () => {
+  assert.deepEqual(reinvitePrefill({ email: "x@e.co", previous_role: "orgAdmin" }, "orgAdmin"),
+    { email: "x@e.co", role: "user" });
+});
+test("reinvitePrefill: NEVER yields a role outside assignableRoles(operator)", () => {
+  for (const opRole of ["orgAdmin", "ralli_admin", "superadmin"]) {
+    for (const prev of ["user", "manager", "orgAdmin", "ralli_admin", "superadmin", undefined]) {
+      const { role } = reinvitePrefill({ email: "e", previous_role: prev }, opRole);
+      assert.ok(assignableRoles(opRole).includes(role), `leaked ${role} for op=${opRole} prev=${prev}`);
+    }
+  }
+});
+test("reinvitePrefill: a Ralli admin may keep an orgAdmin previous role", () => {
+  assert.deepEqual(reinvitePrefill({ email: "x@e.co", previous_role: "orgAdmin" }, "ralli_admin"),
+    { email: "x@e.co", role: "orgAdmin" });
+});
+test("reinvitePrefill: missing member → empty email, safe default role", () => {
+  assert.deepEqual(reinvitePrefill(null, "orgAdmin"), { email: "", role: "user" });
 });
 
 // ── error surfacing ──────────────────────────────────────────────────────────

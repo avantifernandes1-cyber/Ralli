@@ -62,6 +62,21 @@ export function rpcSpec(action, params = {}) {
   }
 }
 
+/**
+ * Reinvite prefill for a deactivated member. Returns the email to invite and a role that is ALWAYS within
+ * the operator's assignable set (#7): the member's previous role if the operator may assign it, else 'user'
+ * (or the first allowed role). The invite form's role picker must likewise use assignableRoles(operatorRole)
+ * — the record's previous_role never widens what the caller can assign.
+ */
+export function reinvitePrefill(member, operatorRole) {
+  const allowed = assignableRoles(operatorRole);
+  const prev = member && member.previous_role;
+  const role = allowed.includes(prev)
+    ? prev
+    : (allowed.includes("user") ? "user" : (allowed[0] || "user"));
+  return { email: (member && member.email) || "", role };
+}
+
 /** Map a Postgres/PostgREST RPC error to a short, honest, user-facing message (or null when there's none). */
 export function friendlyError(error) {
   if (!error) return null;

@@ -120,7 +120,7 @@ import {
 import { getProfile, createMissingProfile, getTenantProfiles } from "./src/lib/profileService.js";
 import { sendInviteEmail } from "./src/lib/emailService.js";
 import { provisionTenant, buildInviteUrl, normalizeProvisionedOrg, createMemberInvite } from "./src/lib/provisioningService.js";
-import { removeFromOrg, changeRole, transferMember, reactivateMember, listDetachedUsers, assignableRoles, canTransfer, canActOnMember, isRalliLevel } from "./src/lib/lifecycleService.js";
+import { removeFromOrg, changeRole, transferMember, reactivateMember, listDetachedUsers, listDeactivatedMembers, reinvitePrefill, assignableRoles, canTransfer, canActOnMember, isRalliLevel } from "./src/lib/lifecycleService.js";
 import { awardLessonPoints, awardCoursePoints, awardGamePointsForSession, getLeaderboard, computeUserMeta, getUserStreak } from "./src/lib/scoringService.js";
 import { TIMEFRAMES, DEFAULT_TIMEFRAME, loadIndividuals, loadTeams, loadTeamMembers } from "./src/lib/ralliLeaderboardService.js";
 import { computeRecognitions, partitionIndividuals, partitionTeams, formatAccuracyPct } from "./src/lib/ralliLeaderboardView.js";
@@ -22327,7 +22327,7 @@ function OrgDetailScreen({ operator, orgs = [], org, orgUsers, onBack, onAddUser
           tenantName={localOrg.name}
           members={members}
           orgs={orgs}
-          onReinvite={() => { setShowInviteForm(true); setNewInviteUrl(null); setInviteError(null); }}
+          onReinvite={(prefill) => { setShowInviteForm(true); setNewInviteUrl(null); setInviteError(null); if (prefill) setInviteForm({ email: prefill.email, role: ["user", "manager", "orgAdmin"].includes(prefill.role) ? prefill.role : "user" }); }}
           onChanged={async () => {
             const { data } = await supabase.from("profiles").select("*").eq("tenant_id", localOrg.id);
             setRealMembers(data ?? []);
@@ -22625,7 +22625,8 @@ function MemberLifecyclePanel({ operator, tenantId, tenantName, members, orgs = 
   const toast = useToast();
   const [busy, setBusy]           = useState(null);   // `${action}:${userId}` while an RPC runs
   const [confirm, setConfirm]     = useState(null);   // { kind, member, destId?, role? }
-  const [detached, setDetached]   = useState(null);   // ralli-only detached list (null = not loaded)
+  const [detached, setDetached]   = useState(null);   // ralli-only GLOBAL detached list (null = not loaded)
+  const [deactivated, setDeactivated] = useState(null); // tenant-scoped removed-from-THIS-org list (null = not loaded)
   const [reactivate, setReactivate] = useState(null); // { member, destId, role } dialog
 
   const ralli       = isRalliLevel(operator?.role);
@@ -22652,7 +22653,7 @@ function MemberLifecyclePanel({ operator, tenantId, tenantName, members, orgs = 
     setBusy(null); setConfirm(null);
     if (error) { toast.error(error); return; }
     toast.success(`${m.name || m.email} was removed from ${tenantName || "the organization"}. Their history is kept — you can reinvite them.`);
-    refresh();
+    refresh(); loadDeactivated();
   }
   async function doTransfer(m, destId, role) {
     if (!destId) { toast.error("Choose a destination organization."); return; }
@@ -22668,6 +22669,18 @@ function MemberLifecyclePanel({ operator, tenantId, tenantName, members, orgs = 
     if (error) { toast.error(error); setDetached([]); return; }
     setDetached(data);
   }
+  // Tenant-scoped: members previously REMOVED from THIS org (authorized RPC; never the global detached query).
+  async function loadDeactivated() {
+    if (!tenantId) { setDeactivated([]); return; }
+    const { data, error } = await listDeactivatedMembers(tenantId);
+    if (error) { toast.error(error); setDeactivated([]); return; }
+    setDeactivated(data);
+  }
+  // Load the deactivated list on mount / when the org changes, so managers see it without a manual click.
+  useEffect(() => { setDeactivated(null); if (tenantId) loadDeactivated(); }, [tenantId]); // eslint-disable-line
+  function doReinvite(member) {
+    if (onReinvite) onReinvite(reinvitePrefill(member, operator?.role));
+  }
   async function doReactivate() {
     const { member, destId, role } = reactivate;
     if (!destId) { toast.error("Choose an organization."); return; }
@@ -22676,7 +22689,7 @@ function MemberLifecyclePanel({ operator, tenantId, tenantName, members, orgs = 
     setBusy(null); setReactivate(null);
     if (error) { toast.error(error); return; }
     toast.success(`${member.name || member.email} was reactivated.`);
-    loadDetached(); refresh();
+    loadDetached(); refresh(); loadDeactivated();
   }
 
   return (
@@ -22722,10 +22735,33 @@ function MemberLifecyclePanel({ operator, tenantId, tenantName, members, orgs = 
         );
       })}
 
-      {/* orgAdmin reactivation hint */}
-      {!ralli && (
-        <div style={{ marginTop: 12, fontSize: 12, color: "#6B7280" }}>
-          To bring a removed person back, <button style={{ ...btn("#F97316", "#F97316"), padding: "2px 8px" }} onClick={() => onReinvite && onReinvite()}>reinvite their email</button> — accepting the invite reactivates their account in this organization.
+      {/* Deactivated users — people previously REMOVED FROM THIS ORG (tenant-scoped authorized RPC).
+          Shown to orgAdmins (and to Ralli admins within a specific org). NOT the global detached list. */}
+      {tenantId && (
+        <div style={{ marginTop: 14, borderTop: "1px solid #E5E7EB", paddingTop: 12 }}>
+          <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between" }}>
+            <div style={{ fontSize: 13, fontWeight: 800 }}>Deactivated users <span style={{ fontWeight: 500, color: "#9CA3AF" }}>— removed from {tenantName || "this organization"}</span></div>
+            <button style={btn("#111827", "#111827")} onClick={loadDeactivated}>Refresh</button>
+          </div>
+          <div style={{ fontSize: 11, color: "#9CA3AF", marginTop: 2 }}>
+            Reinvite sends a fresh invitation to their existing email; accepting it returns them to this
+            organization with their history intact.
+          </div>
+          {deactivated === null && <div style={{ fontSize: 12, color: "#9CA3AF", marginTop: 8 }}>Loading…</div>}
+          {deactivated !== null && deactivated.length === 0 && <div style={{ fontSize: 12, color: "#9CA3AF", marginTop: 8 }}>No deactivated users.</div>}
+          {(deactivated ?? []).map(d => (
+            <div key={d.user_id} style={{ display: "flex", alignItems: "center", gap: 10, padding: "8px 0", borderTop: "1px solid #F3F4F6" }}>
+              <div style={{ flex: 1, minWidth: 0 }}>
+                <div style={{ fontWeight: 700, fontSize: 13 }}>{d.name || d.email}</div>
+                <div style={{ fontSize: 11, color: "#9CA3AF", overflow: "hidden", textOverflow: "ellipsis" }}>{d.email}</div>
+              </div>
+              <div style={{ fontSize: 11, color: "#6B7280", textAlign: "right", minWidth: 0 }}>
+                <div>Was <b>{roleLabel[d.previous_role] || d.previous_role || "Rep"}</b></div>
+                {d.removed_at && <div style={{ color: "#9CA3AF" }}>Removed {new Date(d.removed_at).toLocaleDateString()}</div>}
+              </div>
+              <button style={btn("#F97316", "#F97316")} onClick={() => doReinvite(d)}>Reinvite</button>
+            </div>
+          ))}
         </div>
       )}
 
@@ -23177,7 +23213,7 @@ function TeamScreen({ operator, orgId, orgName, orgUsers, orgs = [], onAddUser, 
           tenantName={orgName}
           members={members}
           orgs={orgs}
-          onReinvite={() => setShowAdd(true)}
+          onReinvite={(prefill) => { setShowAdd(true); if (prefill) setForm(f => ({ ...f, email: prefill.email, role: ["user", "orgAdmin"].includes(prefill.role) ? prefill.role : "user" })); }}
           onChanged={async () => {
             const { data } = await supabase
               .from("profiles").select("id, name, email, role, color, status, team_id").eq("tenant_id", orgId);

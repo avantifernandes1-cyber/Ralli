@@ -13,6 +13,7 @@ import { rpcSpec, friendlyError } from "./lifecyclePolicy.js";
 
 export {
   isRalliLevel, assignableRoles, canManageTenant, canTransfer, canActOnMember, friendlyError, rpcSpec,
+  reinvitePrefill,
 } from "./lifecyclePolicy.js";
 
 async function run(action, params) {
@@ -44,5 +45,17 @@ export async function listDetachedUsers() {
     .is("tenant_id", null)
     .in("status", ["inactive", "invited"])
     .order("name");
+  return { data: error ? null : (data ?? []), error: friendlyError(error) };
+}
+
+/**
+ * Tenant-scoped Deactivated Users: members previously REMOVED from a specific org, with previous role and
+ * removal date. This is the ONLY path an orgAdmin uses — it routes through the authorized SECDEF reader
+ * (readiness_list_deactivated_members), which enforces tenant authorization and returns only 'removed'
+ * (never 'transferred') members. It NEVER touches the global detached-user query above. Pass null to let the
+ * database default to the caller's own tenant.
+ */
+export async function listDeactivatedMembers(tenantId = null) {
+  const { data, error } = await supabase.rpc("readiness_list_deactivated_members", { p_tenant: tenantId });
   return { data: error ? null : (data ?? []), error: friendlyError(error) };
 }
