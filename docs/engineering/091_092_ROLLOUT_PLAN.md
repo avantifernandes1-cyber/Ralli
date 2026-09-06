@@ -34,7 +34,12 @@ in production:
 
 ## Stage 3 — apply migration 092 (close the bypass) — ONLY after Stage 2 verified
 Adds the fail-closed guard trigger, revokes the broad `profiles` grants (re-granting only SELECT + the safe
-presentation columns), removes direct client INSERT, and adds the own-row WITH CHECK.
+presentation columns), removes direct client INSERT, and adds the own-row WITH CHECK. It ALSO carries a
+forward-only correction of `ensure_self_profile.created` (091 shipped an unreliable `xmax = 0` check; 092
+replaces it with `INSERT … ON CONFLICT DO NOTHING RETURNING id`, so first creation → `created:true`, an
+existing profile → `created:false` with protected fields untouched, and concurrent duplicate calls create one
+profile with an honest result and no error). This is applied in 092 because 091 is already live and must not
+be altered. It does not affect the `fbf607e` preview QA — the frontend ignores the `created` field.
 - **Precondition (proven before applying):**
   - **Static caller scan** (this repo, `ffc0e2b`): no client `.from('profiles').insert|upsert`, and no
     `.update` of `role`/`status`/`tenant_id`/`team_id`. Verified — the only client profiles writes are

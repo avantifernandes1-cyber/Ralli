@@ -80,13 +80,32 @@ SELECT pg_temp.ok(NOT has_table_privilege('anon','public.profiles','SELECT')
   AND NOT has_table_privilege('anon','public.profiles','INSERT'), 'GR3: anon has no profiles privileges');
 SELECT pg_temp.ok(NOT has_table_privilege('authenticated','public.profiles','INSERT'), 'GR4: authenticated has NO direct INSERT on profiles');
 
--- ══ SP. ensure_self_profile still works (server-derived identity), while direct INSERT is denied ══
+-- ══ SP. ensure_self_profile: created semantics + protected-field preservation (092 correction) ══
+-- handle_new_user auto-creates a profile on the auth.users insert, so delete it first to test a real "missing
+-- profile" recovery where the INSERT actually happens.
+DELETE FROM public.readiness_scores_current WHERE user_id='00000000-0000-0000-0000-000000920013';
+DELETE FROM public.profiles WHERE id='00000000-0000-0000-0000-000000920013';
 SELECT set_config('request.jwt.claims', json_build_object('sub','00000000-0000-0000-0000-000000920013')::text, true);
-SELECT public.ensure_self_profile('New Voter');
+-- SP1: FIRST creation → created:true, and role=user / status=active / tenant_id NULL / team_id NULL (never invents an org)
+SELECT pg_temp.ok((public.ensure_self_profile('New Voter')->>'created')='true', 'SP1a: first ensure_self_profile returns created:true');
 SELECT pg_temp.ok((SELECT role FROM public.profiles WHERE id='00000000-0000-0000-0000-000000920013')='user'
   AND (SELECT status FROM public.profiles WHERE id='00000000-0000-0000-0000-000000920013')='active'
-  AND (SELECT tenant_id FROM public.profiles WHERE id='00000000-0000-0000-0000-000000920013') IS NULL,
-  'SP: ensure_self_profile creates user/active/no-tenant with server-derived identity');
+  AND (SELECT tenant_id FROM public.profiles WHERE id='00000000-0000-0000-0000-000000920013') IS NULL
+  AND (SELECT team_id FROM public.profiles WHERE id='00000000-0000-0000-0000-000000920013') IS NULL,
+  'SP1b: created as user/active/no-org/no-team (never guesses an organisation)');
+-- SP2: SECOND call for the now-existing profile → created:false
+SELECT pg_temp.ok((public.ensure_self_profile('Different Name')->>'created')='false', 'SP2: existing profile returns created:false');
+SELECT set_config('request.jwt.claims', NULL, true);
+-- SP3: an existing ATTACHED profile → ensure_self_profile returns created:false and leaves protected fields UNCHANGED
+SET LOCAL readiness.allow_unguarded='1';
+UPDATE public.profiles SET role='orgAdmin', status='active', tenant_id=:'TA' WHERE id='00000000-0000-0000-0000-000000920002';
+SET LOCAL readiness.allow_unguarded='';
+SELECT set_config('request.jwt.claims', json_build_object('sub','00000000-0000-0000-0000-000000920002')::text, true);
+SELECT pg_temp.ok((public.ensure_self_profile('Attempted Rename')->>'created')='false', 'SP3a: existing attached profile returns created:false');
+SELECT pg_temp.ok((SELECT role FROM public.profiles WHERE id='00000000-0000-0000-0000-000000920002')='orgAdmin'
+  AND (SELECT status FROM public.profiles WHERE id='00000000-0000-0000-0000-000000920002')='active'
+  AND (SELECT tenant_id FROM public.profiles WHERE id='00000000-0000-0000-0000-000000920002')=:'TA',
+  'SP3b: ensure_self_profile left role/status/tenant of an existing profile UNCHANGED');
 SELECT set_config('request.jwt.claims', NULL, true);
 
 -- ══ SEC: guard metadata ══

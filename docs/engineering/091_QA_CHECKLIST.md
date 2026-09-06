@@ -40,8 +40,10 @@ orgAdmin/manager, two active learners, and a second org for transfer tests.
 
 ## Lane B — Learner (self-service + visibility)
 
-- [ ] **Sign up / first login with no profile yet.** Expect: a profile is created (via `ensure_self_profile`)
-      with role=user, status=active, no org; the app loads normally.
+- [ ] **Sign up / first login with no profile yet (missing-profile recovery).** Expect: `ensure_self_profile`
+      creates the profile with **`role=user`, `status=active`, `tenant_id=NULL`** — it **never guesses or
+      invents an organization**. Attachment to an org happens **only** by accepting an invitation. The app
+      loads normally (no blank company).
 - [ ] **Edit safe profile fields** (name, nickname, avatar emoji, profile picture, notification prefs).
       Expect: all save successfully.
 - [ ] **Attempt self-escalation (negative test — valid ONLY after Stage 3 / migration 092).** Using the

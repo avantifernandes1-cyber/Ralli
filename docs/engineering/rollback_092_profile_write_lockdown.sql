@@ -28,5 +28,38 @@ CREATE POLICY profiles_update_own ON public.profiles
 GRANT INSERT, UPDATE, DELETE, TRUNCATE, REFERENCES, TRIGGER ON public.profiles TO anon, authenticated;
 GRANT SELECT ON public.profiles TO anon, authenticated;
 
+-- (d) restore the EXACT pre-092 ensure_self_profile body (the 091/live version, with the xmax-based
+--     `created`). This is a faithful inverse; the xmax `created` is cosmetic (the frontend ignores it) and
+--     re-applying 092 restores the reliable ON CONFLICT … RETURNING version.
+CREATE OR REPLACE FUNCTION public.ensure_self_profile(
+  p_name           text DEFAULT NULL,
+  p_nickname       text DEFAULT NULL,
+  p_avatar_emoji   text DEFAULT NULL,
+  p_profile_pic_url text DEFAULT NULL,
+  p_notif_prefs    jsonb DEFAULT NULL
+)
+ RETURNS jsonb
+ LANGUAGE plpgsql
+ SECURITY DEFINER
+ SET search_path TO ''
+AS $function$
+DECLARE v_uid uuid := auth.uid(); v_email text;
+BEGIN
+  IF v_uid IS NULL THEN RAISE EXCEPTION 'ensure_self_profile: must be authenticated'; END IF;
+  SELECT email INTO v_email FROM auth.users WHERE id = v_uid;
+  INSERT INTO public.profiles (id, email, name, nickname, avatar_emoji, profile_pic_url,
+                               notif_prefs, role, status, created_at, updated_at)
+  VALUES (v_uid, v_email,
+          COALESCE(NULLIF(TRIM(p_name),''), split_part(COALESCE(v_email,''),'@',1)),
+          p_nickname, p_avatar_emoji, p_profile_pic_url,
+          COALESCE(p_notif_prefs, '{}'::jsonb),
+          'user', 'active', now(), now())
+  ON CONFLICT (id) DO NOTHING;   -- never overwrites role/status/tenant/team of an existing row
+  RETURN jsonb_build_object('userId', v_uid,
+    'created', (SELECT xmax = 0 FROM public.profiles WHERE id = v_uid));
+END $function$;
+REVOKE ALL ON FUNCTION public.ensure_self_profile(text,text,text,text,jsonb) FROM PUBLIC, anon;
+GRANT EXECUTE ON FUNCTION public.ensure_self_profile(text,text,text,text,jsonb) TO authenticated, service_role;
+
 COMMIT;
 -- ─────────────────────────────────────────────────────────────────────────────
