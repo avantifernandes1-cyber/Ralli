@@ -120,6 +120,7 @@ import {
 import { getProfile, createMissingProfile, getTenantProfiles } from "./src/lib/profileService.js";
 import { sendInviteEmail } from "./src/lib/emailService.js";
 import { provisionTenant, buildInviteUrl, normalizeProvisionedOrg, createMemberInvite } from "./src/lib/provisioningService.js";
+import { removeFromOrg, changeRole, transferMember, reactivateMember, listDetachedUsers, assignableRoles, canTransfer, canActOnMember, isRalliLevel } from "./src/lib/lifecycleService.js";
 import { awardLessonPoints, awardCoursePoints, awardGamePointsForSession, getLeaderboard, computeUserMeta, getUserStreak } from "./src/lib/scoringService.js";
 import { TIMEFRAMES, DEFAULT_TIMEFRAME, loadIndividuals, loadTeams, loadTeamMembers } from "./src/lib/ralliLeaderboardService.js";
 import { computeRecognitions, partitionIndividuals, partitionTeams, formatAccuracyPct } from "./src/lib/ralliLeaderboardView.js";
@@ -21797,7 +21798,7 @@ function OrgSetupScreen({ user, onComplete }) {
 
 // ── ORG DETAIL SCREEN (ralli admin only) ─────────────────────────────────────
 // Full lifecycle: view, edit, manage members, manage invitations.
-function OrgDetailScreen({ org, orgUsers, onBack, onAddUser, onDeactivateOrg, onReactivateOrg, onDeleteOrg, onCancelOrg, onUpdateOrg, onUpdateMember, onRemoveMember, onCancelInvite, onResendMemberInvite }) {
+function OrgDetailScreen({ operator, orgs = [], org, orgUsers, onBack, onAddUser, onDeactivateOrg, onReactivateOrg, onDeleteOrg, onCancelOrg, onUpdateOrg, onUpdateMember, onRemoveMember, onCancelInvite, onResendMemberInvite }) {
   const mobile = useMobile();
   const [realMembers, setRealMembers]       = useState(null);   // profiles[]
   const [invitations, setInvitations]       = useState(null);   // all tenant_invitations[]
@@ -22317,6 +22318,23 @@ function OrgDetailScreen({ org, orgUsers, onBack, onAddUser, onDeactivateOrg, on
         </div>
       )}
 
+      {/* Organization-level member management (migration-091 lifecycle RPCs): role change, remove-from-org,
+          transfer between orgs (Ralli), and reactivate detached users (Ralli). */}
+      {operator && (
+        <MemberLifecyclePanel
+          operator={operator}
+          tenantId={localOrg.id}
+          tenantName={localOrg.name}
+          members={members}
+          orgs={orgs}
+          onReinvite={() => { setShowInviteForm(true); setNewInviteUrl(null); setInviteError(null); }}
+          onChanged={async () => {
+            const { data } = await supabase.from("profiles").select("*").eq("tenant_id", localOrg.id);
+            setRealMembers(data ?? []);
+          }}
+        />
+      )}
+
       {/* Members */}
       <div style={{ background: C.white, borderRadius: 12, border: `1px solid ${C.border}`, overflow: "hidden" }}>
         <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", padding: "16px 20px", borderBottom: `1px solid ${C.border}` }}>
@@ -22597,7 +22615,220 @@ function OrgDetailScreen({ org, orgUsers, onBack, onAddUser, onDeactivateOrg, on
 }
 
 // ── TEAM SCREEN (org admin manages their users) ────────────
-function TeamScreen({ orgId, orgName, orgUsers, onAddUser, onMemberInvited }) {
+// ── Member lifecycle management (migration-091 RPCs) ─────────────────────────────────────────────────
+// Org-level member actions that were missing from the UI: change role, remove-from-ORGANIZATION (distinct
+// from remove-from-team), transfer between orgs (Ralli-admin only), and reactivate a detached/removed user
+// (Ralli-admin does it directly; orgAdmins bring people back by reinviting their email). The database
+// (readiness_lifecycle_authz) is the security authority; this panel only shows the actions the operator is
+// allowed to take and surfaces backend errors. Immediate refresh + factual toasts after every action.
+function MemberLifecyclePanel({ operator, tenantId, tenantName, members, orgs = [], onChanged, onReinvite }) {
+  const toast = useToast();
+  const [busy, setBusy]           = useState(null);   // `${action}:${userId}` while an RPC runs
+  const [confirm, setConfirm]     = useState(null);   // { kind, member, destId?, role? }
+  const [detached, setDetached]   = useState(null);   // ralli-only detached list (null = not loaded)
+  const [reactivate, setReactivate] = useState(null); // { member, destId, role } dialog
+
+  const ralli       = isRalliLevel(operator?.role);
+  const roleOptions = assignableRoles(operator?.role);
+  const roleLabel   = { user: "Rep", manager: "Manager", orgAdmin: "Org Admin", ralli_admin: "Ralli Admin", superadmin: "Super Admin" };
+  const activeMembers = (members ?? []).filter(m => (m.status ?? "active") === "active");
+  const box = { border: "1px solid #E5E7EB", borderRadius: 10, background: "#fff" };
+  const btn = (bg, fg) => ({ padding: "6px 10px", borderRadius: 8, border: `1px solid ${bg}`, background: bg + "15", color: fg, fontSize: 12, fontWeight: 700, cursor: "pointer" });
+
+  const refresh = () => { if (onChanged) onChanged(); };
+
+  async function doChangeRole(m, role) {
+    if (!role || role === m.role) return;
+    setBusy(`role:${m.id}`);
+    const { error } = await changeRole(m.id, role);
+    setBusy(null);
+    if (error) { toast.error(error); return; }
+    toast.success(`${m.name || m.email} is now ${roleLabel[role] || role}.`);
+    refresh();
+  }
+  async function doRemoveOrg(m) {
+    setBusy(`removeOrg:${m.id}`);
+    const { error } = await removeFromOrg(m.id);
+    setBusy(null); setConfirm(null);
+    if (error) { toast.error(error); return; }
+    toast.success(`${m.name || m.email} was removed from ${tenantName || "the organization"}. Their history is kept — you can reinvite them.`);
+    refresh();
+  }
+  async function doTransfer(m, destId, role) {
+    if (!destId) { toast.error("Choose a destination organization."); return; }
+    setBusy(`transfer:${m.id}`);
+    const { error } = await transferMember(m.id, destId, role);
+    setBusy(null); setConfirm(null);
+    if (error) { toast.error(error); return; }
+    toast.success(`${m.name || m.email} was transferred.`);
+    refresh();
+  }
+  async function loadDetached() {
+    const { data, error } = await listDetachedUsers();
+    if (error) { toast.error(error); setDetached([]); return; }
+    setDetached(data);
+  }
+  async function doReactivate() {
+    const { member, destId, role } = reactivate;
+    if (!destId) { toast.error("Choose an organization."); return; }
+    setBusy(`reactivate:${member.id}`);
+    const { error } = await reactivateMember(member.id, destId, role);
+    setBusy(null); setReactivate(null);
+    if (error) { toast.error(error); return; }
+    toast.success(`${member.name || member.email} was reactivated.`);
+    loadDetached(); refresh();
+  }
+
+  return (
+    <div style={{ ...box, padding: 16, marginBottom: 16 }}>
+      <div style={{ fontSize: 15, fontWeight: 800, marginBottom: 4 }}>People in {tenantName || "this organization"}</div>
+      <div style={{ fontSize: 12, color: "#6B7280", marginBottom: 12 }}>
+        Change a role or remove someone from the <b>whole organization</b>. Removing from the organization
+        deactivates their access and detaches them but <b>keeps their history</b> — you can reinvite them later.
+        This is different from removing someone from a single team.
+      </div>
+
+      {activeMembers.length === 0 && <div style={{ fontSize: 13, color: "#6B7280" }}>No active members.</div>}
+      {activeMembers.map(m => {
+        const self = !canActOnMember(operator, m);
+        // Never offer role-change / remove / transfer on the operator themselves or on an elevated
+        // (ralli_admin/superadmin) account — the lifecycle RPCs can't assign those roles, and the UI must
+        // not appear to demote or remove them. (In practice Ralli admins are tenant-detached and won't list.)
+        const locked = self || isRalliLevel(m.role);
+        return (
+          <div key={m.id} style={{ display: "flex", alignItems: "center", gap: 10, padding: "8px 0", borderTop: "1px solid #F3F4F6" }}>
+            <div style={{ flex: 1, minWidth: 0 }}>
+              <div style={{ fontWeight: 700, fontSize: 13 }}>{m.name || m.email}{self && <span style={{ color: "#9CA3AF", fontWeight: 500 }}> (you)</span>}</div>
+              <div style={{ fontSize: 11, color: "#9CA3AF", overflow: "hidden", textOverflow: "ellipsis" }}>{m.email}</div>
+            </div>
+            <select
+              aria-label={`Role for ${m.name || m.email}`}
+              value={roleOptions.includes(m.role) ? m.role : ""}
+              disabled={locked || busy === `role:${m.id}`}
+              onChange={e => doChangeRole(m, e.target.value)}
+              style={{ padding: "6px 8px", borderRadius: 8, border: "1px solid #E5E7EB", fontSize: 12, background: locked ? "#F9FAFB" : "#fff" }}>
+              {!roleOptions.includes(m.role) && <option value="">{roleLabel[m.role] || m.role}</option>}
+              {roleOptions.map(r => <option key={r} value={r}>{roleLabel[r]}</option>)}
+            </select>
+            {ralli && !locked && (
+              <button style={btn("#2563EB", "#2563EB")} disabled={!!busy}
+                onClick={() => setConfirm({ kind: "transfer", member: m, destId: "", role: "user" })}>Transfer…</button>
+            )}
+            {!locked && (
+              <button style={btn("#DC2626", "#DC2626")} disabled={busy === `removeOrg:${m.id}`}
+                onClick={() => setConfirm({ kind: "removeOrg", member: m })}>Remove from org</button>
+            )}
+          </div>
+        );
+      })}
+
+      {/* orgAdmin reactivation hint */}
+      {!ralli && (
+        <div style={{ marginTop: 12, fontSize: 12, color: "#6B7280" }}>
+          To bring a removed person back, <button style={{ ...btn("#F97316", "#F97316"), padding: "2px 8px" }} onClick={() => onReinvite && onReinvite()}>reinvite their email</button> — accepting the invite reactivates their account in this organization.
+        </div>
+      )}
+
+      {/* Ralli-admin: detached/removed users */}
+      {ralli && (
+        <div style={{ marginTop: 14, borderTop: "1px solid #E5E7EB", paddingTop: 12 }}>
+          <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between" }}>
+            <div style={{ fontSize: 13, fontWeight: 800 }}>Removed / detached users (no organization)</div>
+            <button style={btn("#111827", "#111827")} onClick={loadDetached}>{detached === null ? "Show" : "Refresh"}</button>
+          </div>
+          {detached !== null && detached.length === 0 && <div style={{ fontSize: 12, color: "#9CA3AF", marginTop: 8 }}>No detached users.</div>}
+          {(detached ?? []).map(d => (
+            <div key={d.id} style={{ display: "flex", alignItems: "center", gap: 10, padding: "8px 0", borderTop: "1px solid #F3F4F6" }}>
+              <div style={{ flex: 1, minWidth: 0 }}>
+                <div style={{ fontWeight: 700, fontSize: 13 }}>{d.name || d.email} <span style={{ fontSize: 10, color: "#9CA3AF" }}>({d.status})</span></div>
+                <div style={{ fontSize: 11, color: "#9CA3AF" }}>{d.email}</div>
+              </div>
+              <button style={btn("#16A34A", "#16A34A")} disabled={!!busy}
+                onClick={() => setReactivate({ member: d, destId: "", role: "user" })}>Reactivate…</button>
+            </div>
+          ))}
+        </div>
+      )}
+
+      {/* Confirm: remove-from-org (distinct language from team removal) */}
+      {confirm?.kind === "removeOrg" && (
+        <div style={{ position: "fixed", inset: 0, background: "rgba(0,0,0,.4)", display: "flex", alignItems: "center", justifyContent: "center", zIndex: 1000 }} onClick={() => setConfirm(null)}>
+          <div style={{ ...box, padding: 20, maxWidth: 420 }} onClick={e => e.stopPropagation()}>
+            <div style={{ fontSize: 16, fontWeight: 800, marginBottom: 8 }}>Remove from organization?</div>
+            <div style={{ fontSize: 13, color: "#374151", marginBottom: 16 }}>
+              This removes <b>{confirm.member.name || confirm.member.email}</b> from the <b>entire organization</b>
+              {tenantName ? ` (${tenantName})` : ""}. Their access is deactivated and they are detached from the org,
+              but <b>their account and readiness history are preserved</b> and they can be reinvited later.
+              This is <b>not</b> the same as removing them from a team.
+            </div>
+            <div style={{ display: "flex", gap: 8, justifyContent: "flex-end" }}>
+              <button style={btn("#6B7280", "#6B7280")} onClick={() => setConfirm(null)}>Cancel</button>
+              <button style={btn("#DC2626", "#DC2626")} disabled={!!busy} onClick={() => doRemoveOrg(confirm.member)}>Remove from organization</button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* Confirm: transfer (ralli) */}
+      {confirm?.kind === "transfer" && (
+        <div style={{ position: "fixed", inset: 0, background: "rgba(0,0,0,.4)", display: "flex", alignItems: "center", justifyContent: "center", zIndex: 1000 }} onClick={() => setConfirm(null)}>
+          <div style={{ ...box, padding: 20, maxWidth: 440 }} onClick={e => e.stopPropagation()}>
+            <div style={{ fontSize: 16, fontWeight: 800, marginBottom: 8 }}>Transfer to another organization</div>
+            <div style={{ fontSize: 13, color: "#374151", marginBottom: 12 }}>
+              Move <b>{confirm.member.name || confirm.member.email}</b> to a different organization. Their history stays
+              with the original organization; a fresh readiness record is built in the new one.
+            </div>
+            <div style={{ display: "flex", gap: 8, marginBottom: 16 }}>
+              <select value={confirm.destId} onChange={e => setConfirm(c => ({ ...c, destId: e.target.value }))}
+                style={{ flex: 1, padding: "8px", borderRadius: 8, border: "1px solid #E5E7EB", fontSize: 13 }}>
+                <option value="">Choose organization…</option>
+                {orgs.filter(o => o.id !== tenantId).map(o => <option key={o.id} value={o.id}>{o.name}</option>)}
+              </select>
+              <select value={confirm.role} onChange={e => setConfirm(c => ({ ...c, role: e.target.value }))}
+                style={{ padding: "8px", borderRadius: 8, border: "1px solid #E5E7EB", fontSize: 13 }}>
+                {["user", "manager", "orgAdmin"].map(r => <option key={r} value={r}>{roleLabel[r]}</option>)}
+              </select>
+            </div>
+            <div style={{ display: "flex", gap: 8, justifyContent: "flex-end" }}>
+              <button style={btn("#6B7280", "#6B7280")} onClick={() => setConfirm(null)}>Cancel</button>
+              <button style={btn("#2563EB", "#2563EB")} disabled={!confirm.destId || !!busy} onClick={() => doTransfer(confirm.member, confirm.destId, confirm.role)}>Transfer</button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* Reactivate (ralli, detached user) */}
+      {reactivate && (
+        <div style={{ position: "fixed", inset: 0, background: "rgba(0,0,0,.4)", display: "flex", alignItems: "center", justifyContent: "center", zIndex: 1000 }} onClick={() => setReactivate(null)}>
+          <div style={{ ...box, padding: 20, maxWidth: 440 }} onClick={e => e.stopPropagation()}>
+            <div style={{ fontSize: 16, fontWeight: 800, marginBottom: 8 }}>Reactivate user</div>
+            <div style={{ fontSize: 13, color: "#374151", marginBottom: 12 }}>
+              Attach <b>{reactivate.member.name || reactivate.member.email}</b> to an organization with a role. Their
+              readiness is recomputed from their preserved evidence.
+            </div>
+            <div style={{ display: "flex", gap: 8, marginBottom: 16 }}>
+              <select value={reactivate.destId} onChange={e => setReactivate(r => ({ ...r, destId: e.target.value }))}
+                style={{ flex: 1, padding: "8px", borderRadius: 8, border: "1px solid #E5E7EB", fontSize: 13 }}>
+                <option value="">Choose organization…</option>
+                {orgs.map(o => <option key={o.id} value={o.id}>{o.name}</option>)}
+              </select>
+              <select value={reactivate.role} onChange={e => setReactivate(r => ({ ...r, role: e.target.value }))}
+                style={{ padding: "8px", borderRadius: 8, border: "1px solid #E5E7EB", fontSize: 13 }}>
+                {["user", "manager", "orgAdmin"].map(r => <option key={r} value={r}>{roleLabel[r]}</option>)}
+              </select>
+            </div>
+            <div style={{ display: "flex", gap: 8, justifyContent: "flex-end" }}>
+              <button style={btn("#6B7280", "#6B7280")} onClick={() => setReactivate(null)}>Cancel</button>
+              <button style={btn("#16A34A", "#16A34A")} disabled={!reactivate.destId || !!busy} onClick={doReactivate}>Reactivate</button>
+            </div>
+          </div>
+        </div>
+      )}
+    </div>
+  );
+}
+
+function TeamScreen({ operator, orgId, orgName, orgUsers, orgs = [], onAddUser, onMemberInvited }) {
   const [localMembers, setLocalMembers] = useState(null); // null = loading
 
   useEffect(() => {
@@ -22908,9 +23139,9 @@ function TeamScreen({ orgId, orgName, orgUsers, onAddUser, onMemberInvited }) {
                 <span style={{ fontSize: 11, fontWeight: 700, padding: "3px 8px", borderRadius: 6, background: (ROLE_COLORS[m.role] ?? C.textMuted) + "18", color: ROLE_COLORS[m.role] ?? C.textMuted }}>
                   {ROLE_LABELS[m.role] ?? m.role}
                 </span>
-                <button onClick={() => handleRemoveMember(m.id)} disabled={isRemoving}
+                <button onClick={() => handleRemoveMember(m.id)} disabled={isRemoving} title="Detach from this team only; stays in the organization"
                   style={{ padding: "5px 10px", borderRadius: 7, border: "1px solid #fca5a5", background: "#fef2f2", color: "#ef4444", fontSize: 11, fontWeight: 600, cursor: isRemoving ? "not-allowed" : "pointer", opacity: isRemoving ? 0.6 : 1 }}>
-                  {isRemoving ? "…" : "Remove"}
+                  {isRemoving ? "…" : "Remove from team"}
                 </button>
               </div>
             );
@@ -22937,6 +23168,28 @@ function TeamScreen({ orgId, orgName, orgUsers, onAddUser, onMemberInvited }) {
           + Invite Member
         </button>
       </div>
+
+      {/* Organization-level member management (migration-091 lifecycle RPCs) */}
+      {operator && (
+        <MemberLifecyclePanel
+          operator={operator}
+          tenantId={orgId}
+          tenantName={orgName}
+          members={members}
+          orgs={orgs}
+          onReinvite={() => setShowAdd(true)}
+          onChanged={async () => {
+            const { data } = await supabase
+              .from("profiles").select("id, name, email, role, color, status, team_id").eq("tenant_id", orgId);
+            setLocalMembers((data ?? []).map(m => ({
+              id: m.id, email: m.email,
+              name: m.name ?? m.email?.split("@")[0] ?? "User",
+              initials: (m.name ?? m.email ?? "U").split(" ").map(p => p[0] ?? "").join("").toUpperCase().slice(0, 2) || "U",
+              role: m.role ?? "user", color: m.color ?? "#F97316", status: m.status ?? "active", _isReal: true,
+            })));
+          }}
+        />
+      )}
 
       {/* Teams */}
       <div style={{ background: C.white, borderRadius: 12, border: `1px solid ${C.border}`, overflow: "hidden" }}>
@@ -23879,7 +24132,7 @@ function LoginScreen({ onLogin, users = USERS }) {
 // ── OrgAdminSettingsScreen ────────────────────────────────────────────────────
 // Tabbed settings for Organization Admin: Role Access + Team Settings
 // ─────────────────────────────────────────────────────────────────────────────
-function OrgAdminSettingsScreen({ rolePermissions, onSaveRolePermissions, currentOrg, orgId, orgName, orgUsers, onAddUser, readinessThreshold = 80, onSaveReadinessThreshold }) {
+function OrgAdminSettingsScreen({ operator, rolePermissions, onSaveRolePermissions, currentOrg, orgId, orgName, orgUsers, onAddUser, readinessThreshold = 80, onSaveReadinessThreshold }) {
   const [tab, setTab] = useState("roles"); // "roles" | "team" | "learning" | "readiness"
   const tabs = [
     { id: "roles",     label: "Role Access" },
@@ -23902,7 +24155,7 @@ function OrgAdminSettingsScreen({ rolePermissions, onSaveRolePermissions, curren
         ))}
       </div>
       {tab === "roles"    && <RoleAccessScreen rolePermissions={rolePermissions} onSave={onSaveRolePermissions} currentOrg={currentOrg} />}
-      {tab === "team"     && <TeamScreen orgId={orgId} orgName={orgName} orgUsers={orgUsers} onAddUser={onAddUser} />}
+      {tab === "team"     && <TeamScreen operator={operator} orgId={orgId} orgName={orgName} orgUsers={orgUsers} onAddUser={onAddUser} />}
       {tab === "learning" && <LearningSettingsScreen readinessThreshold={readinessThreshold} onSave={onSaveReadinessThreshold} />}
       {tab === "readiness" && <ReadinessSettingsScreen />}
     </div>
@@ -27230,12 +27483,12 @@ export default function App() {
       // Any stale deep-link/remembered screen falls through to Ralli Live.
       case "leaderboard":       return <RankdScreen onNav={navigate} onJoin={handleEnterPin} sessions={sessions} pastSessions={pastSessions} onLaunch={handleLaunch} onViewResults={handleViewResults} onRelaunch={handleRelaunch} role={gameRole} currentUser={currentUser} />;
       case "organizations":     return selectedOrg
-        ? <OrgDetailScreen org={selectedOrg} orgUsers={orgUsers} onBack={() => setSelectedOrg(null)} onAddUser={handleAddUser} onDeactivateOrg={handleDeactivateOrg} onReactivateOrg={handleReactivateOrg} onDeleteOrg={handleDeleteOrg} onCancelOrg={handleCancelOrg} onUpdateOrg={handleUpdateOrg} onUpdateMember={handleUpdateMember} onRemoveMember={handleRemoveMember} onCancelInvite={handleCancelInvite} onResendMemberInvite={handleResendMemberInvite} />
+        ? <OrgDetailScreen operator={user} orgs={orgs} org={selectedOrg} orgUsers={orgUsers} onBack={() => setSelectedOrg(null)} onAddUser={handleAddUser} onDeactivateOrg={handleDeactivateOrg} onReactivateOrg={handleReactivateOrg} onDeleteOrg={handleDeleteOrg} onCancelOrg={handleCancelOrg} onUpdateOrg={handleUpdateOrg} onUpdateMember={handleUpdateMember} onRemoveMember={handleRemoveMember} onCancelInvite={handleCancelInvite} onResendMemberInvite={handleResendMemberInvite} />
         : <OrganizationsScreen orgs={orgs} onInviteOrg={handleInviteOrg} onSelectOrg={(org) => setSelectedOrg(org)} onRefresh={handleRefreshOrgs} onDeactivateOrg={handleDeactivateOrg} onReactivateOrg={handleReactivateOrg} onDeleteOrg={handleDeleteOrg} onCancelOrg={handleCancelOrg} />;
-      case "team":              return <TeamScreen orgId={user.orgId} orgName={currentOrg?.name ?? "Your Team"} orgUsers={orgUsers} onAddUser={handleAddUser} />;
+      case "team":              return <TeamScreen operator={user} orgId={user.orgId} orgName={currentOrg?.name ?? "Your Team"} orgUsers={orgUsers} onAddUser={handleAddUser} />;
       case "settings":
         if (isSuperAdmin)  return <RoleAccessScreen rolePermissions={rolePermissions} onSave={handleSaveRolePermissions} currentOrg={currentOrg} />;
-        if (isOrgAdmin)    return <OrgAdminSettingsScreen rolePermissions={rolePermissions} onSaveRolePermissions={handleSaveRolePermissions} currentOrg={currentOrg} orgId={user.orgId} orgName={currentOrg?.name ?? "Your Team"} orgUsers={orgUsers} onAddUser={handleAddUser} readinessThreshold={readinessThreshold} onSaveReadinessThreshold={handleSaveReadinessThreshold} />;
+        if (isOrgAdmin)    return <OrgAdminSettingsScreen operator={user} rolePermissions={rolePermissions} onSaveRolePermissions={handleSaveRolePermissions} currentOrg={currentOrg} orgId={user.orgId} orgName={currentOrg?.name ?? "Your Team"} orgUsers={orgUsers} onAddUser={handleAddUser} readinessThreshold={readinessThreshold} onSaveReadinessThreshold={handleSaveReadinessThreshold} />;
         return <UserSettingsScreen user={user} profile={userProfile} notifPrefs={notifPrefs} onSaveProfile={handleSaveProfile} onSaveNotifs={handleSaveNotifs} currentOrg={currentOrg} showReadiness={canAccessReadinessSettings(role)} onSignOut={async () => { if (user?._isReal) { await supabase.auth.signOut(); /* SIGNED_OUT handler redirects */ } else { setCurrentUser(null); setLastSeenAt(null); setNewAssignmentCount(0); setPendingLessonId(null); setPendingCourseId(null); setPendingQuizId(null); setOrgs(INITIAL_ORGS); setOrgUsers(INITIAL_ORG_USERS); setQuizzesReady(false); setSessions(INITIAL_SESSIONS); setBattleCards(INITIAL_BATTLE_CARDS); clearLearnNavSessionState(); clearActiveGameContext(); clearBattleCardDrafts(); window.location.replace("/login"); } }} />;
       default:                  return <HomeScreen user={user} />;
     }
