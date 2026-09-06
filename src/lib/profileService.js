@@ -33,7 +33,12 @@ export async function getProfile(userId) {
 
   const { data, error } = await supabase
     .from("profiles")
-    .select("*, tenants(id, name, slug, plan)")
+    // Disambiguate the tenants embed by naming the direct FK. Since migration 093 added
+    // tenant_memberships (FKs to both profiles and tenants), PostgREST detects a second
+    // (many-to-many) profiles↔tenants relationship, and an unqualified `tenants(...)` embed
+    // becomes ambiguous (PGRST201 / HTTP 300), which broke account boot. Naming
+    // profiles_tenant_id_fkey resolves to the one-to-one tenant and returns the same shape.
+    .select("*, tenants!profiles_tenant_id_fkey(id, name, slug, plan)")
     .eq("id", userId)
     .single();
 
