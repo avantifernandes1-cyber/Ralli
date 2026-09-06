@@ -57,5 +57,11 @@ export async function listDetachedUsers() {
  */
 export async function listDeactivatedMembers(tenantId = null) {
   const { data, error } = await supabase.rpc("readiness_list_deactivated_members", { p_tenant: tenantId });
+  // Degrade gracefully if migration 093 is not yet applied to this environment (RPC absent): show an empty
+  // list, no error. Once 093 is live the RPC exists and this branch never triggers.
+  if (error && (error.code === "PGRST202" || error.code === "42883"
+      || /Could not find the function|does not exist/i.test(error.message || ""))) {
+    return { data: [], error: null };
+  }
   return { data: error ? null : (data ?? []), error: friendlyError(error) };
 }
