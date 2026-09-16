@@ -22636,6 +22636,24 @@ function MemberLifecyclePanel({ operator, tenantId, tenantName, members, orgs = 
   const box = { border: "1px solid #E5E7EB", borderRadius: 10, background: "#fff" };
   const btn = (bg, fg) => ({ padding: "6px 10px", borderRadius: 8, border: `1px solid ${bg}`, background: bg + "15", color: fg, fontSize: 12, fontWeight: 700, cursor: "pointer" });
 
+  // Company history contract: history belongs to the organization where it was earned. Moving a learner into a
+  // DIFFERENT organization (transfer, or Ralli-admin reactivation into a selected org) does NOT carry prior
+  // quiz, learning, Ralli Live, XP, or readiness history — the learner starts fresh there. This warning is
+  // shown for those cross-org actions. It never claims data was deleted/transferred, and never names the org
+  // that holds the history. (Same-org reinvite from a tenant's Deactivated list keeps history and is exempt.)
+  const historyWarning = (
+    <div data-testid="cross-org-history-warning"
+      style={{ background: "#FEF3C7", border: "1px solid #FCD34D", borderRadius: 8, padding: "10px 12px", marginBottom: 12 }}>
+      <div style={{ fontSize: 13, fontWeight: 800, color: "#92400E", marginBottom: 4 }}>
+        This learner’s history will not move with them.
+      </div>
+      <div style={{ fontSize: 12, color: "#92400E" }}>
+        Quiz attempts, learning progress, Ralli Live results, XP, and readiness history remain with the
+        organization where they were earned. The learner will start fresh in the new organization.
+      </div>
+    </div>
+  );
+
   const refresh = () => { if (onChanged) onChanged(); };
 
   async function doChangeRole(m, role) {
@@ -22725,7 +22743,7 @@ function MemberLifecyclePanel({ operator, tenantId, tenantName, members, orgs = 
             </select>
             {ralli && !locked && (
               <button style={btn("#2563EB", "#2563EB")} disabled={!!busy}
-                onClick={() => setConfirm({ kind: "transfer", member: m, destId: "", role: "user" })}>Transfer…</button>
+                onClick={() => setConfirm({ kind: "transfer", member: m, destId: "", role: "user", ack: false })}>Transfer…</button>
             )}
             {!locked && (
               <button style={btn("#DC2626", "#DC2626")} disabled={busy === `removeOrg:${m.id}`}
@@ -22743,9 +22761,8 @@ function MemberLifecyclePanel({ operator, tenantId, tenantName, members, orgs = 
             <div style={{ fontSize: 13, fontWeight: 800 }}>Deactivated users <span style={{ fontWeight: 500, color: "#9CA3AF" }}>— removed from {tenantName || "this organization"}</span></div>
             <button style={btn("#111827", "#111827")} onClick={loadDeactivated}>Refresh</button>
           </div>
-          <div style={{ fontSize: 11, color: "#9CA3AF", marginTop: 2 }}>
-            Reinvite sends a fresh invitation to their existing email; accepting it returns them to this
-            organization with their history intact.
+          <div data-testid="same-org-history-restore-note" style={{ fontSize: 11, color: "#9CA3AF", marginTop: 2 }}>
+            Reinviting this learner to the same organization restores access to their preserved history.
           </div>
           {deactivated === null && <div style={{ fontSize: 12, color: "#9CA3AF", marginTop: 8 }}>Loading…</div>}
           {deactivated !== null && deactivated.length === 0 && <div style={{ fontSize: 12, color: "#9CA3AF", marginTop: 8 }}>No deactivated users.</div>}
@@ -22780,7 +22797,7 @@ function MemberLifecyclePanel({ operator, tenantId, tenantName, members, orgs = 
                 <div style={{ fontSize: 11, color: "#9CA3AF" }}>{d.email}</div>
               </div>
               <button style={btn("#16A34A", "#16A34A")} disabled={!!busy}
-                onClick={() => setReactivate({ member: d, destId: "", role: "user" })}>Reactivate…</button>
+                onClick={() => setReactivate({ member: d, destId: "", role: "user", ack: false })}>Reactivate…</button>
             </div>
           ))}
         </div>
@@ -22825,9 +22842,16 @@ function MemberLifecyclePanel({ operator, tenantId, tenantName, members, orgs = 
                 {["user", "manager", "orgAdmin"].map(r => <option key={r} value={r}>{roleLabel[r]}</option>)}
               </select>
             </div>
+            {historyWarning}
+            {/* Explicit confirmation is required only once a destination org (and role) are chosen. */}
+            <label style={{ display: "flex", alignItems: "flex-start", gap: 8, fontSize: 12, color: "#374151", marginBottom: 16, cursor: confirm.destId ? "pointer" : "not-allowed", opacity: confirm.destId ? 1 : 0.5 }}>
+              <input type="checkbox" checked={!!confirm.ack} disabled={!confirm.destId}
+                onChange={e => setConfirm(c => ({ ...c, ack: e.target.checked }))} />
+              <span>I understand this learner will start fresh in the new organization and their history stays with the organization where it was earned.</span>
+            </label>
             <div style={{ display: "flex", gap: 8, justifyContent: "flex-end" }}>
               <button style={btn("#6B7280", "#6B7280")} onClick={() => setConfirm(null)}>Cancel</button>
-              <button style={btn("#2563EB", "#2563EB")} disabled={!confirm.destId || !!busy} onClick={() => doTransfer(confirm.member, confirm.destId, confirm.role)}>Transfer</button>
+              <button style={btn("#2563EB", "#2563EB")} disabled={!confirm.destId || !confirm.ack || !!busy} onClick={() => doTransfer(confirm.member, confirm.destId, confirm.role)}>Transfer</button>
             </div>
           </div>
         </div>
@@ -22839,8 +22863,7 @@ function MemberLifecyclePanel({ operator, tenantId, tenantName, members, orgs = 
           <div style={{ ...box, padding: 20, maxWidth: 440 }} onClick={e => e.stopPropagation()}>
             <div style={{ fontSize: 16, fontWeight: 800, marginBottom: 8 }}>Reactivate user</div>
             <div style={{ fontSize: 13, color: "#374151", marginBottom: 12 }}>
-              Attach <b>{reactivate.member.name || reactivate.member.email}</b> to an organization with a role. Their
-              readiness is recomputed from their preserved evidence.
+              Attach <b>{reactivate.member.name || reactivate.member.email}</b> to an organization with a role.
             </div>
             <div style={{ display: "flex", gap: 8, marginBottom: 16 }}>
               <select value={reactivate.destId} onChange={e => setReactivate(r => ({ ...r, destId: e.target.value }))}
@@ -22853,9 +22876,16 @@ function MemberLifecyclePanel({ operator, tenantId, tenantName, members, orgs = 
                 {["user", "manager", "orgAdmin"].map(r => <option key={r} value={r}>{roleLabel[r]}</option>)}
               </select>
             </div>
+            {historyWarning}
+            {/* Explicit confirmation is required only once a destination org (and role) are chosen. */}
+            <label style={{ display: "flex", alignItems: "flex-start", gap: 8, fontSize: 12, color: "#374151", marginBottom: 16, cursor: reactivate.destId ? "pointer" : "not-allowed", opacity: reactivate.destId ? 1 : 0.5 }}>
+              <input type="checkbox" checked={!!reactivate.ack} disabled={!reactivate.destId}
+                onChange={e => setReactivate(r => ({ ...r, ack: e.target.checked }))} />
+              <span>I understand this learner will start fresh in the selected organization and their history stays with the organization where it was earned.</span>
+            </label>
             <div style={{ display: "flex", gap: 8, justifyContent: "flex-end" }}>
               <button style={btn("#6B7280", "#6B7280")} onClick={() => setReactivate(null)}>Cancel</button>
-              <button style={btn("#16A34A", "#16A34A")} disabled={!reactivate.destId || !!busy} onClick={doReactivate}>Reactivate</button>
+              <button style={btn("#16A34A", "#16A34A")} disabled={!reactivate.destId || !reactivate.ack || !!busy} onClick={doReactivate}>Reactivate</button>
             </div>
           </div>
         </div>
