@@ -25733,6 +25733,7 @@ export default function App() {
   const assignSkipPanel = useAssignmentSkipPanel(); // Sprint 2 Task 6 — "View details" on skipped users
   const [currentUser,      setCurrentUser]      = useState(null);
   const [blockedAccount,   setBlockedAccount]   = useState(false);  // deactivated account signed in → show blocked screen, no app content
+  const statusRecheckSeq = useRef(0);                                // guards against stale in-flight status rechecks (see below)
   const [lastSeenAt,       setLastSeenAt]       = useState(null);   // ISO string from profiles.last_seen_assignments_at
   const [newAssignmentCount, setNewAssignmentCount] = useState(0);  // drives "Learn" nav badge
   // Password-recovery mode — true when the user opened a Supabase recovery link.
@@ -26234,6 +26235,44 @@ export default function App() {
 
     return () => subscription.unsubscribe();
   }, []); // eslint-disable-line react-hooks/exhaustive-deps
+
+  // ── Already-open-tab deactivation recheck (focus / visibility) ──────────────────────────────────────
+  // Closes the gap where a user deactivated WHILE their tab was open would keep seeing previously-loaded
+  // org data until a manual refresh. When a signed-in REAL user's tab regains focus or becomes visible,
+  // re-verify their own account status; if they were deactivated, immediately replace the app with the
+  // BlockedAccountScreen (the `blockedAccount` render takes precedence over all app content).
+  //
+  // Safety properties:
+  //   • Fail-SAFE (opposite of login): a slow/failed/inconclusive recheck NEVER deactivates an active user
+  //     — we only flip to blocked on a definitive fetched status that is non-active.
+  //   • No stale restore: this effect ONLY ever SETS blockedAccount (never clears it and never re-seats the
+  //     app), so an old in-flight response can't restore the app after a deactivation result. A monotonic
+  //     sequence guard additionally drops superseded responses.
+  //   • Server-side denial is already immediate (RLS/SECDEF read live profile state); this only closes the
+  //     client-side stale-screen window. No polling — focus/visibility events suffice for the reported case.
+  //   • Scope preserved: only runs for real signed-in users; new-user/invite/tenant-less/Ralli-admin flows
+  //     are unaffected (an active profile is a no-op).
+  useEffect(() => {
+    if (!currentUser?._isReal || !currentUser?.id) return;
+    const uid = currentUser.id;
+    const recheck = async () => {
+      if (typeof document !== "undefined" && document.visibilityState === "hidden") return; // only when visible
+      const seq = ++statusRecheckSeq.current;
+      let profile;
+      try { profile = await getProfile(uid); }
+      catch { return; }                                   // fail-safe: transient error → keep the active user in
+      if (seq !== statusRecheckSeq.current) return;        // superseded by a newer recheck → ignore
+      if (!profile) return;                                // inconclusive (no row) → do not deactivate
+      if (evaluateAccountAccess(profile).blocked) setBlockedAccount(true); // definitive: block now (never restore)
+    };
+    const onVisibility = () => { if (document.visibilityState === "visible") recheck(); };
+    window.addEventListener("focus", recheck);
+    document.addEventListener("visibilitychange", onVisibility);
+    return () => {
+      window.removeEventListener("focus", recheck);
+      document.removeEventListener("visibilitychange", onVisibility);
+    };
+  }, [currentUser?._isReal, currentUser?.id]); // eslint-disable-line react-hooks/exhaustive-deps
 
   // ── Load Supabase content for real users on login ──────────────────────────
   // Fires when a real (Supabase-authenticated) user logs in.

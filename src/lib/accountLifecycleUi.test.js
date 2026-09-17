@@ -108,6 +108,32 @@ test("name field stays editable and accept updates the SAME profile; blank/uncha
     "name input is editable");
 });
 
+// ── Issue 1b: already-open-tab deactivation recheck (focus / visibility) ────────
+test("a focus/visibility recheck re-verifies status and blocks a deactivated open tab", () => {
+  const eff = region("Already-open-tab deactivation recheck", "[currentUser?._isReal, currentUser?.id]");
+  // Runs only for real signed-in users (invite/tenant-less/new-user flows unaffected).
+  assert.match(eff, /if \(!currentUser\?\._isReal \|\| !currentUser\?\.id\) return;/, "guarded to real signed-in users");
+  // Wires BOTH focus and visibilitychange (no polling).
+  assert.match(eff, /addEventListener\("focus", recheck\)/, "listens on window focus");
+  assert.match(eff, /addEventListener\("visibilitychange", onVisibility\)/, "listens on visibilitychange");
+  assert.ok(!/setInterval|setTimeout\([^)]*recheck/.test(eff), "no polling timer");
+  // Re-reads own status and blocks on a definitive non-active result.
+  assert.match(eff, /getProfile\(uid\)/, "re-reads the user's own profile");
+  assert.match(eff, /if \(evaluateAccountAccess\(profile\)\.blocked\) setBlockedAccount\(true\)/, "blocks when deactivated");
+});
+
+test("recheck is fail-safe and cannot restore the app from a stale response", () => {
+  const eff = region("Already-open-tab deactivation recheck", "[currentUser?._isReal, currentUser?.id]");
+  assert.match(eff, /catch \{ return; \}/, "transient error → keep active user in (fail-safe)");
+  assert.match(eff, /if \(!profile\) return;/, "inconclusive (no row) → do not deactivate");
+  assert.match(eff, /seq !== statusRecheckSeq\.current.*return|if \(seq !== statusRecheckSeq\.current\) return/s, "drops superseded responses");
+  // The recheck must never re-seat the app or clear the block (no restore path).
+  assert.ok(!/setCurrentUser\(/.test(eff), "recheck never re-seats currentUser");
+  assert.ok(!/setBlockedAccount\(false\)/.test(eff), "recheck never clears the block");
+  // Only visible tabs trigger a fetch.
+  assert.match(eff, /visibilityState === "hidden"\) return|visibilityState === "visible"/s, "only rechecks when visible");
+});
+
 // ── Guardrails: no new client profile writes / RLS broadening introduced ───────
 test("the fix introduces no new client profiles insert/upsert and no tenant broadening", () => {
   // No client-side profiles insert/upsert anywhere in the app shell (single-line or chained).
