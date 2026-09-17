@@ -118,6 +118,7 @@ import {
   reviewRows,
 } from "./src/lib/quizLearnerFlow.js";
 import { getProfile, createMissingProfile, getTenantProfiles } from "./src/lib/profileService.js";
+import { evaluateAccountAccess, DEACTIVATED_MESSAGE } from "./src/lib/accessPolicy.js";
 import { sendInviteEmail } from "./src/lib/emailService.js";
 import { provisionTenant, buildInviteUrl, normalizeProvisionedOrg, createMemberInvite } from "./src/lib/provisioningService.js";
 import { removeFromOrg, changeRole, transferMember, reactivateMember, listDetachedUsers, listDeactivatedMembers, reinvitePrefill, assignableRoles, canTransfer, canActOnMember, isRalliLevel } from "./src/lib/lifecycleService.js";
@@ -23743,6 +23744,12 @@ function InviteScreen({ token, onSuccess }) {
                     onChange={e => setName(e.target.value)}
                     style={inputStyle} autoFocus
                   />
+                  {/* Same-org reinvite reconnects the SAME account/profile (accept_invitation runs on the
+                      existing user id); leaving this blank preserves the existing profile name and history.
+                      A typed name updates that same profile — it never creates a duplicate. */}
+                  <div data-testid="reinvite-name-help" style={{ fontSize: 11, color: C.textSub, marginTop: 6 }}>
+                    Already have an account? Leave this blank to keep your current name, or edit it to update your profile.
+                  </div>
                 </div>
 
                 <div>
@@ -23912,6 +23919,28 @@ function ResetPasswordScreen({ onSuccess }) {
   );
 }
 
+// ── BLOCKED ACCOUNT SCREEN ──────────────────────────────────
+// Shown when a deactivated (removed) account authenticates. It renders NO app content (no Home/Settings)
+// — only the deactivation message and a Sign out action. Reached via the fail-closed access gate.
+function BlockedAccountScreen({ onSignOut }) {
+  return (
+    <div style={{ minHeight: "100vh", display: "flex", alignItems: "center", justifyContent: "center", background: "#FFF7ED", padding: 24 }}>
+      <div data-testid="blocked-account-screen" role="alert"
+        style={{ maxWidth: 440, width: "100%", background: "#fff", border: "1px solid #E5E7EB", borderRadius: 16, padding: 28, textAlign: "center", boxShadow: "0 8px 30px rgba(0,0,0,.06)" }}>
+        <div style={{ fontSize: 34, marginBottom: 10 }}>🔒</div>
+        <div style={{ fontSize: 18, fontWeight: 800, color: "#111827", marginBottom: 8 }}>Account deactivated</div>
+        <div style={{ fontSize: 14, color: "#374151", lineHeight: 1.5, marginBottom: 20 }}>
+          {DEACTIVATED_MESSAGE}
+        </div>
+        <button onClick={onSignOut}
+          style={{ padding: "10px 18px", borderRadius: 10, border: "none", background: "#F59E0B", color: "#fff", fontSize: 14, fontWeight: 700, cursor: "pointer" }}>
+          Back to sign in
+        </button>
+      </div>
+    </div>
+  );
+}
+
 // ── LOGIN SCREEN ────────────────────────────────────────────
 
 // Maps raw Supabase auth error messages to customer-safe strings.
@@ -23934,7 +23963,7 @@ function mapAuthError(message) {
   return "Sign in failed. Please try again.";
 }
 
-function LoginScreen({ onLogin, users = USERS }) {
+function LoginScreen({ onLogin, onBlocked, users = USERS }) {
   const [email, setEmail] = useState("");
   const [password, setPassword] = useState("");
   const [error, setError] = useState("");
@@ -23974,6 +24003,15 @@ function LoginScreen({ onLogin, users = USERS }) {
     });
 
     if (data?.user) {
+      // Fail-closed access gate: a deactivated (removed) account keeps a profile row (status!='active',
+      // tenant_id=NULL) — it must NOT enter the app. Route to the blocked screen instead of onLogin.
+      // Never recreate/reactivate: for a removed user getProfile returns the existing row, so
+      // createMissingProfile is not reached; even if it were, ensure_self_profile is ON CONFLICT DO NOTHING.
+      const enter = (profile) => {
+        const access = evaluateAccountAccess(profile);
+        if (access.blocked) { if (onBlocked) onBlocked(); return; }  // App shows BlockedAccountScreen
+        onLogin(profile);
+      };
       // Auth succeeded — fetch profile
       let profile = await getProfile(data.user.id);
       if (!profile) {
@@ -23981,11 +24019,11 @@ function LoginScreen({ onLogin, users = USERS }) {
         await new Promise(r => setTimeout(r, 800));
         profile = await getProfile(data.user.id);
       }
-      if (profile) { onLogin(profile); return; }
-      // Auth worked but no profile row — trigger didn't fire, create it now
+      if (profile) { enter(profile); return; }
+      // Auth worked but no profile row — trigger didn't fire, create it now (new signup, active)
       try {
         const created = await createMissingProfile(data.user);
-        if (created) { onLogin(created); return; }
+        if (created) { enter(created); return; }
       } catch {
         setError("We couldn't load your account. Please contact support if this continues.");
         setLoading(false);
@@ -25645,6 +25683,7 @@ export default function App() {
   const toast  = useToast();
   const assignSkipPanel = useAssignmentSkipPanel(); // Sprint 2 Task 6 — "View details" on skipped users
   const [currentUser,      setCurrentUser]      = useState(null);
+  const [blockedAccount,   setBlockedAccount]   = useState(false);  // deactivated account signed in → show blocked screen, no app content
   const [lastSeenAt,       setLastSeenAt]       = useState(null);   // ISO string from profiles.last_seen_assignments_at
   const [newAssignmentCount, setNewAssignmentCount] = useState(0);  // drives "Learn" nav badge
   // Password-recovery mode — true when the user opened a Supabase recovery link.
@@ -25970,6 +26009,13 @@ export default function App() {
       if (session?.user && !currentUser) {
         let profile = await getProfile(session.user.id);
         if (!profile) profile = await createMissingProfile(session.user);
+        // Fail-closed access gate on refresh / session restore: a deactivated (removed) account has a
+        // profile row with status!='active'. Do NOT enter the app — show the blocked screen. We keep the
+        // Supabase session (the blocked screen offers Sign out); we never recreate/reactivate the profile.
+        if (profile && evaluateAccountAccess(profile).blocked) {
+          setBlockedAccount(true);
+          return;
+        }
         if (profile) {
           // Load real XP, level, xpNext, streak from user_point_events (canonical source)
           if (profile.orgId) {
@@ -26398,8 +26444,21 @@ export default function App() {
     );
   }
 
+  // Fail-closed: a deactivated account that authenticated must never see app content. This takes
+  // precedence over the login/app render. The screen offers Sign out (hard-redirects to /login).
+  if (blockedAccount) {
+    return <BlockedAccountScreen onSignOut={async () => {
+      setBlockedAccount(false);
+      try { await supabase.auth.signOut(); } catch {}
+      // SIGNED_OUT handler hard-navigates to /login; fall back in case it doesn't fire.
+      try { window.location.replace("/login"); } catch {}
+    }} />;
+  }
+
   if (!currentUser) {
     const handleLogin = (u) => {
+      // Defense-in-depth: never seat a non-active account even if a caller reaches here.
+      if (evaluateAccountAccess(u).blocked) { setBlockedAccount(true); return; }
       setCurrentUser(u);
       if (isRalliAdmin(u.role)) {
         setScreen("organizations");
@@ -26429,7 +26488,7 @@ export default function App() {
         handleLogin(u);
       }} />;
     }
-    return <LoginScreen onLogin={handleLogin} users={orgUsers} />;
+    return <LoginScreen onLogin={handleLogin} onBlocked={() => setBlockedAccount(true)} users={orgUsers} />;
   }
 
   const handleInviteOrg = async (org) => {
