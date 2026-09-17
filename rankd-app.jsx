@@ -23549,6 +23549,12 @@ function InviteScreen({ token, onSuccess }) {
   const [name,     setName]     = useState("");
   const [password, setPassword] = useState("");
   const [confirm,  setConfirm]  = useState("");
+  // Two-phase accept: 'auth' (set/confirm password) → 'confirm' (review name, then accept). The split gives
+  // us a moment AFTER the invitee authenticates as themselves to read THEIR OWN preserved profile name and
+  // pre-fill the (editable) name field — safely, never via the unauthenticated invite link.
+  const [phase,          setPhase]          = useState("auth");
+  const [authedUserId,   setAuthedUserId]   = useState(null);
+  const [prefilledName,  setPrefilledName]  = useState(false);  // true when the field was pre-filled from an existing profile
 
   // Fetch invitation on mount
   useEffect(() => {
@@ -23561,24 +23567,26 @@ function InviteScreen({ token, onSuccess }) {
     });
   }, [token]);
 
-  const handleSubmit = async (e) => {
+  // Phase 1 — AUTHENTICATE: create the account, or sign in an existing one. On success, read the invitee's
+  // OWN profile (RLS restricts SELECT to id = auth.uid(), so this only ever returns their own row — the name
+  // is never exposed through the unauthenticated invite link) and pre-fill the editable name for phase 2.
+  const handleContinue = async (e) => {
     e.preventDefault();
     if (password !== confirm) { setErrMsg("Passwords don't match."); return; }
     if (password.length < 8)  { setErrMsg("Password must be at least 8 characters."); return; }
     setErrMsg("");
     setStatus("submitting");
 
-    // 1. Create Supabase Auth account (or sign in if email already exists)
     let authData;
     const { data: signUpData, error: signUpErr } = await supabase.auth.signUp({
       email:   inv.adminEmail,
       password,
-      options: { data: { name: name.trim() || inv.adminEmail.split("@")[0] } },
+      options: { data: { name: inv.adminEmail.split("@")[0] } },  // placeholder; the real name is set at accept
     });
 
     if (signUpErr) {
-      // "User already registered" happens when a tenant was deleted but the auth.users
-      // record persists. Allow re-assignment by signing in with existing credentials.
+      // "User already registered" → this is an EXISTING account (e.g. a removed learner being reinvited).
+      // Sign in with their existing password; accept_invitation later runs on this SAME user id (no duplicate).
       const isExisting = signUpErr.status === 422 ||
         signUpErr.message.toLowerCase().includes("already") ||
         signUpErr.message.toLowerCase().includes("registered");
@@ -23602,24 +23610,39 @@ function InviteScreen({ token, onSuccess }) {
       authData = signUpData;
     }
 
-    // 2. Wait for profile trigger (or accept_invitation will upsert it)
-    await new Promise(r => setTimeout(r, 600));
+    setAuthedUserId(authData.user.id);
 
-    // 3. Accept invitation — assigns tenant + role, marks accepted, advances tenant status
+    // POST-AUTH prefill: read the invitee's own preserved profile name, if any. Safe (own row only, RLS).
+    try {
+      const existing = await getProfile(authData.user.id);
+      if (existing?.name && !name.trim()) {
+        setName(existing.name);
+        setPrefilledName(true);
+      }
+    } catch { /* no existing profile (brand-new signup) — name stays as typed/empty */ }
+
+    setStatus("ready");
+    setPhase("confirm");
+  };
+
+  // Phase 2 — ACCEPT: assign tenant + role on the SAME profile. Blank/unchanged name preserves the existing
+  // profile name (accept_invitation keeps it when p_name is null); an edited name updates that same profile.
+  const handleAccept = async (e) => {
+    e.preventDefault();
+    setErrMsg("");
+    setStatus("submitting");
+
     const { error: acceptErr } = await supabase.rpc("accept_invitation", {
       p_token: token,
       p_name:  name.trim() || null,
     });
-
     if (acceptErr) {
       setErrMsg(`Setup failed: ${acceptErr.message}`);
       setStatus("ready");
       return;
     }
 
-    // 4. Fetch full profile and log in
-    const { getProfile } = await import("./src/lib/profileService.js");
-    const profile = await getProfile(authData.user.id);
+    const profile = await getProfile(authedUserId);
     if (!profile) {
       setErrMsg("Account created but profile could not be loaded. Try logging in.");
       setStatus("ready");
@@ -23727,68 +23750,94 @@ function InviteScreen({ token, onSuccess }) {
                 </p>
               </div>
 
-              <form onSubmit={handleSubmit} style={{ display: "flex", flexDirection: "column", gap: 14 }}>
-                {/* Email — read-only, from invitation */}
-                <div>
-                  <label style={labelStyle}>EMAIL</label>
-                  <input
-                    type="email" value={inv.adminEmail} readOnly
-                    style={{ ...inputStyle, background: C.pageBg, color: C.textSub, cursor: "default" }}
-                  />
-                </div>
-
-                <div>
-                  <label style={labelStyle}>YOUR NAME</label>
-                  <input
-                    type="text" value={name} placeholder="First Last"
-                    onChange={e => setName(e.target.value)}
-                    style={inputStyle} autoFocus
-                  />
-                  {/* Same-org reinvite reconnects the SAME account/profile (accept_invitation runs on the
-                      existing user id); leaving this blank preserves the existing profile name and history.
-                      A typed name updates that same profile — it never creates a duplicate. */}
-                  <div data-testid="reinvite-name-help" style={{ fontSize: 11, color: C.textSub, marginTop: 6 }}>
-                    Already have an account? Leave this blank to keep your current name, or edit it to update your profile.
+              {phase === "auth" ? (
+                <form onSubmit={handleContinue} style={{ display: "flex", flexDirection: "column", gap: 14 }}>
+                  {/* Email — read-only, from invitation */}
+                  <div>
+                    <label style={labelStyle}>EMAIL</label>
+                    <input
+                      type="email" value={inv.adminEmail} readOnly
+                      style={{ ...inputStyle, background: C.pageBg, color: C.textSub, cursor: "default" }}
+                    />
                   </div>
-                </div>
 
-                <div>
-                  <label style={labelStyle}>PASSWORD</label>
-                  <input
-                    type="password" value={password} placeholder="At least 8 characters"
-                    onChange={e => setPassword(e.target.value)} required minLength={8}
-                    style={inputStyle}
-                  />
-                </div>
-
-                <div>
-                  <label style={labelStyle}>CONFIRM PASSWORD</label>
-                  <input
-                    type="password" value={confirm} placeholder="Repeat password"
-                    onChange={e => setConfirm(e.target.value)} required
-                    style={inputStyle}
-                  />
-                </div>
-
-                {errMsg && (
-                  <div style={{ fontSize: 13, color: "#ef4444", fontWeight: 500, padding: "8px 12px", background: "#fef2f2", borderRadius: 8 }}>
-                    {errMsg}
+                  <div>
+                    <label style={labelStyle}>PASSWORD</label>
+                    <input
+                      type="password" value={password} placeholder="At least 8 characters"
+                      onChange={e => setPassword(e.target.value)} required minLength={8}
+                      style={inputStyle} autoFocus
+                    />
+                    <div style={{ fontSize: 11, color: C.textSub, marginTop: 6 }}>
+                      Already have an account? Enter your existing password to reconnect it — you keep your name and history.
+                    </div>
                   </div>
-                )}
 
-                <button
-                  type="submit"
-                  disabled={status === "submitting"}
-                  style={{
-                    marginTop: 4, padding: "13px", borderRadius: 8, border: "none",
-                    cursor: status === "submitting" ? "not-allowed" : "pointer",
-                    background: status === "submitting" ? C.textMuted : C.orange,
-                    color: "#fff", fontSize: 14, fontWeight: 700, transition: "background 0.15s",
-                  }}
-                >
-                  {status === "submitting" ? "Creating account..." : "Create Account →"}
-                </button>
-              </form>
+                  <div>
+                    <label style={labelStyle}>CONFIRM PASSWORD</label>
+                    <input
+                      type="password" value={confirm} placeholder="Repeat password"
+                      onChange={e => setConfirm(e.target.value)} required
+                      style={inputStyle}
+                    />
+                  </div>
+
+                  {errMsg && (
+                    <div style={{ fontSize: 13, color: "#ef4444", fontWeight: 500, padding: "8px 12px", background: "#fef2f2", borderRadius: 8 }}>
+                      {errMsg}
+                    </div>
+                  )}
+
+                  <button type="submit" disabled={status === "submitting"}
+                    style={{ marginTop: 4, padding: "13px", borderRadius: 8, border: "none",
+                      cursor: status === "submitting" ? "not-allowed" : "pointer",
+                      background: status === "submitting" ? C.textMuted : C.orange,
+                      color: "#fff", fontSize: 14, fontWeight: 700, transition: "background 0.15s" }}>
+                    {status === "submitting" ? "Signing in…" : "Continue →"}
+                  </button>
+                </form>
+              ) : (
+                <form onSubmit={handleAccept} style={{ display: "flex", flexDirection: "column", gap: 14 }}>
+                  <div>
+                    <label style={labelStyle}>EMAIL</label>
+                    <input
+                      type="email" value={inv.adminEmail} readOnly
+                      style={{ ...inputStyle, background: C.pageBg, color: C.textSub, cursor: "default" }}
+                    />
+                  </div>
+
+                  <div>
+                    <label style={labelStyle}>YOUR NAME</label>
+                    <input
+                      type="text" value={name} placeholder="First Last"
+                      onChange={e => setName(e.target.value)}
+                      style={inputStyle} autoFocus
+                    />
+                    {/* For an EXISTING account this field is pre-filled with the invitee's own preserved
+                        profile name (read post-auth, RLS own-row). Editable: a change updates that SAME
+                        profile on accept; leaving it unchanged/blank keeps the existing name. Never a duplicate. */}
+                    <div data-testid="reinvite-name-help" style={{ fontSize: 11, color: C.textSub, marginTop: 6 }}>
+                      {prefilledName
+                        ? "This is your current name — edit it to update your profile, or keep it as is."
+                        : "This will be your display name."}
+                    </div>
+                  </div>
+
+                  {errMsg && (
+                    <div style={{ fontSize: 13, color: "#ef4444", fontWeight: 500, padding: "8px 12px", background: "#fef2f2", borderRadius: 8 }}>
+                      {errMsg}
+                    </div>
+                  )}
+
+                  <button type="submit" disabled={status === "submitting"}
+                    style={{ marginTop: 4, padding: "13px", borderRadius: 8, border: "none",
+                      cursor: status === "submitting" ? "not-allowed" : "pointer",
+                      background: status === "submitting" ? C.textMuted : C.orange,
+                      color: "#fff", fontSize: 14, fontWeight: 700, transition: "background 0.15s" }}>
+                    {status === "submitting" ? "Joining…" : "Accept invitation →"}
+                  </button>
+                </form>
+              )}
 
               <p style={{ textAlign: "center", marginTop: 16, fontSize: 12, color: C.textSub }}>
                 Already have an account?{" "}

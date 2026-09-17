@@ -78,16 +78,34 @@ test("does not recreate/reactivate a profile on the blocked path (createMissingP
   // ensure_self_profile stays ON CONFLICT DO NOTHING (server-side), so it can't reactivate.
 });
 
-// ── Issue 2: same-org reinvite reconnection + name preservation (no duplicate) ──
-test("InviteScreen reconnects the existing account (sign-in) instead of creating a duplicate", () => {
-  const inv = region("const handleSubmit = async (e) => {", "// 3. Accept invitation");
-  assert.match(inv, /signInWithPassword\(\{/, "existing-account path signs in (no duplicate identity)");
-  assert.match(inv, /already.*registered|isExisting/is, "detects an existing account");
+// ── Issue 2: same-org reinvite reconnection + POST-AUTH name prefill (no duplicate) ──
+test("InviteScreen authenticates first (existing account signs in — no duplicate identity)", () => {
+  const cont = region("const handleContinue = async (e) => {", "setPhase(\"confirm\");");
+  assert.match(cont, /signUp\(\{/, "attempts signUp for brand-new accounts");
+  assert.match(cont, /signInWithPassword\(\{/, "existing-account path signs in (reconnects same identity)");
+  assert.match(cont, /already.*registered|isExisting/is, "detects an existing account");
 });
 
-test("accept_invitation preserves the existing profile name when the field is left blank", () => {
-  assert.match(src, /p_name:\s*name\.trim\(\) \|\| null/, "blank name → null → accept keeps existing name");
-  assert.match(src, /data-testid="reinvite-name-help"/, "name field has clarifying helper text");
+test("post-auth prefill: after sign-in, reads the invitee's OWN profile and pre-fills the editable name", () => {
+  const cont = region("const handleContinue = async (e) => {", "setPhase(\"confirm\");");
+  // The name read happens AFTER auth (inside handleContinue, after authData is set) — never via the invite link.
+  assert.match(cont, /getProfile\(authData\.user\.id\)/, "reads the invitee's own profile post-auth");
+  assert.match(cont, /if \(existing\?\.name && !name\.trim\(\)\) \{\s*setName\(existing\.name\)/,
+    "pre-fills the name field from the preserved profile when empty");
+  assert.match(cont, /setPrefilledName\(true\)/, "marks the field as pre-filled");
+  // The unauthenticated invite lookup must NOT return a profile name (no leak via the link).
+  const invLoad = region('supabase.rpc("get_invitation_by_token"', "setStatus(\"ready\");");
+  assert.ok(!/\bname\b/.test(invLoad) || !/setName/.test(invLoad), "invite-token load does not set a name from the link");
+});
+
+test("name field stays editable and accept updates the SAME profile; blank/unchanged preserves it", () => {
+  const accept = region("const handleAccept = async (e) => {", "setStatus(\"done\");");
+  assert.match(accept, /accept_invitation/, "accept routes through accept_invitation (same user id)");
+  assert.match(accept, /p_name:\s*name\.trim\(\) \|\| null/, "blank/unchanged → null → keeps existing name; edit → updates same profile");
+  assert.match(src, /data-testid="reinvite-name-help"/, "name field is present with helper text in the confirm phase");
+  // The name field is a plain editable input bound to setName (not readOnly/disabled).
+  assert.match(src, /value=\{name\} placeholder="First Last"\s*\n\s*onChange=\{e => setName\(e\.target\.value\)\}/,
+    "name input is editable");
 });
 
 // ── Guardrails: no new client profile writes / RLS broadening introduced ───────
