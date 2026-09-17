@@ -120,6 +120,7 @@ import {
 import { getProfile, createMissingProfile, getTenantProfiles } from "./src/lib/profileService.js";
 import { sendInviteEmail } from "./src/lib/emailService.js";
 import { provisionTenant, buildInviteUrl, normalizeProvisionedOrg, createMemberInvite } from "./src/lib/provisioningService.js";
+import { removeFromOrg, changeRole, transferMember, reactivateMember, listDetachedUsers, listDeactivatedMembers, reinvitePrefill, assignableRoles, canTransfer, canActOnMember, isRalliLevel } from "./src/lib/lifecycleService.js";
 import { awardLessonPoints, awardCoursePoints, awardGamePointsForSession, getLeaderboard, computeUserMeta, getUserStreak } from "./src/lib/scoringService.js";
 import { TIMEFRAMES, DEFAULT_TIMEFRAME, loadIndividuals, loadTeams, loadTeamMembers } from "./src/lib/ralliLeaderboardService.js";
 import { computeRecognitions, partitionIndividuals, partitionTeams, formatAccuracyPct } from "./src/lib/ralliLeaderboardView.js";
@@ -127,6 +128,8 @@ import { triggerReadinessUpdate, getTopicHeatmap, getOrgMetrics, getRepTopicScor
 import { cellScore as heatmapCellScore, coverageLine as heatmapCoverageLine, thresholdNote as heatmapThresholdNote, hasVerifiedEvidence as heatmapHasEvidence } from "./src/lib/heatmapModel.js";
 import { listTenantQuizTags, listQuizTagMap, listQuizClassification, getQuizTagState, createQuizTag, renameQuizTag, archiveQuizTag, restoreQuizTag, mergeQuizTags, setQuizTags } from "./src/lib/taxonomyService.js";
 import { activeMappedTagIds, classificationFromActiveCount, tagCapabilities, buildBuilderTagRows, quizTagModel, filterQuizzesByTag, tagUsageCounts, resolveTag, normalizeTagError, savePayloadId, hasActiveSelection, selectedActiveTagIds, tagRequirementError, governanceOutcome, quizSaveSuccessMessage, canBeginSave, runQuizSave } from "./src/lib/quizTagsUi.js";
+import { getTagCandidates as readinessGetTagCandidates, saveDraft as readinessSaveDraft, activateConfig as readinessActivateConfig, getQuizPrimaries as readinessGetQuizPrimaries, setQuizPrimary as readinessSetQuizPrimary } from "./src/lib/readinessAdminService.js";
+import { deriveSetupState as readinessDeriveSetupState, draftDesignationsFrom as readinessDraftDesignations, isDraftDirty as readinessDraftDirty, warningLabel as readinessWarningLabel, setupBanner as readinessSetupBanner, canAccessReadinessSettings } from "./src/lib/readinessConfig.js";
 
 // ── MOBILE HOOK ────────────────────────────────────────────
 function useMobile() {
@@ -21795,7 +21798,7 @@ function OrgSetupScreen({ user, onComplete }) {
 
 // ── ORG DETAIL SCREEN (ralli admin only) ─────────────────────────────────────
 // Full lifecycle: view, edit, manage members, manage invitations.
-function OrgDetailScreen({ org, orgUsers, onBack, onAddUser, onDeactivateOrg, onReactivateOrg, onDeleteOrg, onCancelOrg, onUpdateOrg, onUpdateMember, onRemoveMember, onCancelInvite, onResendMemberInvite }) {
+function OrgDetailScreen({ operator, orgs = [], org, orgUsers, onBack, onAddUser, onDeactivateOrg, onReactivateOrg, onDeleteOrg, onCancelOrg, onUpdateOrg, onUpdateMember, onRemoveMember, onCancelInvite, onResendMemberInvite }) {
   const mobile = useMobile();
   const [realMembers, setRealMembers]       = useState(null);   // profiles[]
   const [invitations, setInvitations]       = useState(null);   // all tenant_invitations[]
@@ -22315,6 +22318,23 @@ function OrgDetailScreen({ org, orgUsers, onBack, onAddUser, onDeactivateOrg, on
         </div>
       )}
 
+      {/* Organization-level member management (migration-091 lifecycle RPCs): role change, remove-from-org,
+          transfer between orgs (Ralli), and reactivate detached users (Ralli). */}
+      {operator && (
+        <MemberLifecyclePanel
+          operator={operator}
+          tenantId={localOrg.id}
+          tenantName={localOrg.name}
+          members={members}
+          orgs={orgs}
+          onReinvite={(prefill) => { setShowInviteForm(true); setNewInviteUrl(null); setInviteError(null); if (prefill) setInviteForm({ email: prefill.email, role: ["user", "manager", "orgAdmin"].includes(prefill.role) ? prefill.role : "user" }); }}
+          onChanged={async () => {
+            const { data } = await supabase.from("profiles").select("*").eq("tenant_id", localOrg.id);
+            setRealMembers(data ?? []);
+          }}
+        />
+      )}
+
       {/* Members */}
       <div style={{ background: C.white, borderRadius: 12, border: `1px solid ${C.border}`, overflow: "hidden" }}>
         <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", padding: "16px 20px", borderBottom: `1px solid ${C.border}` }}>
@@ -22595,7 +22615,286 @@ function OrgDetailScreen({ org, orgUsers, onBack, onAddUser, onDeactivateOrg, on
 }
 
 // ── TEAM SCREEN (org admin manages their users) ────────────
-function TeamScreen({ orgId, orgName, orgUsers, onAddUser, onMemberInvited }) {
+// ── Member lifecycle management (migration-091 RPCs) ─────────────────────────────────────────────────
+// Org-level member actions that were missing from the UI: change role, remove-from-ORGANIZATION (distinct
+// from remove-from-team), transfer between orgs (Ralli-admin only), and reactivate a detached/removed user
+// (Ralli-admin does it directly; orgAdmins bring people back by reinviting their email). The database
+// (readiness_lifecycle_authz) is the security authority; this panel only shows the actions the operator is
+// allowed to take and surfaces backend errors. Immediate refresh + factual toasts after every action.
+function MemberLifecyclePanel({ operator, tenantId, tenantName, members, orgs = [], onChanged, onReinvite }) {
+  const toast = useToast();
+  const [busy, setBusy]           = useState(null);   // `${action}:${userId}` while an RPC runs
+  const [confirm, setConfirm]     = useState(null);   // { kind, member, destId?, role? }
+  const [detached, setDetached]   = useState(null);   // ralli-only GLOBAL detached list (null = not loaded)
+  const [deactivated, setDeactivated] = useState(null); // tenant-scoped removed-from-THIS-org list (null = not loaded)
+  const [reactivate, setReactivate] = useState(null); // { member, destId, role } dialog
+
+  const ralli       = isRalliLevel(operator?.role);
+  const roleOptions = assignableRoles(operator?.role);
+  const roleLabel   = { user: "Rep", manager: "Manager", orgAdmin: "Org Admin", ralli_admin: "Ralli Admin", superadmin: "Super Admin" };
+  const activeMembers = (members ?? []).filter(m => (m.status ?? "active") === "active");
+  const box = { border: "1px solid #E5E7EB", borderRadius: 10, background: "#fff" };
+  const btn = (bg, fg) => ({ padding: "6px 10px", borderRadius: 8, border: `1px solid ${bg}`, background: bg + "15", color: fg, fontSize: 12, fontWeight: 700, cursor: "pointer" });
+
+  // Company history contract: history belongs to the organization where it was earned. Moving a learner into a
+  // DIFFERENT organization (transfer, or Ralli-admin reactivation into a selected org) does NOT carry prior
+  // quiz, learning, Ralli Live, XP, or readiness history — the learner starts fresh there. This warning is
+  // shown for those cross-org actions. It never claims data was deleted/transferred, and never names the org
+  // that holds the history. (Same-org reinvite from a tenant's Deactivated list keeps history and is exempt.)
+  const historyWarning = (
+    <div data-testid="cross-org-history-warning"
+      style={{ background: "#FEF3C7", border: "1px solid #FCD34D", borderRadius: 8, padding: "10px 12px", marginBottom: 12 }}>
+      <div style={{ fontSize: 13, fontWeight: 800, color: "#92400E", marginBottom: 4 }}>
+        This learner’s history will not move with them.
+      </div>
+      <div style={{ fontSize: 12, color: "#92400E" }}>
+        Quiz attempts, learning progress, Ralli Live results, XP, and readiness history remain with the
+        organization where they were earned. The learner will start fresh in the new organization.
+      </div>
+    </div>
+  );
+
+  const refresh = () => { if (onChanged) onChanged(); };
+
+  async function doChangeRole(m, role) {
+    if (!role || role === m.role) return;
+    setBusy(`role:${m.id}`);
+    const { error } = await changeRole(m.id, role);
+    setBusy(null);
+    if (error) { toast.error(error); return; }
+    toast.success(`${m.name || m.email} is now ${roleLabel[role] || role}.`);
+    refresh();
+  }
+  async function doRemoveOrg(m) {
+    setBusy(`removeOrg:${m.id}`);
+    const { error } = await removeFromOrg(m.id);
+    setBusy(null); setConfirm(null);
+    if (error) { toast.error(error); return; }
+    toast.success(`${m.name || m.email} was removed from ${tenantName || "the organization"}. Their history is kept — you can reinvite them.`);
+    refresh(); loadDeactivated();
+  }
+  async function doTransfer(m, destId, role) {
+    if (!destId) { toast.error("Choose a destination organization."); return; }
+    setBusy(`transfer:${m.id}`);
+    const { error } = await transferMember(m.id, destId, role);
+    setBusy(null); setConfirm(null);
+    if (error) { toast.error(error); return; }
+    toast.success(`${m.name || m.email} was transferred.`);
+    refresh();
+  }
+  async function loadDetached() {
+    const { data, error } = await listDetachedUsers();
+    if (error) { toast.error(error); setDetached([]); return; }
+    setDetached(data);
+  }
+  // Tenant-scoped: members previously REMOVED from THIS org (authorized RPC; never the global detached query).
+  async function loadDeactivated() {
+    if (!tenantId) { setDeactivated([]); return; }
+    const { data, error } = await listDeactivatedMembers(tenantId);
+    if (error) { toast.error(error); setDeactivated([]); return; }
+    setDeactivated(data);
+  }
+  // Load the deactivated list on mount / when the org changes, so managers see it without a manual click.
+  useEffect(() => { setDeactivated(null); if (tenantId) loadDeactivated(); }, [tenantId]); // eslint-disable-line
+  function doReinvite(member) {
+    if (onReinvite) onReinvite(reinvitePrefill(member, operator?.role));
+  }
+  async function doReactivate() {
+    const { member, destId, role } = reactivate;
+    if (!destId) { toast.error("Choose an organization."); return; }
+    setBusy(`reactivate:${member.id}`);
+    const { error } = await reactivateMember(member.id, destId, role);
+    setBusy(null); setReactivate(null);
+    if (error) { toast.error(error); return; }
+    toast.success(`${member.name || member.email} was reactivated.`);
+    loadDetached(); refresh(); loadDeactivated();
+  }
+
+  return (
+    <div style={{ ...box, padding: 16, marginBottom: 16 }}>
+      <div style={{ fontSize: 15, fontWeight: 800, marginBottom: 4 }}>People in {tenantName || "this organization"}</div>
+      <div style={{ fontSize: 12, color: "#6B7280", marginBottom: 12 }}>
+        Change a role or remove someone from the <b>whole organization</b>. Removing from the organization
+        deactivates their access and detaches them but <b>keeps their history</b> — you can reinvite them later.
+        This is different from removing someone from a single team.
+      </div>
+
+      {activeMembers.length === 0 && <div style={{ fontSize: 13, color: "#6B7280" }}>No active members.</div>}
+      {activeMembers.map(m => {
+        const self = !canActOnMember(operator, m);
+        // Never offer role-change / remove / transfer on the operator themselves or on an elevated
+        // (ralli_admin/superadmin) account — the lifecycle RPCs can't assign those roles, and the UI must
+        // not appear to demote or remove them. (In practice Ralli admins are tenant-detached and won't list.)
+        const locked = self || isRalliLevel(m.role);
+        return (
+          <div key={m.id} style={{ display: "flex", alignItems: "center", gap: 10, padding: "8px 0", borderTop: "1px solid #F3F4F6" }}>
+            <div style={{ flex: 1, minWidth: 0 }}>
+              <div style={{ fontWeight: 700, fontSize: 13 }}>{m.name || m.email}{self && <span style={{ color: "#9CA3AF", fontWeight: 500 }}> (you)</span>}</div>
+              <div style={{ fontSize: 11, color: "#9CA3AF", overflow: "hidden", textOverflow: "ellipsis" }}>{m.email}</div>
+            </div>
+            <select
+              aria-label={`Role for ${m.name || m.email}`}
+              value={roleOptions.includes(m.role) ? m.role : ""}
+              disabled={locked || busy === `role:${m.id}`}
+              onChange={e => doChangeRole(m, e.target.value)}
+              style={{ padding: "6px 8px", borderRadius: 8, border: "1px solid #E5E7EB", fontSize: 12, background: locked ? "#F9FAFB" : "#fff" }}>
+              {!roleOptions.includes(m.role) && <option value="">{roleLabel[m.role] || m.role}</option>}
+              {roleOptions.map(r => <option key={r} value={r}>{roleLabel[r]}</option>)}
+            </select>
+            {ralli && !locked && (
+              <button style={btn("#2563EB", "#2563EB")} disabled={!!busy}
+                onClick={() => setConfirm({ kind: "transfer", member: m, destId: "", role: "user", ack: false })}>Transfer…</button>
+            )}
+            {!locked && (
+              <button style={btn("#DC2626", "#DC2626")} disabled={busy === `removeOrg:${m.id}`}
+                onClick={() => setConfirm({ kind: "removeOrg", member: m })}>Remove from org</button>
+            )}
+          </div>
+        );
+      })}
+
+      {/* Deactivated users — people previously REMOVED FROM THIS ORG (tenant-scoped authorized RPC).
+          Shown to orgAdmins (and to Ralli admins within a specific org). NOT the global detached list. */}
+      {tenantId && (
+        <div style={{ marginTop: 14, borderTop: "1px solid #E5E7EB", paddingTop: 12 }}>
+          <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between" }}>
+            <div style={{ fontSize: 13, fontWeight: 800 }}>Deactivated users <span style={{ fontWeight: 500, color: "#9CA3AF" }}>— removed from {tenantName || "this organization"}</span></div>
+            <button style={btn("#111827", "#111827")} onClick={loadDeactivated}>Refresh</button>
+          </div>
+          <div data-testid="same-org-history-restore-note" style={{ fontSize: 11, color: "#9CA3AF", marginTop: 2 }}>
+            Reinviting this learner to the same organization restores access to their preserved history.
+          </div>
+          {deactivated === null && <div style={{ fontSize: 12, color: "#9CA3AF", marginTop: 8 }}>Loading…</div>}
+          {deactivated !== null && deactivated.length === 0 && <div style={{ fontSize: 12, color: "#9CA3AF", marginTop: 8 }}>No deactivated users.</div>}
+          {(deactivated ?? []).map(d => (
+            <div key={d.user_id} style={{ display: "flex", alignItems: "center", gap: 10, padding: "8px 0", borderTop: "1px solid #F3F4F6" }}>
+              <div style={{ flex: 1, minWidth: 0 }}>
+                <div style={{ fontWeight: 700, fontSize: 13 }}>{d.name || d.email}</div>
+                <div style={{ fontSize: 11, color: "#9CA3AF", overflow: "hidden", textOverflow: "ellipsis" }}>{d.email}</div>
+              </div>
+              <div style={{ fontSize: 11, color: "#6B7280", textAlign: "right", minWidth: 0 }}>
+                <div>Was <b>{roleLabel[d.previous_role] || d.previous_role || "Rep"}</b></div>
+                {d.removed_at && <div style={{ color: "#9CA3AF" }}>Removed {new Date(d.removed_at).toLocaleDateString()}</div>}
+              </div>
+              <button style={btn("#F97316", "#F97316")} onClick={() => doReinvite(d)}>Reinvite</button>
+            </div>
+          ))}
+        </div>
+      )}
+
+      {/* Ralli-admin: detached/removed users */}
+      {ralli && (
+        <div style={{ marginTop: 14, borderTop: "1px solid #E5E7EB", paddingTop: 12 }}>
+          <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between" }}>
+            <div style={{ fontSize: 13, fontWeight: 800 }}>Removed / detached users (no organization)</div>
+            <button style={btn("#111827", "#111827")} onClick={loadDetached}>{detached === null ? "Show" : "Refresh"}</button>
+          </div>
+          {detached !== null && detached.length === 0 && <div style={{ fontSize: 12, color: "#9CA3AF", marginTop: 8 }}>No detached users.</div>}
+          {(detached ?? []).map(d => (
+            <div key={d.id} style={{ display: "flex", alignItems: "center", gap: 10, padding: "8px 0", borderTop: "1px solid #F3F4F6" }}>
+              <div style={{ flex: 1, minWidth: 0 }}>
+                <div style={{ fontWeight: 700, fontSize: 13 }}>{d.name || d.email} <span style={{ fontSize: 10, color: "#9CA3AF" }}>({d.status})</span></div>
+                <div style={{ fontSize: 11, color: "#9CA3AF" }}>{d.email}</div>
+              </div>
+              <button style={btn("#16A34A", "#16A34A")} disabled={!!busy}
+                onClick={() => setReactivate({ member: d, destId: "", role: "user", ack: false })}>Reactivate…</button>
+            </div>
+          ))}
+        </div>
+      )}
+
+      {/* Confirm: remove-from-org (distinct language from team removal) */}
+      {confirm?.kind === "removeOrg" && (
+        <div style={{ position: "fixed", inset: 0, background: "rgba(0,0,0,.4)", display: "flex", alignItems: "center", justifyContent: "center", zIndex: 1000 }} onClick={() => setConfirm(null)}>
+          <div style={{ ...box, padding: 20, maxWidth: 420 }} onClick={e => e.stopPropagation()}>
+            <div style={{ fontSize: 16, fontWeight: 800, marginBottom: 8 }}>Remove from organization?</div>
+            <div style={{ fontSize: 13, color: "#374151", marginBottom: 16 }}>
+              This removes <b>{confirm.member.name || confirm.member.email}</b> from the <b>entire organization</b>
+              {tenantName ? ` (${tenantName})` : ""}. Their access is deactivated and they are detached from the org,
+              but <b>their account and readiness history are preserved</b> and they can be reinvited later.
+              This is <b>not</b> the same as removing them from a team.
+            </div>
+            <div style={{ display: "flex", gap: 8, justifyContent: "flex-end" }}>
+              <button style={btn("#6B7280", "#6B7280")} onClick={() => setConfirm(null)}>Cancel</button>
+              <button style={btn("#DC2626", "#DC2626")} disabled={!!busy} onClick={() => doRemoveOrg(confirm.member)}>Remove from organization</button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* Confirm: transfer (ralli) */}
+      {confirm?.kind === "transfer" && (
+        <div style={{ position: "fixed", inset: 0, background: "rgba(0,0,0,.4)", display: "flex", alignItems: "center", justifyContent: "center", zIndex: 1000 }} onClick={() => setConfirm(null)}>
+          <div style={{ ...box, padding: 20, maxWidth: 440 }} onClick={e => e.stopPropagation()}>
+            <div style={{ fontSize: 16, fontWeight: 800, marginBottom: 8 }}>Transfer to another organization</div>
+            <div style={{ fontSize: 13, color: "#374151", marginBottom: 12 }}>
+              Move <b>{confirm.member.name || confirm.member.email}</b> to a different organization. Their history stays
+              with the original organization; a fresh readiness record is built in the new one.
+            </div>
+            <div style={{ display: "flex", gap: 8, marginBottom: 16 }}>
+              <select value={confirm.destId} onChange={e => setConfirm(c => ({ ...c, destId: e.target.value }))}
+                style={{ flex: 1, padding: "8px", borderRadius: 8, border: "1px solid #E5E7EB", fontSize: 13 }}>
+                <option value="">Choose organization…</option>
+                {orgs.filter(o => o.id !== tenantId).map(o => <option key={o.id} value={o.id}>{o.name}</option>)}
+              </select>
+              <select value={confirm.role} onChange={e => setConfirm(c => ({ ...c, role: e.target.value }))}
+                style={{ padding: "8px", borderRadius: 8, border: "1px solid #E5E7EB", fontSize: 13 }}>
+                {["user", "manager", "orgAdmin"].map(r => <option key={r} value={r}>{roleLabel[r]}</option>)}
+              </select>
+            </div>
+            {historyWarning}
+            {/* Explicit confirmation is required only once a destination org (and role) are chosen. */}
+            <label style={{ display: "flex", alignItems: "flex-start", gap: 8, fontSize: 12, color: "#374151", marginBottom: 16, cursor: confirm.destId ? "pointer" : "not-allowed", opacity: confirm.destId ? 1 : 0.5 }}>
+              <input type="checkbox" checked={!!confirm.ack} disabled={!confirm.destId}
+                onChange={e => setConfirm(c => ({ ...c, ack: e.target.checked }))} />
+              <span>I understand this learner will start fresh in the new organization and their history stays with the organization where it was earned.</span>
+            </label>
+            <div style={{ display: "flex", gap: 8, justifyContent: "flex-end" }}>
+              <button style={btn("#6B7280", "#6B7280")} onClick={() => setConfirm(null)}>Cancel</button>
+              <button style={btn("#2563EB", "#2563EB")} disabled={!confirm.destId || !confirm.ack || !!busy} onClick={() => doTransfer(confirm.member, confirm.destId, confirm.role)}>Transfer</button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* Reactivate (ralli, detached user) */}
+      {reactivate && (
+        <div style={{ position: "fixed", inset: 0, background: "rgba(0,0,0,.4)", display: "flex", alignItems: "center", justifyContent: "center", zIndex: 1000 }} onClick={() => setReactivate(null)}>
+          <div style={{ ...box, padding: 20, maxWidth: 440 }} onClick={e => e.stopPropagation()}>
+            <div style={{ fontSize: 16, fontWeight: 800, marginBottom: 8 }}>Reactivate user</div>
+            <div style={{ fontSize: 13, color: "#374151", marginBottom: 12 }}>
+              Attach <b>{reactivate.member.name || reactivate.member.email}</b> to an organization with a role.
+            </div>
+            <div style={{ display: "flex", gap: 8, marginBottom: 16 }}>
+              <select value={reactivate.destId} onChange={e => setReactivate(r => ({ ...r, destId: e.target.value }))}
+                style={{ flex: 1, padding: "8px", borderRadius: 8, border: "1px solid #E5E7EB", fontSize: 13 }}>
+                <option value="">Choose organization…</option>
+                {orgs.map(o => <option key={o.id} value={o.id}>{o.name}</option>)}
+              </select>
+              <select value={reactivate.role} onChange={e => setReactivate(r => ({ ...r, role: e.target.value }))}
+                style={{ padding: "8px", borderRadius: 8, border: "1px solid #E5E7EB", fontSize: 13 }}>
+                {["user", "manager", "orgAdmin"].map(r => <option key={r} value={r}>{roleLabel[r]}</option>)}
+              </select>
+            </div>
+            {historyWarning}
+            {/* Explicit confirmation is required only once a destination org (and role) are chosen. */}
+            <label style={{ display: "flex", alignItems: "flex-start", gap: 8, fontSize: 12, color: "#374151", marginBottom: 16, cursor: reactivate.destId ? "pointer" : "not-allowed", opacity: reactivate.destId ? 1 : 0.5 }}>
+              <input type="checkbox" checked={!!reactivate.ack} disabled={!reactivate.destId}
+                onChange={e => setReactivate(r => ({ ...r, ack: e.target.checked }))} />
+              <span>I understand this learner will start fresh in the selected organization and their history stays with the organization where it was earned.</span>
+            </label>
+            <div style={{ display: "flex", gap: 8, justifyContent: "flex-end" }}>
+              <button style={btn("#6B7280", "#6B7280")} onClick={() => setReactivate(null)}>Cancel</button>
+              <button style={btn("#16A34A", "#16A34A")} disabled={!reactivate.destId || !reactivate.ack || !!busy} onClick={doReactivate}>Reactivate</button>
+            </div>
+          </div>
+        </div>
+      )}
+    </div>
+  );
+}
+
+function TeamScreen({ operator, orgId, orgName, orgUsers, orgs = [], onAddUser, onMemberInvited }) {
   const [localMembers, setLocalMembers] = useState(null); // null = loading
 
   useEffect(() => {
@@ -22906,9 +23205,9 @@ function TeamScreen({ orgId, orgName, orgUsers, onAddUser, onMemberInvited }) {
                 <span style={{ fontSize: 11, fontWeight: 700, padding: "3px 8px", borderRadius: 6, background: (ROLE_COLORS[m.role] ?? C.textMuted) + "18", color: ROLE_COLORS[m.role] ?? C.textMuted }}>
                   {ROLE_LABELS[m.role] ?? m.role}
                 </span>
-                <button onClick={() => handleRemoveMember(m.id)} disabled={isRemoving}
+                <button onClick={() => handleRemoveMember(m.id)} disabled={isRemoving} title="Detach from this team only; stays in the organization"
                   style={{ padding: "5px 10px", borderRadius: 7, border: "1px solid #fca5a5", background: "#fef2f2", color: "#ef4444", fontSize: 11, fontWeight: 600, cursor: isRemoving ? "not-allowed" : "pointer", opacity: isRemoving ? 0.6 : 1 }}>
-                  {isRemoving ? "…" : "Remove"}
+                  {isRemoving ? "…" : "Remove from team"}
                 </button>
               </div>
             );
@@ -22935,6 +23234,28 @@ function TeamScreen({ orgId, orgName, orgUsers, onAddUser, onMemberInvited }) {
           + Invite Member
         </button>
       </div>
+
+      {/* Organization-level member management (migration-091 lifecycle RPCs) */}
+      {operator && (
+        <MemberLifecyclePanel
+          operator={operator}
+          tenantId={orgId}
+          tenantName={orgName}
+          members={members}
+          orgs={orgs}
+          onReinvite={(prefill) => { setShowAdd(true); if (prefill) setForm(f => ({ ...f, email: prefill.email, role: ["user", "orgAdmin"].includes(prefill.role) ? prefill.role : "user" })); }}
+          onChanged={async () => {
+            const { data } = await supabase
+              .from("profiles").select("id, name, email, role, color, status, team_id").eq("tenant_id", orgId);
+            setLocalMembers((data ?? []).map(m => ({
+              id: m.id, email: m.email,
+              name: m.name ?? m.email?.split("@")[0] ?? "User",
+              initials: (m.name ?? m.email ?? "U").split(" ").map(p => p[0] ?? "").join("").toUpperCase().slice(0, 2) || "U",
+              role: m.role ?? "user", color: m.color ?? "#F97316", status: m.status ?? "active", _isReal: true,
+            })));
+          }}
+        />
+      )}
 
       {/* Teams */}
       <div style={{ background: C.white, borderRadius: 12, border: `1px solid ${C.border}`, overflow: "hidden" }}>
@@ -23877,12 +24198,13 @@ function LoginScreen({ onLogin, users = USERS }) {
 // ── OrgAdminSettingsScreen ────────────────────────────────────────────────────
 // Tabbed settings for Organization Admin: Role Access + Team Settings
 // ─────────────────────────────────────────────────────────────────────────────
-function OrgAdminSettingsScreen({ rolePermissions, onSaveRolePermissions, currentOrg, orgId, orgName, orgUsers, onAddUser, readinessThreshold = 80, onSaveReadinessThreshold }) {
-  const [tab, setTab] = useState("roles"); // "roles" | "team" | "learning"
+function OrgAdminSettingsScreen({ operator, rolePermissions, onSaveRolePermissions, currentOrg, orgId, orgName, orgUsers, onAddUser, readinessThreshold = 80, onSaveReadinessThreshold }) {
+  const [tab, setTab] = useState("roles"); // "roles" | "team" | "learning" | "readiness"
   const tabs = [
-    { id: "roles",    label: "Role Access" },
-    { id: "team",     label: "Team Settings" },
-    { id: "learning", label: "Learning" },
+    { id: "roles",     label: "Role Access" },
+    { id: "team",      label: "Team Settings" },
+    { id: "learning",  label: "Learning" },
+    { id: "readiness", label: "Readiness" },
   ];
   return (
     <div style={{ display: "flex", flexDirection: "column", gap: 20 }}>
@@ -23899,8 +24221,9 @@ function OrgAdminSettingsScreen({ rolePermissions, onSaveRolePermissions, curren
         ))}
       </div>
       {tab === "roles"    && <RoleAccessScreen rolePermissions={rolePermissions} onSave={onSaveRolePermissions} currentOrg={currentOrg} />}
-      {tab === "team"     && <TeamScreen orgId={orgId} orgName={orgName} orgUsers={orgUsers} onAddUser={onAddUser} />}
+      {tab === "team"     && <TeamScreen operator={operator} orgId={orgId} orgName={orgName} orgUsers={orgUsers} onAddUser={onAddUser} />}
       {tab === "learning" && <LearningSettingsScreen readinessThreshold={readinessThreshold} onSave={onSaveReadinessThreshold} />}
+      {tab === "readiness" && <ReadinessSettingsScreen />}
     </div>
   );
 }
@@ -23995,6 +24318,211 @@ function LearningSettingsScreen({ readinessThreshold = READINESS_THRESHOLD_DEFAU
           ✓ Saved
         </div>
       )}
+    </div>
+  );
+}
+
+// ── ReadinessSettingsScreen — designate quiz tags as readiness knowledge areas ──
+// Rendered for same-tenant managers and orgAdmins only (via OrgAdminSettingsScreen's
+// Readiness tab for orgAdmins, and UserSettingsScreen's manager-only section). The
+// server RPCs (readiness_caller_can_configure + tenant-scoped RLS) are the real
+// authorization + cross-tenant boundary; this UI gate is convenience. All
+// counts/validity come from the server — the client never computes readiness.
+// Shadow phase: activating a configuration does NOT change the live dashboard.
+function ReadinessSettingsScreen() {
+  const [rows, setRows] = useState(null);          // editable tag rows
+  const [saved, setSaved] = useState([]);          // last-saved designations (for dirty check)
+  const [versionId, setVersionId] = useState(null);
+  const [loading, setLoading] = useState(true);
+  const [err, setErr] = useState(null);
+  const [busy, setBusy] = useState(false);
+  const [notice, setNotice] = useState(null);
+
+  const load = async () => {
+    setLoading(true); setErr(null);
+    const { data, error } = await readinessGetTagCandidates();
+    if (error) { setErr(error.message || "Failed to load readiness configuration."); setLoading(false); return; }
+    const tags = (data?.tags ?? []).map(t => ({ ...t }));
+    setRows(tags);
+    setSaved(readinessDraftDesignations(tags));
+    setVersionId(data?.configVersionId ?? null);
+    setLoading(false);
+  };
+  const [primaries, setPrimaries] = useState(null);  // quizzes carrying designated readiness tags
+  const loadPrimaries = async () => {
+    const { data, error } = await readinessGetQuizPrimaries();
+    if (!error) setPrimaries(data?.quizzes ?? []);
+  };
+  useEffect(() => { load(); loadPrimaries(); /* eslint-disable-next-line react-hooks/exhaustive-deps */ }, []);
+
+  const onPickPrimary = async (quizId, tagId) => {
+    setBusy(true); setErr(null); setNotice(null);
+    const { error } = await readinessSetQuizPrimary(quizId, tagId || null);
+    setBusy(false);
+    if (error) { setErr(error.message || "Failed to set primary readiness tag."); return; }
+    await loadPrimaries();
+  };
+
+  const state = readinessDeriveSetupState({ tags: rows ?? [] });
+  const dirty = rows ? readinessDraftDirty(rows, saved) : false;
+
+  const toggleCounts = (tagId) => setRows(rs => rs.map(r => r.tagId === tagId
+    ? { ...r, countsTowardReadiness: !r.countsTowardReadiness, isRequired: r.countsTowardReadiness ? false : r.isRequired }
+    : r));
+  const toggleRequired = (tagId) => setRows(rs => rs.map(r => r.tagId === tagId && r.countsTowardReadiness
+    ? { ...r, isRequired: !r.isRequired } : r));
+
+  const handleSaveDraft = async () => {
+    setBusy(true); setErr(null); setNotice(null);
+    const { data, error } = await readinessSaveDraft(readinessDraftDesignations(rows));
+    setBusy(false);
+    if (error) { setErr(error.message || "Failed to save draft."); return; }
+    setSaved(readinessDraftDesignations(rows));
+    if (data?.draftVersionId) setVersionId(data.draftVersionId);
+    setNotice("Draft saved. Review coverage, then activate to make it the live readiness configuration.");
+  };
+
+  const handleActivate = async () => {
+    if (!versionId) return;
+    if (!window.confirm("Activate this readiness configuration?\n\nReps' readiness will be measured against these tags. Removing or archiving a required tag later can leave reps without coverage until you assign a replacement.")) return;
+    setBusy(true); setErr(null); setNotice(null);
+    const { data, error } = await readinessActivateConfig(versionId);
+    setBusy(false);
+    if (error) { setErr(error.message || "Failed to activate configuration."); return; }
+    setNotice("Readiness configuration activated.");
+    await load();
+  };
+
+  if (loading) return <div style={{ fontSize: 13, color: C.textSub, padding: 24 }}>Loading readiness configuration…</div>;
+  if (err && !rows) return <div style={{ fontSize: 13, color: C.red, padding: 24 }}>{err}</div>;
+
+  return (
+    <div style={{ display: "flex", flexDirection: "column", gap: 16, maxWidth: 820 }}>
+      <div style={{ background: C.white, borderRadius: 16, border: `1px solid ${C.border}`, padding: 24 }}>
+        <div style={{ fontSize: 16, fontWeight: 800, color: C.text, marginBottom: 6 }}>Readiness Tags</div>
+        <p style={{ margin: "0 0 4px", fontSize: 13, color: C.textSub, lineHeight: 1.6 }}>
+          A <strong>readiness tag</strong> is a knowledge area you designate as required for official readiness.
+          Readiness is measured only from <strong>verified quiz mastery</strong> in these areas — ordinary quiz tags
+          keep organizing content and analytics but never affect a rep's readiness unless designated here.
+        </p>
+        <p style={{ margin: "0 0 2px", fontSize: 12.5, color: C.textSub, lineHeight: 1.6 }}>
+          Mark <strong>Required</strong> for areas every rep must demonstrate. A rep is only scored once they have
+          enough recent verified evidence; until then they show “Establishing readiness,” never a low score.
+        </p>
+        <p style={{ margin: "8px 0 0", fontSize: 12.5, color: C.textSub, lineHeight: 1.6 }}>
+          Only <strong>required</strong> areas affect the official score. Overall readiness is the <strong>equal average
+          across the required areas</strong> (the same denominator for every rep, so scores stay comparable and a quiz in
+          an area with many quizzes counts a little less — not equal-per-quiz weighting). <strong>Optional</strong> areas
+          appear as diagnostic insights only and never change the official score, so attempting a weak optional quiz can
+          never lower readiness. A rep is Established only once <strong>every required area</strong> has current evidence;
+          with no required areas, readiness stays “Establishing.” Each quiz counts toward exactly one area — the
+          <strong> primary</strong> tag you choose below.
+        </p>
+      </div>
+
+      {/* Setup-complete / incomplete banner */}
+      <div style={{
+        borderRadius: 12, padding: "12px 16px", fontSize: 13, fontWeight: 700,
+        border: `1px solid ${state.setupComplete ? "#a7f3d0" : "#fde68a"}`,
+        background: state.setupComplete ? "#ecfdf5" : "#fffbeb",
+        color: state.setupComplete ? "#047857" : "#92400e",
+      }}>
+        {state.setupComplete ? "✓ " : "⚠ "}{readinessSetupBanner(state)}
+      </div>
+
+      {/* Tag table */}
+      <div style={{ background: C.white, borderRadius: 16, border: `1px solid ${C.border}`, overflow: "hidden" }}>
+        <div style={{ display: "grid", gridTemplateColumns: "1.6fr 0.9fr 0.7fr 0.7fr 1.4fr", gap: 0,
+          padding: "10px 16px", background: C.bg2 ?? "#f8fafc", fontSize: 11, fontWeight: 800,
+          color: C.textSub, letterSpacing: "0.04em", textTransform: "uppercase" }}>
+          <div>Tag</div><div>Counts / Required</div><div>Quizzes</div><div>Questions</div><div>Status</div>
+        </div>
+        {(rows ?? []).length === 0 && (
+          <div style={{ padding: 20, fontSize: 13, color: C.textSub }}>No active quiz tags yet. Create and assign tags to quizzes first.</div>
+        )}
+        {(rows ?? []).map(r => {
+          const valid = r.status === "active" && r.coverageSufficient;
+          return (
+            <div key={r.tagId} style={{ display: "grid", gridTemplateColumns: "1.6fr 0.9fr 0.7fr 0.7fr 1.4fr",
+              gap: 0, padding: "12px 16px", borderTop: `1px solid ${C.border}`, alignItems: "center" }}>
+              <div style={{ fontSize: 14, fontWeight: 700, color: C.text }}>{r.label}</div>
+              <div style={{ display: "flex", gap: 12, alignItems: "center", fontSize: 12, fontWeight: 700 }}>
+                <label style={{ display: "flex", gap: 5, alignItems: "center", cursor: "pointer", color: r.countsTowardReadiness ? C.text : C.textSub }}>
+                  <input type="checkbox" checked={!!r.countsTowardReadiness} onChange={() => toggleCounts(r.tagId)} /> Counts
+                </label>
+                <label style={{ display: "flex", gap: 5, alignItems: "center", cursor: r.countsTowardReadiness ? "pointer" : "not-allowed", color: r.countsTowardReadiness ? C.text : C.muted }}>
+                  <input type="checkbox" disabled={!r.countsTowardReadiness} checked={!!r.isRequired} onChange={() => toggleRequired(r.tagId)} /> Required
+                </label>
+              </div>
+              <div style={{ fontSize: 13, fontWeight: 700, color: r.activeQuizCount >= 1 ? C.text : C.red }}>{r.activeQuizCount}</div>
+              <div style={{ fontSize: 13, fontWeight: 700, color: r.distinctQuestionCount >= 1 ? C.text : C.red }}>{r.distinctQuestionCount}</div>
+              <div style={{ fontSize: 12, fontWeight: 700 }}>
+                {valid
+                  ? <span style={{ color: "#047857" }}>Adequate coverage</span>
+                  : <span style={{ color: "#b45309" }}>{(r.warnings && r.warnings.length ? readinessWarningLabel(r.warnings[0]) : "Insufficient coverage")}</span>}
+              </div>
+            </div>
+          );
+        })}
+      </div>
+
+      {notice && <div style={{ fontSize: 12.5, color: "#047857", fontWeight: 700 }}>✓ {notice}</div>}
+      {err && <div style={{ fontSize: 12.5, color: C.red, fontWeight: 700 }}>{err}</div>}
+
+      {/* Actions: save draft (dirty) vs activate (valid + saved). */}
+      <div style={{ display: "flex", gap: 10, alignItems: "center" }}>
+        <button onClick={handleSaveDraft} disabled={!dirty || busy} style={{
+          padding: "10px 20px", borderRadius: 10, border: "none", fontSize: 13, fontWeight: 700, color: "#fff",
+          cursor: (!dirty || busy) ? "not-allowed" : "pointer", background: (!dirty || busy) ? C.muted : C.orange }}>
+          Save draft
+        </button>
+        <button onClick={handleActivate} disabled={!state.canActivate || dirty || busy || !versionId} style={{
+          padding: "10px 20px", borderRadius: 10, border: `1px solid ${(!state.canActivate || dirty) ? C.border : "#047857"}`,
+          fontSize: 13, fontWeight: 700,
+          color: (!state.canActivate || dirty || busy) ? C.muted : "#047857",
+          background: C.white, cursor: (!state.canActivate || dirty || busy || !versionId) ? "not-allowed" : "pointer" }}>
+          Activate configuration
+        </button>
+        {dirty && <span style={{ fontSize: 12, color: C.textSub }}>Unsaved changes — save the draft before activating.</span>}
+      </div>
+
+      {/* Primary readiness tag per quiz — the ONE area each quiz counts toward. */}
+      {primaries && primaries.length > 0 && (
+        <div style={{ background: C.white, borderRadius: 16, border: `1px solid ${C.border}`, overflow: "hidden" }}>
+          <div style={{ padding: "12px 16px", borderBottom: `1px solid ${C.border}` }}>
+            <div style={{ fontSize: 14, fontWeight: 800, color: C.text }}>Primary readiness area per quiz</div>
+            <div style={{ fontSize: 12, color: C.textSub, marginTop: 2 }}>
+              Choose the one readiness area each quiz counts toward for official scoring. Other tags stay insights-only.
+              A quiz with no valid primary is excluded from scoring (and its reps see it as unmeasured), never auto-assigned.
+            </div>
+          </div>
+          {primaries.map(q => {
+            const opts = q.designatedAssignedTags || [];
+            return (
+              <div key={q.quizId} style={{ display: "grid", gridTemplateColumns: "1.6fr 1.2fr 0.8fr", gap: 12,
+                padding: "10px 16px", borderTop: `1px solid ${C.border}`, alignItems: "center" }}>
+                <div style={{ fontSize: 13, fontWeight: 700, color: C.text }}>{q.quizName}</div>
+                <select value={q.primaryTagId || ""} disabled={busy} onChange={e => onPickPrimary(q.quizId, e.target.value)}
+                  style={{ padding: "8px 10px", borderRadius: 8, border: `1px solid ${q.primaryValid ? C.border : C.red}`,
+                    fontSize: 13, fontFamily: "inherit", color: C.text, background: C.white }}>
+                  <option value="">— Select primary area —</option>
+                  {opts.map(t => <option key={t.tagId} value={t.tagId}>{t.label}</option>)}
+                </select>
+                <div style={{ fontSize: 12, fontWeight: 700, color: q.primaryValid ? "#047857" : "#b45309" }}>
+                  {q.primaryValid ? "Set" : "Needs a primary"}
+                </div>
+              </div>
+            );
+          })}
+        </div>
+      )}
+
+      <p style={{ margin: 0, fontSize: 11.5, color: C.textSub, lineHeight: 1.6 }}>
+        Activating a configuration makes it the live readiness definition for scoring. Existing verified evidence
+        for an archived quiz or tag stays valid until it ages out; archived content cannot produce new evidence.
+        Changing designations creates a new draft you can preview before activating — historical scores keep the
+        configuration version they were computed under.
+      </p>
     </div>
   );
 }
@@ -24672,7 +25200,7 @@ function RoleAccessScreen({ rolePermissions, onSave, currentOrg }) {
 // Production hook: replace localStorage reads/writes with API calls to
 // /api/users/:id/profile and /api/users/:id/notification-prefs
 // ─────────────────────────────────────────────────────────────────────────────
-function UserSettingsScreen({ user, profile, notifPrefs, onSaveProfile, onSaveNotifs, currentOrg, onSignOut }) {
+function UserSettingsScreen({ user, profile, notifPrefs, onSaveProfile, onSaveNotifs, currentOrg, onSignOut, showReadiness = false }) {
   // Local draft state so unsaved changes don't immediately affect the app
   const [nick,   setNick]   = useState(profile.nickname ?? "");
   const [avatar, setAvatar] = useState(profile.avatarEmoji ?? null);
@@ -24727,6 +25255,14 @@ function UserSettingsScreen({ user, profile, notifPrefs, onSaveProfile, onSaveNo
   return (
     <div style={{ maxWidth: 600, margin: "0 auto", padding: "32px 24px" }}>
       <h1 style={{ margin: "0 0 32px", fontSize: 22, fontWeight: 900, color: C.text }}>Settings</h1>
+
+      {/* ── READINESS (managers only; learners never see this) ── */}
+      {showReadiness && (
+        <div style={{ marginBottom: 28 }}>
+          <SectionHeader title="Readiness" subtitle="Designate the knowledge areas that count toward rep readiness." />
+          <ReadinessSettingsScreen />
+        </div>
+      )}
 
       {/* ── PROFILE ── */}
       <Card style={{ marginBottom: 20 }}>
@@ -26039,30 +26575,48 @@ export default function App() {
     };
   };
 
+  // Member administration routes through the migration-091 advisory-first lifecycle RPCs
+  // (role/status/tenant are server-only; name is a safe presentation field). update_member/remove_member
+  // were never deployed — these RPCs replace them and keep readiness correct across each transition.
   const handleUpdateMember = async (profileId, fields) => {
-    const { data, error } = await supabase.rpc("update_member", {
-      p_profile_id: profileId,
-      p_name:   fields.name   ?? null,
-      p_role:   fields.role   ?? null,
-      p_status: fields.status ?? null,
-    });
-    if (error) { console.error("[ralli] update_member failed:", error); throw error; }
-    // RPC succeeded — sync App-level orgUsers with the canonical values it returned.
+    const member = orgUsers.find(u => u.id === profileId);
+    const applied = {};
+    try {
+      // name — safe presentation column (direct update)
+      if (fields.name != null && fields.name !== member?.name) {
+        const { error } = await supabase.from("profiles").update({ name: fields.name }).eq("id", profileId);
+        if (error) throw error;
+        applied.name = fields.name;
+      }
+      // role change → lifecycle change_role
+      if (fields.role != null && fields.role !== member?.role) {
+        const { error } = await supabase.rpc("readiness_lifecycle_change_role", { p_user: profileId, p_role: fields.role });
+        if (error) throw error;
+        applied.role = fields.role;
+      }
+      // status change → deactivate (remove) or reactivate into the member's tenant
+      if (fields.status != null && fields.status !== member?.status) {
+        if (fields.status === "inactive") {
+          const { error } = await supabase.rpc("readiness_lifecycle_remove_member", { p_user: profileId });
+          if (error) throw error;
+          applied.status = "inactive";
+        } else if (fields.status === "active") {
+          const { error } = await supabase.rpc("readiness_lifecycle_reactivate_member", {
+            p_user: profileId, p_tenant: member?.orgId ?? null, p_role: fields.role ?? member?.role ?? "user",
+          });
+          if (error) throw error;
+          applied.status = "active";
+        }
+      }
+    } catch (error) { console.error("[ralli] update member (lifecycle) failed:", error); throw error; }
     // Only runs on success; the throw above prevents reaching this on failure.
-    if (data) {
-      setOrgUsers(prev => prev.map(u => u.id === profileId ? {
-        ...u,                          // preserve all fields not touched by this update
-        name:   data.name   ?? u.name,
-        role:   data.role   ?? u.role,
-        status: data.status ?? u.status,
-      } : u));
-    }
-    return data;
+    setOrgUsers(prev => prev.map(u => u.id === profileId ? { ...u, ...applied } : u));
+    return applied;
   };
 
   const handleRemoveMember = async (profileId) => {
-    const { error } = await supabase.rpc("remove_member", { p_profile_id: profileId });
-    if (error) { console.error("[ralli] remove_member failed:", error); throw error; }
+    const { error } = await supabase.rpc("readiness_lifecycle_remove_member", { p_user: profileId });
+    if (error) { console.error("[ralli] remove_member (lifecycle) failed:", error); throw error; }
     // RPC succeeded — remove the user from App-level orgUsers immediately.
     // Only runs on success; the throw above prevents reaching this on failure.
     setOrgUsers(prev => prev.filter(u => u.id !== profileId));
@@ -26995,13 +27549,13 @@ export default function App() {
       // Any stale deep-link/remembered screen falls through to Ralli Live.
       case "leaderboard":       return <RankdScreen onNav={navigate} onJoin={handleEnterPin} sessions={sessions} pastSessions={pastSessions} onLaunch={handleLaunch} onViewResults={handleViewResults} onRelaunch={handleRelaunch} role={gameRole} currentUser={currentUser} />;
       case "organizations":     return selectedOrg
-        ? <OrgDetailScreen org={selectedOrg} orgUsers={orgUsers} onBack={() => setSelectedOrg(null)} onAddUser={handleAddUser} onDeactivateOrg={handleDeactivateOrg} onReactivateOrg={handleReactivateOrg} onDeleteOrg={handleDeleteOrg} onCancelOrg={handleCancelOrg} onUpdateOrg={handleUpdateOrg} onUpdateMember={handleUpdateMember} onRemoveMember={handleRemoveMember} onCancelInvite={handleCancelInvite} onResendMemberInvite={handleResendMemberInvite} />
+        ? <OrgDetailScreen operator={user} orgs={orgs} org={selectedOrg} orgUsers={orgUsers} onBack={() => setSelectedOrg(null)} onAddUser={handleAddUser} onDeactivateOrg={handleDeactivateOrg} onReactivateOrg={handleReactivateOrg} onDeleteOrg={handleDeleteOrg} onCancelOrg={handleCancelOrg} onUpdateOrg={handleUpdateOrg} onUpdateMember={handleUpdateMember} onRemoveMember={handleRemoveMember} onCancelInvite={handleCancelInvite} onResendMemberInvite={handleResendMemberInvite} />
         : <OrganizationsScreen orgs={orgs} onInviteOrg={handleInviteOrg} onSelectOrg={(org) => setSelectedOrg(org)} onRefresh={handleRefreshOrgs} onDeactivateOrg={handleDeactivateOrg} onReactivateOrg={handleReactivateOrg} onDeleteOrg={handleDeleteOrg} onCancelOrg={handleCancelOrg} />;
-      case "team":              return <TeamScreen orgId={user.orgId} orgName={currentOrg?.name ?? "Your Team"} orgUsers={orgUsers} onAddUser={handleAddUser} />;
+      case "team":              return <TeamScreen operator={user} orgId={user.orgId} orgName={currentOrg?.name ?? "Your Team"} orgUsers={orgUsers} onAddUser={handleAddUser} />;
       case "settings":
         if (isSuperAdmin)  return <RoleAccessScreen rolePermissions={rolePermissions} onSave={handleSaveRolePermissions} currentOrg={currentOrg} />;
-        if (isOrgAdmin)    return <OrgAdminSettingsScreen rolePermissions={rolePermissions} onSaveRolePermissions={handleSaveRolePermissions} currentOrg={currentOrg} orgId={user.orgId} orgName={currentOrg?.name ?? "Your Team"} orgUsers={orgUsers} onAddUser={handleAddUser} readinessThreshold={readinessThreshold} onSaveReadinessThreshold={handleSaveReadinessThreshold} />;
-        return <UserSettingsScreen user={user} profile={userProfile} notifPrefs={notifPrefs} onSaveProfile={handleSaveProfile} onSaveNotifs={handleSaveNotifs} currentOrg={currentOrg} onSignOut={async () => { if (user?._isReal) { await supabase.auth.signOut(); /* SIGNED_OUT handler redirects */ } else { setCurrentUser(null); setLastSeenAt(null); setNewAssignmentCount(0); setPendingLessonId(null); setPendingCourseId(null); setPendingQuizId(null); setOrgs(INITIAL_ORGS); setOrgUsers(INITIAL_ORG_USERS); setQuizzesReady(false); setSessions(INITIAL_SESSIONS); setBattleCards(INITIAL_BATTLE_CARDS); clearLearnNavSessionState(); clearActiveGameContext(); clearBattleCardDrafts(); window.location.replace("/login"); } }} />;
+        if (isOrgAdmin)    return <OrgAdminSettingsScreen operator={user} rolePermissions={rolePermissions} onSaveRolePermissions={handleSaveRolePermissions} currentOrg={currentOrg} orgId={user.orgId} orgName={currentOrg?.name ?? "Your Team"} orgUsers={orgUsers} onAddUser={handleAddUser} readinessThreshold={readinessThreshold} onSaveReadinessThreshold={handleSaveReadinessThreshold} />;
+        return <UserSettingsScreen user={user} profile={userProfile} notifPrefs={notifPrefs} onSaveProfile={handleSaveProfile} onSaveNotifs={handleSaveNotifs} currentOrg={currentOrg} showReadiness={canAccessReadinessSettings(role)} onSignOut={async () => { if (user?._isReal) { await supabase.auth.signOut(); /* SIGNED_OUT handler redirects */ } else { setCurrentUser(null); setLastSeenAt(null); setNewAssignmentCount(0); setPendingLessonId(null); setPendingCourseId(null); setPendingQuizId(null); setOrgs(INITIAL_ORGS); setOrgUsers(INITIAL_ORG_USERS); setQuizzesReady(false); setSessions(INITIAL_SESSIONS); setBattleCards(INITIAL_BATTLE_CARDS); clearLearnNavSessionState(); clearActiveGameContext(); clearBattleCardDrafts(); window.location.replace("/login"); } }} />;
       default:                  return <HomeScreen user={user} />;
     }
   };
