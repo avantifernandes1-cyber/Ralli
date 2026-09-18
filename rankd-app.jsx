@@ -26364,6 +26364,13 @@ export default function App() {
               features: { ...DEFAULT_ROLE_PERMISSIONS.orgAdmin.features, ...(db.orgAdmin?.features ?? {}) },
               actions:  { ...DEFAULT_ROLE_PERMISSIONS.orgAdmin.actions,  ...(db.orgAdmin?.actions  ?? {}) },
             },
+            // manager MUST be merged too. Omitting it leaves rolePermissions.manager undefined, so
+            // perm("features", …) is false for every nav item and a promoted Manager gets an EMPTY sidebar
+            // (the User→Manager→refresh bug). Mirrors loadRolePermissions in permissions.js.
+            manager: {
+              features: { ...DEFAULT_ROLE_PERMISSIONS.manager.features,  ...(db.manager?.features  ?? {}) },
+              actions:  { ...DEFAULT_ROLE_PERMISSIONS.manager.actions,   ...(db.manager?.actions   ?? {}) },
+            },
           });
         }
         // Readiness threshold — default to 80 (DEFAULT_READINESS_THRESHOLD in
